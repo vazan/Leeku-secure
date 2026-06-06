@@ -1,0 +1,6 @@
+{
+  "name": "Leeks.miku.rip",
+  "description": "Secure file hosting platform with cyber-kawaii and chaotic leek energy. Protected by encryption and Leeku, the Vocaloid-inspired digital guardian.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
