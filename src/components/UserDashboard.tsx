@@ -169,7 +169,7 @@ export default function UserDashboard({ user, token, onLogout, quotas, onTrigger
   const todayStr = new Date().toISOString().split('T')[0];
   const uploadedTodayBytes = userFiles
     .filter(f => f.created_at.startsWith(todayStr))
-    .reduce((sum, f) => sum + f.size, 0);
+    .reduce((sum, f) => sum + Number(f.size), 0);
   const dailyBandwidthLeftBytes = Math.max(0, dailyUploadLimit - uploadedTodayBytes);
   const dailyBandwidthLeftPercent = Math.max(0, Math.min(100, (dailyBandwidthLeftBytes / dailyUploadLimit) * 100));
 
@@ -177,7 +177,7 @@ export default function UserDashboard({ user, token, onLogout, quotas, onTrigger
   const currentMonthStr = new Date().toISOString().substring(0, 7);
   const uploadedThisMonthBytes = userFiles
     .filter(f => f.created_at.startsWith(currentMonthStr))
-    .reduce((sum, f) => sum + f.size, 0);
+    .reduce((sum, f) => sum + Number(f.size), 0);
   const monthlyBandwidthLeftBytes = Math.max(0, monthlyUploadLimit - uploadedThisMonthBytes);
   const monthlyBandwidthLeftPercent = Math.max(0, Math.min(100, (monthlyBandwidthLeftBytes / monthlyUploadLimit) * 100));
 

@@ -265,7 +265,7 @@ function mapUserRow(row: UserRow): User {
     username:     decryptColumn(row.username_encrypted, row.username_iv, row.username_auth_tag),
     role:         row.role as 'User' | 'Admin',
     quota_id:     row.quota_id,
-    storage_used: row.storage_used_bytes,
+    storage_used: Number(row.storage_used_bytes),
     status:       row.status as 'Active' | 'Suspended',
     created_at:   row.created_at.toISOString(),
   };
@@ -279,8 +279,8 @@ function mapFileRow(row: FileRow, ownerUsername: string): FileMetadata {
     original_name:  decryptColumn(row.original_name_encrypted, row.original_name_iv, row.original_name_auth_tag),
     stored_name:    row.stored_path,
     mime_type:      row.mime_type,
-    size:           row.size_bytes,
-    encrypted_size: row.encrypted_size_bytes,
+    size:           Number(row.size_bytes),
+    encrypted_size: Number(row.encrypted_size_bytes),
     status:         row.status as 'Available' | 'Blocked',
     checksum:       row.checksum_sha256,
     leeku_vibe:     row.leeku_vibe || '',
@@ -404,7 +404,12 @@ app.get('/api/quotas', async (req, res) => {
     const result = await request.query<Quota>(
       'SELECT id, name, storage_limit_bytes, max_file_size_bytes, max_files, daily_upload_limit_bytes FROM quotas ORDER BY storage_limit_bytes'
     );
-    res.json({ quotas: result.recordset });
+    res.json({ quotas: result.recordset.map(q => ({
+      ...q,
+      storage_limit_bytes: Number(q.storage_limit_bytes),
+      max_file_size_bytes: Number(q.max_file_size_bytes),
+      daily_upload_limit_bytes: Number(q.daily_upload_limit_bytes),
+    })) });
   } catch (err) { console.error('[GET /api/quotas]', err); res.status(500).json({ error: 'Failed to load quotas.' }); }
 });
 
