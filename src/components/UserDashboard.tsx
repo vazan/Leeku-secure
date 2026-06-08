@@ -66,6 +66,12 @@ export default function UserDashboard({ user, token, onLogout, quotas, onTrigger
   const [uploadSpeedKiBps, setUploadSpeedKiBps] = useState(0);    // KiB/s
   const [uploadEtaSec, setUploadEtaSec] = useState<number | null>(null); // seconds remaining
 
+  // Download progress tracking
+  const [downloadProgress, setDownloadProgress] = useState(0);        // 0-100
+  const [downloadSpeedKiBps, setDownloadSpeedKiBps] = useState(0);    // KiB/s
+  const [downloadEtaSec, setDownloadEtaSec] = useState<number | null>(null); // seconds remaining
+  const [downloadingFile, setDownloadingFile] = useState<{ name: string; size: number } | null>(null);
+
   // Share portal management
   const [selectedFileToShare, setSelectedFileToShare] = useState<FileMetadata | null>(null);
   const [sharePassword, setSharePassword] = useState('');
@@ -439,25 +445,67 @@ export default function UserDashboard({ user, token, onLogout, quotas, onTrigger
     );
   };
 
-  const handleDownloadFile = async (fileId: string, filename: string) => {
+  const handleDownloadFile = async (fileId: string, filename: string, fileSize: number) => {
+    // Show the download progress overlay
+    setDownloadingFile({ name: filename, size: fileSize });
+    setDownloadProgress(0);
+    setDownloadSpeedKiBps(0);
+    setDownloadEtaSec(null);
+
     try {
-      const res = await fetch(`/api/files/${fileId}/download`, {
-        headers: { 'Authorization': `Bearer ${token}` }
+      const blob = await new Promise<Blob>((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        let lastLoaded = 0;
+        let lastTime = Date.now();
+
+        xhr.addEventListener('progress', (event) => {
+          if (event.lengthComputable) {
+            const pct = Math.round((event.loaded / event.total) * 100);
+            setDownloadProgress(pct);
+
+            // Speed calculation (KiB/s)
+            const now = Date.now();
+            const elapsed = (now - lastTime) / 1000; // seconds
+            if (elapsed >= 1) {
+              const delta = event.loaded - lastLoaded;
+              setDownloadSpeedKiBps(Math.round(delta / 1024 / elapsed));
+              lastLoaded = event.loaded;
+              lastTime = now;
+
+              // ETA
+              const remaining = event.total - event.loaded;
+              const bps = delta / elapsed;
+              if (bps > 0) {
+                setDownloadEtaSec(Math.round(remaining / bps));
+              }
+            }
+          }
+        });
+
+        xhr.addEventListener('load', () => {
+          if (xhr.status >= 200 && xhr.status < 300) {
+            resolve(xhr.response as Blob);
+          } else {
+            let errorMessage = 'Failed to download file.';
+            try {
+              const data = JSON.parse(xhr.responseText);
+              errorMessage = data.error || errorMessage;
+            } catch { /* ignore parse errors */ }
+            reject(new Error(errorMessage));
+          }
+        });
+
+        xhr.addEventListener('error', () => reject(new Error('Connection severed while downloading.')));
+        xhr.addEventListener('abort', () => reject(new Error('Download cancelled.')));
+
+        xhr.open('GET', `/api/files/${fileId}/download`);
+        xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+        xhr.responseType = 'blob';
+        xhr.send();
       });
 
-      if (!res.ok) {
-        let errorMessage = 'Failed to download file.';
-        try {
-          const data = await res.json();
-          errorMessage = data.error || errorMessage;
-        } catch {
-          // ignore body parse errors
-        }
-        customAlert('Download blocked', errorMessage);
-        return;
-      }
-
-      const blob = await res.blob();
+      // Complete — trigger browser save dialog
+      setDownloadProgress(100);
       const objectUrl = URL.createObjectURL(blob);
       const anchor = document.createElement('a');
       anchor.href = objectUrl;
@@ -466,9 +514,13 @@ export default function UserDashboard({ user, token, onLogout, quotas, onTrigger
       anchor.click();
       anchor.remove();
       URL.revokeObjectURL(objectUrl);
-      triggerToast('Direct download started.');
-    } catch (e) {
-      customAlert('Download error', 'Connection severed while downloading.');
+      triggerToast('Direct download completed.');
+
+      // Brief pause at 100% then dismiss overlay
+      setTimeout(() => setDownloadingFile(null), 2000);
+    } catch (e: any) {
+      setDownloadingFile(null);
+      customAlert('Download error', e.message || 'Connection severed while downloading.');
     }
   };
 
@@ -804,6 +856,81 @@ export default function UserDashboard({ user, token, onLogout, quotas, onTrigger
                   <button onClick={() => setDialog(prev => ({ ...prev, isOpen: false }))} className="px-4.5 py-1.5 bg-[#00F2FF] text-black font-black uppercase hover:opacity-90 cursor-pointer text-[10px]">ok</button>
                 )}
               </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Download Progress Overlay */}
+      <AnimatePresence>
+        {downloadingFile && (
+          <motion.div
+            className="fixed inset-0 z-[90] flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+          >
+            <motion.div
+              className="bg-[#0A0E14] border-4 border-[#00F2FF] p-8 max-w-md w-full shadow-[8px_8px_0px_#FF007F] space-y-5 relative overflow-hidden"
+              initial={{ scale: 0.95, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.95, opacity: 0 }}
+            >
+              {/* Cyber Badge */}
+              <div className="absolute top-0 right-0 bg-[#00F2FF] text-[#0A0E14] px-3 py-1 font-black text-[9px] uppercase tracking-wider">
+                DECRYPT_PIPE_V2
+              </div>
+
+              <div className="flex justify-center">
+                <MascotAvatar id="leeku" size="lg" />
+              </div>
+
+              <div className="text-center space-y-1">
+                <div className="p-2.5 bg-black border border-[#10B981] font-mono text-[10px] text-[#10B981] uppercase font-bold">
+                  [ SECURE FILE EXTRACTION — DOWNLOAD IN PROGRESS ]
+                </div>
+                <MascotSpeechBubble
+                  mascotId="leeku"
+                  quote={downloadProgress < 100
+                    ? `Decrypting and delivering "${downloadingFile.name}"... ${downloadProgress}% transferred!`
+                    : 'File fully delivered! Saving to your machine...'}
+                />
+              </div>
+
+              {/* Live progress bar — same style as upload */}
+              <div className="space-y-2 w-full">
+                <div className="flex justify-between text-[10px] font-mono text-gray-500 uppercase">
+                  <span>{downloadProgress}%</span>
+                  <span>{downloadSpeedKiBps >= 1024
+                    ? `${(downloadSpeedKiBps / 1024).toFixed(1)} MiB/s`
+                    : `${downloadSpeedKiBps} KiB/s`}</span>
+                </div>
+                <div className="h-2 w-full bg-gray-900 overflow-hidden border border-gray-800">
+                  <motion.div
+                    className="h-full bg-[#10B981]"
+                    animate={{ width: `${downloadProgress}%` }}
+                    transition={{ duration: 0.3, ease: 'easeOut' }}
+                  />
+                </div>
+                <div className="flex justify-between text-[10px] font-mono text-gray-600 uppercase">
+                  <span>
+                    {downloadProgress < 100 && downloadEtaSec !== null
+                      ? `~${formatEta(downloadEtaSec)} remaining`
+                      : downloadProgress >= 100
+                        ? 'Finalizing...'
+                        : 'Calculating...'}
+                  </span>
+                  <span>
+                    {downloadingFile
+                      ? `${formatSize(downloadProgress / 100 * downloadingFile.size)} / ${formatSize(downloadingFile.size)}`
+                      : ''}
+                  </span>
+                </div>
+              </div>
+
+              <p className="text-[9px] font-mono text-gray-600 text-center uppercase">
+                {downloadingFile.name}
+              </p>
             </motion.div>
           </motion.div>
         )}
@@ -1527,7 +1654,7 @@ export default function UserDashboard({ user, token, onLogout, quotas, onTrigger
                                 <code>{f.checksum.substring(0, 10).toUpperCase()}</code>
                               </td>
                               <td className="py-4 px-5 text-right space-x-1.5">
-                                <button onClick={() => handleDownloadFile(f.id, f.original_name)} disabled={f.status === 'Blocked'} className="p-2 border border-gray-800 text-gray-400 hover:border-[#00F2FF] hover:text-[#00F2FF] disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer" title={f.status === 'Blocked' ? 'Blocked files cannot be downloaded' : 'Direct download'}>
+                                <button onClick={() => handleDownloadFile(f.id, f.original_name, f.size)} disabled={f.status === 'Blocked'} className="p-2 border border-gray-800 text-gray-400 hover:border-[#00F2FF] hover:text-[#00F2FF] disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer" title={f.status === 'Blocked' ? 'Blocked files cannot be downloaded' : 'Direct download'}>
                                   <Download className="w-3.5 h-3.5" />
                                 </button>
                                 <button onClick={() => openShareWizard(f)} disabled={f.status === 'Blocked'} className="p-2 border border-gray-800 text-gray-400 hover:border-[#00F2FF] hover:text-[#00F2FF] cursor-pointer" title="Config share link">
