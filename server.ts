@@ -169,7 +169,9 @@ app.use(iisLoggingMiddleware);
 // JSON body limit — base64 encoding inflates binary data by ~33%.
 // For a 700MB file the JSON body is ~933MB. Set MAX_UPLOAD_BODY_MB
 // in .env to match your largest expected upload × 1.4 (headroom).
-// Default: 2048 MB (2 GB) — SQL Server 2022 handles LOBs up to 2 GB.
+// Default: 2048 MB (2 GB) — Node.js max Buffer is ~4 GB on 64-bit.
+// For files larger than ~1.5 GB, a streaming/chunked upload approach
+// is required instead of base64 JSON (see upload architecture docs).
 const uploadBodyLimitMb = parseInt(process.env.MAX_UPLOAD_BODY_MB || '2048', 10);
 app.use(express.json({ limit: `${uploadBodyLimitMb}mb` }));
 app.use(express.urlencoded({ limit: `${uploadBodyLimitMb}mb`, extended: true }));
