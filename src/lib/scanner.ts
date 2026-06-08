@@ -413,6 +413,31 @@ const BLOCKED_EXTENSIONS = new Set([
 ]);
 
 /**
+ * Regex patterns for filenames that indicate pirated, cracked, or
+ * otherwise illegitimate content. Each pattern is tested case-insensitively
+ * against the full original filename (including extension).
+ *
+ * Patterns are deliberately ordered from most-specific to most-generic
+ * to ensure clearer threat messages.
+ */
+const BLOCKED_FILENAME_PATTERNS: { pattern: RegExp; label: string }[] = [
+  { pattern: /_?crack/i,                              label: 'Crack' },
+  { pattern: /keygen/i,                               label: 'Keygen' },
+  { pattern: /_?serial[_\-.]?(key|gen|generator)/i,   label: 'Serial/Key Generator' },
+  { pattern: /activator/i,                            label: 'Activator' },
+  { pattern: /_?patched/i,                            label: 'Patched binary' },
+  { pattern: /_?nulled/i,                             label: 'Nulled script' },
+  { pattern: /warez/i,                                label: 'Warez' },
+  { pattern: /torrent/i,                              label: 'Torrent' },
+  { pattern: /_?hack/i,                               label: 'Hack tool' },
+  { pattern: /_?cheat/i,                              label: 'Cheat tool' },
+  { pattern: /_?loader\.(exe|dll|bin)/i,              label: 'Malicious loader' },
+  { pattern: /password[_\-.]?(stealer|grabber)/i,     label: 'Credential stealer' },
+  { pattern: /_?unlocker/i,                           label: 'Unlocker' },
+  { pattern: /_?injector/i,                           label: 'Code injector' },
+];
+
+/**
  * Fast heuristic check that runs before Bitdefender to immediately
  * reject obviously dangerous file types, saving scan time.
  *
@@ -433,6 +458,20 @@ export function heuristicPreScan(
       message:        `File type "${ext}" is not permitted. Executables and scripts are blocked.`,
       scanDurationMs: 0,
     };
+  }
+
+  // ── Filename pattern checks ──────────────────────────────────
+  const baseName = path.basename(originalName);
+  for (const { pattern, label } of BLOCKED_FILENAME_PATTERNS) {
+    if (pattern.test(baseName)) {
+      return {
+        clean:          false,
+        status:         'Infected',
+        threats:        [`Blocked filename pattern: ${label}`],
+        message:        `Filename matches prohibited pattern (${label}). This content is not allowed.`,
+        scanDurationMs: 0,
+      };
+    }
   }
 
   return null; // passes heuristics — proceed to Bitdefender scan
