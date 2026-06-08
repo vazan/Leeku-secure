@@ -21,11 +21,13 @@ export default function AuthPage({ initialMode, onAuthSuccess, onCancel }: AuthP
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
+  const [regSuccess, setRegSuccess] = useState(false);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
     setErrorMsg('');
+    setRegSuccess(false);
 
     const url = mode === 'login' ? '/api/auth/login' : '/api/auth/register';
     const payload = mode === 'login' 
@@ -45,9 +47,12 @@ export default function AuthPage({ initialMode, onAuthSuccess, onCancel }: AuthP
         throw new Error(data.error || 'Something went wrong. The leeks are running away!');
       }
 
-      // Success
+      // Success — check if we got a token (login or dev mode)
       if (data.token && data.user) {
         onAuthSuccess(data.token, data.user);
+      } else if (data.success && data.message) {
+        // Registration with email verification required
+        setRegSuccess(true);
       }
     } catch (err: any) {
       setErrorMsg(err.message || 'Network communication glitch.');
@@ -104,8 +109,31 @@ export default function AuthPage({ initialMode, onAuthSuccess, onCancel }: AuthP
               ⚠️ GOBLIN DETECTED: {errorMsg.toUpperCase()}
             </motion.div>
           )}
+          {regSuccess && (
+            <motion.div 
+              className="bg-black border-2 border-[#00F2FF] p-4 mb-6 text-[#00F2FF] text-xs font-mono"
+              initial={{ opacity: 0, height: 0 }}
+              animate={{ opacity: 1, height: 'auto' }}
+              exit={{ opacity: 0, height: 0 }}
+            >
+              <div className="text-center">
+                <span className="text-lg">📬</span>
+                <p className="mt-2 font-bold uppercase">VERIFICATION EMAIL SENT</p>
+                <p className="mt-1 text-gray-400 normal-case">Check <strong className="text-[#00F2FF]">{email}</strong> and click the link to activate your account. Then you can log in.</p>
+                <button 
+                  type="button"
+                  onClick={() => { setRegSuccess(false); setMode('login'); setErrorMsg(''); }}
+                  className="mt-3 px-4 py-2 bg-[#00F2FF] text-[#0A0E14] font-black uppercase text-[10px] hover:bg-[#00F2FF]/80 transition-colors cursor-pointer"
+                >
+                  GO TO LOGIN
+                </button>
+              </div>
+            </motion.div>
+          )}
         </AnimatePresence>
 
+        {/* Show form only if not in success state */}
+        {!regSuccess && (
         <form onSubmit={handleSubmit} className="space-y-4">
           {mode === 'register' && (
             <div>
@@ -182,6 +210,7 @@ export default function AuthPage({ initialMode, onAuthSuccess, onCancel }: AuthP
             )}
           </button>
         </form>
+        )}
 
         <div className="mt-6 border-t border-gray-800 pt-4 text-center">
           <button 

@@ -36,6 +36,7 @@ import {
   computeExpiresAt, isValidTtl,
   type ExpiredFileRecord,
 } from './src/lib/expiry-cleanup.js';
+import { sendVerificationEmail, validateMxRecord, verifySmtpConnection } from './src/lib/email.js';
 import { iisLoggingMiddleware, validateIISLoggingConfig } from './src/lib/iis-logger.js';
 import type { Quota, User, FileMetadata, ShareLink, SystemLog, SystemStats } from './src/types.js';
 
@@ -51,6 +52,7 @@ const MAX_LOG_ENTRIES    = parseInt(process.env.MAX_LOG_ENTRIES || '500', 10);
 const MAX_LOGIN_ATTEMPTS = parseInt(process.env.MAX_LOGIN_ATTEMPTS || '5', 10);
 const LOCKOUT_DURATION_MS= parseInt(process.env.LOCKOUT_DURATION_MINUTES || '15', 10) * 60_000;
 const PROXY_TRUST_HOPS   = parseInt(process.env.PROXY_TRUST_HOPS || '0', 10);
+const SMTP_ENABLED       = !!process.env.SMTP_HOST && !!process.env.SMTP_USER && !!process.env.SMTP_PASSWORD;
 const GEMINI_API_KEY     = process.env.GEMINI_API_KEY;
 const JWT_EXPIRY         = parseInt(process.env.JWT_ACCESS_EXPIRY_SECONDS || '900', 10);
 const JWT_ISSUER         = process.env.JWT_ISSUER   || APP_URL;
@@ -216,6 +218,9 @@ interface UserRow {
   role: string; quota_id: string; storage_used_bytes: number; status: string;
   created_at: Date; failed_login_count: number; locked_until: Date | null;
   password_hash?: string;
+  email_verified?: boolean;
+  email_verification_token?: string | null;
+  email_verification_expires?: Date | null;
 }
 
 interface FileRow {
@@ -448,6 +453,13 @@ app.post('/api/auth/register', async (req, res) => {
   const usernameHash = hashColumnForLookup(usernameTrim.toLowerCase());
 
   try {
+    // 1. MX record validation
+    const mxCheck = await validateMxRecord(emailLower);
+    if (!mxCheck.valid) {
+      return res.status(400).json({ error: mxCheck.reason || 'Invalid email domain.' });
+    }
+
+    // 2. Duplicate check
     const dupReq = await getRequest();
     dupReq.input('eH', sql.Char(64), emailHash);
     dupReq.input('uH', sql.Char(64), usernameHash);
@@ -458,10 +470,20 @@ app.post('/api/auth/register', async (req, res) => {
     if (dup.recordset[0].eE > 0) return res.status(400).json({ error: 'Email already registered!' });
     if (dup.recordset[0].uE > 0) return res.status(400).json({ error: 'Username already taken!' });
 
+    // 3. Generate verification token (if SMTP enabled)
+    let verificationToken: string | null = null;
+    let verificationExpires: Date | null = null;
+    if (SMTP_ENABLED) {
+      verificationToken = generateSecureToken(32); // 64-char hex
+      verificationExpires = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24h
+    }
+
+    // 4. Encrypt & hash
     const encEmail    = encryptColumn(emailLower);
     const encUsername = encryptColumn(usernameTrim);
     const pwHash      = await hashPassword(password);
 
+    // 5. Insert user
     const insReq = await getRequest();
     insReq.input('eEnc',  sql.VarBinary(512),  encEmail.ciphertext);
     insReq.input('eIv',   sql.VarBinary(16),   encEmail.iv);
@@ -473,26 +495,111 @@ app.post('/api/auth/register', async (req, res) => {
     insReq.input('uHash', sql.Char(64),         usernameHash);
     insReq.input('pw',    sql.NVarChar(512),    pwHash);
     insReq.input('quota', sql.NVarChar(50),     'guest');
+    insReq.input('vTok',  sql.Char(64),         verificationToken);
+    insReq.input('vExp',  sql.DateTimeOffset,   verificationExpires);
+    insReq.input('vOk',   sql.Bit,              SMTP_ENABLED ? 0 : 1);
 
     const newUser = await insReq.query<UserRow>(
       `INSERT INTO users (
          email_encrypted, email_iv, email_auth_tag, email_hash,
          username_encrypted, username_iv, username_auth_tag, username_hash,
-         password_hash, quota_id
+         password_hash, quota_id, email_verified, email_verification_token, email_verification_expires
        )
        OUTPUT INSERTED.id, INSERTED.email_encrypted, INSERTED.email_iv, INSERTED.email_auth_tag,
               INSERTED.username_encrypted, INSERTED.username_iv, INSERTED.username_auth_tag,
               INSERTED.role, INSERTED.quota_id, INSERTED.storage_used_bytes,
-              INSERTED.status, INSERTED.created_at, INSERTED.failed_login_count, INSERTED.locked_until
-       VALUES (@eEnc,@eIv,@eTag,@eHash, @uEnc,@uIv,@uTag,@uHash, @pw, @quota)`
+              INSERTED.status, INSERTED.created_at, INSERTED.failed_login_count, INSERTED.locked_until,
+              INSERTED.email_verified, INSERTED.email_verification_token, INSERTED.email_verification_expires
+       VALUES (@eEnc,@eIv,@eTag,@eHash, @uEnc,@uIv,@uTag,@uHash, @pw, @quota, @vOk, @vTok, @vExp)`
     );
 
-    const user  = mapUserRow(newUser.recordset[0]);
-    const token = signToken(user.id, user.role);
-    await logSystemEvent(user.id, user.username, 'Auth', 'User', user.id, req, `Registered: ${emailLower}`);
-    res.json({ token, user });
+    const row = newUser.recordset[0];
+    const user  = mapUserRow(row);
+
+    // 6. Send verification email (async — don't block response)
+    if (SMTP_ENABLED && verificationToken) {
+      sendVerificationEmail(emailLower, usernameTrim, verificationToken)
+        .catch(e => console.error('[email] Failed to send verification:', e.message));
+    }
+
+    await logSystemEvent(user.id, user.username, 'Auth', 'User', user.id, req,
+      `Registered: ${emailLower}${SMTP_ENABLED ? ' (verification email sent)' : ' (email verification disabled)'}`);
+
+    if (SMTP_ENABLED) {
+      // Don't log them in yet — they need to verify email first
+      res.json({ success: true, message: 'Account created! Check your email for a verification link.' });
+    } else {
+      // Dev mode — auto-verified, log them in
+      const token = signToken(user.id, user.role);
+      res.json({ token, user });
+    }
   } catch (err) { console.error('[POST /api/auth/register]', err); res.status(500).json({ error: 'Registration failed.' }); }
 });
+
+// ──────────────────────────────────────────────────────────────
+// API: Auth — Verify Email
+// ──────────────────────────────────────────────────────────────
+
+app.get('/api/auth/verify-email', async (req, res) => {
+  const { token } = req.query;
+  if (!token || typeof token !== 'string') {
+    return res.status(400).send(renderVerificationPage(false, 'Missing verification token.'));
+  }
+
+  try {
+    const request = await getRequest();
+    request.input('tok', sql.Char(64), token);
+    const result = await request.query<{ id: string; email_verified: boolean; email_verification_expires: Date | null }>(
+      `SELECT id, email_verified, email_verification_expires
+       FROM users WHERE email_verification_token = @tok`
+    );
+
+    if (!result.recordset.length) {
+      return res.status(400).send(renderVerificationPage(false, 'Invalid or expired verification token.'));
+    }
+
+    const row = result.recordset[0];
+
+    if (row.email_verified) {
+      return res.send(renderVerificationPage(true, 'Your email is already verified. You can now log in.'));
+    }
+
+    if (row.email_verification_expires && new Date(row.email_verification_expires) < new Date()) {
+      return res.status(400).send(renderVerificationPage(false, 'Verification token has expired. Please register again.'));
+    }
+
+    // Mark as verified
+    const upReq = await getRequest();
+    upReq.input('id', sql.UniqueIdentifier, row.id);
+    await upReq.query(
+      `UPDATE users SET email_verified=1, email_verification_token=NULL, email_verification_expires=NULL WHERE id=@id`
+    );
+
+    await logSystemEvent(row.id, null, 'Auth', 'User', row.id, req, 'Email verified successfully.');
+    res.send(renderVerificationPage(true, 'Email verified! You can now log in to your account.'));
+  } catch (err) {
+    console.error('[GET /api/auth/verify-email]', err);
+    res.status(500).send(renderVerificationPage(false, 'Verification failed due to a server error.'));
+  }
+});
+
+/**
+ * Renders a simple HTML page for the email verification result.
+ */
+function renderVerificationPage(success: boolean, message: string): string {
+  const color = success ? '#00F2FF' : '#FF007F';
+  const title = success ? 'VERIFICATION SUCCESSFUL' : 'VERIFICATION FAILED';
+  return `<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Leeku Secure — Email Verification</title>
+<style>body{background:#0A0E14;color:#ccc;font-family:monospace;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+.card{max-width:480px;padding:40px;border:3px solid ${color};text-align:center;background:#0F1419}
+h1{color:${color};font-size:20px;text-transform:uppercase;letter-spacing:2px;margin:0 0 16px}
+p{font-size:13px;line-height:1.6;margin:0 0 24px}
+a{display:inline-block;background:#FF007F;color:#fff;padding:12px 28px;font-weight:900;text-transform:uppercase;text-decoration:none;font-size:12px;border:2px solid #00F2FF}
+</style></head>
+<body><div class="card"><h1>${title}</h1><p>${message}</p><a href="${APP_URL}">GO TO LOGIN</a></div></body></html>`;
+}
 
 // ──────────────────────────────────────────────────────────────
 // API: Auth — Login
@@ -512,7 +619,8 @@ app.post('/api/auth/login', async (req, res) => {
       `SELECT id, email_encrypted, email_iv, email_auth_tag,
               username_encrypted, username_iv, username_auth_tag,
               password_hash, role, quota_id, storage_used_bytes,
-              status, created_at, failed_login_count, locked_until
+              status, created_at, failed_login_count, locked_until,
+              email_verified, email_verification_token, email_verification_expires
        FROM users WHERE email_hash = @eH`
     );
 
@@ -527,6 +635,11 @@ app.post('/api/auth/login', async (req, res) => {
     }
     if (row.status === 'Suspended')
       return res.status(403).json({ error: 'Account suspended. Contact an administrator.' });
+
+    // Email verification check — only enforced when SMTP is enabled
+    if (SMTP_ENABLED && !row.email_verified) {
+      return res.status(403).json({ error: 'Please verify your email address before logging in. Check your inbox for the verification link.' });
+    }
 
     const valid = await verifyPassword(password, row.password_hash!);
     if (!valid) {
@@ -1377,15 +1490,27 @@ async function bootstrap() {
   // 3. Validate IIS logging config
   validateIISLoggingConfig();
 
-  // 4. Start expiry cleanup
+  // 5. Verify SMTP connection (if configured)
+  if (SMTP_ENABLED) {
+    try {
+      await verifySmtpConnection();
+      console.log('[server] SMTP email verification is enabled.');
+    } catch (err: any) {
+      console.error('[server] SMTP connection failed — email verification will not work:', err.message);
+    }
+  } else {
+    console.log('[server] SMTP not configured — email verification disabled.');
+  }
+
+  // 6. Start expiry cleanup
   startExpiryCleanup(getExpiredFiles, markFilesExpired, logExpiredFile);
 
-  // 5. Static files & SPA fallback
+  // 7. Static files & SPA fallback
   const distPath = path.join(process.cwd(), 'dist');
   app.use(express.static(distPath));
   app.get('*', (req, res) => res.sendFile(path.join(distPath, 'index.html')));
 
-  // 6. HTTP or HTTPS
+  // 8. HTTP or HTTPS
   const sslEnabled = process.env.SSL_ENABLED === 'true';
   if (sslEnabled) {
     let sslOptions: https.ServerOptions = {};
