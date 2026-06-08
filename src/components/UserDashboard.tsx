@@ -15,6 +15,20 @@ import { User, FileMetadata, ShareLink, Quota, SystemLog, SystemStats } from '..
 import leekuMascot from '../leeku_mascot.png';
 import { MascotAvatar, MascotSpeechBubble, MASCOTS, QUOTEKU_MESSAGES } from './Mascots.js';
 
+// ── Upload progress helpers ──────────────────────────────────
+function formatSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GiB`;
+}
+
+function formatEta(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+  return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
+}
+
 interface UserDashboardProps {
   user: User;
   token: string;
@@ -40,12 +54,17 @@ export default function UserDashboard({ user, token, onLogout, quotas, onTrigger
 
   // Upload Experience Setup States
   const [dragActive, setDragActive] = useState(false);
-  const [uploadStep, setUploadStep] = useState<number>(0); // 0 = idle, 1 = detected, 2 = scan, 3 = encrypt, 4 = vault, 5 = done, 6 = failed
+  const [uploadStep, setUploadStep] = useState<number>(0); // 0 = idle, 1 = detected, 2 = scan, 3 = encrypt, 4 = uploading, 5 = done, 6 = failed
   const [uploadingFile, setUploadingFile] = useState<File | null>(null);
   const [easterEggQuote, setEasterEggQuote] = useState<string>('');
-  const [isLosingLeek, setIsLosingLeek] = useState<boolean>(false); // 0.1% Leeku dropped a leek event
+  const [isLosingLeek, setIsLosingLeek] = useState<boolean>(false); // 5% Leeku dropped a leek event
   const [uploadSuccessDetails, setUploadSuccessDetails] = useState<FileMetadata | null>(null);
   const [uploadErrorMsg, setUploadErrorMsg] = useState<string>('');
+
+  // Upload progress tracking
+  const [uploadProgress, setUploadProgress] = useState(0);        // 0-100
+  const [uploadSpeedKiBps, setUploadSpeedKiBps] = useState(0);    // KiB/s
+  const [uploadEtaSec, setUploadEtaSec] = useState<number | null>(null); // seconds remaining
 
   // Share portal management
   const [selectedFileToShare, setSelectedFileToShare] = useState<FileMetadata | null>(null);
@@ -266,6 +285,9 @@ export default function UserDashboard({ user, token, onLogout, quotas, onTrigger
   };
 
   const runUploadSaga = async (file: File, customQuote: string) => {
+    setUploadProgress(0);
+    setUploadSpeedKiBps(0);
+    setUploadEtaSec(null);
     try {
       // Step 1 -> Step 2 (Security Scan)
       await new Promise(r => setTimeout(r, 1200));
@@ -283,33 +305,71 @@ export default function UserDashboard({ user, token, onLogout, quotas, onTrigger
       await new Promise(r => setTimeout(r, 1300));
       setUploadStep(3);
 
-      // Step 3 -> Step 4 (Storage Assignment)
+      // Step 3 -> Step 4 (Real upload with progress tracking)
       await new Promise(r => setTimeout(r, 1000));
       setUploadStep(4);
 
-      // Step 4 -> Step 5 (Server upload via multipart/form-data — streaming, no memory inflation)
-      await new Promise(r => setTimeout(r, 900));
+      // Use XMLHttpRequest for upload progress (fetch doesn't support it)
+      const result = await new Promise<{ file: FileMetadata }>((resolve, reject) => {
+        const formData = new FormData();
+        formData.append('file', file);
+        formData.append('original_name', file.name);
+        formData.append('mime_type', file.type || 'application/octet-stream');
 
-      const formData = new FormData();
-      formData.append('file', file);
-      formData.append('original_name', file.name);
-      formData.append('mime_type', file.type || 'application/octet-stream');
+        const xhr = new XMLHttpRequest();
+        let lastLoaded = 0;
+        let lastTime = Date.now();
 
-      // Don't set Content-Type header — the browser sets it with the correct boundary
-      const res = await fetch('/api/files/upload', {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${token}`
-        },
-        body: formData
+        xhr.upload.addEventListener('progress', (event) => {
+          if (event.lengthComputable) {
+            const pct = Math.round((event.loaded / event.total) * 100);
+            setUploadProgress(pct);
+
+            // Speed calculation (KiB/s)
+            const now = Date.now();
+            const elapsed = (now - lastTime) / 1000; // seconds
+            if (elapsed >= 1) {
+              const delta = event.loaded - lastLoaded;
+              setUploadSpeedKiBps(Math.round(delta / 1024 / elapsed));
+              lastLoaded = event.loaded;
+              lastTime = now;
+
+              // ETA
+              const remaining = event.total - event.loaded;
+              const bps = delta / elapsed;
+              if (bps > 0) {
+                setUploadEtaSec(Math.round(remaining / bps));
+              }
+            }
+          }
+        });
+
+        xhr.addEventListener('load', () => {
+          if (xhr.status >= 200 && xhr.status < 300) {
+            try {
+              resolve(JSON.parse(xhr.responseText));
+            } catch {
+              reject(new Error('Invalid server response.'));
+            }
+          } else {
+            try {
+              const data = JSON.parse(xhr.responseText);
+              reject(new Error(data.error || `Server error ${xhr.status}`));
+            } catch {
+              reject(new Error(`Server error ${xhr.status}`));
+            }
+          }
+        });
+
+        xhr.addEventListener('error', () => reject(new Error('Network error. Connection lost during upload.')));
+        xhr.addEventListener('abort', () => reject(new Error('Upload cancelled.')));
+
+        xhr.open('POST', '/api/files/upload');
+        xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+        xhr.send(formData);
       });
 
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || 'The system could not parse the bytes. Approved status rejected.');
-      }
-
-      setUploadSuccessDetails(data.file);
+      setUploadSuccessDetails(result.file);
       setUploadStep(5);
       fetchUserFiles();
       onTriggerRefreshUser(); // recalculate capacity
@@ -1152,7 +1212,7 @@ export default function UserDashboard({ user, token, onLogout, quotas, onTrigger
                     </motion.div>
                   )}
 
-                  {/* Step 4: Storage assignment (Mascot: Veeku) */}
+                  {/* Step 4: Uploading with live progress bar */}
                   {uploadStep === 4 && (
                     <motion.div 
                       key="step-vault"
@@ -1165,14 +1225,42 @@ export default function UserDashboard({ user, token, onLogout, quotas, onTrigger
                       </div>
                       <div className="space-y-3 text-center w-full">
                         <div className="p-2.5 bg-black border border-[#10B981] font-mono text-[10px] text-[#10B981] uppercase font-bold">
-                          [ SECURE VAULT GATE ALPHA ALLOCATING CONTAINER ]
+                          [ SECURE VAULT GATE ALPHA — FILE UPLINK IN PROGRESS ]
                         </div>
                         <MascotSpeechBubble 
                           mascotId="veeku" 
-                          quote="Relocating file to Vault Alpha... Hard drive allocation confirmed. Rest well, secure file."
+                          quote={uploadProgress < 100 ? `Beaming file through the secure uplink... ${uploadProgress}% clear so far!` : 'File fully received! Handing off to the scan chamber...'}
                         />
-                        <div className="h-1.5 w-full bg-gray-900 p-0.5 overflow-hidden">
-                          <div className="w-4/5 bg-[#10B981] h-full" />
+
+                        {/* Live progress bar */}
+                        <div className="space-y-2 w-full">
+                          <div className="flex justify-between text-[10px] font-mono text-gray-500 uppercase">
+                            <span>{uploadProgress}%</span>
+                            <span>{uploadSpeedKiBps >= 1024
+                              ? `${(uploadSpeedKiBps / 1024).toFixed(1)} MiB/s`
+                              : `${uploadSpeedKiBps} KiB/s`}</span>
+                          </div>
+                          <div className="h-2 w-full bg-gray-900 overflow-hidden border border-gray-800">
+                            <motion.div
+                              className="h-full bg-[#10B981]"
+                              animate={{ width: `${uploadProgress}%` }}
+                              transition={{ duration: 0.3, ease: 'easeOut' }}
+                            />
+                          </div>
+                          <div className="flex justify-between text-[10px] font-mono text-gray-600 uppercase">
+                            <span>
+                              {uploadProgress < 100 && uploadEtaSec !== null
+                                ? `~${formatEta(uploadEtaSec)} remaining`
+                                : uploadProgress >= 100
+                                  ? 'Finalizing...'
+                                  : 'Calculating...'}
+                            </span>
+                            <span>
+                              {uploadingFile
+                                ? `${formatSize(uploadProgress / 100 * uploadingFile.size)} / ${formatSize(uploadingFile.size)}`
+                                : ''}
+                            </span>
+                          </div>
                         </div>
                       </div>
                     </motion.div>
