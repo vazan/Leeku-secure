@@ -280,7 +280,7 @@ export default function App() {
                     }}
                     className="px-4 py-1.5 border-2 border-[#FF007F] text-[#FF007F] font-bold skew-x-[-10deg] cursor-pointer hover:bg-[#FF007F] hover:text-white transition-colors"
                   >
-                    <span className="inline-block skew-x-[10deg]">Authorize Key</span>
+                    <span className="inline-block skew-x-[10deg]">Sign In</span>
                   </button>
                 )}
               </div>
