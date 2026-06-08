@@ -24,7 +24,8 @@
 --   06 → refresh_tokens  (FK → users)
 --   07 → system_logs     (no FK — intentional)
 --   08 → stored procedures + GuidList type
---   09 → security grants (must run last)
+--   10 → email_verification columns for users table
+--   11 → account deletion token columns for users table
 -- ============================================================
 
 :r 00_create_database.sql
@@ -37,6 +38,8 @@
 :r 07_system_logs.sql
 :r 08_stored_procedures.sql
 :r 09_security_grants.sql
+:r 10_email_verification.sql
+:r 11_account_deletion.sql
 
 PRINT '============================================';
 PRINT 'LeekuSecure database setup completed.';

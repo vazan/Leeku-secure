@@ -161,3 +161,62 @@ export async function sendVerificationEmail(to: string, username: string, token:
 
   console.log(`[email] Verification email sent to ${to} (envelope from: ${authUser})`);
 }
+
+// ──────────────────────────────────────────────────────────────
+// Send account deletion confirmation email
+// ──────────────────────────────────────────────────────────────
+
+/**
+ * Sends an account deletion confirmation email to the user.
+ * The email contains a link that, when clicked, finalizes the deletion.
+ * @param to Recipient email address
+ * @param username The user's display name
+ * @param token The deletion confirmation token
+ */
+export async function sendAccountDeletionEmail(to: string, username: string, token: string): Promise<void> {
+  const appUrl = process.env.APP_URL || 'http://localhost:3000';
+  const confirmUrl = `${appUrl}/api/users/me/delete-confirm?token=${encodeURIComponent(token)}`;
+
+  const html = `
+<div style="max-width:600px;margin:0 auto;font-family:monospace;background:#0A0E14;border:3px solid #FF007F;padding:32px;">
+  <div style="text-align:center;margin-bottom:24px;">
+    <span style="background:#FF007F;color:#fff;padding:4px 12px;font-size:10px;font-weight:900;letter-spacing:2px;">LEEKU_ACCOUNT_TERMINATION</span>
+  </div>
+  <h1 style="color:#FF007F;text-align:center;font-size:22px;text-transform:uppercase;letter-spacing:1px;margin:0 0 8px;">
+    Account Deletion Request
+  </h1>
+  <p style="color:#ccc;text-align:center;font-size:12px;margin:0 0 24px;">
+    Hey <strong style="color:#00F2FF;">${username}</strong>, we received a request to <strong style="color:#FF007F;">permanently delete</strong> your Leeku Secure account.<br/>
+    This action will erase all your uploaded files, share links, and encryption keys — <strong>forever</strong>.
+  </p>
+  <div style="text-align:center;margin:32px 0;">
+    <a href="${confirmUrl}" style="display:inline-block;background:#FF007F;color:#fff;padding:14px 36px;font-size:14px;font-weight:900;text-transform:uppercase;text-decoration:none;letter-spacing:2px;border:2px solid #00F2FF;">
+      Confirm Account Deletion
+    </a>
+  </div>
+  <p style="color:#555;text-align:center;font-size:10px;margin:24px 0 0;">
+    If you did not request this, you can safely ignore this message — no changes will be made.<br/>
+    This confirmation token expires in 1 hour.
+  </p>
+  <p style="color:#444;text-align:center;font-size:9px;">
+    &mdash; Leeku, sad to see you go 🥬💧
+  </p>
+</div>`;
+
+  const smtp = getSmtpConfig();
+  const authUser = smtp.auth.user;
+  const displayFrom = process.env.SMTP_FROM || authUser;
+
+  await getTransporter().sendMail({
+    from: `"Leeku Secure" <${displayFrom}>`,
+    to,
+    subject: 'Confirm account deletion — Leeku Secure',
+    html,
+    envelope: {
+      from: authUser,
+      to,
+    },
+  });
+
+  console.log(`[email] Account deletion email sent to ${to} (envelope from: ${authUser})`);
+}

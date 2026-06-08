@@ -36,7 +36,7 @@ import {
   computeExpiresAt, isValidTtl,
   type ExpiredFileRecord,
 } from './src/lib/expiry-cleanup.js';
-import { sendVerificationEmail, validateMxRecord, verifySmtpConnection } from './src/lib/email.js';
+import { sendVerificationEmail, sendAccountDeletionEmail, validateMxRecord, verifySmtpConnection } from './src/lib/email.js';
 import { iisLoggingMiddleware, validateIISLoggingConfig } from './src/lib/iis-logger.js';
 import type { Quota, User, FileMetadata, ShareLink, SystemLog, SystemStats } from './src/types.js';
 
@@ -221,6 +221,8 @@ interface UserRow {
   email_verified?: boolean;
   email_verification_token?: string | null;
   email_verification_expires?: Date | null;
+  deletion_token?: string | null;
+  deletion_token_expires?: Date | null;
 }
 
 interface FileRow {
@@ -727,6 +729,160 @@ app.post('/api/users/me/update', authenticateUser as express.RequestHandler, asy
     res.json({ success: true, user });
   } catch (err) { console.error('[POST /api/users/me/update]', err); res.status(500).json({ error: 'Failed to update account.' }); }
 });
+
+// ──────────────────────────────────────────────────────────────
+// API: User — Request Account Deletion (Step 1: generate token & email)
+// ──────────────────────────────────────────────────────────────
+
+app.post('/api/users/me/delete-request', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  const userId = req.userId!;
+  const username = req.user!.username;
+  try {
+    // Get the user's email (decrypted) for sending the confirmation
+    const userReq = await getRequest();
+    userReq.input('id', sql.UniqueIdentifier, userId);
+    const userResult = await userReq.query<UserRow>(
+      `SELECT id, email_encrypted, email_iv, email_auth_tag,
+              username_encrypted, username_iv, username_auth_tag,
+              role, quota_id, storage_used_bytes, status, created_at,
+              failed_login_count, locked_until
+       FROM users WHERE id = @id AND status = 'Active'`
+    );
+    if (!userResult.recordset.length) return res.status(404).json({ error: 'Account not found.' });
+
+    const row = userResult.recordset[0];
+    const email = decryptColumn(row.email_encrypted, row.email_iv, row.email_auth_tag);
+
+    // Generate deletion token (valid for 1 hour)
+    const deletionToken = generateSecureToken(32); // 64-char hex
+    const deletionExpires = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+
+    const updReq = await getRequest();
+    updReq.input('id', sql.UniqueIdentifier, userId);
+    updReq.input('tok', sql.Char(64), deletionToken);
+    updReq.input('exp', sql.DateTimeOffset, deletionExpires);
+    await updReq.query(
+      `UPDATE users SET deletion_token=@tok, deletion_token_expires=@exp WHERE id=@id`
+    );
+
+    // Send confirmation email (async — don't block response)
+    if (SMTP_ENABLED) {
+      sendAccountDeletionEmail(email, username, deletionToken)
+        .catch(e => console.error('[email] Failed to send deletion confirmation:', e.message));
+      res.json({ success: true, message: 'A confirmation email has been sent. Please check your inbox to finalize account deletion.' });
+    } else {
+      // Dev mode — return the confirmation URL directly
+      const appUrl = process.env.APP_URL || `http://localhost:${PORT}`;
+      res.json({
+        success: true,
+        message: 'SMTP not configured. Use the confirmation URL below to finalize deletion.',
+        confirmationUrl: `${appUrl}/api/users/me/delete-confirm?token=${encodeURIComponent(deletionToken)}`,
+      });
+    }
+
+    await logSystemEvent(userId, username, 'Security', 'User', userId, req, 'Requested account deletion — confirmation email sent.');
+  } catch (err) { console.error('[POST /api/users/me/delete-request]', err); res.status(500).json({ error: 'Failed to initiate account deletion.' }); }
+});
+
+// ──────────────────────────────────────────────────────────────
+// API: User — Confirm Account Deletion (Step 2: verify token & cascade delete)
+// ──────────────────────────────────────────────────────────────
+
+app.get('/api/users/me/delete-confirm', async (req, res) => {
+  const { token } = req.query;
+  if (!token || typeof token !== 'string') {
+    return res.status(400).send(renderDeletionPage(false, 'Missing deletion confirmation token.'));
+  }
+
+  try {
+    const request = await getRequest();
+    request.input('tok', sql.Char(64), token);
+    const result = await request.query<UserRow>(
+      `SELECT id, email_encrypted, email_iv, email_auth_tag,
+              username_encrypted, username_iv, username_auth_tag,
+              role, quota_id, storage_used_bytes, status, created_at,
+              failed_login_count, locked_until, deletion_token, deletion_token_expires
+       FROM users WHERE deletion_token = @tok`
+    );
+
+    if (!result.recordset.length) {
+      return res.status(400).send(renderDeletionPage(false, 'Invalid or already-used deletion token.'));
+    }
+
+    const row = result.recordset[0];
+
+    if (row.deletion_token_expires && new Date(row.deletion_token_expires) < new Date()) {
+      // Clean up expired token
+      const clReq = await getRequest();
+      clReq.input('id', sql.UniqueIdentifier, row.id);
+      await clReq.query(`UPDATE users SET deletion_token=NULL, deletion_token_expires=NULL WHERE id=@id`);
+      return res.status(400).send(renderDeletionPage(false, 'Deletion confirmation token has expired. Please request a new one from your account settings.'));
+    }
+
+    const username = decryptColumn(row.username_encrypted, row.username_iv, row.username_auth_tag);
+    const email = decryptColumn(row.email_encrypted, row.email_iv, row.email_auth_tag);
+
+    // Log before deletion (this log entry will survive since system_logs has no FK to users)
+    await logSystemEvent(row.id, username, 'Security', 'User', row.id, req,
+      `Account permanently deleted: ${email}. All files, share links, and keys cascaded.`);
+
+    // Fetch vault file paths BEFORE deleting the user (files cascade on user delete)
+    const vaultPathsToDelete: string[] = [];
+    try {
+      const fpReq = await getRequest();
+      fpReq.input('uid', sql.UniqueIdentifier, row.id);
+      const fpResult = await fpReq.query<{ stored_path: string }>(
+        `SELECT stored_path FROM files WHERE owner_user_id=@uid`
+      );
+      for (const f of fpResult.recordset) {
+        vaultPathsToDelete.push(f.stored_path);
+      }
+    } catch (e) {
+      console.warn('[delete-confirm] Could not fetch file paths before deletion:', (e as Error).message);
+    }
+
+    // Cascade delete the user — CASCADE on files → file_encryption_keys, share_links, refresh_tokens
+    const delReq = await getRequest();
+    delReq.input('id', sql.UniqueIdentifier, row.id);
+    await delReq.query(`DELETE FROM users WHERE id=@id`);
+
+    // Clean up vault files from disk
+    for (const storedPath of vaultPathsToDelete) {
+      try {
+        const vaultPath = path.join(FILE_VAULT, storedPath);
+        if (fs.existsSync(vaultPath)) fs.unlinkSync(vaultPath);
+      } catch (e) { /* file may already be gone */ }
+    }
+
+    console.log(`[account-deletion] User "${username}" (${email}) and all associated data permanently deleted.`);
+    res.send(renderDeletionPage(true, `Your account (${username}) and all associated files have been permanently deleted. Goodbye!`));
+  } catch (err) {
+    console.error('[GET /api/users/me/delete-confirm]', err);
+    res.status(500).send(renderDeletionPage(false, 'Account deletion failed due to a server error.'));
+  }
+});
+
+/**
+ * Renders a simple HTML page for the account deletion result.
+ */
+function renderDeletionPage(success: boolean, message: string): string {
+  const color = success ? '#00F2FF' : '#FF007F';
+  const title = success ? 'ACCOUNT DELETED' : 'DELETION FAILED';
+  return `<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Leeku Secure — Account Deletion</title>
+<style>body{background:#0A0E14;color:#ccc;font-family:monospace;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+.card{max-width:480px;padding:40px;border:3px solid ${color};text-align:center;background:#0F1419}
+h1{color:${color};font-size:20px;text-transform:uppercase;letter-spacing:2px;margin:0 0 16px}
+p{font-size:13px;line-height:1.6;margin:0 0 24px}
+a{display:inline-block;background:#FF007F;color:#fff;padding:12px 28px;font-weight:900;text-transform:uppercase;text-decoration:none;font-size:12px;border:2px solid #00F2FF}
+</style></head>
+<body><div class="card">
+  <h1>${title}</h1>
+  <p>${message}</p>
+  <a href="/">Return to Leeku Secure</a>
+</div></body></html>`;
+}
 
 // ──────────────────────────────────────────────────────────────
 // API: Files — List

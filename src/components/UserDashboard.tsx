@@ -9,7 +9,7 @@ import {
   Upload, HardDrive, Shield, Key, Share2, Trash2, ShieldAlert, Download,
   Terminal, Globe, Lock, Clock, Copy, Plus, Users, Settings, LogOut,
   Sparkles, CheckCircle2, ChevronRight, Ban, Eye, Radio, Server, Check, HelpCircle,
-  Activity, Database, Heart, Cpu
+  Activity, Database, Heart, Cpu, Skull
 } from 'lucide-react';
 import { User, FileMetadata, ShareLink, Quota, SystemLog, SystemStats } from '../types.js';
 import leekuMascot from '../leeku_mascot.png';
@@ -109,6 +109,10 @@ export default function UserDashboard({ user, token, onLogout, quotas, onTrigger
   const [profileEmail, setProfileEmail] = useState(user.email);
   const [profilePassword, setProfilePassword] = useState('');
   const [profileUpdating, setProfileUpdating] = useState(false);
+
+  // Account Deletion State
+  const [deletionStep, setDeletionStep] = useState<'idle' | 'confirming' | 'sending' | 'sent'>('idle');
+  const [deletionMessage, setDeletionMessage] = useState('');
 
   // Admin Editing User details Dialog State
   const [adminEditingUser, setAdminEditingUser] = useState<User | null>(null);
@@ -449,6 +453,30 @@ export default function UserDashboard({ user, token, onLogout, quotas, onTrigger
       customAlert('Meltdown', 'Failed to synchronize updated identity.');
     } finally {
       setProfileUpdating(false);
+    }
+  };
+
+  const handleRequestAccountDeletion = async () => {
+    setDeletionStep('sending');
+    try {
+      const res = await fetch('/api/users/me/delete-request', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        }
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setDeletionStep('sent');
+        setDeletionMessage(data.message || 'Check your email for the confirmation link.');
+      } else {
+        setDeletionStep('idle');
+        customAlert('Deletion Request Failed', data.error || 'Could not send confirmation email.');
+      }
+    } catch (err) {
+      setDeletionStep('idle');
+      customAlert('Meltdown', 'Failed to communicate deletion request.');
     }
   };
 
@@ -1706,6 +1734,82 @@ export default function UserDashboard({ user, token, onLogout, quotas, onTrigger
                     {profileUpdating ? 'Recalibration in progress...' : 'Execute Profile Recalibration'}
                   </button>
                 </form>
+              </div>
+
+              {/* ACCOUNT DELETION DANGER ZONE */}
+              <div className="bg-[#0A0E14] border-4 border-red-900 p-6 shadow-[6px_6px_0px_#FF007F] space-y-6">
+                <div className="border-b border-red-900/50 pb-4 flex items-center gap-2">
+                  <Skull className="w-5 h-5 text-[#FF007F]" />
+                  <span className="font-mono font-black text-sm text-[#FF007F] block uppercase tracking-wide">Danger Zone — Account Termination</span>
+                </div>
+
+                {deletionStep === 'idle' && (
+                  <div className="space-y-4">
+                    <p className="text-xs text-gray-500 font-mono uppercase leading-relaxed">
+                      ⚠️ <strong className="text-red-400">Warning:</strong> Deleting your account permanently erases ALL your uploaded files, share links, encryption keys, and account data. This action is <strong className="text-[#FF007F]">IRREVERSIBLE</strong>.
+                    </p>
+                    <button
+                      onClick={() => setDeletionStep('confirming')}
+                      className="px-6 py-2.5 bg-transparent border-2 border-red-800 text-red-400 font-mono text-xs font-extrabold uppercase hover:bg-red-950 hover:border-[#FF007F] hover:text-[#FF007F] cursor-pointer transition-colors"
+                    >
+                      <Trash2 className="w-3.5 h-3.5 inline mr-1.5" />
+                      Request Account Deletion
+                    </button>
+                  </div>
+                )}
+
+                {deletionStep === 'confirming' && (
+                  <div className="space-y-4 p-4 bg-red-950/30 border border-red-900/50">
+                    <div className="flex items-start gap-3">
+                      <div className="w-10 h-10 flex-shrink-0">
+                        <MascotAvatar id="leeku" size="xs" />
+                      </div>
+                      <div className="text-xs font-mono text-gray-300 leading-relaxed">
+                        <p className="text-[#FF007F] font-black uppercase mb-2">Leeku is worried… 🥬💧</p>
+                        <p>Are you absolutely sure you want to leave? All your files will be vaporized from the vault. All share links will break. There is <strong className="text-[#FF007F]">no undo</strong>.</p>
+                      </div>
+                    </div>
+                    <p className="text-xs text-gray-500 font-mono uppercase">
+                      A one-time confirmation token will be sent to <strong className="text-[#00F2FF]">{user.email}</strong>. You must click the link in that email to finalize.
+                    </p>
+                    <div className="flex gap-3">
+                      <button
+                        onClick={handleRequestAccountDeletion}
+                        disabled={deletionStep === 'sending'}
+                        className="px-6 py-2.5 bg-[#FF007F] text-white font-mono text-xs font-extrabold uppercase hover:opacity-90 cursor-pointer disabled:opacity-50"
+                      >
+                        {deletionStep === 'sending' ? 'Sending confirmation...' : 'Yes, send confirmation email'}
+                      </button>
+                      <button
+                        onClick={() => setDeletionStep('idle')}
+                        className="px-6 py-2.5 bg-transparent border-2 border-gray-800 text-gray-400 font-mono text-xs font-extrabold uppercase hover:border-gray-600 hover:text-gray-300 cursor-pointer"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {deletionStep === 'sent' && (
+                  <div className="space-y-4 p-4 bg-green-950/30 border border-green-900/50">
+                    <div className="flex items-start gap-3">
+                      <CheckCircle2 className="w-5 h-5 text-green-400 flex-shrink-0 mt-0.5" />
+                      <div>
+                        <p className="text-green-400 font-black text-xs font-mono uppercase mb-1">Confirmation Email Sent</p>
+                        <p className="text-xs text-gray-400 font-mono leading-relaxed">{deletionMessage}</p>
+                        <p className="text-xs text-gray-500 font-mono mt-3">
+                          The confirmation link expires in <strong className="text-[#00F2FF]">1 hour</strong>. If you change your mind, simply ignore the email.
+                        </p>
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => setDeletionStep('idle')}
+                      className="px-4 py-2 bg-transparent border-2 border-gray-800 text-gray-400 font-mono text-[10px] font-extrabold uppercase hover:border-gray-600 hover:text-gray-300 cursor-pointer"
+                    >
+                      I changed my mind — Go Back
+                    </button>
+                  </div>
+                )}
               </div>
             </motion.div>
           )}
