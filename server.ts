@@ -929,7 +929,8 @@ if (!fs.existsSync(UPLOAD_TEMP)) {
 const upload = multer({
   dest: UPLOAD_TEMP,
   limits: {
-    fileSize: 0, // unlimited — quota checks handle the limit
+    // No fileSize limit — quota checks handle the limit server-side.
+    // Must be omitted (not 0) in multer v2.x — 0 rejects ALL non-empty files.
     files: 1,
   },
 });
