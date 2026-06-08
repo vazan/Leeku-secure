@@ -137,12 +137,50 @@ export async function scanFileBuffer(
   fileBytes: Buffer,
   mimeType:  string
 ): Promise<ScanResult> {
+  const tempDir = getScanTempPath();
+  const tempFileName = crypto.randomBytes(16).toString('hex') + '.scan';
+  const tempFilePath = path.join(tempDir, tempFileName);
+
+  if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
+  fs.writeFileSync(tempFilePath, fileBytes);
+
+  try {
+    return await scanFileAtPath(tempFilePath, fileBytes.length);
+  } finally {
+    try { if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath); }
+    catch (e) { /* best effort */ }
+  }
+}
+
+/**
+ * Scans a file that already exists on disk using the Bitdefender CLI.
+ * This variant avoids loading the entire file into a Node.js Buffer —
+ * the scanner reads it directly via CLI.
+ *
+ * @param filePath   Absolute path to the plaintext file on disk.
+ * @param fileSize   Size of the file in bytes (for logging).
+ * @returns          Structured ScanResult with clean/infected verdict.
+ */
+export async function scanFilePath(
+  filePath: string,
+  fileSize?: number,
+): Promise<ScanResult> {
+  return scanFileAtPath(filePath, fileSize);
+}
+
+// ──────────────────────────────────────────────────────────────
+// Internal: common scan logic against a file path on disk
+// ──────────────────────────────────────────────────────────────
+
+async function scanFileAtPath(
+  filePath: string,
+  fileSize?: number,
+): Promise<ScanResult> {
   const cliPath    = getScanCliPath();
   const timeoutMs  = getScanTimeoutMs();
-  const tempDir    = getScanTempPath();
 
   console.info(
-    `[scanner] Starting scan. bytes=${fileBytes.length} mime=${mimeType || 'unknown'} tempDir="${tempDir}" timeoutMs=${timeoutMs} cliPath=${cliPath || '[not found]'}`
+    `[scanner] Starting scan. path="${filePath}" size=${fileSize ?? 'unknown'} timeoutMs=${timeoutMs} cliPath=${cliPath || '[not found]'}`
   );
 
   // ── Pre-flight: check scanner binary exists ──────────────────
@@ -168,45 +206,8 @@ export async function scanFileBuffer(
     };
   }
 
-  // ── Ensure temp directory exists ────────────────────────────
-  if (!fs.existsSync(tempDir)) {
-    fs.mkdirSync(tempDir, { recursive: true });
-    console.info(`[scanner] Created scan temp directory: ${tempDir}`);
-  }
-
-  // ── Write bytes to a randomly-named temp file ───────────────
-  // Use a random name so the filename cannot influence the scan result
-  // and there are no collisions under concurrent uploads.
-  const tempFileName = crypto.randomBytes(16).toString('hex') + '.scan';
-  const tempFilePath = path.join(tempDir, tempFileName);
-
-  try {
-    fs.writeFileSync(tempFilePath, fileBytes);
-    console.info(`[scanner] Wrote temp scan file: ${tempFilePath}`);
-  } catch (err) {
-    console.error('[scanner] Failed to write temp scan file.', { tempFilePath, tempDir, error: (err as Error).message });
-    return {
-      clean:          false,
-      status:         'Error',
-      threats:        [],
-      message:        `Failed to write scan staging file: ${(err as Error).message}`,
-      scanDurationMs: 0,
-    };
-  }
-
-  // ── Run the scanner ──────────────────────────────────────────
-  try {
-    return await runScanner(cliPath, tempFilePath, timeoutMs);
-  } finally {
-    // Always delete the temp file, even if the scan throws
-    try {
-      if (fs.existsSync(tempFilePath)) {
-        fs.unlinkSync(tempFilePath);
-      }
-    } catch (cleanupErr) {
-      console.error('[scanner] Failed to delete scan temp file:', tempFilePath, cleanupErr);
-    }
-  }
+  // ── Run the scanner directly against the file path ──────────
+  return await runScanner(cliPath, filePath, timeoutMs);
 }
 
 // ──────────────────────────────────────────────────────────────

@@ -26,6 +26,7 @@
  */
 
 import crypto from 'crypto';
+import fs from 'fs';
 import argon2 from 'argon2';
 import bcrypt from 'bcryptjs';
 
@@ -258,6 +259,123 @@ export function generateSecureToken(byteLength: number = 16): string {
  */
 export function computeChecksum(data: Buffer): string {
   return crypto.createHash('sha256').update(data).digest('hex');
+}
+
+/**
+ * Computes a SHA-256 checksum of a file on disk via streaming.
+ * Uses constant memory regardless of file size.
+ */
+export function computeFileChecksum(filePath: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash('sha256');
+    const stream = fs.createReadStream(filePath);
+    stream.on('data', (chunk: Buffer) => hash.update(chunk));
+    stream.on('end', () => resolve(hash.digest('hex')));
+    stream.on('error', reject);
+  });
+}
+
+// ──────────────────────────────────────────────────────────────
+// Streaming File Encryption / Decryption  (AES-256-GCM on disk)
+// ──────────────────────────────────────────────────────────────
+// For files larger than ~1 GB, these avoid loading the entire
+// file into a Node.js Buffer by using ReadStream / WriteStream
+// with crypto Cipher/Decipher in pipeline mode.
+// ──────────────────────────────────────────────────────────────
+
+export interface EncryptFileStreamResult {
+  /** Random 12-byte IV used for this file. Store in DB (file_encryption_keys.file_iv). */
+  iv:         Buffer;
+  /** 16-byte GCM authentication tag. Store in DB (file_encryption_keys.file_auth_tag). */
+  authTag:    Buffer;
+  /** Random 32-byte AES-256 key for this file. Wrap before storing (see wrapKey). */
+  key:        Buffer;
+  /** SHA-256 of the plaintext (computed during encryption). */
+  checksum:   string;
+  /** Size of the encrypted file in bytes. */
+  encryptedSize: number;
+}
+
+/**
+ * Encrypts a plaintext file on disk to a ciphertext file using AES-256-GCM.
+ * Memory usage is constant (~64KB chunk size) regardless of file size.
+ *
+ * @param srcPath  Absolute path to the plaintext file.
+ * @param destPath Absolute path where the encrypted file will be written.
+ * @returns        The key, IV, auth tag, plaintext checksum, and encrypted size.
+ */
+export function encryptFileStream(
+  srcPath:  string,
+  destPath: string,
+): Promise<EncryptFileStreamResult> {
+  return new Promise((resolve, reject) => {
+    const key = crypto.randomBytes(KEY_LENGTH);
+    const iv  = crypto.randomBytes(IV_LENGTH);
+    const checksum = crypto.createHash('sha256');
+    const cipher = crypto.createCipheriv(ALGORITHM, key, iv, { authTagLength: TAG_LENGTH });
+
+    const readStream  = fs.createReadStream(srcPath,  { highWaterMark: 64 * 1024 });
+    const writeStream = fs.createWriteStream(destPath);
+
+    let encryptedSize = 0;
+
+    readStream.on('data', (chunk: Buffer) => {
+      checksum.update(chunk);
+    });
+
+    cipher.on('data', (chunk: Buffer) => {
+      encryptedSize += chunk.length;
+    });
+
+    readStream
+      .pipe(cipher)
+      .pipe(writeStream)
+      .on('finish', () => {
+        try {
+          const authTag = cipher.getAuthTag();
+          resolve({
+            iv, authTag, key,
+            checksum: checksum.digest('hex'),
+            encryptedSize,
+          });
+        } catch (err) {
+          reject(err);
+        }
+      })
+      .on('error', reject);
+  });
+}
+
+/**
+ * Decrypts a ciphertext file on disk to a plaintext file using AES-256-GCM.
+ * Verifies the GCM auth tag — rejects if the data was tampered with.
+ *
+ * @param srcPath  Absolute path to the encrypted file.
+ * @param destPath Absolute path where the decrypted file will be written.
+ * @param key      The 32-byte AES-256 key.
+ * @param iv       The 12-byte IV used during encryption.
+ * @param authTag  The 16-byte GCM auth tag from encryption.
+ */
+export function decryptFileStream(
+  srcPath:  string,
+  destPath: string,
+  key:      Buffer,
+  iv:       Buffer,
+  authTag:  Buffer,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const decipher = crypto.createDecipheriv(ALGORITHM, key, iv, { authTagLength: TAG_LENGTH });
+    decipher.setAuthTag(authTag);
+
+    const readStream  = fs.createReadStream(srcPath,  { highWaterMark: 64 * 1024 });
+    const writeStream = fs.createWriteStream(destPath);
+
+    readStream
+      .pipe(decipher)
+      .pipe(writeStream)
+      .on('finish', resolve)
+      .on('error', reject);
+  });
 }
 
 /**

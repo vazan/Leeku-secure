@@ -266,70 +266,57 @@ export default function UserDashboard({ user, token, onLogout, quotas, onTrigger
   };
 
   const runUploadSaga = async (file: File, customQuote: string) => {
-    // Read base64 content
-    const reader = new FileReader();
-    reader.readAsDataURL(file);
+    try {
+      // Step 1 -> Step 2 (Security Scan)
+      await new Promise(r => setTimeout(r, 1200));
+      setUploadStep(2);
 
-    reader.onload = async () => {
-      const base64Content = (reader.result as string).split(',')[1];
-      
-      try {
-        // Step 1 -> Step 2 (Security Scan)
-        await new Promise(r => setTimeout(r, 1200));
-        setUploadStep(2);
-
-        // Rare Event: 0.1% chance Leeku dropped a leek (let's do exactly 2% to make it findable, conforming to the alert message logic!)
-        const isRareEvent = Math.random() < 0.05; // 5% chance in preview so it is testing-friendly! Let's handle exactly 0.1% as well
-        if (isRareEvent) {
-          setIsLosingLeek(true);
-          await new Promise(r => setTimeout(r, 2000));
-          setIsLosingLeek(false);
-        }
-
-        // Step 2 -> Step 3 (Encryption)
-        await new Promise(r => setTimeout(r, 1300));
-        setUploadStep(3);
-
-        // Step 3 -> Step 4 (Storage Assignment)
-        await new Promise(r => setTimeout(r, 1000));
-        setUploadStep(4);
-
-        // Step 4 -> Step 5 (Server storage call & Save)
-        await new Promise(r => setTimeout(r, 900));
-
-        const res = await fetch('/api/files/upload', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${token}`
-          },
-          body: JSON.stringify({
-            original_name: file.name,
-            mime_type: file.type || 'application/octet-stream',
-            size: file.size,
-            content: base64Content
-          })
-        });
-
-        const data = await res.json();
-        if (!res.ok) {
-          throw new Error(data.error || 'The system could not parse the bytes. Approved status rejected.');
-        }
-
-        setUploadSuccessDetails(data.file);
-        setUploadStep(5);
-        fetchUserFiles();
-        onTriggerRefreshUser(); // recalculate capacity
-      } catch (err: any) {
-        setUploadErrorMsg(err.message || 'Miku core server breakdown.');
-        setUploadStep(6); // failed
+      // Rare Event: 5% chance Leeku dropped a leek
+      const isRareEvent = Math.random() < 0.05;
+      if (isRareEvent) {
+        setIsLosingLeek(true);
+        await new Promise(r => setTimeout(r, 2000));
+        setIsLosingLeek(false);
       }
-    };
 
-    reader.onerror = () => {
-      setUploadErrorMsg("Resource reading denied. Digital security walls are up.");
-      setUploadStep(6);
-    };
+      // Step 2 -> Step 3 (Encryption)
+      await new Promise(r => setTimeout(r, 1300));
+      setUploadStep(3);
+
+      // Step 3 -> Step 4 (Storage Assignment)
+      await new Promise(r => setTimeout(r, 1000));
+      setUploadStep(4);
+
+      // Step 4 -> Step 5 (Server upload via multipart/form-data — streaming, no memory inflation)
+      await new Promise(r => setTimeout(r, 900));
+
+      const formData = new FormData();
+      formData.append('file', file);
+      formData.append('original_name', file.name);
+      formData.append('mime_type', file.type || 'application/octet-stream');
+
+      // Don't set Content-Type header — the browser sets it with the correct boundary
+      const res = await fetch('/api/files/upload', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`
+        },
+        body: formData
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || 'The system could not parse the bytes. Approved status rejected.');
+      }
+
+      setUploadSuccessDetails(data.file);
+      setUploadStep(5);
+      fetchUserFiles();
+      onTriggerRefreshUser(); // recalculate capacity
+    } catch (err: any) {
+      setUploadErrorMsg(err.message || 'Miku core server breakdown.');
+      setUploadStep(6); // failed
+    }
   };
 
   // File Purging Handler

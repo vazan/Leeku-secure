@@ -26,17 +26,20 @@ import si from 'systeminformation';
 import { getPool, closePool, getRequest } from './src/lib/database.js';
 import {
   encryptFile, decryptFile, wrapKey, unwrapKey,
+  encryptFileStream, decryptFileStream, computeFileChecksum,
   encryptColumn, decryptColumn, hashColumnForLookup,
   hashPassword, verifyPassword, hashSharePassword, verifySharePassword,
   generateSecureToken, computeChecksum, validateEncryptionConfig,
 } from './src/lib/encryption.js';
-import { scanFileBuffer, heuristicPreScan } from './src/lib/scanner.js';
+import { scanFileBuffer, scanFilePath, heuristicPreScan } from './src/lib/scanner.js';
 import {
   startExpiryCleanup, stopExpiryCleanup,
   computeExpiresAt, isValidTtl,
   type ExpiredFileRecord,
 } from './src/lib/expiry-cleanup.js';
 import { sendVerificationEmail, sendAccountDeletionEmail, validateMxRecord, verifySmtpConnection } from './src/lib/email.js';
+import multer from 'multer';
+import os from 'os';
 import { iisLoggingMiddleware, validateIISLoggingConfig } from './src/lib/iis-logger.js';
 import type { Quota, User, FileMetadata, ShareLink, SystemLog, SystemStats } from './src/types.js';
 
@@ -48,6 +51,7 @@ const PORT               = parseInt(process.env.PORT || '3000', 10);
 const APP_URL            = process.env.APP_URL || `http://localhost:${PORT}`;
 const NODE_ENV           = process.env.NODE_ENV || 'development';
 const FILE_VAULT         = process.env.FILE_STORAGE_UNC_PATH || path.join(process.cwd(), 'vault');
+const UPLOAD_TEMP        = process.env.UPLOAD_TEMP_PATH || path.join(os.tmpdir(), 'leeku-uploads');
 const MAX_LOG_ENTRIES    = parseInt(process.env.MAX_LOG_ENTRIES || '500', 10);
 const MAX_LOGIN_ATTEMPTS = parseInt(process.env.MAX_LOGIN_ATTEMPTS || '5', 10);
 const LOCKOUT_DURATION_MS= parseInt(process.env.LOCKOUT_DURATION_MINUTES || '15', 10) * 60_000;
@@ -166,13 +170,10 @@ app.use(cors({
 validateIISLoggingConfig();
 app.use(iisLoggingMiddleware);
 
-// JSON body limit — base64 encoding inflates binary data by ~33%.
-// For a 700MB file the JSON body is ~933MB. Set MAX_UPLOAD_BODY_MB
-// in .env to match your largest expected upload × 1.4 (headroom).
-// Default: 2048 MB (2 GB) — Node.js max Buffer is ~4 GB on 64-bit.
-// For files larger than ~1.5 GB, a streaming/chunked upload approach
-// is required instead of base64 JSON (see upload architecture docs).
-const uploadBodyLimitMb = parseInt(process.env.MAX_UPLOAD_BODY_MB || '2048', 10);
+// JSON body limit — only used for auth/profile/share endpoints now.
+// Uploads go through multipart/form-data (streaming, no memory limits).
+// Default: 1 MB is plenty for auth/profile/share JSON payloads.
+const uploadBodyLimitMb = parseInt(process.env.MAX_UPLOAD_BODY_MB || '1', 10);
 app.use(express.json({ limit: `${uploadBodyLimitMb}mb` }));
 app.use(express.urlencoded({ limit: `${uploadBodyLimitMb}mb`, extended: true }));
 
@@ -916,40 +917,63 @@ app.get('/api/files', authenticateUser as express.RequestHandler, async (req: Au
 // API: Files — Upload
 // ──────────────────────────────────────────────────────────────
 
-app.post('/api/files/upload', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
-  const { original_name, mime_type, content, size, ttl_hours } = req.body;
-  if (!original_name || !mime_type || !content || size === undefined)
-    return res.status(400).json({ error: 'Incomplete file metadata or payload.' });
+// ──────────────────────────────────────────────────────────────
+// Multer — multipart upload middleware (streaming, no memory limits)
+// ──────────────────────────────────────────────────────────────
+
+if (!fs.existsSync(UPLOAD_TEMP)) {
+  fs.mkdirSync(UPLOAD_TEMP, { recursive: true });
+  console.log(`[server] Created upload temp directory: ${UPLOAD_TEMP}`);
+}
+
+const upload = multer({
+  dest: UPLOAD_TEMP,
+  limits: {
+    fileSize: 0, // unlimited — quota checks handle the limit
+    files: 1,
+  },
+});
+
+// ──────────────────────────────────────────────────────────────
+// API: Files — Upload (multipart/form-data, streaming)
+// ──────────────────────────────────────────────────────────────
+
+app.post('/api/files/upload', authenticateUser as express.RequestHandler, upload.single('file'), async (req: AuthenticatedRequest, res) => {
+  const multerFile = req.file;
+  if (!multerFile) return res.status(400).json({ error: 'No file attached. Use multipart/form-data with field name "file".' });
+
+  const original_name = req.body.original_name || multerFile.originalname;
+  const mime_type     = req.body.mime_type     || multerFile.mimetype || 'application/octet-stream';
+  const ttl_hours     = req.body.ttl_hours     || null;
+  const size          = multerFile.size;
+  const tempFilePath  = multerFile.path; // on-disk temp file from multer
 
   const user = req.user!;
   let currentStage = 'quota_lookup';
   let vaultFilePath: string | null = null;
+
   try {
-    console.info('[upload] Request received.', {
+    console.info('[upload] Multipart upload received.', {
       userId: user.id,
       username: user.username,
       originalName: original_name,
       mimeType: mime_type,
       declaredSize: size,
       ttlHours: ttl_hours ?? null,
-      contentLength: typeof content === 'string' ? content.length : null,
+      tempPath: tempFilePath,
     });
 
+    // ── Quota checks ──────────────────────────────────────────
+    currentStage = 'quota_lookup';
     const qReq = await getRequest();
     qReq.input('qid', sql.NVarChar(50), user.quota_id);
     const qRes = await qReq.query<Quota>('SELECT id,name,storage_limit_bytes,max_file_size_bytes,max_files,daily_upload_limit_bytes FROM quotas WHERE id=@qid');
     const quota = qRes.recordset[0];
-    if (!quota) return res.status(400).json({ error: 'Quota tier not found.' });
+    if (!quota) return cleanupAndRespond(res, tempFilePath, 400, 'Quota tier not found.');
 
     if (size > quota.max_file_size_bytes) {
-      console.warn('[upload] Rejected by max file size quota.', {
-        userId: user.id,
-        originalName: original_name,
-        declaredSize: size,
-        maxFileSizeBytes: quota.max_file_size_bytes,
-        quotaId: quota.id,
-      });
-      return res.status(400).json({ error: `File too large. Tier "${quota.name}" allows ${Math.round(quota.max_file_size_bytes/1024/1024)}MB per file.` });
+      console.warn('[upload] Rejected by max file size quota.', { userId: user.id, originalName: original_name, declaredSize: size, maxFileSizeBytes: quota.max_file_size_bytes });
+      return cleanupAndRespond(res, tempFilePath, 400, `File too large. Tier "${quota.name}" allows ${Math.round(quota.max_file_size_bytes/1024/1024)}MB per file.`);
     }
 
     const cntReq = await getRequest();
@@ -959,102 +983,53 @@ app.post('/api/files/upload', authenticateUser as express.RequestHandler, async 
     );
     const { cnt, used } = cntRes.recordset[0];
     if (cnt >= quota.max_files) {
-      console.warn('[upload] Rejected by file count quota.', {
-        userId: user.id,
-        originalName: original_name,
-        fileCount: cnt,
-        maxFiles: quota.max_files,
-        quotaId: quota.id,
-      });
-      return res.status(400).json({ error: `File count limit reached (${quota.max_files} files).` });
+      console.warn('[upload] Rejected by file count quota.', { userId: user.id, fileCount: cnt, maxFiles: quota.max_files });
+      return cleanupAndRespond(res, tempFilePath, 400, `File count limit reached (${quota.max_files} files).`);
     }
     if (used + size > quota.storage_limit_bytes) {
-      console.warn('[upload] Rejected by storage quota.', {
-        userId: user.id,
-        originalName: original_name,
-        usedBytes: used,
-        incomingSize: size,
-        storageLimitBytes: quota.storage_limit_bytes,
-        quotaId: quota.id,
-      });
-      return res.status(400).json({ error: `Storage full. ${Math.round(used/1024/1024)}MB / ${Math.round(quota.storage_limit_bytes/1024/1024)}MB used.` });
+      console.warn('[upload] Rejected by storage quota.', { userId: user.id, usedBytes: used, incomingSize: size, storageLimitBytes: quota.storage_limit_bytes });
+      return cleanupAndRespond(res, tempFilePath, 400, `Storage full. ${Math.round(used/1024/1024)}MB / ${Math.round(quota.storage_limit_bytes/1024/1024)}MB used.`);
     }
 
-    currentStage = 'base64_decode';
-    const fileBytes = Buffer.from(content, 'base64');
-    console.info('[upload] Payload decoded.', {
-      userId: user.id,
-      originalName: original_name,
-      declaredSize: size,
-      decodedBytes: fileBytes.length,
-      mimeType: mime_type,
-    });
-
-    // Heuristic pre-scan
+    // ── Heuristic pre-scan (extension-based, no file I/O) ─────
     currentStage = 'heuristic_scan';
     const heuristic = heuristicPreScan(original_name, mime_type);
     if (heuristic !== null && !heuristic.clean) {
-      console.warn('[upload] Rejected by heuristic pre-scan.', {
-        userId: user.id,
-        originalName: original_name,
-        mimeType: mime_type,
-        heuristicStatus: heuristic.status,
-        heuristicMessage: heuristic.message,
-      });
+      console.warn('[upload] Rejected by heuristic pre-scan.', { userId: user.id, originalName: original_name });
       const vibe = await generateLeekuVibe(original_name, false);
       await logSystemEvent(user.id, user.username, 'Scan', 'File', 'rejected', req, `Heuristic block: "${original_name}" — ${heuristic.message}`);
-      return res.status(422).json({ error: heuristic.message || vibe });
+      return cleanupAndRespond(res, tempFilePath, 422, heuristic.message || vibe);
     }
 
-    // Bitdefender scan
+    // ── Bitdefender scan (reads the temp file directly from disk) ──
     currentStage = 'bitdefender_scan';
-    const scanResult = await scanFileBuffer(fileBytes, mime_type);
-    console.info('[upload] Scan completed.', {
-      userId: user.id,
-      originalName: original_name,
-      scanStatus: scanResult.status,
-      scanClean: scanResult.clean,
-      scanDurationMs: scanResult.scanDurationMs,
-      threatCount: scanResult.threats.length,
-      scanMessage: scanResult.message,
-    });
+    const scanResult = await scanFilePath(tempFilePath, size);
+    console.info('[upload] Scan completed.', { userId: user.id, originalName: original_name, scanStatus: scanResult.status, scanDurationMs: scanResult.scanDurationMs });
     if (!scanResult.clean && scanResult.status !== 'Unavailable') {
-      console.warn('[upload] Rejected by Bitdefender scan.', {
-        userId: user.id,
-        originalName: original_name,
-        scanStatus: scanResult.status,
-        scanDurationMs: scanResult.scanDurationMs,
-        threatCount: scanResult.threats.length,
-        scanMessage: scanResult.message,
-      });
+      console.warn('[upload] Rejected by Bitdefender scan.', { userId: user.id, originalName: original_name, scanStatus: scanResult.status });
       const vibe = await generateLeekuVibe(original_name, false);
       await logSystemEvent(user.id, user.username, 'Scan', 'File', 'rejected', req, `AV block: "${original_name}" — ${scanResult.message}`);
-      return res.status(422).json({ error: vibe || scanResult.message });
+      return cleanupAndRespond(res, tempFilePath, 422, vibe || scanResult.message);
     }
 
-    // Encrypt
+    // ── Stream-encrypt directly to vault (constant memory) ─────
     currentStage = 'encrypt_file';
-    const checksum  = computeChecksum(fileBytes);
-    const encrypted = encryptFile(fileBytes);
-    const wrapped   = wrapKey(encrypted.key);
-
     const vaultFileName = generateSecureToken(16) + '.vault';
     vaultFilePath = path.join(FILE_VAULT, vaultFileName);
-    currentStage = 'write_vault';
-    fs.writeFileSync(vaultFilePath, encrypted.ciphertext);
-    console.info('[upload] Encrypted file written to vault.', {
-      userId: user.id,
-      originalName: original_name,
-      vaultFileName,
-      encryptedSizeBytes: encrypted.ciphertext.length,
-      vaultPath: vaultFilePath,
-    });
 
+    const encryptResult = await encryptFileStream(tempFilePath, vaultFilePath);
+    const wrapped = wrapKey(encryptResult.key);
+    console.info('[upload] Stream-encrypted to vault.', { userId: user.id, originalName: original_name, vaultFileName, encryptedSizeBytes: encryptResult.encryptedSize });
+
+    // ── Clean up the multer temp file ─────────────────────────
+    try { fs.unlinkSync(tempFilePath); } catch (e) { /* best effort */ }
+
+    // ── Prepare metadata & insert DB records ──────────────────
     currentStage = 'prepare_metadata';
-    const ttlH     = isValidTtl(Number(ttl_hours)) ? Number(ttl_hours) as any : null;
-    const expiresAt= ttlH ? computeExpiresAt(ttlH) : null;
-    const encName  = encryptColumn(original_name);
-    const leekuVibe= await generateLeekuVibe(original_name, true);
+    const ttlH      = isValidTtl(Number(ttl_hours)) ? Number(ttl_hours) as any : null;
+    const expiresAt = ttlH ? computeExpiresAt(ttlH) : null;
+    const encName   = encryptColumn(original_name);
+    const leekuVibe = await generateLeekuVibe(original_name, true);
 
     currentStage = 'insert_file_record';
     const fileReq = await getRequest();
@@ -1065,8 +1040,8 @@ app.post('/api/files/upload', authenticateUser as express.RequestHandler, async 
     fileReq.input('spath',  sql.NVarChar(1000),  vaultFileName);
     fileReq.input('mime',   sql.NVarChar(255),   mime_type);
     fileReq.input('sz',     sql.BigInt,          size);
-    fileReq.input('esz',    sql.BigInt,          encrypted.ciphertext.length);
-    fileReq.input('chk',    sql.Char(64),        checksum);
+    fileReq.input('esz',    sql.BigInt,          encryptResult.encryptedSize);
+    fileReq.input('chk',    sql.Char(64),        encryptResult.checksum);
     fileReq.input('scan',   sql.NVarChar(20),    scanResult.status === 'Unavailable' ? null : scanResult.status);
     fileReq.input('smsg',   sql.NVarChar(sql.MAX), scanResult.message);
     fileReq.input('vibe',   sql.NVarChar(500),   leekuVibe);
@@ -1088,12 +1063,7 @@ app.post('/api/files/upload', authenticateUser as express.RequestHandler, async 
        VALUES (@ownerId,@nEnc,@nIv,@nTag, @spath,@mime,@sz,@esz, @chk,@scan,@smsg,SYSDATETIMEOFFSET(), @vibe,@ttl,@exp,1)`
     );
     const newFile = fileResult.recordset[0];
-    console.info('[upload] File record inserted.', {
-      userId: user.id,
-      originalName: original_name,
-      fileId: newFile.id,
-      scanStatus: scanResult.status,
-    });
+    console.info('[upload] File record inserted.', { userId: user.id, originalName: original_name, fileId: newFile.id });
 
     currentStage = 'insert_key_record';
     const keyReq = await getRequest();
@@ -1101,8 +1071,8 @@ app.post('/api/files/upload', authenticateUser as express.RequestHandler, async 
     keyReq.input('encK',  sql.VarBinary(64),    wrapped.encryptedKey);
     keyReq.input('kIv',   sql.VarBinary(16),    wrapped.iv);
     keyReq.input('kTag',  sql.VarBinary(16),    wrapped.authTag);
-    keyReq.input('fIv',   sql.VarBinary(16),    encrypted.iv);
-    keyReq.input('fTag',  sql.VarBinary(16),    encrypted.authTag);
+    keyReq.input('fIv',   sql.VarBinary(16),    encryptResult.iv);
+    keyReq.input('fTag',  sql.VarBinary(16),    encryptResult.authTag);
     await keyReq.query(
       'INSERT INTO file_encryption_keys (file_id,encrypted_key,key_iv,key_auth_tag,file_iv,file_auth_tag) VALUES (@fid,@encK,@kIv,@kTag,@fIv,@fTag)'
     );
@@ -1117,30 +1087,35 @@ app.post('/api/files/upload', authenticateUser as express.RequestHandler, async 
       `Uploaded "${original_name}" (${Math.round(size/1024)}KB). Scan: ${scanResult.status}.`);
 
     console.info('[upload] Upload completed successfully.', {
-      userId: user.id,
-      username: user.username,
-      originalName: original_name,
-      fileId: newFile.id,
-      scanStatus: scanResult.status,
-      storedPath: newFile.stored_path,
+      userId: user.id, username: user.username, originalName: original_name,
+      fileId: newFile.id, scanStatus: scanResult.status, storedPath: newFile.stored_path,
     });
 
     res.json({ success: true, message: 'File approved and encrypted!', file: mapFileRow(newFile, user.username) });
   } catch (err) {
     console.error('[POST /api/files/upload] Upload failed.', {
-      userId: user.id,
-      username: user.username,
-      originalName: original_name,
-      mimeType: mime_type,
-      declaredSize: size,
-      stage: currentStage,
-      vaultFilePath,
+      userId: user.id, username: user.username, originalName: original_name,
+      stage: currentStage, vaultFilePath,
       error: err instanceof Error ? err.message : String(err),
       stack: err instanceof Error ? err.stack : undefined,
     });
+    // Clean up: delete vault file if created AND temp upload file
+    if (vaultFilePath) try { if (fs.existsSync(vaultFilePath)) fs.unlinkSync(vaultFilePath); } catch {}
+    try { if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath); } catch {}
     res.status(500).json({ error: 'Upload failed. Please try again.' });
   }
 });
+
+/**
+ * Helper: clean up the temp upload file and send an error response.
+ */
+function cleanupAndRespond(
+  res: express.Response, tempFilePath: string,
+  statusCode: number, message: string
+): void {
+  try { if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath); } catch {}
+  res.status(statusCode).json({ error: message });
+}
 
 // ──────────────────────────────────────────────────────────────
 // API: Files — Delete
