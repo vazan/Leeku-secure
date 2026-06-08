@@ -79,15 +79,6 @@ export default function LandingPage({ onGoToAuth, quotas, onSetView }: LandingPa
                 <span>Create Free Account</span>
               </span>
             </button>
-            <button
-              onClick={() => onGoToAuth('login')}
-              className="border-2 border-[#00F2FF] text-[#00F2FF] bg-transparent px-8 py-4 font-black text-lg skew-x-[-12deg] shadow-[4px_4px_0px_#FF007F] hover:translate-x-1 hover:translate-y-1 hover:shadow-none transition-all cursor-pointer font-display inline-flex items-center gap-2 uppercase tracking-wide"
-              id="btn-sign-in"
-            >
-              <span className="inline-block skew-x-[12deg]">
-                Sign In
-              </span>
-            </button>
           </div>
 
           <div className="flex items-center gap-6 pt-4 text-gray-400 text-xs font-mono" id="hero-badges">

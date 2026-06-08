@@ -278,9 +278,8 @@ export default function App() {
                       setAuthMode('login');
                       setCurrentView('auth');
                     }}
-                    className="px-4 py-1.5 border-2 border-[#FF007F] text-[#FF007F] font-bold skew-x-[-10deg] cursor-pointer hover:bg-[#FF007F] hover:text-white transition-colors"
-                  >
-                    <span className="inline-block skew-x-[10deg]">Sign In</span>
+                    className="border-2 border-[#00F2FF] text-[#00F2FF] bg-transparent px-8 py-4 font-black text-lg skew-x-[-12deg] shadow-[4px_4px_0px_#FF007F] hover:translate-x-1 hover:translate-y-1 hover:shadow-none transition-all cursor-pointer font-display inline-flex items-center gap-2 uppercase tracking-wide"
+                  >Sign In
                   </button>
                 )}
               </div>
