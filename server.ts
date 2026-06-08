@@ -987,7 +987,7 @@ app.post('/api/files/upload', authenticateUser as express.RequestHandler, upload
       console.warn('[upload] Rejected by file count quota.', { userId: user.id, fileCount: cnt, maxFiles: quota.max_files });
       return cleanupAndRespond(res, tempFilePath, 400, `File count limit reached (${quota.max_files} files).`);
     }
-    if (used + size > quota.storage_limit_bytes) {
+    if (Number(used) + size > Number(quota.storage_limit_bytes)) {
       console.warn('[upload] Rejected by storage quota.', { userId: user.id, usedBytes: used, incomingSize: size, storageLimitBytes: quota.storage_limit_bytes });
       return cleanupAndRespond(res, tempFilePath, 400, `Storage full. ${Math.round(used/1024/1024)}MB / ${Math.round(quota.storage_limit_bytes/1024/1024)}MB used.`);
     }
