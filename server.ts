@@ -166,8 +166,13 @@ app.use(cors({
 validateIISLoggingConfig();
 app.use(iisLoggingMiddleware);
 
-app.use(express.json({ limit: `${process.env.MAX_UPLOAD_BODY_MB || 64}mb` }));
-app.use(express.urlencoded({ limit: `${process.env.MAX_UPLOAD_BODY_MB || 64}mb`, extended: true }));
+// JSON body limit — base64 encoding inflates binary data by ~33%.
+// For a 700MB file the JSON body is ~933MB. Set MAX_UPLOAD_BODY_MB
+// in .env to match your largest expected upload × 1.4 (headroom).
+// Default: 2048 MB (2 GB) — SQL Server 2022 handles LOBs up to 2 GB.
+const uploadBodyLimitMb = parseInt(process.env.MAX_UPLOAD_BODY_MB || '2048', 10);
+app.use(express.json({ limit: `${uploadBodyLimitMb}mb` }));
+app.use(express.urlencoded({ limit: `${uploadBodyLimitMb}mb`, extended: true }));
 
 const authLimiter = rateLimit({
   windowMs: 60_000,
