@@ -31,7 +31,7 @@ export default function AuthPage({ initialMode, onAuthSuccess, onCancel }: AuthP
 
     const url = mode === 'login' ? '/api/auth/login' : '/api/auth/register';
     const payload = mode === 'login' 
-      ? { email, password } 
+      ? { login: email, password } 
       : { username, email, password };
 
     try {
@@ -153,13 +153,15 @@ export default function AuthPage({ initialMode, onAuthSuccess, onCancel }: AuthP
           )}
 
           <div>
-            <label className="block text-[10px] font-mono text-[#00F2FF] uppercase font-black tracking-wider mb-1.5 font-bold">Email Address</label>
+            <label className="block text-[10px] font-mono text-[#00F2FF] uppercase font-black tracking-wider mb-1.5 font-bold">
+              {mode === 'login' ? 'Email or Username' : 'Email Address'}
+            </label>
             <div className="relative">
               <span className="absolute left-3.5 top-1/2 -translate-y-1/2 text-gray-500"><Mail className="w-4 h-4" /></span>
               <input 
-                type="email"
+                type={mode === 'login' ? 'text' : 'email'}
                 required
-                placeholder="yourname@leek.sh"
+                placeholder={mode === 'login' ? 'you@email.com or MyUsername' : 'yourname@leek.sh'}
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
                 className="w-full pl-10 pr-4 py-3 rounded-none bg-[#1A1F26] border-2 border-gray-800 text-white placeholder-gray-600 focus:outline-none focus:border-[#00F2FF] text-xs font-mono transition-colors"
@@ -182,7 +184,7 @@ export default function AuthPage({ initialMode, onAuthSuccess, onCancel }: AuthP
             </div>
             {mode === 'login' && (
               <span className="block mt-1 text-[10px] text-gray-500 font-mono text-right">
-                Hint: Standard user is <code className="text-[#00F2FF] font-bold">user@miku.rip</code> / <code className="text-[#00F2FF] font-bold">user123</code>
+                Hint: Standard user is <code className="text-[#00F2FF] font-bold">user@miku.rip</code> / <code className="text-[#00F2FF] font-bold">user</code> / <code className="text-[#00F2FF] font-bold">user123</code>
               </span>
             )}
             {mode === 'register' && (

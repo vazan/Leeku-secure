@@ -606,26 +606,29 @@ a{display:inline-block;background:#FF007F;color:#fff;padding:12px 28px;font-weig
 // ──────────────────────────────────────────────────────────────
 
 app.post('/api/auth/login', async (req, res) => {
-  const { email, password } = req.body;
-  if (!email || !password)
-    return res.status(400).json({ error: 'Please enter both email and password!' });
+  const { login, password } = req.body;
+  if (!login || !password)
+    return res.status(400).json({ error: 'Please enter both login (email or username) and password!' });
 
-  const emailHash = hashColumnForLookup(email.toLowerCase().trim());
+  // Determine if login is an email (contains @) or username
+  const isEmail = login.includes('@');
+  const lookupHash = hashColumnForLookup(login.trim().toLowerCase());
+  const lookupField = isEmail ? 'email_hash' : 'username_hash';
 
   try {
     const request = await getRequest();
-    request.input('eH', sql.Char(64), emailHash);
+    request.input('h', sql.Char(64), lookupHash);
     const result = await request.query<UserRow>(
       `SELECT id, email_encrypted, email_iv, email_auth_tag,
               username_encrypted, username_iv, username_auth_tag,
               password_hash, role, quota_id, storage_used_bytes,
               status, created_at, failed_login_count, locked_until,
               email_verified, email_verification_token, email_verification_expires
-       FROM users WHERE email_hash = @eH`
+       FROM users WHERE ${lookupField} = @h`
     );
 
     if (!result.recordset.length)
-      return res.status(400).json({ error: 'Invalid email or password combination.' });
+      return res.status(400).json({ error: 'Invalid login or password combination.' });
 
     const row = result.recordset[0];
 
@@ -651,7 +654,7 @@ app.post('/api/auth/login', async (req, res) => {
       upReq.input('lu', sql.DateTimeOffset, lockUntil);
       await upReq.query('UPDATE users SET failed_login_count=@c, locked_until=@lu WHERE id=@id');
       if (lockUntil) await logSystemEvent(row.id, null, 'Security', 'User', row.id, req, `Account locked after ${newCount} failed attempts.`);
-      return res.status(400).json({ error: 'Invalid email or password combination.' });
+      return res.status(400).json({ error: 'Invalid login or password combination.' });
     }
 
     const resetReq = await getRequest();
