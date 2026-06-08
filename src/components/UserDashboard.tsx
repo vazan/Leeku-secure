@@ -335,8 +335,8 @@ export default function UserDashboard({ user, token, onLogout, quotas, onTrigger
       `Permanently delete "${filename}"? All sharing gateways will be severed immediately.`,
       async () => {
         try {
-          const res = await fetch(`/api/files/${fileId}`, {
-            method: 'DELETE',
+          const res = await fetch(`/api/files/${fileId}/delete`, {
+            method: 'POST',
             headers: { 'Authorization': `Bearer ${token}` }
           });
           if (res.ok) {
@@ -364,8 +364,8 @@ export default function UserDashboard({ user, token, onLogout, quotas, onTrigger
       `Activating ADMINISTRATIVE PURGE. Completely delete "${filename}" from server storage volumes? This action is absolute and IRREVERSIBLE.`,
       async () => {
         try {
-          const res = await fetch(`/api/files/${fileId}`, {
-            method: 'DELETE',
+          const res = await fetch(`/api/files/${fileId}/delete`, {
+            method: 'POST',
             headers: { 'Authorization': `Bearer ${token}` }
           });
           if (res.ok) {

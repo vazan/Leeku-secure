@@ -867,7 +867,7 @@ app.post('/api/files/upload', authenticateUser as express.RequestHandler, async 
 // API: Files — Delete
 // ──────────────────────────────────────────────────────────────
 
-app.delete('/api/files/:id', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+app.post('/api/files/:id/delete', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
   const fileId = req.params.id;
   try {
     const fileReq = await getRequest();
