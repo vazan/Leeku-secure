@@ -1001,9 +1001,11 @@ app.post('/api/files/upload', authenticateUser as express.RequestHandler, upload
     currentStage = 'heuristic_scan';
     const heuristic = heuristicPreScan(original_name, mime_type);
     if (heuristic !== null && !heuristic.clean) {
-      console.warn('[upload] Rejected by heuristic pre-scan.', { userId: user.id, originalName: original_name });
+      console.warn('[upload] Rejected by heuristic pre-scan.', { userId: user.id, originalName: original_name, threats: heuristic.threats });
       const vibe = await generateLeekuVibe(original_name, false);
-      await logSystemEvent(user.id, user.username, 'Scan', 'File', 'rejected', req, `Heuristic block: "${original_name}" — ${heuristic.message}`);
+      const threatDetail = heuristic.threats.length > 0 ? heuristic.threats.join('; ') : 'unknown';
+      const logMsg = `Heuristic block: "${original_name}" — ${heuristic.message} [Flags: ${threatDetail}]`;
+      await logSystemEvent(user.id, user.username, 'Scan', 'File', original_name, req, logMsg);
       return cleanupAndRespond(res, tempFilePath, 422, heuristic.message || vibe);
     }
 
