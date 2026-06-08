@@ -870,9 +870,6 @@ export default function UserDashboard({ user, token, onLogout, quotas, onTrigger
                   <h2 className="font-display font-black text-3xl text-white uppercase italic tracking-tight">Vocaloid Secure Hub</h2>
                   <p className="text-xs text-gray-400 mt-1 uppercase font-mono">Pleased to serve you, guardian leeks are healthy.</p>
                 </div>
-                <div className="bg-[#1A1F26] border border-[#00F2FF]/40 py-1.5 px-3 font-mono text-[10px] text-[#00F2FF] uppercase font-bold tracking-wider">
-                  ALIVE PORT: 3000
-                </div>
               </div>
 
               {/* Clean metrics row */}
