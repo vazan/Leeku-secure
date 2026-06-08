@@ -70,4 +70,13 @@ export interface SystemStats {
   uploadsToday: number;
   blockedFiles: number;
   failedScans: number;
+  // Windows Server 2022 System Health
+  cpuUsagePercent?: number;
+  memoryUsagePercent?: number;
+  memoryUsedMB?: number;
+  memoryTotalMB?: number;
+  diskUsagePercent?: number;
+  diskUsedGB?: number;
+  diskTotalGB?: number;
+  uptime?: number;
 }

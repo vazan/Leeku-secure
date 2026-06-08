@@ -6,7 +6,7 @@
 import React, { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
-  Upload, HardDrive, Shield, Key, Share2, Trash2, ShieldAlert,
+  Upload, HardDrive, Shield, Key, Share2, Trash2, ShieldAlert, Download,
   Terminal, Globe, Lock, Clock, Copy, Plus, Users, Settings, LogOut,
   Sparkles, CheckCircle2, ChevronRight, Ban, Eye, Radio, Server, Check, HelpCircle,
   Activity, Database, Heart, Cpu
@@ -17,12 +17,13 @@ import { MascotAvatar, MascotSpeechBubble, MASCOTS, QUOTEKU_MESSAGES } from './M
 
 interface UserDashboardProps {
   user: User;
+  token: string;
   onLogout: () => void;
   quotas: Quota[];
   onTriggerRefreshUser: () => void;
 }
 
-export default function UserDashboard({ user, onLogout, quotas, onTriggerRefreshUser }: UserDashboardProps) {
+export default function UserDashboard({ user, token, onLogout, quotas, onTriggerRefreshUser }: UserDashboardProps) {
   // Navigation tabs state
   const [activeTab, setActiveTab] = useState<'dashboard' | 'upload' | 'files' | 'sharing' | 'settings' | 'admin'>('dashboard');
   
@@ -155,7 +156,7 @@ export default function UserDashboard({ user, onLogout, quotas, onTriggerRefresh
   const fetchUserFiles = async () => {
     try {
       const res = await fetch('/api/files', {
-        headers: { 'Authorization': `Bearer ${user.id}` }
+        headers: { 'Authorization': `Bearer ${token}` }
       });
       const data = await res.json();
       if (res.ok) setUserFiles(data.files || []);
@@ -167,7 +168,7 @@ export default function UserDashboard({ user, onLogout, quotas, onTriggerRefresh
   const fetchSharingLinks = async () => {
     try {
       const res = await fetch('/api/sharing/links', {
-        headers: { 'Authorization': `Bearer ${user.id}` }
+        headers: { 'Authorization': `Bearer ${token}` }
       });
       const data = await res.json();
       if (res.ok) setSharingLinks(data.links || []);
@@ -179,7 +180,7 @@ export default function UserDashboard({ user, onLogout, quotas, onTriggerRefresh
   const fetchAdminData = async () => {
     if (user.role !== 'Admin') return;
     try {
-      const headers = { 'Authorization': `Bearer ${user.id}` };
+      const headers = { 'Authorization': `Bearer ${token}` };
       const [uRes, fRes, lRes, sRes] = await Promise.all([
         fetch('/api/admin/users', { headers }),
         fetch('/api/admin/files', { headers }),
@@ -296,7 +297,7 @@ export default function UserDashboard({ user, onLogout, quotas, onTriggerRefresh
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'Authorization': `Bearer ${user.id}`
+            'Authorization': `Bearer ${token}`
           },
           body: JSON.stringify({
             original_name: file.name,
@@ -336,7 +337,7 @@ export default function UserDashboard({ user, onLogout, quotas, onTriggerRefresh
         try {
           const res = await fetch(`/api/files/${fileId}`, {
             method: 'DELETE',
-            headers: { 'Authorization': `Bearer ${user.id}` }
+            headers: { 'Authorization': `Bearer ${token}` }
           });
           if (res.ok) {
             triggerToast('File and links eliminated.');
@@ -365,7 +366,7 @@ export default function UserDashboard({ user, onLogout, quotas, onTriggerRefresh
         try {
           const res = await fetch(`/api/files/${fileId}`, {
             method: 'DELETE',
-            headers: { 'Authorization': `Bearer ${user.id}` }
+            headers: { 'Authorization': `Bearer ${token}` }
           });
           if (res.ok) {
             triggerToast('Security Purge completed.');
@@ -387,6 +388,39 @@ export default function UserDashboard({ user, onLogout, quotas, onTriggerRefresh
     );
   };
 
+  const handleDownloadFile = async (fileId: string, filename: string) => {
+    try {
+      const res = await fetch(`/api/files/${fileId}/download`, {
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+
+      if (!res.ok) {
+        let errorMessage = 'Failed to download file.';
+        try {
+          const data = await res.json();
+          errorMessage = data.error || errorMessage;
+        } catch {
+          // ignore body parse errors
+        }
+        customAlert('Download blocked', errorMessage);
+        return;
+      }
+
+      const blob = await res.blob();
+      const objectUrl = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = objectUrl;
+      anchor.download = filename;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(objectUrl);
+      triggerToast('Direct download started.');
+    } catch (e) {
+      customAlert('Download error', 'Connection severed while downloading.');
+    }
+  };
+
   const handleSaveProfile = async (e: React.FormEvent) => {
     e.preventDefault();
     setProfileUpdating(true);
@@ -395,7 +429,7 @@ export default function UserDashboard({ user, onLogout, quotas, onTriggerRefresh
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${user.id}`
+          'Authorization': `Bearer ${token}`
         },
         body: JSON.stringify({
           username: profileUsername,
@@ -427,7 +461,7 @@ export default function UserDashboard({ user, onLogout, quotas, onTriggerRefresh
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${user.id}`
+          'Authorization': `Bearer ${token}`
         },
         body: JSON.stringify({
           username: adminEditUsername,
@@ -460,7 +494,7 @@ export default function UserDashboard({ user, onLogout, quotas, onTriggerRefresh
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${user.id}`
+          'Authorization': `Bearer ${token}`
         },
         body: JSON.stringify({ migrate_to_quota_id: migrateToQuotaId })
       });
@@ -506,7 +540,7 @@ export default function UserDashboard({ user, onLogout, quotas, onTriggerRefresh
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${user.id}`
+          'Authorization': `Bearer ${token}`
         },
         body: JSON.stringify({
           password: sharePassword || undefined,
@@ -540,7 +574,7 @@ export default function UserDashboard({ user, onLogout, quotas, onTriggerRefresh
         try {
           const res = await fetch(`/api/admin/users/${targetId}/suspend`, {
             method: 'POST',
-            headers: { 'Authorization': `Bearer ${user.id}` }
+            headers: { 'Authorization': `Bearer ${token}` }
           });
           if (res.ok) {
             triggerToast('User locks updated.');
@@ -562,7 +596,7 @@ export default function UserDashboard({ user, onLogout, quotas, onTriggerRefresh
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${user.id}`
+          'Authorization': `Bearer ${token}`
         },
         body: JSON.stringify({ quota_id: quotaId })
       });
@@ -586,7 +620,7 @@ export default function UserDashboard({ user, onLogout, quotas, onTriggerRefresh
         try {
           const res = await fetch(`/api/admin/files/${fileId}/block`, {
             method: 'POST',
-            headers: { 'Authorization': `Bearer ${user.id}` }
+            headers: { 'Authorization': `Bearer ${token}` }
           });
           if (res.ok) {
             triggerToast('File clearance updated.');
@@ -609,7 +643,7 @@ export default function UserDashboard({ user, onLogout, quotas, onTriggerRefresh
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${user.id}`
+          'Authorization': `Bearer ${token}`
         },
         body: JSON.stringify({
           id: newQuota.id.trim().toLowerCase(),
@@ -1393,6 +1427,9 @@ export default function UserDashboard({ user, onLogout, quotas, onTriggerRefresh
                                 <code>{f.checksum.substring(0, 10).toUpperCase()}</code>
                               </td>
                               <td className="py-4 px-5 text-right space-x-1.5">
+                                <button onClick={() => handleDownloadFile(f.id, f.original_name)} disabled={f.status === 'Blocked'} className="p-2 border border-gray-800 text-gray-400 hover:border-[#00F2FF] hover:text-[#00F2FF] disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer" title={f.status === 'Blocked' ? 'Blocked files cannot be downloaded' : 'Direct download'}>
+                                  <Download className="w-3.5 h-3.5" />
+                                </button>
                                 <button onClick={() => openShareWizard(f)} disabled={f.status === 'Blocked'} className="p-2 border border-gray-800 text-gray-400 hover:border-[#00F2FF] hover:text-[#00F2FF] cursor-pointer" title="Config share link">
                                   <Share2 className="w-3.5 h-3.5" />
                                 </button>

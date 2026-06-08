@@ -1,1162 +1,1438 @@
 /**
  * @license
  * SPDX-License-Identifier: Apache-2.0
+ *
+ * Leeku Secure — Main Express Server
+ * Integrates: SQL Server 2022, AES-256-GCM encryption, Bitdefender AV,
+ * JWT auth, rate limiting, CORS, IIS W3C logging, file expiry cleanup.
  */
 
+import dotenv from 'dotenv';
+dotenv.config();
+
 import express from 'express';
-import path from 'path';
+import cors from 'cors';
+import rateLimit from 'express-rate-limit';
+import jwt from 'jsonwebtoken';
 import fs from 'fs';
+import path from 'path';
+import https from 'https';
 import { fileURLToPath } from 'url';
+import { execFileSync } from 'child_process';
 import { createServer as createViteServer } from 'vite';
-import { Quota, User, FileMetadata, ShareLink, SystemLog, SystemStats } from './src/types.js';
+import { GoogleGenAI } from '@google/genai';
+import sql from 'mssql';
+import si from 'systeminformation';
+
+import { getPool, closePool, getRequest } from './src/lib/database.js';
+import {
+  encryptFile, decryptFile, wrapKey, unwrapKey,
+  encryptColumn, decryptColumn, hashColumnForLookup,
+  hashPassword, verifyPassword, hashSharePassword, verifySharePassword,
+  generateSecureToken, computeChecksum, validateEncryptionConfig,
+} from './src/lib/encryption.js';
+import { scanFileBuffer, heuristicPreScan } from './src/lib/scanner.js';
+import {
+  startExpiryCleanup, stopExpiryCleanup,
+  computeExpiresAt, isValidTtl,
+  type ExpiredFileRecord,
+} from './src/lib/expiry-cleanup.js';
+import { iisLoggingMiddleware, validateIISLoggingConfig } from './src/lib/iis-logger.js';
+import type { Quota, User, FileMetadata, ShareLink, SystemLog, SystemStats } from './src/types.js';
+
+// ──────────────────────────────────────────────────────────────
+// Constants from environment
+// ──────────────────────────────────────────────────────────────
+
+const PORT               = parseInt(process.env.PORT || '3000', 10);
+const APP_URL            = process.env.APP_URL || `http://localhost:${PORT}`;
+const NODE_ENV           = process.env.NODE_ENV || 'development';
+const FILE_VAULT         = process.env.FILE_STORAGE_UNC_PATH || path.join(process.cwd(), 'vault');
+const MAX_LOG_ENTRIES    = parseInt(process.env.MAX_LOG_ENTRIES || '500', 10);
+const MAX_LOGIN_ATTEMPTS = parseInt(process.env.MAX_LOGIN_ATTEMPTS || '5', 10);
+const LOCKOUT_DURATION_MS= parseInt(process.env.LOCKOUT_DURATION_MINUTES || '15', 10) * 60_000;
+const PROXY_TRUST_HOPS   = parseInt(process.env.PROXY_TRUST_HOPS || '0', 10);
+const GEMINI_API_KEY     = process.env.GEMINI_API_KEY;
+const JWT_EXPIRY         = parseInt(process.env.JWT_ACCESS_EXPIRY_SECONDS || '900', 10);
+const JWT_ISSUER         = process.env.JWT_ISSUER   || APP_URL;
+const JWT_AUDIENCE       = process.env.JWT_AUDIENCE || 'leeku-secure-api';
+
+function getJwtSecret(): string {
+  const raw = process.env.COOKIE_SECRET_BASE64;
+  if (!raw) throw new Error('[server] COOKIE_SECRET_BASE64 must be set in .env');
+  return raw;
+}
+
+// ──────────────────────────────────────────────────────────────
+// Vault directory / UNC share mount
+// ──────────────────────────────────────────────────────────────
+
+/**
+ * If STORAGE_NET_USE_PATH is set, run `net use` at startup to map
+ * the UNC share with the supplied credentials. This is only needed
+ * when the Windows service account cannot be pre-configured with
+ * persistent credentials for the share.
+ *
+ * Credentials are read from env vars — never hardcoded.
+ */
+if (process.env.STORAGE_NET_USE_PATH) {
+  const sharePath = process.env.STORAGE_NET_USE_PATH;
+  const shareUser = process.env.STORAGE_NET_USE_USER;
+  const sharePass = process.env.STORAGE_NET_USE_PASS;
+  try {
+    const args = [sharePath];
+    if (sharePass) args.push(sharePass);
+    if (shareUser) args.push(`/user:${shareUser}`);
+    args.push('/persistent:no');
+    execFileSync('net', ['use', ...args], { stdio: 'pipe' });
+    console.log(`[server] UNC share mapped: ${sharePath}`);
+  } catch (e: any) {
+    // Already mapped or reconnected — not fatal
+    const msg = (e.stderr?.toString() || e.message || '').trim();
+    if (/already been used|multiple connections/i.test(msg)) {
+      console.log(`[server] UNC share already mapped: ${sharePath}`);
+    } else {
+      console.error(`[server] Failed to map UNC share "${sharePath}": ${msg}`);
+    }
+  }
+}
+
+if (!FILE_VAULT.startsWith('\\\\') && !fs.existsSync(FILE_VAULT)) {
+  fs.mkdirSync(FILE_VAULT, { recursive: true });
+  console.log(`[server] Created local vault directory: ${FILE_VAULT}`);
+}
+
+// ──────────────────────────────────────────────────────────────
+// Gemini AI (optional)
+// ──────────────────────────────────────────────────────────────
+
+let genai: GoogleGenAI | null = null;
+if (GEMINI_API_KEY && GEMINI_API_KEY !== 'CHANGE_ME') {
+  genai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+  console.log('[server] Gemini AI enabled for leeku_vibe messages.');
+}
+
+async function generateLeekuVibe(filename: string, clean: boolean): Promise<string> {
+  const fallbacks = clean
+    ? [
+        'Clean file. Leeku approves.',
+        'No malware detected. Surprisingly.',
+        'Passed digital health exam. Safe inside the virtual container.',
+        'Your file has been blessed by the leek guardian. Zero goblins.',
+      ]
+    : [
+        'Cursed bytes detected. Upload denied.',
+        'Digital goblins found in payload. Rejected.',
+        'Leeku found something suspicious. Access denied.',
+      ];
+
+  if (!genai) {
+    return fallbacks[Math.floor(Math.random() * fallbacks.length)];
+  }
+
+  try {
+    const prompt = clean
+      ? `Generate a short, funny, cyber-kawaii one-liner (max 80 chars) saying a file named "${filename}" passed security scan. Be witty and use Vocaloid/anime references. No hashtags.`
+      : `Generate a short, funny, cyber-kawaii one-liner (max 80 chars) saying a file named "${filename}" was blocked. Be dramatic and use Vocaloid/anime references. No hashtags.`;
+
+    const result = await genai.models.generateContent({ model: 'gemini-2.0-flash', contents: prompt });
+    const text = result.text?.trim();
+    return text || fallbacks[0];
+  } catch {
+    return fallbacks[Math.floor(Math.random() * fallbacks.length)];
+  }
+}
+
+// ──────────────────────────────────────────────────────────────
+// Express app
+// ──────────────────────────────────────────────────────────────
 
 const app = express();
-const PORT = 3000;
 
-// Increase payload bounds for Base64 attachments
-app.use(express.json({ limit: '64mb' }));
-app.use(express.urlencoded({ limit: '64mb', extended: true }));
+if (PROXY_TRUST_HOPS > 0) app.set('trust proxy', PROXY_TRUST_HOPS);
 
-// Path to flat database persistence file
-const DB_FILE = path.join(process.cwd(), 'leeks_db.json');
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || APP_URL)
+  .split(',').map(o => o.trim()).filter(Boolean);
 
-// Memory/disk hybrid store structure that mimics the product specification schema
-interface DatabaseState {
-  users: User[];
-  passwords: Record<string, string>; // user_id -> password
-  files: FileMetadata[];
-  fileContents: Record<string, string>; // file_id -> encrypted base64 content
-  shareLinks: ShareLink[];
-  quotas: Quota[];
-  logs: SystemLog[];
+app.use(cors({
+  origin: (origin, cb) => {
+    if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
+    cb(new Error(`CORS: origin ${origin} not allowed`));
+  },
+  credentials: true,
+}));
+
+validateIISLoggingConfig();
+app.use(iisLoggingMiddleware);
+
+app.use(express.json({ limit: `${process.env.MAX_UPLOAD_BODY_MB || 64}mb` }));
+app.use(express.urlencoded({ limit: `${process.env.MAX_UPLOAD_BODY_MB || 64}mb`, extended: true }));
+
+const authLimiter = rateLimit({
+  windowMs: 60_000,
+  max: parseInt(process.env.AUTH_RATE_LIMIT_RPM || '20', 10),
+  standardHeaders: true, legacyHeaders: false,
+  message: { error: 'Too many attempts. Please wait before trying again.' },
+});
+
+const apiLimiter = rateLimit({
+  windowMs: 60_000,
+  max: parseInt(process.env.API_RATE_LIMIT_RPM || '120', 10),
+  standardHeaders: true, legacyHeaders: false,
+  message: { error: 'Rate limit exceeded.' },
+});
+
+app.use('/api/auth', authLimiter);
+app.use('/api', apiLimiter);
+
+// ──────────────────────────────────────────────────────────────
+// JWT helpers
+// ──────────────────────────────────────────────────────────────
+
+interface JwtPayload { sub: string; role: string; }
+
+function signToken(userId: string, role: string): string {
+  return jwt.sign(
+    { sub: userId, role } as JwtPayload,
+    getJwtSecret(),
+    { expiresIn: JWT_EXPIRY, issuer: JWT_ISSUER, audience: JWT_AUDIENCE }
+  );
 }
 
-// ---------------------------------------------------------
-// Seed / Initialize Database
-// ---------------------------------------------------------
-const DEFAULT_QUOTAS: Quota[] = [
-  { id: 'guest', name: 'Guest Leek', storage_limit_bytes: 524288000, max_file_size_bytes: 52428800, max_files: 10, daily_upload_limit_bytes: 104857600 }, // 50MB limit per file, 500MB total
-  { id: 'small', name: 'Small Leek', storage_limit_bytes: 5368709120, max_file_size_bytes: 268435456, max_files: 100, daily_upload_limit_bytes: 1073741824 }, // 5GB total, 250MB single file
-  { id: 'big', name: 'Big Leek', storage_limit_bytes: 26843545600, max_file_size_bytes: 2147483648, max_files: 1000, daily_upload_limit_bytes: 5368709120 }, // 25GB total
-  { id: 'mega', name: 'Mega Leek', storage_limit_bytes: 107374182400, max_file_size_bytes: 10737418240, max_files: 5000, daily_upload_limit_bytes: 21474836480 }, // 100GB total
-  { id: 'eternal', name: 'Eternal Leek', storage_limit_bytes: 1099511627776, max_file_size_bytes: 53687091200, max_files: 50000, daily_upload_limit_bytes: 107374182400 } // 1TB total
-];
-
-let db: DatabaseState = {
-  users: [],
-  passwords: {},
-  files: [],
-  fileContents: {},
-  shareLinks: [],
-  quotas: DEFAULT_QUOTAS,
-  logs: []
-};
-
-function saveDb() {
+function verifyToken(token: string): JwtPayload | null {
   try {
-    fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2), 'utf-8');
-  } catch (err) {
-    console.error('Failed to save DB:', err);
-  }
+    return jwt.verify(token, getJwtSecret(), {
+      issuer: JWT_ISSUER, audience: JWT_AUDIENCE,
+    }) as JwtPayload;
+  } catch { return null; }
 }
 
-function loadDb() {
-  if (fs.existsSync(DB_FILE)) {
-    try {
-      const content = fs.readFileSync(DB_FILE, 'utf-8');
-      db = JSON.parse(content);
-      // Ensure essential lists are loaded safely
-      if (!db.quotas || db.quotas.length === 0) db.quotas = DEFAULT_QUOTAS;
-      if (!db.users) db.users = [];
-      if (!db.files) db.files = [];
-      if (!db.fileContents) db.fileContents = {};
-      if (!db.shareLinks) db.shareLinks = [];
-      if (!db.logs) db.logs = [];
-    } catch (err) {
-      console.error('Failed to parse storage, booting fresh db');
-    }
-  } else {
-    // Seed essential user profiles for testing
-    const adminId = 'user_admin';
-    const standardId = 'user_standard';
+// ──────────────────────────────────────────────────────────────
+// SQL row type interfaces
+// ──────────────────────────────────────────────────────────────
 
-    db.users = [
-      {
-        id: adminId,
-        email: 'admin@miku.rip',
-        username: 'MikuAdmin',
-        role: 'Admin',
-        quota_id: 'eternal',
-        storage_used: 12450000,
-        status: 'Active',
-        created_at: new Date('2026-01-01').toISOString()
-      },
-      {
-        id: standardId,
-        email: 'user@miku.rip',
-        username: 'LeekFan',
-        role: 'User',
-        quota_id: 'guest',
-        storage_used: 4235000,
-        status: 'Active',
-        created_at: new Date('2026-03-15').toISOString()
-      }
-    ];
-
-    db.passwords = {
-      [adminId]: 'admin1337',
-      [standardId]: 'user123'
-    };
-
-    // Pre-populate system logs to look highly authentic
-    db.logs = [
-      {
-        id: 'log_1',
-        user_id: null,
-        username: 'SYSTEM',
-        event_type: 'Security',
-        target_type: 'System',
-        target_id: 'leeks_reactor',
-        ip_address: '127.0.0.1',
-        message: 'Leek reactor is stable. Core status: VIBRANT. Vocaloid encryption shielding ACTIVE.',
-        created_at: new Date(Date.now() - 3600000 * 24).toISOString()
-      },
-      {
-        id: 'log_2',
-        user_id: adminId,
-        username: 'MikuAdmin',
-        event_type: 'Admin',
-        target_type: 'Quota',
-        target_id: 'eternal',
-        ip_address: '192.168.1.100',
-        message: 'Configured default model quotas for Guest, Small, Big, and Eternal tiers.',
-        created_at: new Date(Date.now() - 3600000 * 12).toISOString()
-      },
-      {
-        id: 'log_3',
-        user_id: standardId,
-        username: 'LeekFan',
-        event_type: 'Auth',
-        target_type: 'User',
-        target_id: standardId,
-        ip_address: '172.56.21.3',
-        message: 'User logged in successfully from mobile browser.',
-        created_at: new Date(Date.now() - 600000).toISOString()
-      }
-    ];
-
-    // Prepopulate 2 dummy files for LeekFan
-    const dummyFile1Id = 'file_dummy_1';
-    db.files.push({
-      id: dummyFile1Id,
-      owner_user_id: standardId,
-      username: 'LeekFan',
-      original_name: 'secret_miku_leak_draft.txt',
-      stored_name: 'encrypted_vault_miku_leak.leek',
-      mime_type: 'text/plain',
-      size: 1530,
-      encrypted_size: 1530,
-      status: 'Available',
-      checksum: 'e7c653d4ebfcf214b7',
-      leeku_vibe: 'Clean file. Leeku approves. Vibe check passed.',
-      is_encrypted: true,
-      created_at: new Date(Date.now() - 300000).toISOString()
-    });
-    db.fileContents[dummyFile1Id] = Buffer.from("My super secret document detailing plans to plant leaks on Mars. Project Green Leek is a go!").toString('base64');
-
-    // Create share token for it
-    db.shareLinks.push({
-      id: 'link_dummy_1',
-      file_id: dummyFile1Id,
-      public_token: 'abc123',
-      expires_at: null,
-      max_downloads: null,
-      download_count: 5,
-      is_active: true,
-      created_at: new Date(Date.now() - 300000).toISOString()
-    });
-
-    const dummyFile2Id = 'file_dummy_2';
-    db.files.push({
-      id: dummyFile2Id,
-      owner_user_id: standardId,
-      username: 'LeekFan',
-      original_name: 'cursed_ransomware_goblin.exe',
-      stored_name: 'encrypted_blocked_goblin.leek',
-      mime_type: 'application/octet-stream',
-      size: 4096,
-      encrypted_size: 4096,
-      status: 'Blocked',
-      checksum: 'db092fcd1bca9826a',
-      leeku_vibe: 'Leeku found cursed bytes. Suspicious antivirus warning! Blocked with combat leek!',
-      is_encrypted: true,
-      created_at: new Date(Date.now() - 50000).toISOString()
-    });
-    db.fileContents[dummyFile2Id] = Buffer.from("MOCK EXE BYTES").toString('base64');
-
-    db.logs.push({
-      id: 'log_4',
-      user_id: standardId,
-      username: 'LeekFan',
-      event_type: 'Scan',
-      target_type: 'File',
-      target_id: dummyFile2Id,
-      ip_address: '172.56.21.3',
-      message: 'Blocked file curs_ransomware_goblin.exe. Reason: Executable file trigger & suspicious digital-goblin checksum.',
-      created_at: new Date(Date.now() - 50000).toISOString()
-    });
-
-    // Save initial seed state
-    saveDb();
-  }
+interface UserRow {
+  id: string; email_encrypted: Buffer; email_iv: Buffer; email_auth_tag: Buffer;
+  username_encrypted: Buffer; username_iv: Buffer; username_auth_tag: Buffer;
+  role: string; quota_id: string; storage_used_bytes: number; status: string;
+  created_at: Date; failed_login_count: number; locked_until: Date | null;
+  password_hash?: string;
 }
 
-// Perform initial database load
-loadDb();
-
-// ---------------------------------------------------------
-// Antivirus check & Encryption Helpers
-// ---------------------------------------------------------
-function auditAntivirus(filename: string, base64Content: string): { clean: boolean; msg: string } {
-  const badPatterns = ['virus', 'exploit', 'hacker', 'malware', 'goblin', 'cursed', 'ransomware', 'trojan', 'cmd.exe', 'infect'];
-  const nameLower = filename.toLowerCase();
-
-  // 1. Check for bad naming keywords
-  for (const pat of badPatterns) {
-    if (nameLower.includes(pat)) {
-      return {
-        clean: false,
-        msg: `File rejected. Antivirus sniffing triggered by name keyword "${pat}". Digital goblins detected!`
-      };
-    }
-  }
-
-  // 2. Reject hazardous formats if name is suspicious, or .exe / .bat / .sh without account-clearance
-  if (nameLower.endsWith('.exe') || nameLower.endsWith('.bat') || nameLower.endsWith('.sh') || nameLower.endsWith('.vbs')) {
-    // Let's flag .exe files with funny messages 80% of the time, or make them rejected. We can let users upload text/images easily
-    return {
-      clean: false,
-      msg: 'Leeku found cursed bytes. Upload denied. Executables contain too much questionable energy.'
-    };
-  }
-
-  // 3. Scan fake byte patterns (e.g. searching for text triggers in Base64 decodes)
-  try {
-    const rawText = Buffer.from(base64Content, 'base64').toString('utf-8').toLowerCase();
-    const toxicPhrases = ['dangerous payloads', 'delete system32', 'steal bitcoins', 'kill process', 'attack server'];
-    for (const phrase of toxicPhrases) {
-      if (rawText.includes(phrase)) {
-        return {
-          clean: false,
-          msg: `Suspicious payload block. Leeku says: "I found "${phrase}" in your text bytes!"`
-        };
-      }
-    }
-  } catch (e) {
-    // non-text file
-  }
-
-  // Cleanapproved
-  const cleanVibes = [
-    'Clean file. Leeku approves.',
-    'No malware detected. Surprisingly.',
-    'The leek approved this upload. Acceptable vibes.',
-    'Passed digital health exam. Safe inside the virtual container.',
-    'Your file has been blessed by the leek guardian. Zero goblins.'
-  ];
-  const randVibe = cleanVibes[Math.floor(Math.random() * cleanVibes.length)];
-
-  return { clean: true, msg: randVibe };
+interface FileRow {
+  id: string; owner_user_id: string;
+  original_name_encrypted: Buffer; original_name_iv: Buffer; original_name_auth_tag: Buffer;
+  stored_path: string; mime_type: string; size_bytes: number; encrypted_size_bytes: number;
+  status: string; checksum_sha256: string; scan_result: string | null; scan_message: string | null;
+  is_encrypted: boolean; leeku_vibe: string | null; ttl_hours: number | null;
+  expires_at: Date | null; created_at: Date;
 }
 
-// Reversible encryption shift pattern to guarantee non-readability of raw stored files
-function encryptFileContents(base64Data: string): string {
-  // Simple reversive base64 shift for clean data pipeline handling
-  return base64Data.split('').reverse().join('');
+interface ShareRow {
+  id: string; file_id: string; public_token: string; password_hash: string | null;
+  expires_at: Date | null; max_downloads: number | null; download_count: number;
+  is_active: boolean; created_at: Date;
 }
 
-function decryptFileContents(encryptedData: string): string {
-  return encryptedData.split('').reverse().join('');
+interface LogRow {
+  id: string | number; user_id: string | null; username_snapshot: string | null;
+  event_type: string; target_type: string; target_id: string;
+  ip_address: string; message: string; created_at: Date;
 }
 
-// Token generator helper
-function generateToken(len = 10): string {
-  const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-  let token = '';
-  for (let i = 0; i < len; i++) {
-    token += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return token;
+// ──────────────────────────────────────────────────────────────
+// Row mappers
+// ──────────────────────────────────────────────────────────────
+
+function mapUserRow(row: UserRow): User {
+  return {
+    id:           row.id,
+    email:        decryptColumn(row.email_encrypted, row.email_iv, row.email_auth_tag),
+    username:     decryptColumn(row.username_encrypted, row.username_iv, row.username_auth_tag),
+    role:         row.role as 'User' | 'Admin',
+    quota_id:     row.quota_id,
+    storage_used: row.storage_used_bytes,
+    status:       row.status as 'Active' | 'Suspended',
+    created_at:   row.created_at.toISOString(),
+  };
 }
 
-// ---------------------------------------------------------
-// Token validation middleware
-// ---------------------------------------------------------
+function mapFileRow(row: FileRow, ownerUsername: string): FileMetadata {
+  return {
+    id:             row.id,
+    owner_user_id:  row.owner_user_id,
+    username:       ownerUsername,
+    original_name:  decryptColumn(row.original_name_encrypted, row.original_name_iv, row.original_name_auth_tag),
+    stored_name:    row.stored_path,
+    mime_type:      row.mime_type,
+    size:           row.size_bytes,
+    encrypted_size: row.encrypted_size_bytes,
+    status:         row.status as 'Available' | 'Blocked',
+    checksum:       row.checksum_sha256,
+    leeku_vibe:     row.leeku_vibe || '',
+    is_encrypted:   row.is_encrypted,
+    created_at:     row.created_at.toISOString(),
+  };
+}
+
+function mapShareRow(row: ShareRow): ShareLink {
+  return {
+    id:             row.id,
+    file_id:        row.file_id,
+    public_token:   row.public_token,
+    password:       row.password_hash ? '[protected]' : undefined,
+    expires_at:     row.expires_at ? row.expires_at.toISOString() : null,
+    max_downloads:  row.max_downloads,
+    download_count: row.download_count,
+    is_active:      row.is_active,
+    created_at:     row.created_at.toISOString(),
+  };
+}
+
+function mapLogRow(row: LogRow): SystemLog {
+  return {
+    id:          String(row.id),
+    user_id:     row.user_id,
+    username:    row.username_snapshot,
+    event_type:  row.event_type as SystemLog['event_type'],
+    target_type: row.target_type,
+    target_id:   row.target_id,
+    ip_address:  row.ip_address,
+    message:     row.message,
+    created_at:  row.created_at.toISOString(),
+  };
+}
+
+// ──────────────────────────────────────────────────────────────
+// Auth middleware
+// ──────────────────────────────────────────────────────────────
+
 interface AuthenticatedRequest extends express.Request {
   user?: User;
+  userId?: string;
 }
 
-function authenticateUser(req: AuthenticatedRequest, res: express.Response, next: express.NextFunction) {
+async function authenticateUser(
+  req: AuthenticatedRequest, res: express.Response, next: express.NextFunction
+): Promise<void> {
   const authHeader = req.headers['authorization'];
   let token = '';
-  if (authHeader && authHeader.startsWith('Bearer ')) {
-    token = authHeader.substring(7).trim();
-  } else if (req.headers['x-leek-token']) {
-    token = String(req.headers['x-leek-token']).trim();
-  }
+  if (authHeader?.startsWith('Bearer ')) token = authHeader.substring(7).trim();
+  else if (req.headers['x-leek-token'])  token = String(req.headers['x-leek-token']).trim();
 
-  if (!token) {
-    return res.status(401).json({ error: 'Auth credentials missing. Please log in first.' });
-  }
+  if (!token) { res.status(401).json({ error: 'Auth credentials missing. Please log in first.' }); return; }
 
-  const user = db.users.find(u => u.id === token);
-  if (!user) {
-    return res.status(401).json({ error: 'Invalid or expired session token.' });
-  }
+  const payload = verifyToken(token);
+  if (!payload) { res.status(401).json({ error: 'Invalid or expired session token.' }); return; }
 
-  if (user.status === 'Suspended') {
-    return res.status(403).json({ error: 'Your account has been suspended by an administrator. Leeku does not appreciate code-breakers.' });
+  try {
+    const request = await getRequest();
+    request.input('id', sql.UniqueIdentifier, payload.sub);
+    const result = await request.query<UserRow>(
+      `SELECT id, email_encrypted, email_iv, email_auth_tag,
+              username_encrypted, username_iv, username_auth_tag,
+              role, quota_id, storage_used_bytes, status, created_at,
+              failed_login_count, locked_until
+       FROM users WHERE id = @id AND status = 'Active'`
+    );
+    if (!result.recordset.length) { res.status(401).json({ error: 'Account not found or suspended.' }); return; }
+    req.user   = mapUserRow(result.recordset[0]);
+    req.userId = payload.sub;
+    next();
+  } catch (err) {
+    console.error('[auth] DB error:', err);
+    res.status(500).json({ error: 'Authentication service unavailable.' });
   }
+}
 
-  req.user = user;
+function verifyAdmin(req: AuthenticatedRequest, res: express.Response, next: express.NextFunction): void {
+  if (req.user?.role !== 'Admin') {
+    res.status(403).json({ error: 'Access denied. Admin privileges required.' });
+    return;
+  }
   next();
 }
 
-// Add system logging utility
-function logSystemEvent(
-  userId: string | null,
-  username: string | null,
-  eventType: SystemLog['event_type'],
-  targetType: string,
-  targetId: string,
-  req: express.Request,
-  message: string
-) {
-  const ip = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '127.0.0.1');
-  const newLog: SystemLog = {
-    id: 'log_' + Date.now() + '_' + Math.floor(Math.random() * 1000),
-    user_id: userId,
-    username: username || 'Guest',
-    event_type: eventType,
-    target_type: targetType,
-    target_id: targetId,
-    ip_address: ip,
-    message,
-    created_at: new Date().toISOString()
-  };
-  db.logs.unshift(newLog);
-  // Keep logs under a healthy limit
-  if (db.logs.length > 500) {
-    db.logs = db.logs.slice(0, 500);
-  }
-  saveDb();
+// ──────────────────────────────────────────────────────────────
+// System log helper
+// ──────────────────────────────────────────────────────────────
+
+async function logSystemEvent(
+  userId: string | null, username: string | null,
+  eventType: SystemLog['event_type'], targetType: string, targetId: string,
+  req: express.Request, message: string
+): Promise<void> {
+  const ip = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '127.0.0.1')
+    .split(',')[0].trim();
+  try {
+    const request = await getRequest();
+    request.input('userId',    sql.UniqueIdentifier,    userId);
+    request.input('username',  sql.NVarChar(200),       username || 'System');
+    request.input('eventType', sql.NVarChar(20),        eventType);
+    request.input('targetType',sql.NVarChar(50),        targetType);
+    request.input('targetId',  sql.NVarChar(100),       targetId.substring(0, 100));
+    request.input('ip',        sql.NVarChar(45),        ip);
+    request.input('message',   sql.NVarChar(sql.MAX),   message);
+    await request.query(
+      `INSERT INTO system_logs (user_id, username_snapshot, event_type, target_type, target_id, ip_address, message)
+       VALUES (@userId, @username, @eventType, @targetType, @targetId, @ip, @message)`
+    );
+  } catch (err) { console.error('[logSystemEvent]', err); }
 }
 
-// ---------------------------------------------------------
-// REST API ENDPOINTS
-// ---------------------------------------------------------
+// ──────────────────────────────────────────────────────────────
+// API: Quotas & Stats
+// ──────────────────────────────────────────────────────────────
 
-// --- AUTH ROUTER ---
+app.get('/api/quotas', async (req, res) => {
+  try {
+    const request = await getRequest();
+    const result = await request.query<Quota>(
+      'SELECT id, name, storage_limit_bytes, max_file_size_bytes, max_files, daily_upload_limit_bytes FROM quotas ORDER BY storage_limit_bytes'
+    );
+    res.json({ quotas: result.recordset });
+  } catch (err) { console.error('[GET /api/quotas]', err); res.status(500).json({ error: 'Failed to load quotas.' }); }
+});
 
-app.post('/api/auth/register', (req, res) => {
+app.get('/api/stats', async (req, res) => {
+  try {
+    const r1 = await getRequest();
+    const stats = await r1.query<{ totalUsers: number; totalFiles: number; storageUsedBytes: number; uploadsToday: number; blockedFiles: number }>(
+      `SELECT
+         (SELECT COUNT(*) FROM users WHERE status='Active')                                   AS totalUsers,
+         (SELECT COUNT(*) FROM files  WHERE status='Available')                               AS totalFiles,
+         (SELECT ISNULL(SUM(storage_used_bytes),0) FROM users WHERE status='Active')          AS storageUsedBytes,
+         (SELECT COUNT(*) FROM files  WHERE CAST(created_at AS DATE)=CAST(GETDATE() AS DATE)) AS uploadsToday,
+         (SELECT COUNT(*) FROM files  WHERE status='Blocked')                                 AS blockedFiles`
+    );
+    const r2 = await getRequest();
+    const fscans = await r2.query<{ failedScans: number }>(
+      "SELECT COUNT(*) AS failedScans FROM system_logs WHERE event_type='Scan' AND message LIKE '%Blocked%'"
+    );
+    const s = stats.recordset[0];
+    // Get real Windows Server system stats
+    const [cpuData, memData, diskData, osData] = await Promise.all([
+      si.currentLoad().catch(() => null),
+      si.mem().catch(() => null),
+      si.fsSize().catch(() => null),
+      si.osInfo().catch(() => null),
+    ]);
+
+    const systemStats: SystemStats = {
+      ...s,
+      failedScans: fscans.recordset[0]?.failedScans || 0,
+      cpuUsagePercent: cpuData?.currentLoad || 0,
+      memoryUsagePercent: memData ? Math.round((memData.used / memData.total) * 100) : 0,
+      memoryUsedMB: memData ? Math.round(memData.used / 1024 / 1024) : 0,
+      memoryTotalMB: memData ? Math.round(memData.total / 1024 / 1024) : 0,
+      diskUsagePercent: diskData && diskData[0] ? Math.round(((diskData[0].used || 0) / (diskData[0].size || 1)) * 100) : 0,
+      diskUsedGB: diskData && diskData[0] ? Math.round((diskData[0].used || 0) / 1024 / 1024 / 1024) : 0,
+      diskTotalGB: diskData && diskData[0] ? Math.round((diskData[0].size || 0) / 1024 / 1024 / 1024) : 0,
+      uptime: osData ? Math.round(osData.uptime || 0) : 0,
+    };
+    res.json(systemStats);
+  } catch (err) { console.error('[GET /api/stats]', err); res.status(500).json({ error: 'Failed to compute stats.' }); }
+});
+
+// ──────────────────────────────────────────────────────────────
+// API: Auth — Register
+// ──────────────────────────────────────────────────────────────
+
+app.post('/api/auth/register', async (req, res) => {
   const { username, email, password } = req.body;
-  if (!username || !email || !password) {
+  if (!username || !email || !password)
     return res.status(400).json({ error: 'All fields are strictly required!' });
-  }
 
-  const emailLower = email.toLowerCase().trim();
-  if (db.users.some(u => u.email.toLowerCase() === emailLower)) {
-    return res.status(400).json({ error: 'Email already registered!' });
-  }
+  const emailLower   = email.toLowerCase().trim();
+  const usernameTrim = username.trim();
+  const emailHash    = hashColumnForLookup(emailLower);
+  const usernameHash = hashColumnForLookup(usernameTrim.toLowerCase());
 
-  if (db.users.some(u => u.username.toLowerCase() === username.toLowerCase().trim())) {
-    return res.status(400).json({ error: 'Username already taken!' });
-  }
+  try {
+    const dupReq = await getRequest();
+    dupReq.input('eH', sql.Char(64), emailHash);
+    dupReq.input('uH', sql.Char(64), usernameHash);
+    const dup = await dupReq.query<{ eE: number; uE: number }>(
+      `SELECT (SELECT COUNT(*) FROM users WHERE email_hash=@eH)    AS eE,
+              (SELECT COUNT(*) FROM users WHERE username_hash=@uH) AS uE`
+    );
+    if (dup.recordset[0].eE > 0) return res.status(400).json({ error: 'Email already registered!' });
+    if (dup.recordset[0].uE > 0) return res.status(400).json({ error: 'Username already taken!' });
 
-  const newUserId = 'user_' + Date.now();
-  const newUser: User = {
-    id: newUserId,
-    email: emailLower,
-    username: username.trim(),
-    role: emailLower.includes('admin') || username.toLowerCase().includes('admin') ? 'Admin' : 'User', // Convenient for developer simulation
-    quota_id: 'guest', // Seed with basic tier
-    storage_used: 0,
-    status: 'Active',
-    created_at: new Date().toISOString()
-  };
+    const encEmail    = encryptColumn(emailLower);
+    const encUsername = encryptColumn(usernameTrim);
+    const pwHash      = await hashPassword(password);
 
-  db.users.push(newUser);
-  db.passwords[newUserId] = password;
-  saveDb();
+    const insReq = await getRequest();
+    insReq.input('eEnc',  sql.VarBinary(512),  encEmail.ciphertext);
+    insReq.input('eIv',   sql.VarBinary(16),   encEmail.iv);
+    insReq.input('eTag',  sql.VarBinary(16),   encEmail.authTag);
+    insReq.input('eHash', sql.Char(64),         emailHash);
+    insReq.input('uEnc',  sql.VarBinary(512),  encUsername.ciphertext);
+    insReq.input('uIv',   sql.VarBinary(16),   encUsername.iv);
+    insReq.input('uTag',  sql.VarBinary(16),   encUsername.authTag);
+    insReq.input('uHash', sql.Char(64),         usernameHash);
+    insReq.input('pw',    sql.NVarChar(512),    pwHash);
+    insReq.input('quota', sql.NVarChar(50),     'guest');
 
-  logSystemEvent(
-    newUserId,
-    newUser.username,
-    'Auth',
-    'User',
-    newUserId,
-    req,
-    `New account registered using email: ${emailLower}`
-  );
+    const newUser = await insReq.query<UserRow>(
+      `INSERT INTO users (
+         email_encrypted, email_iv, email_auth_tag, email_hash,
+         username_encrypted, username_iv, username_auth_tag, username_hash,
+         password_hash, quota_id
+       )
+       OUTPUT INSERTED.id, INSERTED.email_encrypted, INSERTED.email_iv, INSERTED.email_auth_tag,
+              INSERTED.username_encrypted, INSERTED.username_iv, INSERTED.username_auth_tag,
+              INSERTED.role, INSERTED.quota_id, INSERTED.storage_used_bytes,
+              INSERTED.status, INSERTED.created_at, INSERTED.failed_login_count, INSERTED.locked_until
+       VALUES (@eEnc,@eIv,@eTag,@eHash, @uEnc,@uIv,@uTag,@uHash, @pw, @quota)`
+    );
 
-  res.json({ token: newUserId, user: newUser });
+    const user  = mapUserRow(newUser.recordset[0]);
+    const token = signToken(user.id, user.role);
+    await logSystemEvent(user.id, user.username, 'Auth', 'User', user.id, req, `Registered: ${emailLower}`);
+    res.json({ token, user });
+  } catch (err) { console.error('[POST /api/auth/register]', err); res.status(500).json({ error: 'Registration failed.' }); }
 });
 
-app.post('/api/auth/login', (req, res) => {
+// ──────────────────────────────────────────────────────────────
+// API: Auth — Login
+// ──────────────────────────────────────────────────────────────
+
+app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body;
-  if (!email || !password) {
+  if (!email || !password)
     return res.status(400).json({ error: 'Please enter both email and password!' });
-  }
 
-  const emailLower = email.toLowerCase().trim();
-  const user = db.users.find(u => u.email.toLowerCase() === emailLower);
+  const emailHash = hashColumnForLookup(email.toLowerCase().trim());
 
-  if (!user || db.passwords[user.id] !== password) {
-    return res.status(400).json({ error: 'Invalid email or password combination.' });
-  }
+  try {
+    const request = await getRequest();
+    request.input('eH', sql.Char(64), emailHash);
+    const result = await request.query<UserRow>(
+      `SELECT id, email_encrypted, email_iv, email_auth_tag,
+              username_encrypted, username_iv, username_auth_tag,
+              password_hash, role, quota_id, storage_used_bytes,
+              status, created_at, failed_login_count, locked_until
+       FROM users WHERE email_hash = @eH`
+    );
 
-  if (user.status === 'Suspended') {
-    return res.status(403).json({ error: 'This profile is suspended. Please contact Leeku.' });
-  }
+    if (!result.recordset.length)
+      return res.status(400).json({ error: 'Invalid email or password combination.' });
 
-  logSystemEvent(
-    user.id,
-    user.username,
-    'Auth',
-    'User',
-    user.id,
-    req,
-    `User logged in successfully`
-  );
+    const row = result.recordset[0];
 
-  res.json({ token: user.id, user });
+    if (row.locked_until && new Date(row.locked_until) > new Date()) {
+      const remaining = Math.ceil((new Date(row.locked_until).getTime() - Date.now()) / 60_000);
+      return res.status(429).json({ error: `Account locked. Try again in ${remaining} minute(s).` });
+    }
+    if (row.status === 'Suspended')
+      return res.status(403).json({ error: 'Account suspended. Contact an administrator.' });
+
+    const valid = await verifyPassword(password, row.password_hash!);
+    if (!valid) {
+      const newCount = (row.failed_login_count || 0) + 1;
+      const lockUntil = newCount >= MAX_LOGIN_ATTEMPTS ? new Date(Date.now() + LOCKOUT_DURATION_MS) : null;
+      const upReq = await getRequest();
+      upReq.input('id', sql.UniqueIdentifier, row.id);
+      upReq.input('c',  sql.Int, newCount);
+      upReq.input('lu', sql.DateTimeOffset, lockUntil);
+      await upReq.query('UPDATE users SET failed_login_count=@c, locked_until=@lu WHERE id=@id');
+      if (lockUntil) await logSystemEvent(row.id, null, 'Security', 'User', row.id, req, `Account locked after ${newCount} failed attempts.`);
+      return res.status(400).json({ error: 'Invalid email or password combination.' });
+    }
+
+    const resetReq = await getRequest();
+    resetReq.input('id', sql.UniqueIdentifier, row.id);
+    await resetReq.query('UPDATE users SET failed_login_count=0, locked_until=NULL, last_login_at=SYSDATETIMEOFFSET() WHERE id=@id');
+
+    const user  = mapUserRow(row);
+    const token = signToken(user.id, user.role);
+    await logSystemEvent(user.id, user.username, 'Auth', 'User', user.id, req, 'User logged in.');
+    res.json({ token, user });
+  } catch (err) { console.error('[POST /api/auth/login]', err); res.status(500).json({ error: 'Login service unavailable.' }); }
 });
+
+// ──────────────────────────────────────────────────────────────
+// API: Auth — Me & Update
+// ──────────────────────────────────────────────────────────────
 
 app.get('/api/auth/me', authenticateUser as express.RequestHandler, (req: AuthenticatedRequest, res) => {
   res.json({ user: req.user });
 });
 
-app.post('/api/users/me/update', authenticateUser as express.RequestHandler, (req: AuthenticatedRequest, res) => {
-  const user = req.user!;
+app.post('/api/users/me/update', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
   const { username, email, password } = req.body;
+  const userId = req.userId!;
+  try {
+    const sets: string[] = [];
+    const upReq = await getRequest();
+    upReq.input('id', sql.UniqueIdentifier, userId);
 
-  if (username !== undefined) {
-    const trimmedUsername = username.trim();
-    if (!trimmedUsername) {
-      return res.status(400).json({ error: 'Username cannot be blank.' });
+    if (username !== undefined) {
+      const trim = username.trim();
+      if (!trim) return res.status(400).json({ error: 'Username cannot be blank.' });
+      const h = hashColumnForLookup(trim.toLowerCase());
+      const d = await getRequest(); d.input('h', sql.Char(64), h); d.input('id', sql.UniqueIdentifier, userId);
+      const dr = await d.query<{c:number}>('SELECT COUNT(*) AS c FROM users WHERE username_hash=@h AND id!=@id');
+      if (dr.recordset[0].c) return res.status(400).json({ error: 'Username already taken.' });
+      const enc = encryptColumn(trim);
+      upReq.input('uEnc', sql.VarBinary(512), enc.ciphertext); upReq.input('uIv', sql.VarBinary(16), enc.iv);
+      upReq.input('uTag', sql.VarBinary(16), enc.authTag);     upReq.input('uHash', sql.Char(64), h);
+      sets.push('username_encrypted=@uEnc,username_iv=@uIv,username_auth_tag=@uTag,username_hash=@uHash');
     }
-    if (db.users.some(u => u.id !== user.id && u.username.toLowerCase() === trimmedUsername.toLowerCase())) {
-      return res.status(400).json({ error: 'Username is already taken by another user.' });
+    if (email !== undefined) {
+      const te = email.toLowerCase().trim();
+      if (!te) return res.status(400).json({ error: 'Email cannot be blank.' });
+      const h = hashColumnForLookup(te);
+      const d = await getRequest(); d.input('h', sql.Char(64), h); d.input('id', sql.UniqueIdentifier, userId);
+      const dr = await d.query<{c:number}>('SELECT COUNT(*) AS c FROM users WHERE email_hash=@h AND id!=@id');
+      if (dr.recordset[0].c) return res.status(400).json({ error: 'Email already in use.' });
+      const enc = encryptColumn(te);
+      upReq.input('eEnc', sql.VarBinary(512), enc.ciphertext); upReq.input('eIv', sql.VarBinary(16), enc.iv);
+      upReq.input('eTag', sql.VarBinary(16), enc.authTag);     upReq.input('eHash', sql.Char(64), h);
+      sets.push('email_encrypted=@eEnc,email_iv=@eIv,email_auth_tag=@eTag,email_hash=@eHash');
     }
-    // Update uploader descriptions on files
-    db.files.forEach(f => {
-      if (f.owner_user_id === user.id) {
-        f.username = trimmedUsername;
-      }
-    });
-    user.username = trimmedUsername;
-  }
-
-  if (email !== undefined) {
-    const trimmedEmail = email.toLowerCase().trim();
-    if (!trimmedEmail) {
-      return res.status(400).json({ error: 'Email cannot be blank.' });
+    if (password?.trim()) {
+      const h = await hashPassword(password.trim());
+      upReq.input('pw', sql.NVarChar(512), h); sets.push('password_hash=@pw');
     }
-    if (db.users.some(u => u.id !== user.id && u.email.toLowerCase() === trimmedEmail)) {
-      return res.status(400).json({ error: 'Email is already registered by another user.' });
-    }
-    user.email = trimmedEmail;
-  }
+    if (!sets.length) return res.status(400).json({ error: 'No fields to update.' });
 
-  if (password !== undefined) {
-    const trimmedPassword = password.trim();
-    if (!trimmedPassword) {
-      return res.status(400).json({ error: 'Password cannot be blank.' });
-    }
-    db.passwords[user.id] = trimmedPassword;
-  }
-
-  saveDb();
-
-  logSystemEvent(
-    user.id,
-    user.username,
-    'Auth',
-    'User',
-    user.id,
-    req,
-    `User updated account credentials (username/email/password)`
-  );
-
-  res.json({ success: true, user });
+    const updated = await upReq.query<UserRow>(
+      `UPDATE users SET ${sets.join(',')}
+       OUTPUT INSERTED.id, INSERTED.email_encrypted, INSERTED.email_iv, INSERTED.email_auth_tag,
+              INSERTED.username_encrypted, INSERTED.username_iv, INSERTED.username_auth_tag,
+              INSERTED.role, INSERTED.quota_id, INSERTED.storage_used_bytes,
+              INSERTED.status, INSERTED.created_at, INSERTED.failed_login_count, INSERTED.locked_until
+       WHERE id=@id`
+    );
+    const user = mapUserRow(updated.recordset[0]);
+    await logSystemEvent(userId, user.username, 'Auth', 'User', userId, req, 'Updated account details.');
+    res.json({ success: true, user });
+  } catch (err) { console.error('[POST /api/users/me/update]', err); res.status(500).json({ error: 'Failed to update account.' }); }
 });
 
-// --- GENERAL STORAGE METADATA / STATS ---
+// ──────────────────────────────────────────────────────────────
+// API: Files — List
+// ──────────────────────────────────────────────────────────────
 
-app.get('/api/quotas', (req, res) => {
-  res.json({ quotas: db.quotas });
+app.get('/api/files', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  try {
+    const request = await getRequest();
+    request.input('ownerId', sql.UniqueIdentifier, req.userId!);
+    const result = await request.query<FileRow>(
+      `SELECT id, owner_user_id,
+              original_name_encrypted, original_name_iv, original_name_auth_tag,
+              stored_path, mime_type, size_bytes, encrypted_size_bytes,
+              status, checksum_sha256, scan_result, scan_message,
+              is_encrypted, leeku_vibe, ttl_hours, expires_at, created_at
+       FROM files WHERE owner_user_id=@ownerId AND status!='Expired'
+       ORDER BY created_at DESC`
+    );
+    res.json({ files: result.recordset.map(r => mapFileRow(r, req.user!.username)) });
+  } catch (err) { console.error('[GET /api/files]', err); res.status(500).json({ error: 'Failed to load files.' }); }
 });
 
-app.get('/api/stats', (req, res) => {
-  const totalUsers = db.users.length;
-  const totalFiles = db.files.filter(f => f.status === 'Available').length;
-  const storageUsedBytes = db.files.filter(f => f.status === 'Available').reduce((sum, f) => sum + f.size, 0);
-  const uploadsToday = db.files.filter(f => f.created_at.startsWith(new Date().toISOString().split('T')[0])).length;
-  const blockedFiles = db.files.filter(f => f.status === 'Blocked').length;
-  const failedScans = db.logs.filter(l => l.event_type === 'Scan' && l.message.includes('Blocked')).length;
+// ──────────────────────────────────────────────────────────────
+// API: Files — Upload
+// ──────────────────────────────────────────────────────────────
 
-  res.json({
-    totalUsers,
-    totalFiles,
-    storageUsedBytes,
-    uploadsToday,
-    blockedFiles,
-    failedScans
-  });
-});
-
-// --- USER FILE ENDPOINTS ---
-
-app.get('/api/files', authenticateUser as express.RequestHandler, (req: AuthenticatedRequest, res) => {
-  const userFiles = db.files.filter(f => f.owner_user_id === req.user!.id);
-  res.json({ files: userFiles });
-});
-
-app.post('/api/files/upload', authenticateUser as express.RequestHandler, (req: AuthenticatedRequest, res) => {
-  const { original_name, mime_type, content, size } = req.body; // content is raw Base64
-
-  if (!original_name || !mime_type || !content || size === undefined) {
-    return res.status(400).json({ error: 'Incomplete file metadata / binary payload.' });
-  }
+app.post('/api/files/upload', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  const { original_name, mime_type, content, size, ttl_hours } = req.body;
+  if (!original_name || !mime_type || !content || size === undefined)
+    return res.status(400).json({ error: 'Incomplete file metadata or payload.' });
 
   const user = req.user!;
-  const userQuota = db.quotas.find(q => q.id === user.quota_id) || DEFAULT_QUOTAS[0];
-
-  // 1. Quota checks (file limit, storage limit, files count)
-  if (size > userQuota.max_file_size_bytes) {
-    return res.status(400).json({
-      error: `File is too large! Your tier ("${userQuota.name}") limit is ${Math.round(userQuota.max_file_size_bytes / (1024 * 1024))}MB per file.`
+  let currentStage = 'quota_lookup';
+  let vaultFilePath: string | null = null;
+  try {
+    console.info('[upload] Request received.', {
+      userId: user.id,
+      username: user.username,
+      originalName: original_name,
+      mimeType: mime_type,
+      declaredSize: size,
+      ttlHours: ttl_hours ?? null,
+      contentLength: typeof content === 'string' ? content.length : null,
     });
-  }
 
-  const currentCount = db.files.filter(f => f.owner_user_id === user.id && f.status === 'Available').length;
-  if (currentCount >= userQuota.max_files) {
-    return res.status(400).json({
-      error: `Files count cap reached. Your maximum quota allows ${userQuota.max_files} concurrent files.`
+    const qReq = await getRequest();
+    qReq.input('qid', sql.NVarChar(50), user.quota_id);
+    const qRes = await qReq.query<Quota>('SELECT id,name,storage_limit_bytes,max_file_size_bytes,max_files,daily_upload_limit_bytes FROM quotas WHERE id=@qid');
+    const quota = qRes.recordset[0];
+    if (!quota) return res.status(400).json({ error: 'Quota tier not found.' });
+
+    if (size > quota.max_file_size_bytes) {
+      console.warn('[upload] Rejected by max file size quota.', {
+        userId: user.id,
+        originalName: original_name,
+        declaredSize: size,
+        maxFileSizeBytes: quota.max_file_size_bytes,
+        quotaId: quota.id,
+      });
+      return res.status(400).json({ error: `File too large. Tier "${quota.name}" allows ${Math.round(quota.max_file_size_bytes/1024/1024)}MB per file.` });
+    }
+
+    const cntReq = await getRequest();
+    cntReq.input('ownerId', sql.UniqueIdentifier, req.userId!);
+    const cntRes = await cntReq.query<{cnt:number;used:number}>(
+      "SELECT COUNT(*) AS cnt, ISNULL(SUM(size_bytes),0) AS used FROM files WHERE owner_user_id=@ownerId AND status='Available'"
+    );
+    const { cnt, used } = cntRes.recordset[0];
+    if (cnt >= quota.max_files) {
+      console.warn('[upload] Rejected by file count quota.', {
+        userId: user.id,
+        originalName: original_name,
+        fileCount: cnt,
+        maxFiles: quota.max_files,
+        quotaId: quota.id,
+      });
+      return res.status(400).json({ error: `File count limit reached (${quota.max_files} files).` });
+    }
+    if (used + size > quota.storage_limit_bytes) {
+      console.warn('[upload] Rejected by storage quota.', {
+        userId: user.id,
+        originalName: original_name,
+        usedBytes: used,
+        incomingSize: size,
+        storageLimitBytes: quota.storage_limit_bytes,
+        quotaId: quota.id,
+      });
+      return res.status(400).json({ error: `Storage full. ${Math.round(used/1024/1024)}MB / ${Math.round(quota.storage_limit_bytes/1024/1024)}MB used.` });
+    }
+
+    currentStage = 'base64_decode';
+    const fileBytes = Buffer.from(content, 'base64');
+    console.info('[upload] Payload decoded.', {
+      userId: user.id,
+      originalName: original_name,
+      declaredSize: size,
+      decodedBytes: fileBytes.length,
+      mimeType: mime_type,
     });
-  }
 
-  if (user.storage_used + size > userQuota.storage_limit_bytes) {
-    return res.status(400).json({
-      error: `Storage is full! Leeku tried to push one more file in, but it did not work. Current: ${Math.round(user.storage_used / 1024 / 1024)}MB / Max: ${Math.round(userQuota.storage_limit_bytes / 1024 / 1024)}MB.`
+    // Heuristic pre-scan
+    currentStage = 'heuristic_scan';
+    const heuristic = heuristicPreScan(original_name, mime_type);
+    if (heuristic !== null && !heuristic.clean) {
+      console.warn('[upload] Rejected by heuristic pre-scan.', {
+        userId: user.id,
+        originalName: original_name,
+        mimeType: mime_type,
+        heuristicStatus: heuristic.status,
+        heuristicMessage: heuristic.message,
+      });
+      const vibe = await generateLeekuVibe(original_name, false);
+      await logSystemEvent(user.id, user.username, 'Scan', 'File', 'rejected', req, `Heuristic block: "${original_name}" — ${heuristic.message}`);
+      return res.status(422).json({ error: heuristic.message || vibe });
+    }
+
+    // Bitdefender scan
+    currentStage = 'bitdefender_scan';
+    const scanResult = await scanFileBuffer(fileBytes, mime_type);
+    console.info('[upload] Scan completed.', {
+      userId: user.id,
+      originalName: original_name,
+      scanStatus: scanResult.status,
+      scanClean: scanResult.clean,
+      scanDurationMs: scanResult.scanDurationMs,
+      threatCount: scanResult.threats.length,
+      scanMessage: scanResult.message,
     });
-  }
+    if (!scanResult.clean && scanResult.status !== 'Unavailable') {
+      console.warn('[upload] Rejected by Bitdefender scan.', {
+        userId: user.id,
+        originalName: original_name,
+        scanStatus: scanResult.status,
+        scanDurationMs: scanResult.scanDurationMs,
+        threatCount: scanResult.threats.length,
+        scanMessage: scanResult.message,
+      });
+      const vibe = await generateLeekuVibe(original_name, false);
+      await logSystemEvent(user.id, user.username, 'Scan', 'File', 'rejected', req, `AV block: "${original_name}" — ${scanResult.message}`);
+      return res.status(422).json({ error: vibe || scanResult.message });
+    }
 
-  // Generate clean IDs
-  const fileId = 'file_' + Date.now();
+    // Encrypt
+    currentStage = 'encrypt_file';
+    const checksum  = computeChecksum(fileBytes);
+    const encrypted = encryptFile(fileBytes);
+    const wrapped   = wrapKey(encrypted.key);
 
-  // 2. Perform Antivirus & Vibe scanning
-  const scanResult = auditAntivirus(original_name, content);
+    const vaultFileName = generateSecureToken(16) + '.vault';
+    vaultFilePath = path.join(FILE_VAULT, vaultFileName);
+    currentStage = 'write_vault';
+    fs.writeFileSync(vaultFilePath, encrypted.ciphertext);
+    console.info('[upload] Encrypted file written to vault.', {
+      userId: user.id,
+      originalName: original_name,
+      vaultFileName,
+      encryptedSizeBytes: encrypted.ciphertext.length,
+      vaultPath: vaultFilePath,
+    });
 
-  // If scan fails, keep it in system logs, save, and return error
-  if (!scanResult.clean) {
-    // Audit log
-    logSystemEvent(
-      user.id,
-      user.username,
-      'Scan',
-      'File',
-      fileId,
-      req,
-      `Rejected file "${original_name}" (${Math.round(size / 1024)} KB) from upload. ${scanResult.msg}`
+    currentStage = 'prepare_metadata';
+    const ttlH     = isValidTtl(Number(ttl_hours)) ? Number(ttl_hours) as any : null;
+    const expiresAt= ttlH ? computeExpiresAt(ttlH) : null;
+    const encName  = encryptColumn(original_name);
+    const leekuVibe= await generateLeekuVibe(original_name, true);
+
+    currentStage = 'insert_file_record';
+    const fileReq = await getRequest();
+    fileReq.input('ownerId', sql.UniqueIdentifier, req.userId!);
+    fileReq.input('nEnc',   sql.VarBinary(2048), encName.ciphertext);
+    fileReq.input('nIv',    sql.VarBinary(16),   encName.iv);
+    fileReq.input('nTag',   sql.VarBinary(16),   encName.authTag);
+    fileReq.input('spath',  sql.NVarChar(1000),  vaultFileName);
+    fileReq.input('mime',   sql.NVarChar(255),   mime_type);
+    fileReq.input('sz',     sql.BigInt,          size);
+    fileReq.input('esz',    sql.BigInt,          encrypted.ciphertext.length);
+    fileReq.input('chk',    sql.Char(64),        checksum);
+    fileReq.input('scan',   sql.NVarChar(20),    scanResult.status === 'Unavailable' ? null : scanResult.status);
+    fileReq.input('smsg',   sql.NVarChar(sql.MAX), scanResult.message);
+    fileReq.input('vibe',   sql.NVarChar(500),   leekuVibe);
+    fileReq.input('ttl',    sql.Int,             ttlH);
+    fileReq.input('exp',    sql.DateTimeOffset,  expiresAt);
+
+    const fileResult = await fileReq.query<FileRow>(
+      `INSERT INTO files (
+         owner_user_id, original_name_encrypted, original_name_iv, original_name_auth_tag,
+         stored_path, mime_type, size_bytes, encrypted_size_bytes,
+         checksum_sha256, scan_result, scan_message, scanned_at,
+         leeku_vibe, ttl_hours, expires_at, is_encrypted
+       )
+       OUTPUT INSERTED.id, INSERTED.owner_user_id,
+              INSERTED.original_name_encrypted, INSERTED.original_name_iv, INSERTED.original_name_auth_tag,
+              INSERTED.stored_path, INSERTED.mime_type, INSERTED.size_bytes, INSERTED.encrypted_size_bytes,
+              INSERTED.status, INSERTED.checksum_sha256, INSERTED.scan_result, INSERTED.scan_message,
+              INSERTED.is_encrypted, INSERTED.leeku_vibe, INSERTED.ttl_hours, INSERTED.expires_at, INSERTED.created_at
+       VALUES (@ownerId,@nEnc,@nIv,@nTag, @spath,@mime,@sz,@esz, @chk,@scan,@smsg,SYSDATETIMEOFFSET(), @vibe,@ttl,@exp,1)`
+    );
+    const newFile = fileResult.recordset[0];
+    console.info('[upload] File record inserted.', {
+      userId: user.id,
+      originalName: original_name,
+      fileId: newFile.id,
+      scanStatus: scanResult.status,
+    });
+
+    currentStage = 'insert_key_record';
+    const keyReq = await getRequest();
+    keyReq.input('fid',   sql.UniqueIdentifier, newFile.id);
+    keyReq.input('encK',  sql.VarBinary(64),    wrapped.encryptedKey);
+    keyReq.input('kIv',   sql.VarBinary(16),    wrapped.iv);
+    keyReq.input('kTag',  sql.VarBinary(16),    wrapped.authTag);
+    keyReq.input('fIv',   sql.VarBinary(16),    encrypted.iv);
+    keyReq.input('fTag',  sql.VarBinary(16),    encrypted.authTag);
+    await keyReq.query(
+      'INSERT INTO file_encryption_keys (file_id,encrypted_key,key_iv,key_auth_tag,file_iv,file_auth_tag) VALUES (@fid,@encK,@kIv,@kTag,@fIv,@fTag)'
     );
 
-    // Save blocked metadata to allow admin auditing
-    const blockedFileMeta: FileMetadata = {
-      id: fileId,
-      owner_user_id: user.id,
+    currentStage = 'update_storage_usage';
+    const storageReq = await getRequest();
+    storageReq.input('sz', sql.BigInt, size); storageReq.input('id', sql.UniqueIdentifier, req.userId!);
+    await storageReq.query('UPDATE users SET storage_used_bytes=storage_used_bytes+@sz WHERE id=@id');
+
+    currentStage = 'log_upload_event';
+    await logSystemEvent(user.id, user.username, 'Upload', 'File', newFile.id, req,
+      `Uploaded "${original_name}" (${Math.round(size/1024)}KB). Scan: ${scanResult.status}.`);
+
+    console.info('[upload] Upload completed successfully.', {
+      userId: user.id,
       username: user.username,
-      original_name,
-      stored_name: `rejected_${fileId}.leek`,
-      mime_type,
-      size,
-      encrypted_size: size,
-      status: 'Blocked',
-      checksum: 'chk_' + generateToken(8),
-      leeku_vibe: scanResult.msg,
-      is_encrypted: false,
-      created_at: new Date().toISOString()
-    };
-    db.files.push(blockedFileMeta);
-    saveDb();
-
-    return res.status(422).json({
-      error: scanResult.msg,
-      meta: blockedFileMeta
+      originalName: original_name,
+      fileId: newFile.id,
+      scanStatus: scanResult.status,
+      storedPath: newFile.stored_path,
     });
+
+    res.json({ success: true, message: 'File approved and encrypted!', file: mapFileRow(newFile, user.username) });
+  } catch (err) {
+    console.error('[POST /api/files/upload] Upload failed.', {
+      userId: user.id,
+      username: user.username,
+      originalName: original_name,
+      mimeType: mime_type,
+      declaredSize: size,
+      stage: currentStage,
+      vaultFilePath,
+      error: err instanceof Error ? err.message : String(err),
+      stack: err instanceof Error ? err.stack : undefined,
+    });
+    res.status(500).json({ error: 'Upload failed. Please try again.' });
   }
-
-  // 3. Encrypt file contents with custom reversal encryption (technical shield requirement)
-  const encryptedPayload = encryptFileContents(content);
-
-  // 4. Save metadata and stored payload
-  const newFileMeta: FileMetadata = {
-    id: fileId,
-    owner_user_id: user.id,
-    username: user.username,
-    original_name,
-    stored_name: `leek_${generateToken(12)}.vault`,
-    mime_type,
-    size,
-    encrypted_size: encryptedPayload.length,
-    status: 'Available',
-    checksum: 'hash_' + generateToken(16),
-    leeku_vibe: scanResult.msg,
-    is_encrypted: true,
-    created_at: new Date().toISOString()
-  };
-
-  db.files.push(newFileMeta);
-  db.fileContents[fileId] = encryptedPayload;
-
-  // 5. Update user quota database registry
-  user.storage_used += size;
-  saveDb();
-
-  // 6. Log success event
-  logSystemEvent(
-    user.id,
-    user.username,
-    'Upload',
-    'File',
-    fileId,
-    req,
-    `Successfully uploaded & encrypted file "${original_name}" (${Math.round(size / 1024)} KB).`
-  );
-
-  res.json({
-    success: true,
-    message: 'File approved and encrypted!',
-    file: newFileMeta
-  });
 });
 
-app.delete('/api/files/:id', authenticateUser as express.RequestHandler, (req: AuthenticatedRequest, res) => {
-  const user = req.user!;
+// ──────────────────────────────────────────────────────────────
+// API: Files — Delete
+// ──────────────────────────────────────────────────────────────
+
+app.delete('/api/files/:id', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
   const fileId = req.params.id;
-  const fileIdx = db.files.findIndex(f => f.id === fileId);
+  try {
+    const fileReq = await getRequest();
+    fileReq.input('id', sql.UniqueIdentifier, fileId);
+    const fileResult = await fileReq.query<FileRow>(
+      `SELECT id,owner_user_id,original_name_encrypted,original_name_iv,original_name_auth_tag,
+              stored_path,size_bytes,status,mime_type,encrypted_size_bytes,checksum_sha256,
+              scan_result,scan_message,is_encrypted,leeku_vibe,ttl_hours,expires_at,created_at
+       FROM files WHERE id=@id`
+    );
+    if (!fileResult.recordset.length) return res.status(404).json({ error: 'File not found.' });
+    const file = fileResult.recordset[0];
+    if (file.owner_user_id !== req.userId && req.user!.role !== 'Admin')
+      return res.status(403).json({ error: 'You do not have permission to delete this file.' });
 
-  if (fileIdx === -1) {
-    return res.status(404).json({ error: 'File metadata not found.' });
-  }
+    const originalName = decryptColumn(file.original_name_encrypted, file.original_name_iv, file.original_name_auth_tag);
+    const vaultPath = path.join(FILE_VAULT, file.stored_path);
+    if (fs.existsSync(vaultPath)) fs.unlinkSync(vaultPath);
 
-  const file = db.files[fileIdx];
+    const delReq = await getRequest();
+    delReq.input('id', sql.UniqueIdentifier, fileId);
+    await delReq.query('DELETE FROM files WHERE id=@id');
 
-  // Permissions check: must be owner or admin
-  if (file.owner_user_id !== user.id && user.role !== 'Admin') {
-    return res.status(403).json({ error: 'This file is not for your eyes or admin eyes only.' });
-  }
-
-  // Remove content payload and update storage size subtraction
-  if (file.status === 'Available') {
-    // Only subtract if it wasn't blocked before
-    const owner = db.users.find(u => u.id === file.owner_user_id);
-    if (owner) {
-      owner.storage_used = Math.max(0, owner.storage_used - file.size);
+    if (file.status === 'Available') {
+      const sReq = await getRequest();
+      sReq.input('sz', sql.BigInt, file.size_bytes); sReq.input('uid', sql.UniqueIdentifier, file.owner_user_id);
+      await sReq.query('UPDATE users SET storage_used_bytes=CASE WHEN storage_used_bytes-@sz<0 THEN 0 ELSE storage_used_bytes-@sz END WHERE id=@uid');
     }
-  }
 
-  // Delete associated contents and share links
-  delete db.fileContents[fileId];
-  db.shareLinks = db.shareLinks.filter(lnk => lnk.file_id !== fileId);
-
-  // Delete metadata
-  db.files.splice(fileIdx, 1);
-  saveDb();
-
-  logSystemEvent(
-    user.id,
-    user.username,
-    'Delete',
-    'File',
-    fileId,
-    req,
-    `Hard deleted file "${file.original_name}". Associated share links purged.`
-  );
-
-  res.json({ success: true, message: 'File has been deleted from vault.' });
+    await logSystemEvent(req.userId!, req.user!.username, 'Delete', 'File', fileId, req, `Deleted "${originalName}".`);
+    res.json({ success: true, message: 'File deleted from vault.' });
+  } catch (err) { console.error('[DELETE /api/files/:id]', err); res.status(500).json({ error: 'Failed to delete file.' }); }
 });
 
-// --- SHARING FLIGHTS ---
-
-// Get active links for logged in user
-app.get('/api/sharing/links', authenticateUser as express.RequestHandler, (req: AuthenticatedRequest, res) => {
-  const userFiles = db.files.filter(f => f.owner_user_id === req.user!.id).map(f => f.id);
-  const userLinks = db.shareLinks.filter(l => userFiles.includes(l.file_id));
-  res.json({ links: userLinks });
-});
-
-// Configure share settings (Create link or update fields)
-app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, (req: AuthenticatedRequest, res) => {
-  const user = req.user!;
+app.get('/api/files/:id/download', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
   const fileId = req.params.id;
-  const file = db.files.find(f => f.id === fileId);
+  try {
+    const fileReq = await getRequest();
+    fileReq.input('id', sql.UniqueIdentifier, fileId);
+    const fileResult = await fileReq.query<FileRow>(
+      `SELECT id,owner_user_id,original_name_encrypted,original_name_iv,original_name_auth_tag,
+              stored_path,size_bytes,status,mime_type,encrypted_size_bytes,checksum_sha256,
+              scan_result,scan_message,is_encrypted,leeku_vibe,ttl_hours,expires_at,created_at
+       FROM files WHERE id=@id`
+    );
+    if (!fileResult.recordset.length) return res.status(404).json({ error: 'File not found.' });
+    const file = fileResult.recordset[0];
+    if (file.owner_user_id !== req.userId && req.user!.role !== 'Admin')
+      return res.status(403).json({ error: 'You do not have permission to download this file.' });
+    if (file.status === 'Blocked')
+      return res.status(410).json({ error: 'Blocked files cannot be downloaded.' });
 
-  if (!file) {
-    return res.status(404).json({ error: 'File folder/reference does not exist.' });
-  }
+    const vaultPath = path.join(FILE_VAULT, file.stored_path);
+    if (!fs.existsSync(vaultPath)) return res.status(410).json({ error: 'Vault file not found.' });
 
-  if (file.owner_user_id !== user.id && user.role !== 'Admin') {
-    return res.status(403).json({ error: 'Only owners can activate share portals.' });
-  }
+    const keyReq = await getRequest();
+    keyReq.input('fid', sql.UniqueIdentifier, fileId);
+    const keyRes = await keyReq.query<{ encrypted_key: Buffer; key_iv: Buffer; key_auth_tag: Buffer; file_iv: Buffer; file_auth_tag: Buffer }>(
+      'SELECT encrypted_key,key_iv,key_auth_tag,file_iv,file_auth_tag FROM file_encryption_keys WHERE file_id=@fid'
+    );
+    if (!keyRes.recordset.length) return res.status(500).json({ error: 'Encryption key not found.' });
 
-  if (file.status === 'Blocked') {
-    return res.status(400).json({ error: 'Cursed files cannot have active share tokens!' });
-  }
+    const encBytes = fs.readFileSync(vaultPath);
+    const keyRow = keyRes.recordset[0];
+    const fileKey = unwrapKey(keyRow.encrypted_key, keyRow.key_iv, keyRow.key_auth_tag);
+    const plainBytes = decryptFile(encBytes, fileKey, keyRow.file_iv, keyRow.file_auth_tag);
 
+    if (computeChecksum(plainBytes) !== file.checksum_sha256)
+      return res.status(500).json({ error: 'File integrity check failed.' });
+
+    const originalName = decryptColumn(file.original_name_encrypted, file.original_name_iv, file.original_name_auth_tag);
+    const safeName = originalName.replace(/"/g, '\\"');
+
+    res.setHeader('Content-Type', file.mime_type || 'application/octet-stream');
+    res.setHeader('Content-Disposition', `attachment; filename="${safeName}"`);
+    res.setHeader('Content-Length', plainBytes.length.toString());
+    await logSystemEvent(req.userId!, req.user!.username, 'Download', 'File', fileId, req, `Direct download of "${originalName}".`);
+    res.send(plainBytes);
+  } catch (err) { console.error('[GET /api/files/:id/download]', err); res.status(500).json({ error: 'Download failed.' }); }
+});
+
+// ──────────────────────────────────────────────────────────────
+// API: Share Links
+// ──────────────────────────────────────────────────────────────
+
+app.get('/api/sharing/links', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  try {
+    const request = await getRequest();
+    request.input('ownerId', sql.UniqueIdentifier, req.userId!);
+    const result = await request.query<ShareRow>(
+      `SELECT sl.id,sl.file_id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.created_at
+       FROM share_links sl INNER JOIN files f ON sl.file_id=f.id
+       WHERE f.owner_user_id=@ownerId ORDER BY sl.created_at DESC`
+    );
+    res.json({ links: result.recordset.map(mapShareRow) });
+  } catch (err) { console.error('[GET /api/sharing/links]', err); res.status(500).json({ error: 'Failed to load share links.' }); }
+});
+
+app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  const fileId = req.params.id;
   const { password, expires_at, max_downloads, is_active } = req.body;
+  try {
+    const fReq = await getRequest(); fReq.input('id', sql.UniqueIdentifier, fileId);
+    const fRes = await fReq.query<{owner_user_id:string;status:string}>('SELECT owner_user_id,status FROM files WHERE id=@id');
+    if (!fRes.recordset.length) return res.status(404).json({ error: 'File not found.' });
+    const file = fRes.recordset[0];
+    if (file.owner_user_id !== req.userId && req.user!.role !== 'Admin')
+      return res.status(403).json({ error: 'Only the file owner can manage share links.' });
+    if (file.status === 'Blocked') return res.status(400).json({ error: 'Blocked files cannot be shared.' });
 
-  // Search if a share token already exists
-  let link = db.shareLinks.find(l => l.file_id === fileId);
-  if (!link) {
-    link = {
-      id: 'lnk_' + Date.now(),
-      file_id: fileId,
-      public_token: generateToken(8),
-      password: password || undefined,
-      expires_at: expires_at || null,
-      max_downloads: max_downloads ? Number(max_downloads) : null,
-      download_count: 0,
-      is_active: is_active !== undefined ? !!is_active : true,
-      created_at: new Date().toISOString()
-    };
-    db.shareLinks.push(link);
-  } else {
-    // Update existing settings
-    if (password !== undefined) link.password = password || undefined;
-    if (expires_at !== undefined) link.expires_at = expires_at || null;
-    if (max_downloads !== undefined) link.max_downloads = max_downloads ? Number(max_downloads) : null;
-    if (is_active !== undefined) link.is_active = !!is_active;
-  }
+    const exReq = await getRequest(); exReq.input('fid', sql.UniqueIdentifier, fileId);
+    const existing = await exReq.query<ShareRow>(
+      'SELECT id,file_id,public_token,password_hash,expires_at,max_downloads,download_count,is_active,created_at FROM share_links WHERE file_id=@fid'
+    );
 
-  saveDb();
+    let shareRow: ShareRow;
+    if (!existing.recordset.length) {
+      const token = generateSecureToken(16);
+      const pwH   = password ? await hashSharePassword(password) : null;
+      const insReq = await getRequest();
+      insReq.input('fid',   sql.UniqueIdentifier, fileId);
+      insReq.input('tok',   sql.Char(32),         token);
+      insReq.input('pwH',   sql.NVarChar(256),    pwH);
+      insReq.input('exp',   sql.DateTimeOffset,   expires_at || null);
+      insReq.input('md',    sql.Int,              max_downloads ? Number(max_downloads) : null);
+      insReq.input('act',   sql.Bit,              is_active !== undefined ? (is_active ? 1 : 0) : 1);
+      const insRes = await insReq.query<ShareRow>(
+        `INSERT INTO share_links (file_id,public_token,password_hash,expires_at,max_downloads,is_active)
+         OUTPUT INSERTED.id,INSERTED.file_id,INSERTED.public_token,INSERTED.password_hash,
+                INSERTED.expires_at,INSERTED.max_downloads,INSERTED.download_count,INSERTED.is_active,INSERTED.created_at
+         VALUES (@fid,@tok,@pwH,@exp,@md,@act)`
+      );
+      shareRow = insRes.recordset[0];
+    } else {
+      shareRow = existing.recordset[0];
+      const sets: string[] = [];
+      const upReq = await getRequest(); upReq.input('id', sql.UniqueIdentifier, shareRow.id);
+      if (password !== undefined) { upReq.input('pw', sql.NVarChar(256), password ? await hashSharePassword(password) : null); sets.push('password_hash=@pw'); }
+      if (expires_at !== undefined) { upReq.input('exp', sql.DateTimeOffset, expires_at||null); sets.push('expires_at=@exp'); }
+      if (max_downloads !== undefined) { upReq.input('md', sql.Int, max_downloads ? Number(max_downloads) : null); sets.push('max_downloads=@md'); }
+      if (is_active !== undefined) { upReq.input('act', sql.Bit, is_active ? 1 : 0); sets.push('is_active=@act'); }
+      if (sets.length) {
+        const upRes = await upReq.query<ShareRow>(
+          `UPDATE share_links SET ${sets.join(',')}
+           OUTPUT INSERTED.id,INSERTED.file_id,INSERTED.public_token,INSERTED.password_hash,
+                  INSERTED.expires_at,INSERTED.max_downloads,INSERTED.download_count,INSERTED.is_active,INSERTED.created_at
+           WHERE id=@id`
+        );
+        shareRow = upRes.recordset[0];
+      }
+    }
 
-  logSystemEvent(
-    user.id,
-    user.username,
-    'Link',
-    'ShareLink',
-    link.id,
-    req,
-    `Configured sharing route for link token: ${link.public_token}`
-  );
-
-  res.json({ success: true, link });
+    await logSystemEvent(req.userId!, req.user!.username, 'Link', 'ShareLink', shareRow.id, req, `Configured share for file ${fileId}.`);
+    res.json({ success: true, link: mapShareRow(shareRow) });
+  } catch (err) { console.error('[POST /api/files/:id/share]', err); res.status(500).json({ error: 'Failed to configure share link.' }); }
 });
 
-// --- PUBLIC DOWNLOAD / PREVIEW ENDPOINTS ---
+// ──────────────────────────────────────────────────────────────
+// API: Public Download
+// ──────────────────────────────────────────────────────────────
 
-app.get('/api/public/share/:token', (req, res) => {
+app.get('/api/public/share/:token', async (req, res) => {
   const token = req.params.token;
-  const link = db.shareLinks.find(l => l.public_token === token);
+  try {
+    const request = await getRequest(); request.input('tok', sql.Char(32), token);
+    const result = await request.query<ShareRow & {
+      file_status: string; leeku_vibe: string|null; mime_type: string;
+      size_bytes: number; file_created_at: Date;
+      owner_username_encrypted: Buffer; owner_username_iv: Buffer; owner_username_auth_tag: Buffer;
+    }>(
+      `SELECT sl.id,sl.file_id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.created_at,
+              f.status AS file_status,f.leeku_vibe,f.mime_type,f.size_bytes,f.created_at AS file_created_at,
+              u.username_encrypted AS owner_username_encrypted, u.username_iv AS owner_username_iv, u.username_auth_tag AS owner_username_auth_tag
+       FROM share_links sl
+       INNER JOIN files f ON sl.file_id=f.id
+       INNER JOIN users u ON f.owner_user_id=u.id
+       WHERE sl.public_token=@tok`
+    );
+    if (!result.recordset.length) return res.status(404).json({ error: 'Share link not found.' });
+    const row = result.recordset[0];
+    if (!row.is_active)                                                    return res.status(404).json({ error: 'Share link inactive.' });
+    if (row.file_status === 'Blocked')                                     return res.status(410).json({ error: 'File has been blocked.' });
+    if (row.expires_at && new Date(row.expires_at) < new Date())           return res.status(410).json({ error: 'Share link has expired.' });
+    if (row.max_downloads && row.download_count >= row.max_downloads)      return res.status(410).json({ error: 'Download limit reached.' });
 
-  if (!link || !link.is_active) {
-    return res.status(404).json({ error: 'Share link found in the nether, but it is currently closed or invalid.' });
-  }
-
-  const file = db.files.find(f => f.id === link.file_id);
-  if (!file || file.status === 'Blocked') {
-    return res.status(404).json({ error: 'File link is offline. File approved status has changed or files were purged.' });
-  }
-
-  // Check expiration if any
-  if (link.expires_at && new Date(link.expires_at).getTime() < Date.now()) {
-    return res.status(410).json({ error: 'The leek spell has expired. This public share portal is closed.' });
-  }
-
-  // Check download limits
-  if (link.max_downloads && link.download_count >= link.max_downloads) {
-    return res.status(410).json({ error: 'Download quota met. This share link reached its access limits.' });
-  }
-
-  const owner = db.users.find(u => u.id === file.owner_user_id);
-
-  res.json({
-    token: link.public_token,
-    file_name: file.original_name,
-    mime_type: file.mime_type,
-    size: file.size,
-    created_at: file.created_at,
-    protected: !!link.password,
-    uploader: owner ? owner.username : 'Anonymous',
-    leeku_vibe: file.leeku_vibe,
-    downloads_current: link.download_count,
-    downloads_max: link.max_downloads
-  });
+    const ownerUsername = decryptColumn(row.owner_username_encrypted, row.owner_username_iv, row.owner_username_auth_tag);
+    res.json({
+      token: row.public_token, mime_type: row.mime_type, size: row.size_bytes,
+      created_at: row.file_created_at?.toISOString(), protected: !!row.password_hash,
+      uploader: ownerUsername, leeku_vibe: row.leeku_vibe||'',
+      downloads_current: row.download_count, downloads_max: row.max_downloads,
+    });
+  } catch (err) { console.error('[GET /api/public/share/:token]', err); res.status(500).json({ error: 'Failed to load share info.' }); }
 });
 
-app.post('/api/public/share/:token/download', (req, res) => {
+app.post('/api/public/share/:token/download', async (req, res) => {
   const token = req.params.token;
   const { password } = req.body;
+  try {
+    const request = await getRequest(); request.input('tok', sql.Char(32), token);
+    const result = await request.query<ShareRow & {
+      file_status: string; stored_path: string;
+      original_name_encrypted: Buffer; original_name_iv: Buffer; original_name_auth_tag: Buffer;
+      mime_type: string; checksum_sha256: string; file_id_join: string;
+      encrypted_key: Buffer; key_iv: Buffer; key_auth_tag: Buffer; file_iv: Buffer; file_auth_tag: Buffer;
+    }>(
+      `SELECT sl.id,sl.file_id AS file_id_join,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.created_at,
+              f.status AS file_status,f.stored_path,f.mime_type,f.checksum_sha256,
+              f.original_name_encrypted,f.original_name_iv,f.original_name_auth_tag,
+              k.encrypted_key,k.key_iv,k.key_auth_tag,k.file_iv,k.file_auth_tag
+       FROM share_links sl
+       INNER JOIN files f ON sl.file_id=f.id
+       INNER JOIN file_encryption_keys k ON f.id=k.file_id
+       WHERE sl.public_token=@tok`
+    );
+    if (!result.recordset.length) return res.status(404).json({ error: 'Share link not found.' });
+    const row = result.recordset[0];
+    if (!row.is_active)                                               return res.status(404).json({ error: 'Share link inactive.' });
+    if (row.file_status === 'Blocked')                                return res.status(410).json({ error: 'File has been blocked.' });
+    if (row.expires_at && new Date(row.expires_at) < new Date())      return res.status(410).json({ error: 'Link expired.' });
+    if (row.max_downloads && row.download_count >= row.max_downloads) return res.status(410).json({ error: 'Download limit reached.' });
 
-  const link = db.shareLinks.find(l => l.public_token === token);
-  if (!link || !link.is_active) {
-    return res.status(404).json({ error: 'Share gateway is closed.' });
-  }
+    if (row.password_hash) {
+      if (!password) return res.status(403).json({ error: 'Password required.' });
+      const valid = await verifySharePassword(password, row.password_hash);
+      if (!valid) return res.status(403).json({ error: 'Incorrect vault password.' });
+    }
 
-  const file = db.files.find(f => f.id === link.file_id);
-  if (!file || file.status === 'Blocked') {
-    return res.status(404).json({ error: 'File is not online.' });
-  }
+    const vaultPath = path.join(FILE_VAULT, row.stored_path);
+    if (!fs.existsSync(vaultPath)) return res.status(410).json({ error: 'Vault file not found.' });
 
-  if (link.expires_at && new Date(link.expires_at).getTime() < Date.now()) {
-    return res.status(410).json({ error: 'Link portal expired.' });
-  }
+    const encBytes  = fs.readFileSync(vaultPath);
+    const fileKey   = unwrapKey(row.encrypted_key, row.key_iv, row.key_auth_tag);
+    const plainBytes= decryptFile(encBytes, fileKey, row.file_iv, row.file_auth_tag);
 
-  if (link.max_downloads && link.download_count >= link.max_downloads) {
-    return res.status(410).json({ error: 'Download limit was fulfilled.' });
-  }
+    if (computeChecksum(plainBytes) !== row.checksum_sha256)
+      return res.status(500).json({ error: 'File integrity check failed.' });
 
-  // Password verification
-  if (link.password && link.password !== password) {
-    return res.status(403).json({ error: 'This file is not for your eyes. Incorrect vault keys.' });
-  }
+    const dlReq = await getRequest(); dlReq.input('id', sql.UniqueIdentifier, row.id);
+    await dlReq.query('UPDATE share_links SET download_count=download_count+1 WHERE id=@id');
 
-  // Update download counter
-  link.download_count++;
+    const originalName = decryptColumn(row.original_name_encrypted, row.original_name_iv, row.original_name_auth_tag);
+    await logSystemEvent(null, 'Anonymous', 'Download', 'File', row.file_id_join, req,
+      `Anonymous download of "${originalName}" via token ${token}.`);
 
-  const rawEncrypted = db.fileContents[file.id] || '';
-  const decryptedBase64 = decryptFileContents(rawEncrypted);
-
-  saveDb();
-
-  logSystemEvent(
-    null,
-    'Anonymous',
-    'Download',
-    'File',
-    file.id,
-    req,
-    `Anonymous client downloaded file "${file.original_name}" via portal: ${token}`
-  );
-
-  res.json({
-    original_name: file.original_name,
-    mime_type: file.mime_type,
-    content: decryptedBase64
-  });
+    res.json({ original_name: originalName, mime_type: row.mime_type, content: plainBytes.toString('base64') });
+  } catch (err) { console.error('[POST /api/public/share/:token/download]', err); res.status(500).json({ error: 'Download failed.' }); }
 });
 
-// --- ADMIN SYSTEM CONTROLS ---
+// ──────────────────────────────────────────────────────────────
+// API: Admin
+// ──────────────────────────────────────────────────────────────
 
-function verifyAdmin(req: AuthenticatedRequest, res: express.Response, next: express.NextFunction) {
-  if (req.user!.role !== 'Admin') {
-    return res.status(403).json({ error: 'Access denied. Only system administrators can run command codes.' });
-  }
-  next();
+app.get('/api/admin/users', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, async (req, res) => {
+  try {
+    const request = await getRequest();
+    const result = await request.query<UserRow>(
+      `SELECT id,email_encrypted,email_iv,email_auth_tag,username_encrypted,username_iv,username_auth_tag,
+              role,quota_id,storage_used_bytes,status,created_at,failed_login_count,locked_until
+       FROM users ORDER BY created_at DESC`
+    );
+    res.json({ users: result.recordset.map(mapUserRow) });
+  } catch (err) { console.error('[GET /api/admin/users]', err); res.status(500).json({ error: 'Failed to load users.' }); }
+});
+
+app.post('/api/admin/users/:id/suspend', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  const userId = req.params.id;
+  try {
+    const uReq = await getRequest(); uReq.input('id', sql.UniqueIdentifier, userId);
+    const uRes = await uReq.query<UserRow>(
+      'SELECT id,email_encrypted,email_iv,email_auth_tag,username_encrypted,username_iv,username_auth_tag,role,quota_id,storage_used_bytes,status,created_at,failed_login_count,locked_until FROM users WHERE id=@id'
+    );
+    if (!uRes.recordset.length) return res.status(404).json({ error: 'User not found.' });
+    const row = uRes.recordset[0];
+    if (row.role === 'Admin' && req.userId !== userId)
+      return res.status(403).json({ error: 'Cannot suspend another admin.' });
+
+    const newStatus = row.status === 'Active' ? 'Suspended' : 'Active';
+    const upReq = await getRequest(); upReq.input('s', sql.NVarChar(20), newStatus); upReq.input('id', sql.UniqueIdentifier, userId);
+    const updated = await upReq.query<UserRow>(
+      `UPDATE users SET status=@s
+       OUTPUT INSERTED.id,INSERTED.email_encrypted,INSERTED.email_iv,INSERTED.email_auth_tag,
+              INSERTED.username_encrypted,INSERTED.username_iv,INSERTED.username_auth_tag,
+              INSERTED.role,INSERTED.quota_id,INSERTED.storage_used_bytes,INSERTED.status,INSERTED.created_at,INSERTED.failed_login_count,INSERTED.locked_until
+       WHERE id=@id`
+    );
+    const user = mapUserRow(updated.recordset[0]);
+    await logSystemEvent(req.userId!, req.user!.username, 'Admin', 'User', userId, req, `Toggled status of "${user.username}" to ${newStatus}.`);
+    res.json({ success: true, user });
+  } catch (err) { console.error('[POST /api/admin/users/:id/suspend]', err); res.status(500).json({ error: 'Failed to update user.' }); }
+});
+
+app.post('/api/admin/users/:id/quota', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  const { quota_id } = req.body; const userId = req.params.id;
+  try {
+    const qC = await getRequest(); qC.input('qid', sql.NVarChar(50), quota_id);
+    const qR = await qC.query<{c:number}>('SELECT COUNT(*) AS c FROM quotas WHERE id=@qid');
+    if (!qR.recordset[0].c) return res.status(400).json({ error: 'Quota tier not found.' });
+
+    const upReq = await getRequest(); upReq.input('q', sql.NVarChar(50), quota_id); upReq.input('id', sql.UniqueIdentifier, userId);
+    const updated = await upReq.query<UserRow>(
+      `UPDATE users SET quota_id=@q
+       OUTPUT INSERTED.id,INSERTED.email_encrypted,INSERTED.email_iv,INSERTED.email_auth_tag,
+              INSERTED.username_encrypted,INSERTED.username_iv,INSERTED.username_auth_tag,
+              INSERTED.role,INSERTED.quota_id,INSERTED.storage_used_bytes,INSERTED.status,INSERTED.created_at,INSERTED.failed_login_count,INSERTED.locked_until
+       WHERE id=@id`
+    );
+    if (!updated.recordset.length) return res.status(404).json({ error: 'User not found.' });
+    const user = mapUserRow(updated.recordset[0]);
+    await logSystemEvent(req.userId!, req.user!.username, 'Admin', 'User', userId, req, `Changed quota of "${user.username}" to "${quota_id}".`);
+    res.json({ success: true, user });
+  } catch (err) { console.error('[POST /api/admin/users/:id/quota]', err); res.status(500).json({ error: 'Failed to update quota.' }); }
+});
+
+app.post('/api/admin/users/:id/edit', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  const userId = req.params.id; const { username, email, role, status, password } = req.body;
+  try {
+    const sets: string[] = []; const upReq = await getRequest(); upReq.input('id', sql.UniqueIdentifier, userId);
+    if (username !== undefined) {
+      const t = username.trim(); const h = hashColumnForLookup(t.toLowerCase());
+      const d = await getRequest(); d.input('h', sql.Char(64), h); d.input('id', sql.UniqueIdentifier, userId);
+      const dr = await d.query<{c:number}>('SELECT COUNT(*) AS c FROM users WHERE username_hash=@h AND id!=@id');
+      if (dr.recordset[0].c) return res.status(400).json({ error: 'Username already taken.' });
+      const enc = encryptColumn(t);
+      upReq.input('uE', sql.VarBinary(512), enc.ciphertext); upReq.input('uI', sql.VarBinary(16), enc.iv);
+      upReq.input('uT', sql.VarBinary(16), enc.authTag); upReq.input('uH', sql.Char(64), h);
+      sets.push('username_encrypted=@uE,username_iv=@uI,username_auth_tag=@uT,username_hash=@uH');
+    }
+    if (email !== undefined) {
+      const te = email.toLowerCase().trim(); const h = hashColumnForLookup(te);
+      const d = await getRequest(); d.input('h', sql.Char(64), h); d.input('id', sql.UniqueIdentifier, userId);
+      const dr = await d.query<{c:number}>('SELECT COUNT(*) AS c FROM users WHERE email_hash=@h AND id!=@id');
+      if (dr.recordset[0].c) return res.status(400).json({ error: 'Email already in use.' });
+      const enc = encryptColumn(te);
+      upReq.input('eE', sql.VarBinary(512), enc.ciphertext); upReq.input('eI', sql.VarBinary(16), enc.iv);
+      upReq.input('eT', sql.VarBinary(16), enc.authTag); upReq.input('eH', sql.Char(64), h);
+      sets.push('email_encrypted=@eE,email_iv=@eI,email_auth_tag=@eT,email_hash=@eH');
+    }
+    if (role && ['Admin','User'].includes(role)) { upReq.input('role', sql.NVarChar(10), role); sets.push('role=@role'); }
+    if (status && ['Active','Suspended'].includes(status)) { upReq.input('st', sql.NVarChar(20), status); sets.push('status=@st'); }
+    if (password?.trim()) { const h = await hashPassword(password.trim()); upReq.input('pw', sql.NVarChar(512), h); sets.push('password_hash=@pw'); }
+    if (!sets.length) return res.status(400).json({ error: 'No changes to apply.' });
+
+    const updated = await upReq.query<UserRow>(
+      `UPDATE users SET ${sets.join(',')}
+       OUTPUT INSERTED.id,INSERTED.email_encrypted,INSERTED.email_iv,INSERTED.email_auth_tag,
+              INSERTED.username_encrypted,INSERTED.username_iv,INSERTED.username_auth_tag,
+              INSERTED.role,INSERTED.quota_id,INSERTED.storage_used_bytes,INSERTED.status,INSERTED.created_at,INSERTED.failed_login_count,INSERTED.locked_until
+       WHERE id=@id`
+    );
+    if (!updated.recordset.length) return res.status(404).json({ error: 'User not found.' });
+    const user = mapUserRow(updated.recordset[0]);
+    await logSystemEvent(req.userId!, req.user!.username, 'Admin', 'User', userId, req, `Admin edited "${user.username}".`);
+    res.json({ success: true, user });
+  } catch (err) { console.error('[POST /api/admin/users/:id/edit]', err); res.status(500).json({ error: 'Failed to edit user.' }); }
+});
+
+app.get('/api/admin/files', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, async (req, res) => {
+  try {
+    const request = await getRequest();
+    const result = await request.query<FileRow & {username_encrypted:Buffer;username_iv:Buffer;username_auth_tag:Buffer}>(
+      `SELECT f.id,f.owner_user_id,f.original_name_encrypted,f.original_name_iv,f.original_name_auth_tag,
+              f.stored_path,f.mime_type,f.size_bytes,f.encrypted_size_bytes,f.status,f.checksum_sha256,
+              f.scan_result,f.scan_message,f.is_encrypted,f.leeku_vibe,f.ttl_hours,f.expires_at,f.created_at,
+              u.username_encrypted,u.username_iv,u.username_auth_tag
+       FROM files f INNER JOIN users u ON f.owner_user_id=u.id ORDER BY f.created_at DESC`
+    );
+    res.json({ files: result.recordset.map(r => mapFileRow(r, decryptColumn(r.username_encrypted, r.username_iv, r.username_auth_tag))) });
+  } catch (err) { console.error('[GET /api/admin/files]', err); res.status(500).json({ error: 'Failed to load files.' }); }
+});
+
+app.post('/api/admin/files/:id/block', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  const fileId = req.params.id;
+  try {
+    const fReq = await getRequest(); fReq.input('id', sql.UniqueIdentifier, fileId);
+    const fRes = await fReq.query<{status:string;size_bytes:number;owner_user_id:string}>('SELECT status,size_bytes,owner_user_id FROM files WHERE id=@id');
+    if (!fRes.recordset.length) return res.status(404).json({ error: 'File not found.' });
+    const f = fRes.recordset[0];
+    const newStatus = f.status === 'Available' ? 'Blocked' : 'Available';
+    const upReq = await getRequest(); upReq.input('s', sql.NVarChar(20), newStatus); upReq.input('id', sql.UniqueIdentifier, fileId);
+    await upReq.query('UPDATE files SET status=@s WHERE id=@id');
+
+    const sReq = await getRequest(); sReq.input('sz', sql.BigInt, f.size_bytes); sReq.input('uid', sql.UniqueIdentifier, f.owner_user_id);
+    if (newStatus === 'Blocked')
+      await sReq.query('UPDATE users SET storage_used_bytes=CASE WHEN storage_used_bytes-@sz<0 THEN 0 ELSE storage_used_bytes-@sz END WHERE id=@uid');
+    else
+      await sReq.query('UPDATE users SET storage_used_bytes=storage_used_bytes+@sz WHERE id=@uid');
+
+    await logSystemEvent(req.userId!, req.user!.username, 'Admin', 'File', fileId, req, `File status changed to ${newStatus}.`);
+    res.json({ success: true, file: { id: fileId, status: newStatus } });
+  } catch (err) { console.error('[POST /api/admin/files/:id/block]', err); res.status(500).json({ error: 'Failed to update file status.' }); }
+});
+
+app.get('/api/admin/logs', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, async (req, res) => {
+  try {
+    const request = await getRequest(); request.input('top', sql.Int, MAX_LOG_ENTRIES);
+    const result = await request.query<LogRow>(
+      'SELECT TOP (@top) id,user_id,username_snapshot,event_type,target_type,target_id,ip_address,message,created_at FROM system_logs ORDER BY created_at DESC'
+    );
+    res.json({ logs: result.recordset.map(mapLogRow) });
+  } catch (err) { console.error('[GET /api/admin/logs]', err); res.status(500).json({ error: 'Failed to load logs.' }); }
+});
+
+app.post('/api/admin/quotas', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  const { id, name, storage_limit_bytes, max_file_size_bytes, max_files, daily_upload_limit_bytes } = req.body;
+  if (!id || !name || !storage_limit_bytes || !max_file_size_bytes || !max_files || !daily_upload_limit_bytes)
+    return res.status(400).json({ error: 'All quota fields are required.' });
+  try {
+    const request = await getRequest();
+    request.input('id', sql.NVarChar(50), id); request.input('name', sql.NVarChar(100), name);
+    request.input('sl', sql.BigInt, Number(storage_limit_bytes)); request.input('mf', sql.BigInt, Number(max_file_size_bytes));
+    request.input('mfi', sql.Int, Number(max_files)); request.input('dl', sql.BigInt, Number(daily_upload_limit_bytes));
+    await request.query(
+      `MERGE quotas AS target USING (SELECT @id AS id) AS src ON target.id=src.id
+       WHEN MATCHED THEN UPDATE SET name=@name,storage_limit_bytes=@sl,max_file_size_bytes=@mf,max_files=@mfi,daily_upload_limit_bytes=@dl
+       WHEN NOT MATCHED THEN INSERT (id,name,storage_limit_bytes,max_file_size_bytes,max_files,daily_upload_limit_bytes) VALUES (@id,@name,@sl,@mf,@mfi,@dl);`
+    );
+    const allReq = await getRequest();
+    const allQuotas = await allReq.query<Quota>('SELECT id,name,storage_limit_bytes,max_file_size_bytes,max_files,daily_upload_limit_bytes FROM quotas ORDER BY storage_limit_bytes');
+    await logSystemEvent(req.userId!, req.user!.username, 'Admin', 'Quota', id, req, `Saved quota tier "${name}".`);
+    res.json({ success: true, quotas: allQuotas.recordset });
+  } catch (err) { console.error('[POST /api/admin/quotas]', err); res.status(500).json({ error: 'Failed to save quota.' }); }
+});
+
+app.post('/api/admin/quotas/:id/delete', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  const quotaId = req.params.id; const { migrate_to_quota_id } = req.body;
+  try {
+    const qC = await getRequest(); qC.input('id', sql.NVarChar(50), quotaId);
+    const qR = await qC.query<{c:number}>('SELECT COUNT(*) AS c FROM quotas WHERE id=@id');
+    if (!qR.recordset[0].c) return res.status(404).json({ error: 'Quota tier not found.' });
+
+    const tC = await getRequest(); const tR = await tC.query<{c:number}>('SELECT COUNT(*) AS c FROM quotas');
+    if (tR.recordset[0].c <= 1) return res.status(400).json({ error: 'Cannot delete the last quota tier.' });
+
+    const uC = await getRequest(); uC.input('qid', sql.NVarChar(50), quotaId);
+    const uR = await uC.query<{c:number}>('SELECT COUNT(*) AS c FROM users WHERE quota_id=@qid');
+    if (uR.recordset[0].c > 0) {
+      if (!migrate_to_quota_id) return res.status(400).json({ error: 'Migration required', needs_migration: true, attached_count: uR.recordset[0].c });
+      const mReq = await getRequest(); mReq.input('to', sql.NVarChar(50), migrate_to_quota_id); mReq.input('from', sql.NVarChar(50), quotaId);
+      await mReq.query('UPDATE users SET quota_id=@to WHERE quota_id=@from');
+    }
+
+    const dReq = await getRequest(); dReq.input('id', sql.NVarChar(50), quotaId);
+    await dReq.query('DELETE FROM quotas WHERE id=@id');
+
+    const allReq = await getRequest();
+    const allQuotas = await allReq.query<Quota>('SELECT id,name,storage_limit_bytes,max_file_size_bytes,max_files,daily_upload_limit_bytes FROM quotas ORDER BY storage_limit_bytes');
+    await logSystemEvent(req.userId!, req.user!.username, 'Admin', 'Quota', quotaId, req, `Deleted quota tier "${quotaId}".`);
+    res.json({ success: true, quotas: allQuotas.recordset });
+  } catch (err) { console.error('[POST /api/admin/quotas/:id/delete]', err); res.status(500).json({ error: 'Failed to delete quota.' }); }
+});
+
+// ──────────────────────────────────────────────────────────────
+// Expiry cleanup callbacks
+// ──────────────────────────────────────────────────────────────
+
+async function getExpiredFiles(): Promise<ExpiredFileRecord[]> {
+  const request = await getRequest();
+  const result = await request.query<{
+    id: string; stored_path: string; owner_user_id: string;
+    original_name_encrypted: Buffer; original_name_iv: Buffer; original_name_auth_tag: Buffer;
+    expires_at: Date; size_bytes: number;
+  }>(
+    `SELECT id,stored_path,owner_user_id,original_name_encrypted,original_name_iv,original_name_auth_tag,expires_at,size_bytes
+     FROM files WHERE expires_at IS NOT NULL AND expires_at<=SYSDATETIMEOFFSET() AND status='Available'`
+  );
+  return result.recordset.map(r => ({
+    id:           r.id,
+    storedPath:   path.join(FILE_VAULT, r.stored_path),
+    ownerId:      r.owner_user_id,
+    originalName: decryptColumn(r.original_name_encrypted, r.original_name_iv, r.original_name_auth_tag),
+    expiresAt:    r.expires_at.toISOString(),
+    sizeBytes:    r.size_bytes,
+  }));
 }
 
-app.get('/api/admin/users', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, (req, res) => {
-  res.json({ users: db.users });
-});
-
-app.post('/api/admin/users/:id/suspend', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, (req: AuthenticatedRequest, res) => {
-  const userId = req.params.id;
-  const user = db.users.find(u => u.id === userId);
-
-  if (!user) {
-    return res.status(404).json({ error: 'Target user not registered.' });
+async function markFilesExpired(fileIds: string[]): Promise<void> {
+  for (const fileId of fileIds) {
+    const r = await getRequest(); r.input('id', sql.UniqueIdentifier, fileId);
+    await r.query("UPDATE files SET status='Expired',deleted_at=SYSDATETIMEOFFSET() WHERE id=@id");
+    const s = await getRequest(); s.input('id', sql.UniqueIdentifier, fileId);
+    await s.query(`UPDATE users SET storage_used_bytes=CASE WHEN storage_used_bytes-(SELECT size_bytes FROM files WHERE id=@id)<0 THEN 0 ELSE storage_used_bytes-(SELECT size_bytes FROM files WHERE id=@id) END WHERE id=(SELECT owner_user_id FROM files WHERE id=@id)`);
   }
+}
 
-  if (user.role === 'Admin' && req.user!.id !== user.id) {
-    return res.status(403).json({ error: 'You are forbidden from suspending fellow Miku admins.' });
-  }
+async function logExpiredFile(file: ExpiredFileRecord): Promise<void> {
+  const r = await getRequest();
+  r.input('uid', sql.UniqueIdentifier, file.ownerId); r.input('usr', sql.NVarChar(200), 'System');
+  r.input('et',  sql.NVarChar(20),  'Delete');        r.input('tt',  sql.NVarChar(50),  'File');
+  r.input('tid', sql.NVarChar(100), file.id);          r.input('ip',  sql.NVarChar(45),  '127.0.0.1');
+  r.input('msg', sql.NVarChar(sql.MAX), `File "${file.originalName}" auto-deleted after TTL expiry (${file.expiresAt}).`);
+  await r.query('INSERT INTO system_logs (user_id,username_snapshot,event_type,target_type,target_id,ip_address,message) VALUES (@uid,@usr,@et,@tt,@tid,@ip,@msg)');
+}
 
-  user.status = user.status === 'Active' ? 'Suspended' : 'Active';
-  saveDb();
-
-  logSystemEvent(
-    req.user!.id,
-    req.user!.username,
-    'Admin',
-    'User',
-    user.id,
-    req,
-    `Toggled suspend state of user "${user.username}". Current state: ${user.status}`
-  );
-
-  res.json({ success: true, user });
-});
-
-app.post('/api/admin/users/:id/quota', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, (req: AuthenticatedRequest, res) => {
-  const { quota_id } = req.body;
-  const userId = req.params.id;
-  const user = db.users.find(u => u.id === userId);
-
-  if (!user) {
-    return res.status(404).json({ error: 'Target user not found.' });
-  }
-
-  if (!db.quotas.some(q => q.id === quota_id)) {
-    return res.status(400).json({ error: 'Specified quota model tier does not exist.' });
-  }
-
-  user.quota_id = quota_id;
-  saveDb();
-
-  logSystemEvent(
-    req.user!.id,
-    req.user!.username,
-    'Admin',
-    'User',
-    user.id,
-    req,
-    `Changed storage quota level of user "${user.username}" to tier: ${quota_id}`
-  );
-
-  res.json({ success: true, user });
-});
-
-app.post('/api/admin/users/:id/edit', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, (req: AuthenticatedRequest, res) => {
-  const userId = req.params.id;
-  const user = db.users.find(u => u.id === userId);
-
-  if (!user) {
-    return res.status(404).json({ error: 'Target user not found.' });
-  }
-
-  const { username, email, role, status, password } = req.body;
-
-  if (username !== undefined) {
-    const trimmedUsername = username.trim();
-    if (!trimmedUsername) {
-      return res.status(400).json({ error: 'Username cannot be blank.' });
-    }
-    if (db.users.some(u => u.id !== userId && u.username.toLowerCase() === trimmedUsername.toLowerCase())) {
-      return res.status(400).json({ error: 'Username is already taken by another user.' });
-    }
-    // Update matching file references
-    db.files.forEach(f => {
-      if (f.owner_user_id === userId) {
-        f.username = trimmedUsername;
-      }
-    });
-    user.username = trimmedUsername;
-  }
-
-  if (email !== undefined) {
-    const trimmedEmail = email.toLowerCase().trim();
-    if (!trimmedEmail) {
-      return res.status(400).json({ error: 'Email cannot be blank.' });
-    }
-    if (db.users.some(u => u.id !== userId && u.email.toLowerCase() === trimmedEmail)) {
-      return res.status(400).json({ error: 'Email is already registered by another user.' });
-    }
-    user.email = trimmedEmail;
-  }
-
-  if (role !== undefined) {
-    if (role !== 'Admin' && role !== 'User') {
-      return res.status(400).json({ error: 'Invalid role classification.' });
-    }
-    user.role = role;
-  }
-
-  if (status !== undefined) {
-    if (status !== 'Active' && status !== 'Suspended') {
-      return res.status(400).json({ error: 'Invalid status classification.' });
-    }
-    user.status = status;
-  }
-
-  if (password !== undefined && password.trim() !== '') {
-    db.passwords[userId] = password.trim();
-  }
-
-  saveDb();
-
-  logSystemEvent(
-    req.user!.id,
-    req.user!.username,
-    'Admin',
-    'User',
-    user.id,
-    req,
-    `Admin updated information details for user "${user.username}" (username/email/role/status)`
-  );
-
-  res.json({ success: true, user });
-});
-
-app.get('/api/admin/files', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, (req, res) => {
-  res.json({ files: db.files });
-});
-
-app.post('/api/admin/files/:id/block', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, (req: AuthenticatedRequest, res) => {
-  const fileId = req.params.id;
-  const file = db.files.find(f => f.id === fileId);
-
-  if (!file) {
-    return res.status(404).json({ error: 'Target file not loaded.' });
-  }
-
-  const oldStatus = file.status;
-  file.status = file.status === 'Available' ? 'Blocked' : 'Available';
-
-  // If blocked, update user's quota storage calculation so that blocked files are subtracted
-  const owner = db.users.find(u => u.id === file.owner_user_id);
-  if (owner) {
-    if (file.status === 'Blocked' && oldStatus === 'Available') {
-      owner.storage_used = Math.max(0, owner.storage_used - file.size);
-    } else if (file.status === 'Available' && oldStatus === 'Blocked') {
-      owner.storage_used += file.size;
-    }
-  }
-
-  saveDb();
-
-  logSystemEvent(
-    req.user!.id,
-    req.user!.username,
-    'Admin',
-    'File',
-    file.id,
-    req,
-    `Admin changed block status of file "${file.original_name}". Current status: ${file.status}`
-  );
-
-  res.json({ success: true, file });
-});
-
-app.get('/api/admin/logs', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, (req, res) => {
-  res.json({ logs: db.logs });
-});
-
-app.post('/api/admin/quotas', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, (req: AuthenticatedRequest, res) => {
-  const { id, name, storage_limit_bytes, max_file_size_bytes, max_files, daily_upload_limit_bytes } = req.body;
-
-  if (!id || !name || !storage_limit_bytes || !max_file_size_bytes || !max_files || !daily_upload_limit_bytes) {
-    return res.status(400).json({ error: 'All parameters must be provided to create a quota model.' });
-  }
-
-  const existingIdx = db.quotas.findIndex(q => q.id === id);
-  const newQuota: Quota = {
-    id,
-    name,
-    storage_limit_bytes: Number(storage_limit_bytes),
-    max_file_size_bytes: Number(max_file_size_bytes),
-    max_files: Number(max_files),
-    daily_upload_limit_bytes: Number(daily_upload_limit_bytes)
-  };
-
-  if (existingIdx !== -1) {
-    db.quotas[existingIdx] = newQuota;
-  } else {
-    db.quotas.push(newQuota);
-  }
-
-  saveDb();
-
-  logSystemEvent(
-    req.user!.id,
-    req.user!.username,
-    'Admin',
-    'Quota',
-    id,
-    req,
-    `Admin saved/updated quota template details: "${name}"`
-  );
-
-  res.json({ success: true, quotas: db.quotas });
-});
-
-app.post('/api/admin/quotas/:id/delete', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, (req: AuthenticatedRequest, res) => {
-  const quotaId = req.params.id;
-  const { migrate_to_quota_id } = req.body;
-
-  const quotaIdx = db.quotas.findIndex(q => q.id === quotaId);
-  if (quotaIdx === -1) {
-    return res.status(404).json({ error: 'Quota tier not found.' });
-  }
-
-  if (db.quotas.length <= 1) {
-    return res.status(400).json({ error: 'Cannot delete the final remaining quota tier. At least one must be online!' });
-  }
-
-  // Check if users are currently attached
-  const attachedUsers = db.users.filter(u => u.quota_id === quotaId);
-  if (attachedUsers.length > 0) {
-    if (!migrate_to_quota_id) {
-      return res.status(400).json({
-        error: 'Migration required',
-        needs_migration: true,
-        attached_count: attachedUsers.length
-      });
-    }
-
-    if (!db.quotas.some(q => q.id === migrate_to_quota_id) || migrate_to_quota_id === quotaId) {
-      return res.status(400).json({ error: 'Invalid destination quota specified for account migration.' });
-    }
-
-    // Migrate users to specified target
-    attachedUsers.forEach(u => {
-      u.quota_id = migrate_to_quota_id;
-    });
-
-    logSystemEvent(
-      req.user!.id,
-      req.user!.username,
-      'Admin',
-      'Quota',
-      quotaId,
-      req,
-      `Migrated ${attachedUsers.length} accounts from deleted quota tier "${quotaId}" to "${migrate_to_quota_id}"`
-    );
-  }
-
-  const deletedQuota = db.quotas[quotaIdx];
-  db.quotas.splice(quotaIdx, 1);
-  saveDb();
-
-  logSystemEvent(
-    req.user!.id,
-    req.user!.username,
-    'Admin',
-    'Quota',
-    quotaId,
-    req,
-    `Purged quota tier: "${deletedQuota.name}"`
-  );
-
-  res.json({ success: true, quotas: db.quotas });
-});
-
-// ---------------------------------------------------------
-// STARTUP SERVER & VITE INTEGRATION
-// ---------------------------------------------------------
+// ──────────────────────────────────────────────────────────────
+// Bootstrap
+// ──────────────────────────────────────────────────────────────
 
 async function bootstrap() {
-  if (process.env.NODE_ENV !== 'production') {
-    // Serve with Vite in Dev Mode
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
+  // 1. Validate master encryption key
+  validateEncryptionConfig();
+
+  // 2. Connect SQL Server
+  await getPool();
+  console.log('[server] SQL Server connection pool ready.');
+
+  // 3. Validate IIS logging config
+  validateIISLoggingConfig();
+
+  // 4. Start expiry cleanup
+  startExpiryCleanup(getExpiredFiles, markFilesExpired, logExpiredFile);
+
+  // 5. Vite (dev) or static (prod)
+  if (NODE_ENV !== 'production') {
+    const vite = await createViteServer({ server: { middlewareMode: true }, appType: 'spa' });
     app.use(vite.middlewares);
   } else {
-    // Static production paths
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
+    app.get('*', (req, res) => res.sendFile(path.join(distPath, 'index.html')));
+  }
 
-    // Handle SPA Routing fallbacks safely
-    app.get('*', (req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
+  // 6. HTTP or HTTPS
+  const sslEnabled = process.env.SSL_ENABLED === 'true';
+  if (sslEnabled) {
+    let sslOptions: https.ServerOptions = {};
+    const pfxPath = process.env.SSL_PFX_PATH;
+    if (pfxPath && fs.existsSync(pfxPath)) {
+      sslOptions.pfx        = fs.readFileSync(pfxPath);
+      sslOptions.passphrase = process.env.SSL_PFX_PASSPHRASE || '';
+    } else {
+      const certPath = process.env.SSL_CERT_PATH;
+      const keyPath  = process.env.SSL_KEY_PATH;
+      if (!certPath || !keyPath) throw new Error('[server] SSL_CERT_PATH and SSL_KEY_PATH required when SSL_ENABLED=true.');
+      sslOptions.cert = fs.readFileSync(certPath);
+      sslOptions.key  = fs.readFileSync(keyPath);
+      if (process.env.SSL_CA_PATH && fs.existsSync(process.env.SSL_CA_PATH))
+        sslOptions.ca = fs.readFileSync(process.env.SSL_CA_PATH);
+    }
+    sslOptions.minVersion = (process.env.SSL_MIN_VERSION as any) || 'TLSv1.2';
+    if (process.env.SSL_CIPHERS?.trim()) sslOptions.ciphers = process.env.SSL_CIPHERS;
+
+    const sslPort = parseInt(process.env.SSL_PORT || '443', 10);
+    https.createServer(sslOptions, app).listen(sslPort, '0.0.0.0', () => {
+      console.log(`[server] Leeks.miku.rip HTTPS port ${sslPort}`);
+    });
+  } else {
+    app.listen(PORT, '0.0.0.0', () => {
+      console.log(`[server] Leeks.miku.rip http://0.0.0.0:${PORT}`);
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Leeks.miku.rip virtual portal running on port ${PORT}`);
-  });
+  // 7. Graceful shutdown
+  const shutdown = async (sig: string) => {
+    console.log(`[server] ${sig} — shutting down.`);
+    stopExpiryCleanup();
+    await closePool();
+    process.exit(0);
+  };
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT',  () => shutdown('SIGINT'));
 }
 
-bootstrap();
+bootstrap().catch(err => {
+  console.error('[server] Fatal startup error:', err);
+  process.exit(1);
+});

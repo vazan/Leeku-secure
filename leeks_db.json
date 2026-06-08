@@ -1,0 +1,230 @@
+{
+  "users": [
+    {
+      "id": "user_admin",
+      "email": "admin@miku.rip",
+      "username": "MikuAdmin",
+      "role": "Admin",
+      "quota_id": "eternal",
+      "storage_used": 12450000,
+      "status": "Active",
+      "created_at": "2026-01-01T00:00:00.000Z"
+    },
+    {
+      "id": "user_standard",
+      "email": "user@miku.rip",
+      "username": "LeekFan",
+      "role": "User",
+      "quota_id": "guest",
+      "storage_used": 4235000,
+      "status": "Active",
+      "created_at": "2026-03-15T00:00:00.000Z"
+    }
+  ],
+  "passwords": {
+    "user_admin": "admin1337",
+    "user_standard": "user123"
+  },
+  "files": [
+    {
+      "id": "file_dummy_1",
+      "owner_user_id": "user_standard",
+      "username": "LeekFan",
+      "original_name": "secret_miku_leak_draft.txt",
+      "stored_name": "encrypted_vault_miku_leak.leek",
+      "mime_type": "text/plain",
+      "size": 1530,
+      "encrypted_size": 1530,
+      "status": "Available",
+      "checksum": "e7c653d4ebfcf214b7",
+      "leeku_vibe": "Clean file. Leeku approves. Vibe check passed.",
+      "is_encrypted": true,
+      "created_at": "2026-06-07T19:13:13.075Z"
+    },
+    {
+      "id": "file_dummy_2",
+      "owner_user_id": "user_standard",
+      "username": "LeekFan",
+      "original_name": "cursed_ransomware_goblin.exe",
+      "stored_name": "encrypted_blocked_goblin.leek",
+      "mime_type": "application/octet-stream",
+      "size": 4096,
+      "encrypted_size": 4096,
+      "status": "Blocked",
+      "checksum": "db092fcd1bca9826a",
+      "leeku_vibe": "Leeku found cursed bytes. Suspicious antivirus warning! Blocked with combat leek!",
+      "is_encrypted": true,
+      "created_at": "2026-06-07T19:17:23.075Z"
+    }
+  ],
+  "fileContents": {
+    "file_dummy_1": "TXkgc3VwZXIgc2VjcmV0IGRvY3VtZW50IGRldGFpbGluZyBwbGFucyB0byBwbGFudCBsZWFrcyBvbiBNYXJzLiBQcm9qZWN0IEdyZWVuIExlZWsgaXMgYSBnbyE=",
+    "file_dummy_2": "TU9DSyBFWEUgQllURVM="
+  },
+  "shareLinks": [
+    {
+      "id": "link_dummy_1",
+      "file_id": "file_dummy_1",
+      "public_token": "abc123",
+      "expires_at": null,
+      "max_downloads": null,
+      "download_count": 5,
+      "is_active": true,
+      "created_at": "2026-06-07T19:13:13.075Z"
+    }
+  ],
+  "quotas": [
+    {
+      "id": "guest",
+      "name": "Guest Leek",
+      "storage_limit_bytes": 524288000,
+      "max_file_size_bytes": 52428800,
+      "max_files": 10,
+      "daily_upload_limit_bytes": 104857600
+    },
+    {
+      "id": "small",
+      "name": "Small Leek",
+      "storage_limit_bytes": 5368709120,
+      "max_file_size_bytes": 268435456,
+      "max_files": 100,
+      "daily_upload_limit_bytes": 1073741824
+    },
+    {
+      "id": "big",
+      "name": "Big Leek",
+      "storage_limit_bytes": 26843545600,
+      "max_file_size_bytes": 2147483648,
+      "max_files": 1000,
+      "daily_upload_limit_bytes": 5368709120
+    },
+    {
+      "id": "mega",
+      "name": "Mega Leek",
+      "storage_limit_bytes": 107374182400,
+      "max_file_size_bytes": 10737418240,
+      "max_files": 5000,
+      "daily_upload_limit_bytes": 21474836480
+    },
+    {
+      "id": "eternal",
+      "name": "Eternal Leek",
+      "storage_limit_bytes": 1099511627776,
+      "max_file_size_bytes": 53687091200,
+      "max_files": 50000,
+      "daily_upload_limit_bytes": 107374182400
+    }
+  ],
+  "logs": [
+    {
+      "id": "log_1780860481782_910",
+      "user_id": "user_standard",
+      "username": "LeekFan",
+      "event_type": "Delete",
+      "target_type": "File",
+      "target_id": "file_1780860441510",
+      "ip_address": "127.0.0.1",
+      "message": "Hard deleted file \"BG3SE-Updater-20260417 (1).zip\". Associated share links purged.",
+      "created_at": "2026-06-07T19:28:01.782Z"
+    },
+    {
+      "id": "log_1780860461822_594",
+      "user_id": null,
+      "username": "Anonymous",
+      "event_type": "Download",
+      "target_type": "File",
+      "target_id": "file_1780860441510",
+      "ip_address": "127.0.0.1",
+      "message": "Anonymous client downloaded file \"BG3SE-Updater-20260417 (1).zip\" via portal: MczhFtff",
+      "created_at": "2026-06-07T19:27:41.822Z"
+    },
+    {
+      "id": "log_1780860453427_61",
+      "user_id": "user_standard",
+      "username": "LeekFan",
+      "event_type": "Link",
+      "target_type": "ShareLink",
+      "target_id": "lnk_1780860453396",
+      "ip_address": "127.0.0.1",
+      "message": "Configured sharing route for link token: MczhFtff",
+      "created_at": "2026-06-07T19:27:33.427Z"
+    },
+    {
+      "id": "log_1780860441824_752",
+      "user_id": "user_standard",
+      "username": "LeekFan",
+      "event_type": "Upload",
+      "target_type": "File",
+      "target_id": "file_1780860441510",
+      "ip_address": "127.0.0.1",
+      "message": "Successfully uploaded & encrypted file \"BG3SE-Updater-20260417 (1).zip\" (5178 KB).",
+      "created_at": "2026-06-07T19:27:21.824Z"
+    },
+    {
+      "id": "log_1780860302518_7",
+      "user_id": "user_standard",
+      "username": "LeekFan",
+      "event_type": "Link",
+      "target_type": "ShareLink",
+      "target_id": "link_dummy_1",
+      "ip_address": "127.0.0.1",
+      "message": "Configured sharing route for link token: abc123",
+      "created_at": "2026-06-07T19:25:02.518Z"
+    },
+    {
+      "id": "log_1780860270966_194",
+      "user_id": "user_standard",
+      "username": "LeekFan",
+      "event_type": "Auth",
+      "target_type": "User",
+      "target_id": "user_standard",
+      "ip_address": "127.0.0.1",
+      "message": "User logged in successfully",
+      "created_at": "2026-06-07T19:24:30.966Z"
+    },
+    {
+      "id": "log_1",
+      "user_id": null,
+      "username": "SYSTEM",
+      "event_type": "Security",
+      "target_type": "System",
+      "target_id": "leeks_reactor",
+      "ip_address": "127.0.0.1",
+      "message": "Leek reactor is stable. Core status: VIBRANT. Vocaloid encryption shielding ACTIVE.",
+      "created_at": "2026-06-06T19:18:13.075Z"
+    },
+    {
+      "id": "log_2",
+      "user_id": "user_admin",
+      "username": "MikuAdmin",
+      "event_type": "Admin",
+      "target_type": "Quota",
+      "target_id": "eternal",
+      "ip_address": "192.168.1.100",
+      "message": "Configured default model quotas for Guest, Small, Big, and Eternal tiers.",
+      "created_at": "2026-06-07T07:18:13.075Z"
+    },
+    {
+      "id": "log_3",
+      "user_id": "user_standard",
+      "username": "LeekFan",
+      "event_type": "Auth",
+      "target_type": "User",
+      "target_id": "user_standard",
+      "ip_address": "172.56.21.3",
+      "message": "User logged in successfully from mobile browser.",
+      "created_at": "2026-06-07T19:08:13.075Z"
+    },
+    {
+      "id": "log_4",
+      "user_id": "user_standard",
+      "username": "LeekFan",
+      "event_type": "Scan",
+      "target_type": "File",
+      "target_id": "file_dummy_2",
+      "ip_address": "172.56.21.3",
+      "message": "Blocked file curs_ransomware_goblin.exe. Reason: Executable file trigger & suspicious digital-goblin checksum.",
+      "created_at": "2026-06-07T19:17:23.075Z"
+    }
+  ]
+}

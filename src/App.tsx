@@ -343,6 +343,7 @@ export default function App() {
               >
                 <UserDashboard 
                   user={user}
+                  token={token}
                   quotas={quotas}
                   onLogout={handleLogout}
                   onTriggerRefreshUser={handleRefreshUser}
