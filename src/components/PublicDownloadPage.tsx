@@ -79,25 +79,24 @@ export default function PublicDownloadPage({ token, onGoHome }: PublicDownloadPa
         body: JSON.stringify({ password })
       });
 
-      const data = await res.json();
       if (!res.ok) {
+        const data = await res.json().catch(() => ({ error: 'Download failed.' }));
         throw new Error(data.error || 'Vault decryption failed. Double check your credentials.');
       }
 
-      // Convert Base64 payload back to direct blob stream
-      const decodedBytes = atob(data.content);
-      const byteNumbers = new Array(decodedBytes.length);
-      for (let i = 0; i < decodedBytes.length; i++) {
-        byteNumbers[i] = decodedBytes.charCodeAt(i);
-      }
-      const byteArray = new Uint8Array(byteNumbers);
-      const blob = new Blob([byteArray], { type: data.mime_type || 'application/octet-stream' });
+      // Streaming binary response — read as blob directly
+      const blob = await res.blob();
       
-      // Creating virtual trigger anchor to fetch browser grab
+      // Derive filename from Content-Disposition or fallback
+      const disposition = res.headers.get('Content-Disposition') || '';
+      const filenameMatch = disposition.match(/filename="(.+?)"/);
+      const downloadName = filenameMatch ? filenameMatch[1] : (meta?.file_name || 'secured_leek_file.bin');
+
+      // Trigger browser download
       const objUrl = URL.createObjectURL(blob);
       const tempAnchor = document.createElement('a');
       tempAnchor.href = objUrl;
-      tempAnchor.download = data.original_name || 'secured_leek_file.bin';
+      tempAnchor.download = downloadName;
       document.body.appendChild(tempAnchor);
       tempAnchor.click();
       document.body.removeChild(tempAnchor);

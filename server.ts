@@ -25,11 +25,11 @@ import si from 'systeminformation';
 
 import { getPool, closePool, getRequest } from './src/lib/database.js';
 import {
-  encryptFile, decryptFile, wrapKey, unwrapKey,
+  encryptFile, wrapKey, unwrapKey,
   encryptFileStream, decryptFileStream, computeFileChecksum,
   encryptColumn, decryptColumn, hashColumnForLookup,
   hashPassword, verifyPassword, hashSharePassword, verifySharePassword,
-  generateSecureToken, computeChecksum, validateEncryptionConfig,
+  generateSecureToken, validateEncryptionConfig,
 } from './src/lib/encryption.js';
 import { scanFileBuffer, scanFilePath, heuristicPreScan } from './src/lib/scanner.js';
 import {
@@ -1185,22 +1185,33 @@ app.get('/api/files/:id/download', authenticateUser as express.RequestHandler, a
     );
     if (!keyRes.recordset.length) return res.status(500).json({ error: 'Encryption key not found.' });
 
-    const encBytes = fs.readFileSync(vaultPath);
     const keyRow = keyRes.recordset[0];
     const fileKey = unwrapKey(keyRow.encrypted_key, keyRow.key_iv, keyRow.key_auth_tag);
-    const plainBytes = decryptFile(encBytes, fileKey, keyRow.file_iv, keyRow.file_auth_tag);
 
-    if (computeChecksum(plainBytes) !== file.checksum_sha256)
+    // ── Streaming decrypt to temp file (avoids 2 GiB Buffer limit) ──
+    const tempPath = path.join(os.tmpdir(), `leeku-dl-${fileId}-${Date.now()}.tmp`);
+    await decryptFileStream(vaultPath, tempPath, fileKey, keyRow.file_iv, keyRow.file_auth_tag);
+
+    // Verify checksum via streaming (constant memory)
+    const actualChecksum = await computeFileChecksum(tempPath);
+    if (actualChecksum !== file.checksum_sha256) {
+      try { fs.unlinkSync(tempPath); } catch {}
       return res.status(500).json({ error: 'File integrity check failed.' });
+    }
 
     const originalName = decryptColumn(file.original_name_encrypted, file.original_name_iv, file.original_name_auth_tag);
     const safeName = originalName.replace(/"/g, '\\"');
+    const stat = fs.statSync(tempPath);
 
     res.setHeader('Content-Type', file.mime_type || 'application/octet-stream');
     res.setHeader('Content-Disposition', `attachment; filename="${safeName}"`);
-    res.setHeader('Content-Length', plainBytes.length.toString());
+    res.setHeader('Content-Length', stat.size.toString());
     await logSystemEvent(req.userId!, req.user!.username, 'Download', 'File', fileId, req, `Direct download of "${originalName}".`);
-    res.send(plainBytes);
+
+    const readStream = fs.createReadStream(tempPath);
+    readStream.pipe(res);
+    readStream.on('end',  () => { try { fs.unlinkSync(tempPath); } catch {} });
+    readStream.on('error', () => { try { fs.unlinkSync(tempPath); } catch {} });
   } catch (err) { console.error('[GET /api/files/:id/download]', err); res.status(500).json({ error: 'Download failed.' }); }
 });
 
@@ -1354,21 +1365,36 @@ app.post('/api/public/share/:token/download', async (req, res) => {
     const vaultPath = path.join(FILE_VAULT, row.stored_path);
     if (!fs.existsSync(vaultPath)) return res.status(410).json({ error: 'Vault file not found.' });
 
-    const encBytes  = fs.readFileSync(vaultPath);
+    // ── Streaming decrypt to temp file (avoids 2 GiB Buffer limit) ──
+    const tempPath = path.join(os.tmpdir(), `leeku-share-${token}-${Date.now()}.tmp`);
     const fileKey   = unwrapKey(row.encrypted_key, row.key_iv, row.key_auth_tag);
-    const plainBytes= decryptFile(encBytes, fileKey, row.file_iv, row.file_auth_tag);
+    await decryptFileStream(vaultPath, tempPath, fileKey, row.file_iv, row.file_auth_tag);
 
-    if (computeChecksum(plainBytes) !== row.checksum_sha256)
+    // Verify checksum via streaming (constant memory)
+    const actualChecksum = await computeFileChecksum(tempPath);
+    if (actualChecksum !== row.checksum_sha256) {
+      try { fs.unlinkSync(tempPath); } catch {}
       return res.status(500).json({ error: 'File integrity check failed.' });
+    }
 
     const dlReq = await getRequest(); dlReq.input('id', sql.UniqueIdentifier, row.id);
     await dlReq.query('UPDATE share_links SET download_count=download_count+1 WHERE id=@id');
 
     const originalName = decryptColumn(row.original_name_encrypted, row.original_name_iv, row.original_name_auth_tag);
+    const safeName = originalName.replace(/"/g, '\\"');
+    const stat = fs.statSync(tempPath);
+
     await logSystemEvent(null, 'Anonymous', 'Download', 'File', row.file_id_join, req,
       `Anonymous download of "${originalName}" via token ${token}.`);
 
-    res.json({ original_name: originalName, mime_type: row.mime_type, content: plainBytes.toString('base64') });
+    res.setHeader('Content-Type', row.mime_type || 'application/octet-stream');
+    res.setHeader('Content-Disposition', `attachment; filename="${safeName}"`);
+    res.setHeader('Content-Length', stat.size.toString());
+
+    const readStream = fs.createReadStream(tempPath);
+    readStream.pipe(res);
+    readStream.on('end',   () => { try { fs.unlinkSync(tempPath); } catch {} });
+    readStream.on('error', () => { try { fs.unlinkSync(tempPath); } catch {} });
   } catch (err) { console.error('[POST /api/public/share/:token/download]', err); res.status(500).json({ error: 'Download failed.' }); }
 });
 
