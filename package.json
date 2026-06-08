@@ -4,7 +4,7 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "cross-env NODE_ENV=development tsx watch server.ts",
+    "dev": "cross-env NODE_ENV=development vite build && cross-env NODE_ENV=development tsx watch server.ts",
     "build": "cross-env NODE_ENV=production vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
     "preview": "cross-env NODE_ENV=production node dist/server.cjs",
     "start": "cross-env NODE_ENV=production node dist/server.cjs",

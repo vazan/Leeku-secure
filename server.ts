@@ -19,7 +19,6 @@ import path from 'path';
 import https from 'https';
 import { fileURLToPath } from 'url';
 import { execFileSync } from 'child_process';
-import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI } from '@google/genai';
 import sql from 'mssql';
 import si from 'systeminformation';
@@ -1381,15 +1380,10 @@ async function bootstrap() {
   // 4. Start expiry cleanup
   startExpiryCleanup(getExpiredFiles, markFilesExpired, logExpiredFile);
 
-  // 5. Vite (dev) or static (prod)
-  if (NODE_ENV !== 'production') {
-    const vite = await createViteServer({ server: { middlewareMode: true }, appType: 'spa' });
-    app.use(vite.middlewares);
-  } else {
-    const distPath = path.join(process.cwd(), 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (req, res) => res.sendFile(path.join(distPath, 'index.html')));
-  }
+  // 5. Static files & SPA fallback
+  const distPath = path.join(process.cwd(), 'dist');
+  app.use(express.static(distPath));
+  app.get('*', (req, res) => res.sendFile(path.join(distPath, 'index.html')));
 
   // 6. HTTP or HTTPS
   const sslEnabled = process.env.SSL_ENABLED === 'true';
