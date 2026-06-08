@@ -144,23 +144,7 @@ export default function LandingPage({ onGoToAuth, quotas, onSetView }: LandingPa
       </div>
 
       {/* Core Features Section */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-8 mb-16">
-        <motion.div 
-          className="bg-[#1A1F26]/80 border-2 border-[#00F2FF] p-6 relative"
-          whileHover={{ y: -4 }}
-        >
-          <div className="absolute top-0 right-0 bg-[#00F2FF] text-[#0A0E14] px-2 py-0.5 text-[9px] font-mono font-black uppercase">
-            CATBOX_VIBE
-          </div>
-          <div className="w-12 h-12 bg-[#00F2FF]/10 text-[#00F2FF] border border-[#00F2FF]/40 rounded-none flex items-center justify-center mb-4">
-            <Upload className="w-6 h-6" id="feat-upload-logo" />
-          </div>
-          <h3 className="font-display font-black text-xl italic uppercase text-white mb-2">Simplicity of Catbox</h3>
-          <p className="text-gray-300 text-sm leading-relaxed">
-            Quick drag-and-drop file transfers with dynamic generation of short, neat share URLs. Download back anytime.
-          </p>
-        </motion.div>
-
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-8 mb-16 max-w-3xl mx-auto">
         <motion.div 
           className="bg-[#1A1F26]/80 border-2 border-[#FF007F] p-6 relative"
           whileHover={{ y: -4 }}
