@@ -206,6 +206,7 @@ export default function App() {
           {/* Logo element */}
           <div 
             onClick={() => {
+              setCurrentView('landing');
               setLogoClicks(prev => {
                 const updated = prev + 1;
                 if (updated >= 10) {
@@ -243,27 +244,10 @@ export default function App() {
                 <span className="text-slate-300 text-xs hidden sm:inline-flex items-center gap-1.5 bg-[#1A1F26] px-3 py-1 border border-[#00F2FF]/40 rounded-none font-bold">
                   <span className="w-2 h-2 rounded-full bg-[#00FF00] animate-ping"></span>
                   <span>@{user.username.toUpperCase()}</span>
-                </span>
-                <button
-                  onClick={() => setCurrentView('dashboard')}
-                  className="px-4 py-1.5 border-2 border-[#00F2FF] text-[#00F2FF] font-bold skew-x-[-10deg] cursor-pointer hover:bg-[#00F2FF] hover:text-black transition-colors"
-                >
-                  <span className="inline-block skew-x-[10deg]">Workspace</span>
-                </button>
+                </span>                
               </div>
             ) : (
               <div className="flex items-center gap-2">
-                {currentView !== 'landing' && (
-                  <button 
-                    onClick={() => {
-                      window.location.hash = '';
-                      setCurrentView('landing');
-                    }}
-                    className="text-gray-400 hover:text-[#00F2FF] pr-2.5 transition-colors font-bold uppercase"
-                  >
-                    Home
-                  </button>
-                )}
                 {currentView !== 'auth' && (
                   <button
                     onClick={() => {
