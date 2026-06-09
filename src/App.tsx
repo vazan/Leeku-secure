@@ -145,8 +145,19 @@ export default function App() {
   };
 
   const handleLogout = async () => {
+    const csrfToken = document.cookie
+    .split('; ')
+    .find(row => row.startsWith('leeku_csrf='))
+    ?.split('=')[1];
+
     try {
-      await fetch('/api/auth/logout', { method: 'POST' });
+      await fetch('/api/auth/logout', { 
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-CSRF-Token': csrfToken || ''
+        }
+      });
     } catch {
       // Best effort; local state is still cleared.
     }
