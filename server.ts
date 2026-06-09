@@ -61,11 +61,117 @@ const GEMINI_API_KEY     = process.env.GEMINI_API_KEY;
 const JWT_EXPIRY         = parseInt(process.env.JWT_ACCESS_EXPIRY_SECONDS || '900', 10);
 const JWT_ISSUER         = process.env.JWT_ISSUER   || APP_URL;
 const JWT_AUDIENCE       = process.env.JWT_AUDIENCE || 'leeku-secure-api';
+const SESSION_COOKIE_NAME = process.env.SESSION_COOKIE_NAME || 'leeku_session';
+const CSRF_COOKIE_NAME    = process.env.CSRF_COOKIE_NAME || 'leeku_csrf';
 
 function getJwtSecret(): string {
   const raw = process.env.COOKIE_SECRET_BASE64;
   if (!raw) throw new Error('[server] COOKIE_SECRET_BASE64 must be set in .env');
   return raw;
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function getSessionCookieOptions(): express.CookieOptions {
+  return {
+    httpOnly: true,
+    secure: NODE_ENV === 'production',
+    sameSite: 'lax',
+    path: '/',
+    maxAge: JWT_EXPIRY * 1000,
+  };
+}
+
+function setAuthCookie(res: express.Response, token: string): void {
+  res.cookie(SESSION_COOKIE_NAME, token, getSessionCookieOptions());
+  res.cookie(CSRF_COOKIE_NAME, generateSecureToken(24), {
+    httpOnly: false,
+    secure: NODE_ENV === 'production',
+    sameSite: 'lax',
+    path: '/',
+    maxAge: JWT_EXPIRY * 1000,
+  });
+}
+
+function clearAuthCookie(res: express.Response): void {
+  res.clearCookie(SESSION_COOKIE_NAME, {
+    httpOnly: true,
+    secure: NODE_ENV === 'production',
+    sameSite: 'lax',
+    path: '/',
+  });
+  res.clearCookie(CSRF_COOKIE_NAME, {
+    httpOnly: false,
+    secure: NODE_ENV === 'production',
+    sameSite: 'lax',
+    path: '/',
+  });
+}
+
+function getCookieValue(req: express.Request, cookieName: string): string {
+  const raw = req.headers.cookie || '';
+  if (!raw) return '';
+  const parts = raw.split(';');
+  for (const part of parts) {
+    const [k, ...rest] = part.trim().split('=');
+    if (k === cookieName) {
+      return decodeURIComponent(rest.join('='));
+    }
+  }
+  return '';
+}
+
+function getOrCreateCsrfToken(req: express.Request, res: express.Response): string {
+  const existing = getCookieValue(req, CSRF_COOKIE_NAME);
+  if (existing) return existing;
+  const token = generateSecureToken(24);
+  res.cookie(CSRF_COOKIE_NAME, token, {
+    httpOnly: false,
+    secure: NODE_ENV === 'production',
+    sameSite: 'lax',
+    path: '/',
+    maxAge: JWT_EXPIRY * 1000,
+  });
+  return token;
+}
+
+function requireCsrfForCookieSession(req: express.Request, res: express.Response, next: express.NextFunction): void {
+  if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') {
+    next();
+    return;
+  }
+
+  const sessionCookie = getCookieValue(req, SESSION_COOKIE_NAME);
+  if (!sessionCookie) {
+    next();
+    return;
+  }
+
+  const authHeader = String(req.headers['authorization'] || '');
+  if (/^Bearer\s+/i.test(authHeader)) {
+    next();
+    return;
+  }
+
+  const csrfCookie = getCookieValue(req, CSRF_COOKIE_NAME);
+  const csrfHeader = req.headers['x-csrf-token'];
+  const csrfHeaderValue = Array.isArray(csrfHeader) ? csrfHeader[0] : (csrfHeader || '');
+  const csrfBodyValue = typeof req.body?._csrf === 'string' ? req.body._csrf : '';
+  const provided = String(csrfHeaderValue || csrfBodyValue || '');
+
+  if (!csrfCookie || !provided || provided !== csrfCookie) {
+    res.status(403).json({ error: 'CSRF validation failed.' });
+    return;
+  }
+
+  next();
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -176,6 +282,7 @@ app.use(iisLoggingMiddleware);
 const uploadBodyLimitMb = parseInt(process.env.MAX_UPLOAD_BODY_MB || '1', 10);
 app.use(express.json({ limit: `${uploadBodyLimitMb}mb` }));
 app.use(express.urlencoded({ limit: `${uploadBodyLimitMb}mb`, extended: true }));
+app.use('/api', requireCsrfForCookieSession);
 
 const authLimiter = rateLimit({
   windowMs: 60_000,
@@ -324,20 +431,38 @@ function mapLogRow(row: LogRow): SystemLog {
 interface AuthenticatedRequest extends express.Request {
   user?: User;
   userId?: string;
+  authToken?: string;
 }
 
 async function authenticateUser(
   req: AuthenticatedRequest, res: express.Response, next: express.NextFunction
 ): Promise<void> {
   const authHeader = req.headers['authorization'];
-  let token = '';
-  if (authHeader?.startsWith('Bearer ')) token = authHeader.substring(7).trim();
-  else if (req.headers['x-leek-token'])  token = String(req.headers['x-leek-token']).trim();
+  const bearerToken = authHeader?.startsWith('Bearer ') ? authHeader.substring(7).trim() : '';
+  const altHeaderToken = req.headers['x-leek-token'] ? String(req.headers['x-leek-token']).trim() : '';
+  const cookieToken = getCookieValue(req, SESSION_COOKIE_NAME);
 
-  if (!token) { res.status(401).json({ error: 'Auth credentials missing. Please log in first.' }); return; }
+  const candidates = [bearerToken, altHeaderToken, cookieToken].filter(Boolean);
+  if (!candidates.length) {
+    res.status(401).json({ error: 'Auth credentials missing. Please log in first.' });
+    return;
+  }
 
-  const payload = verifyToken(token);
-  if (!payload) { res.status(401).json({ error: 'Invalid or expired session token.' }); return; }
+  let payload: JwtPayload | null = null;
+  let selectedToken = '';
+  for (const t of candidates) {
+    const decoded = verifyToken(t);
+    if (decoded) {
+      payload = decoded;
+      selectedToken = t;
+      break;
+    }
+  }
+
+  if (!payload) {
+    res.status(401).json({ error: 'Invalid or expired session token.' });
+    return;
+  }
 
   try {
     const request = await getRequest();
@@ -352,6 +477,7 @@ async function authenticateUser(
     if (!result.recordset.length) { res.status(401).json({ error: 'Account not found or suspended.' }); return; }
     req.user   = mapUserRow(result.recordset[0]);
     req.userId = payload.sub;
+    req.authToken = selectedToken;
     next();
   } catch (err) {
     console.error('[auth] DB error:', err);
@@ -413,7 +539,7 @@ app.get('/api/quotas', async (req, res) => {
   } catch (err) { console.error('[GET /api/quotas]', err); res.status(500).json({ error: 'Failed to load quotas.' }); }
 });
 
-app.get('/api/stats', async (req, res) => {
+app.get('/api/stats', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, async (req, res) => {
   try {
     const r1 = await getRequest();
     const stats = await r1.query<{ totalUsers: number; totalFiles: number; storageUsedBytes: number; uploadsToday: number; blockedFiles: number }>(
@@ -546,6 +672,7 @@ app.post('/api/auth/register', async (req, res) => {
     } else {
       // Dev mode — auto-verified, log them in
       const token = signToken(user.id, user.role);
+      setAuthCookie(res, token);
       res.json({ token, user });
     }
   } catch (err) { console.error('[POST /api/auth/register]', err); res.status(500).json({ error: 'Registration failed.' }); }
@@ -604,6 +731,9 @@ app.get('/api/auth/verify-email', async (req, res) => {
 function renderVerificationPage(success: boolean, message: string): string {
   const color = success ? '#00F2FF' : '#FF007F';
   const title = success ? 'VERIFICATION SUCCESSFUL' : 'VERIFICATION FAILED';
+  const safeTitle = escapeHtml(title);
+  const safeMessage = escapeHtml(message);
+  const safeAppUrl = escapeHtml(APP_URL);
   return `<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="UTF-8"><title>Leeku Secure — Email Verification</title>
@@ -613,7 +743,7 @@ h1{color:${color};font-size:20px;text-transform:uppercase;letter-spacing:2px;mar
 p{font-size:13px;line-height:1.6;margin:0 0 24px}
 a{display:inline-block;background:#FF007F;color:#fff;padding:12px 28px;font-weight:900;text-transform:uppercase;text-decoration:none;font-size:12px;border:2px solid #00F2FF}
 </style></head>
-<body><div class="card"><h1>${title}</h1><p>${message}</p><a href="${APP_URL}">GO TO LOGIN</a></div></body></html>`;
+<body><div class="card"><h1>${safeTitle}</h1><p>${safeMessage}</p><a href="${safeAppUrl}">GO TO LOGIN</a></div></body></html>`;
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -678,6 +808,7 @@ app.post('/api/auth/login', async (req, res) => {
 
     const user  = mapUserRow(row);
     const token = signToken(user.id, user.role);
+    setAuthCookie(res, token);
     await logSystemEvent(user.id, user.username, 'Auth', 'User', user.id, req, 'User logged in.');
     res.json({ token, user });
   } catch (err) { console.error('[POST /api/auth/login]', err); res.status(500).json({ error: 'Login service unavailable.' }); }
@@ -688,7 +819,18 @@ app.post('/api/auth/login', async (req, res) => {
 // ──────────────────────────────────────────────────────────────
 
 app.get('/api/auth/me', authenticateUser as express.RequestHandler, (req: AuthenticatedRequest, res) => {
-  res.json({ user: req.user });
+  const csrfToken = getOrCreateCsrfToken(req, res);
+  res.json({ user: req.user, csrfToken });
+});
+
+app.get('/api/auth/csrf', (req, res) => {
+  const csrfToken = getOrCreateCsrfToken(req, res);
+  res.json({ csrfToken });
+});
+
+app.post('/api/auth/logout', (req, res) => {
+  clearAuthCookie(res);
+  res.json({ success: true });
 });
 
 app.post('/api/users/me/update', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
@@ -832,6 +974,45 @@ app.get('/api/users/me/delete-confirm', async (req, res) => {
       return res.status(400).send(renderDeletionPage(false, 'Deletion confirmation token has expired. Please request a new one from your account settings.'));
     }
 
+    const csrfToken = getOrCreateCsrfToken(req, res);
+    res.send(renderDeletionConfirmPage(token, csrfToken));
+  } catch (err) {
+    console.error('[GET /api/users/me/delete-confirm]', err);
+    res.status(500).send(renderDeletionPage(false, 'Account deletion confirmation failed due to a server error.'));
+  }
+});
+
+app.post('/api/users/me/delete-confirm', async (req, res) => {
+  const { token } = req.body;
+  if (!token || typeof token !== 'string') {
+    return res.status(400).send(renderDeletionPage(false, 'Missing deletion confirmation token.'));
+  }
+
+  try {
+    const request = await getRequest();
+    request.input('tok', sql.Char(64), token);
+    const result = await request.query<UserRow>(
+      `SELECT id, email_encrypted, email_iv, email_auth_tag,
+              username_encrypted, username_iv, username_auth_tag,
+              role, quota_id, storage_used_bytes, status, created_at,
+              failed_login_count, locked_until, deletion_token, deletion_token_expires
+       FROM users WHERE deletion_token = @tok`
+    );
+
+    if (!result.recordset.length) {
+      return res.status(400).send(renderDeletionPage(false, 'Invalid or already-used deletion token.'));
+    }
+
+    const row = result.recordset[0];
+
+    if (row.deletion_token_expires && new Date(row.deletion_token_expires) < new Date()) {
+      // Clean up expired token
+      const clReq = await getRequest();
+      clReq.input('id', sql.UniqueIdentifier, row.id);
+      await clReq.query(`UPDATE users SET deletion_token=NULL, deletion_token_expires=NULL WHERE id=@id`);
+      return res.status(400).send(renderDeletionPage(false, 'Deletion confirmation token has expired. Please request a new one from your account settings.'));
+    }
+
     const username = decryptColumn(row.username_encrypted, row.username_iv, row.username_auth_tag);
     const email = decryptColumn(row.email_encrypted, row.email_iv, row.email_auth_tag);
 
@@ -870,10 +1051,35 @@ app.get('/api/users/me/delete-confirm', async (req, res) => {
     console.log(`[account-deletion] User "${username}" (${email}) and all associated data permanently deleted.`);
     res.send(renderDeletionPage(true, `Your account (${username}) and all associated files have been permanently deleted. Goodbye!`));
   } catch (err) {
-    console.error('[GET /api/users/me/delete-confirm]', err);
+    console.error('[POST /api/users/me/delete-confirm]', err);
     res.status(500).send(renderDeletionPage(false, 'Account deletion failed due to a server error.'));
   }
 });
+
+function renderDeletionConfirmPage(token: string, csrfToken: string): string {
+  const safeToken = escapeHtml(token);
+  const safeCsrfToken = escapeHtml(csrfToken);
+  return `<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Leeku Secure — Confirm Account Deletion</title>
+<style>body{background:#0A0E14;color:#ccc;font-family:monospace;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+.card{max-width:520px;padding:40px;border:3px solid #FF007F;text-align:center;background:#0F1419}
+h1{color:#FF007F;font-size:20px;text-transform:uppercase;letter-spacing:2px;margin:0 0 16px}
+p{font-size:13px;line-height:1.6;margin:0 0 24px}
+button{display:inline-block;background:#FF007F;color:#fff;padding:12px 28px;font-weight:900;text-transform:uppercase;text-decoration:none;font-size:12px;border:2px solid #00F2FF;cursor:pointer}
+a{display:inline-block;color:#00F2FF;text-decoration:none;font-size:12px;margin-top:16px}
+</style></head>
+<body><div class="card">
+  <h1>CONFIRM ACCOUNT DELETION</h1>
+  <p>This action is permanent and will remove your account, files, share links, and encryption keys.</p>
+  <form method="POST" action="/api/users/me/delete-confirm">
+    <input type="hidden" name="token" value="${safeToken}" />
+    <input type="hidden" name="_csrf" value="${safeCsrfToken}" />
+    <button type="submit">Delete Account Permanently</button>
+  </form>
+  <a href="/">Cancel and return</a>
+</div></body></html>`;
+}
 
 /**
  * Renders a simple HTML page for the account deletion result.
@@ -881,6 +1087,8 @@ app.get('/api/users/me/delete-confirm', async (req, res) => {
 function renderDeletionPage(success: boolean, message: string): string {
   const color = success ? '#00F2FF' : '#FF007F';
   const title = success ? 'ACCOUNT DELETED' : 'DELETION FAILED';
+  const safeTitle = escapeHtml(title);
+  const safeMessage = escapeHtml(message);
   return `<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="UTF-8"><title>Leeku Secure — Account Deletion</title>
@@ -891,8 +1099,8 @@ p{font-size:13px;line-height:1.6;margin:0 0 24px}
 a{display:inline-block;background:#FF007F;color:#fff;padding:12px 28px;font-weight:900;text-transform:uppercase;text-decoration:none;font-size:12px;border:2px solid #00F2FF}
 </style></head>
 <body><div class="card">
-  <h1>${title}</h1>
-  <p>${message}</p>
+  <h1>${safeTitle}</h1>
+  <p>${safeMessage}</p>
   <a href="/">Return to Leeku Secure</a>
 </div></body></html>`;
 }
@@ -1013,7 +1221,7 @@ app.post('/api/files/upload', authenticateUser as express.RequestHandler, upload
     currentStage = 'bitdefender_scan';
     const scanResult = await scanFilePath(tempFilePath, size);
     console.info('[upload] Scan completed.', { userId: user.id, originalName: original_name, scanStatus: scanResult.status, scanDurationMs: scanResult.scanDurationMs });
-    if (!scanResult.clean && scanResult.status !== 'Unavailable') {
+    if (!scanResult.clean) {
       console.warn('[upload] Rejected by Bitdefender scan.', { userId: user.id, originalName: original_name, scanStatus: scanResult.status });
       const vibe = await generateLeekuVibe(original_name, false);
       await logSystemEvent(user.id, user.username, 'Scan', 'File', 'rejected', req, `AV block: "${original_name}" — ${scanResult.message}`);
@@ -1050,7 +1258,7 @@ app.post('/api/files/upload', authenticateUser as express.RequestHandler, upload
     fileReq.input('sz',     sql.BigInt,          size);
     fileReq.input('esz',    sql.BigInt,          encryptResult.encryptedSize);
     fileReq.input('chk',    sql.Char(64),        encryptResult.checksum);
-    fileReq.input('scan',   sql.NVarChar(20),    scanResult.status === 'Unavailable' ? null : scanResult.status);
+    fileReq.input('scan',   sql.NVarChar(20),    scanResult.status);
     fileReq.input('smsg',   sql.NVarChar(sql.MAX), scanResult.message);
     fileReq.input('vibe',   sql.NVarChar(500),   leekuVibe);
     fileReq.input('ttl',    sql.Int,             ttlH);

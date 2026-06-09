@@ -21,6 +21,8 @@
       ]
     },
     "allowImportingTsExtensions": true,
+    "noFallthroughCasesInSwitch": true,
+    "noImplicitOverride": true,
     "noEmit": true
   }
 }

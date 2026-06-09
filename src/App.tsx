@@ -17,7 +17,7 @@ import PublicDownloadPage from './components/PublicDownloadPage.js';
 export default function App() {
   // Session / Cred State  
   const [user, setUser] = useState<User | null>(null);
-  const [token, setToken] = useState<string | null>(null);
+  const [token, setToken] = useState<string>('');
   const [loading, setLoading] = useState(true);
 
   // Layout View States  
@@ -61,7 +61,7 @@ export default function App() {
     } else {
       setDownloadToken(null);
       // Fallback routes  
-      if (token) {
+      if (user) {
         setCurrentView('dashboard');
       } else {
         setCurrentView('landing');
@@ -82,23 +82,18 @@ export default function App() {
     }
   };
 
-  // Verify cached log profiles  
-  const verifySessionToken = async (cachedToken: string) => {
+  // Restore session from secure cookie  
+  const restoreSessionFromCookie = async () => {
     try {
-      const res = await fetch('/api/auth/me', {
-         headers: { 'Authorization': `Bearer ${cachedToken}` }
-      });
+      const res = await fetch('/api/auth/me');
       const data = await res.json();
       if (res.ok && data.user) {
         setUser(data.user);
-        setToken(cachedToken);
+        setToken('cookie');
         // If we are currently not visiting a file-share path directly, route to dashboard  
         if (!window.location.hash.startsWith('#f/')) {
           setCurrentView('dashboard');
         }
-      } else {
-        // Stale credential purge  
-        localStorage.removeItem('leeks_session_token');
       }
     } catch (e) {
       console.error('Connection failure during credentials validations.', e);
@@ -109,13 +104,7 @@ export default function App() {
 
   useEffect(() => {
     fetchQuotas();
-
-    const cached = localStorage.getItem('leeks_session_token');
-    if (cached) {
-      verifySessionToken(cached);
-    } else {
-      setLoading(false);
-    }
+    restoreSessionFromCookie();
 
     // Set listener and run once for initial deep-links checks  
     window.addEventListener('hashchange', handleHashChange);
@@ -128,10 +117,10 @@ export default function App() {
 
   // Sync user values if needed (quota capacity recalculations)  
   const handleRefreshUser = async () => {
-    if (!token) return;
+    if (!user) return;
     try {
       const res = await fetch('/api/auth/me', {
-        headers: { 'Authorization': `Bearer ${token}` }
+        headers: token ? { 'Authorization': `Bearer ${token}` } : undefined
       });
       const data = await res.json();
       if (res.ok && data.user) {
@@ -144,7 +133,6 @@ export default function App() {
 
   // Handle Log states  
   const handleAuthSuccess = (newToken: string, authedUser: User) => {
-    localStorage.setItem('leeks_session_token', newToken);
     setToken(newToken);
     setUser(authedUser);
     
@@ -156,9 +144,13 @@ export default function App() {
     }
   };
 
-  const handleLogout = () => {
-    localStorage.removeItem('leeks_session_token');
-    setToken(null);
+  const handleLogout = async () => {
+    try {
+      await fetch('/api/auth/logout', { method: 'POST' });
+    } catch {
+      // Best effort; local state is still cleared.
+    }
+    setToken('');
     setUser(null);
     window.location.hash = '';
     setCurrentView('landing');
@@ -227,7 +219,7 @@ export default function App() {
                 return updated;
               });
               window.location.hash = '';
-              setCurrentView(token ? 'dashboard' : 'landing');
+              setCurrentView(user ? 'dashboard' : 'landing');
             }}
             className="flex items-center gap-3 cursor-pointer group"
           >
@@ -246,7 +238,7 @@ export default function App() {
           <div className="flex items-center gap-4 text-xs font-mono">
             {loading ? (
               <span className="text-slate-500 animate-pulse">Syncing Crypt portals...</span>
-            ) : token && user ? (
+            ) : user ? (
               <div className="flex items-center gap-3">
                 <span className="text-slate-300 text-xs hidden sm:inline-flex items-center gap-1.5 bg-[#1A1F26] px-3 py-1 border border-[#00F2FF]/40 rounded-none font-bold">
                   <span className="w-2 h-2 rounded-full bg-[#00FF00] animate-ping"></span>
@@ -327,12 +319,12 @@ export default function App() {
                 <AuthPage 
                   initialMode={authMode}
                   onAuthSuccess={handleAuthSuccess}
-                  onCancel={() => setCurrentView(token ? 'dashboard' : 'landing')}
+                  onCancel={() => setCurrentView(user ? 'dashboard' : 'landing')}
                 />
               </motion.div>
             )}
 
-            {currentView === 'dashboard' && token && user && (
+            {currentView === 'dashboard' && user && (
               <motion.div
                 key="dashboard"
                 initial={{ opacity: 0, y: 15 }}
@@ -362,7 +354,7 @@ export default function App() {
                   token={downloadToken}
                   onGoHome={() => {
                     window.location.hash = '';
-                    setCurrentView(token ? 'dashboard' : 'landing');
+                    setCurrentView(user ? 'dashboard' : 'landing');
                   }}
                 />
               </motion.div>

@@ -166,7 +166,11 @@ function writeLogHeader(filePath: string): void {
       '',
     ].join('\r\n');
 
-    fs.appendFileSync(filePath, header, 'utf-8');
+    fs.appendFile(filePath, header, 'utf-8', (err) => {
+      if (err) {
+        console.error('[iis-logger] Failed to append log header:', err);
+      }
+    });
   } catch (err) {
     console.error('[iis-logger] Failed to write log header:', err);
   }
@@ -233,7 +237,11 @@ export function logRequest(ctx: IISLogContext): void {
     });
 
     const logLine = values.join(' ');
-    fs.appendFileSync(logFile, logLine + '\r\n', 'utf-8');
+    fs.appendFile(logFile, logLine + '\r\n', 'utf-8', (err) => {
+      if (err) {
+        console.error('[iis-logger] Failed to append request log:', err);
+      }
+    });
   } catch (err) {
     console.error('[iis-logger] Failed to write request log:', err);
   }
@@ -253,7 +261,6 @@ export function iisLoggingMiddleware(
   }
 
   const startTime = Date.now();
-  const username = (req as any).user?.username || '-';
 
   // Capture original response.end to log after headers are sent
   const originalEnd = res.end;
@@ -278,6 +285,7 @@ export function iisLoggingMiddleware(
     const clientIp = String(
       req.headers['x-forwarded-for'] || req.socket.remoteAddress || '127.0.0.1'
     ).split(',')[0].trim();
+    const username = (req as any).user?.username || '-';
 
     const userAgent = req.headers['user-agent'] || '';
     const requestBytes = req.get('content-length') ? parseInt(req.get('content-length')!, 10) : 0;

@@ -120,6 +120,15 @@ Set-Acl -Path $scannerPath -AclObject $acl
 | 3+ | `Error` | Engine error, permission denied, timeout issue — **file blocked** |
 | Timeout | `Timeout` | Scan exceeded `BITDEFENDER_TIMEOUT_MS` — **file blocked** |
 
+### 4. **Fail-Closed Security Policy (Current Implementation)**
+
+Leeku Secure currently uses a fail-closed upload policy:
+
+- `Clean` -> upload continues.
+- Any non-clean status (`Infected`, `Suspicious`, `Error`, `Timeout`, `Unavailable`) -> upload is rejected.
+
+This means scanner outages or misconfiguration do not allow uploads to bypass malware controls.
+
 ---
 
 ## Troubleshooting

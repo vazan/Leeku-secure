@@ -1,20 +1,106 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://ai.google.dev/static/site-assets/images/share-ais-513315318.png" />
-</div>
+# Leeku Secure
 
-# Run and deploy your AI Studio app
+Leeku Secure is a secure file-sharing platform with:
 
-This contains everything you need to run your app locally.
+- User/admin authentication with short-lived JWT access tokens
+- httpOnly session cookie support for browser session restore
+- Encrypted file storage (AES-256-GCM)
+- Per-file key wrapping and integrity checksum verification
+- Malware scanning pipeline with fail-closed upload policy
+- Sharing links with optional password protection and limits
+- IIS W3C logging integration and SQL-backed audit logs
 
-View your app in AI Studio: https://ai.studio/apps/55e3dc21-8fcc-43d3-bc1e-7c5d65b43c15
+## Requirements
 
-## Run Locally
+- Node.js 20+
+- SQL Server (configured through environment variables)
+- Optional: Bitdefender Endpoint Security Tools CLI for AV scanning
+- Optional: SMTP server for verification/deletion emails
 
-**Prerequisites:**  Node.js
+## Install
 
+```bash
+npm install
+```
 
-1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
+## Environment
+
+Create a `.env` file in the project root and configure at minimum:
+
+```env
+# App
+NODE_ENV=development
+PORT=3000
+APP_URL=http://localhost:3000
+ALLOWED_ORIGINS=http://localhost:3000
+
+# Crypto / auth
+MASTER_KEY_BASE64=<base64-32-bytes-or-more>
+COOKIE_SECRET_BASE64=<strong-jwt-secret>
+JWT_ACCESS_EXPIRY_SECONDS=900
+
+# SQL Server
+DB_SERVER=localhost
+DB_PORT=1433
+DB_NAME=LeekuSecure
+DB_USER=<db_user>
+DB_PASSWORD=<db_password>
+DB_ENCRYPT=false
+DB_TRUST_SERVER_CERTIFICATE=true
+
+# Storage
+FILE_STORAGE_UNC_PATH=<vault-path-or-local-folder>
+UPLOAD_TEMP_PATH=<local-temp-folder>
+
+# Optional AV
+BITDEFENDER_SCAN_CLI_PATH=<path-to-bdscan-or-product-console>
+BITDEFENDER_TIMEOUT_MS=30000
+FILE_SCAN_TEMP_PATH=C:\\LeekuTemp\\scan-staging
+
+# Optional SMTP
+SMTP_HOST=
+SMTP_PORT=587
+SMTP_USER=
+SMTP_PASSWORD=
+SMTP_SECURE=false
+```
+
+## Run
+
+Development:
+
+```bash
+npm run dev
+```
+
+Production build and start:
+
+```bash
+npm run build
+npm run start
+```
+
+Type check:
+
+```bash
+npm run lint
+```
+
+## Security Notes
+
+- Upload scanning is fail-closed: any non-clean AV result blocks upload.
+- Session cookie is httpOnly with SameSite=Lax and secure in production.
+- Browser localStorage persistence for auth tokens is removed from App flow.
+- Account deletion requires explicit POST confirmation step.
+
+## Operations
+
+- Main server entry: `server.ts`
+- Frontend app entry: `src/App.tsx`
+- Security/debt tracker: `Documentations/SECURITY_TECHNICAL_DEBT_ANALYSIS.md`
+- AV integration guide: `Documentations/BITDEFENDER_INTEGRATION.md`
+
+## Current Known Gaps
+
+- SQL documentation scripts are currently absent from `Documentations/SQL` in this workspace snapshot.
+- Session model is cookie-enabled but still supports bearer header compatibility during migration.
