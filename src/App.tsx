@@ -261,15 +261,30 @@ export default function App() {
               </div>
             ) : (
               <div className="flex items-center gap-2">
-                {currentView !== 'auth' && (
-                  <button
-                    onClick={() => {
-                      setAuthMode('login');
-                      setCurrentView('auth');
-                    }}
-                    className="border-2 border-[#00F2FF] text-[#00F2FF] bg-transparent px-8 py-4 font-black text-lg skew-x-[-12deg] shadow-[4px_4px_0px_#FF007F] hover:translate-x-1 hover:translate-y-1 hover:shadow-none transition-all cursor-pointer font-display inline-flex items-center gap-2 uppercase tracking-wide"
-                  >Sign In
-                  </button>
+                {/* If on the auth page, render nothing */}
+                {currentView === 'auth' ? null : (
+                  user ? (
+                    // Show Dashboard button (shows on download page or home if logged in)
+                    <button
+                      onClick={() => {
+                        setCurrentView('dashboard');
+                      }}
+                      className="border-2 border-[#00F2FF] text-[#00F2FF] bg-transparent px-8 py-4 font-black text-lg skew-x-[-12deg] shadow-[4px_4px_0px_#FF007F] hover:translate-x-1 hover:translate-y-1 hover:shadow-none transition-all cursor-pointer font-display inline-flex items-center gap-2 uppercase tracking-wide"
+                    >
+                      Dashboard
+                    </button>
+                  ) : (
+                    // Show Sign In button (shows if not logged in)
+                    <button
+                      onClick={() => {
+                        setAuthMode('login');
+                        setCurrentView('auth');
+                      }}
+                      className="border-2 border-[#00F2FF] text-[#00F2FF] bg-transparent px-8 py-4 font-black text-lg skew-x-[-12deg] shadow-[4px_4px_0px_#FF007F] hover:translate-x-1 hover:translate-y-1 hover:shadow-none transition-all cursor-pointer font-display inline-flex items-center gap-2 uppercase tracking-wide"
+                    >
+                      Sign In
+                    </button>
+                  )
                 )}
               </div>
             )}
