@@ -254,8 +254,10 @@ export default function App() {
               <div className="flex items-center gap-3">
                 <span className="text-slate-300 text-xs hidden sm:inline-flex items-center gap-1.5 bg-[#1A1F26] px-3 py-1 border border-[#00F2FF]/40 rounded-none font-bold">
                   <span className="w-2 h-2 rounded-full bg-[#00FF00] animate-ping"></span>
-                  <span>@{user.username.toUpperCase()}</span>
-                </span>                
+                  <button onClick={() => {
+                      setCurrentView('dashboard');
+                    }} >@{user.username.toUpperCase()}</button>
+                </span>             
               </div>
             ) : (
               <div className="flex items-center gap-2">
