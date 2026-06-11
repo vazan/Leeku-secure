@@ -263,6 +263,21 @@ export default function UserDashboard({
     } else notifyError(data.error || "Could not create the share link.");
   };
 
+  const unshareFile = async (link: ShareLink) => {
+    const file = files.find((item) => item.id === link.file_id);
+    const response = await fetch(`/api/files/${link.file_id}/share`, {
+      method: "POST",
+      headers: { ...authHeaders(token), "Content-Type": "application/json" },
+      body: JSON.stringify({ is_active: false }),
+    });
+    if (response.ok) {
+      notify(`Stopped sharing ${file?.original_name || "file"}.`);
+      await loadWorkspace();
+    } else {
+      notifyError("Could not unshare the file.");
+    }
+  };
+
   const saveProfile = async (event: React.FormEvent) => {
     event.preventDefault();
     const response = await fetch("/api/users/me/update", {
@@ -427,8 +442,8 @@ export default function UserDashboard({
 
         <div className="mx-auto max-w-7xl p-5 lg:p-8">
           {view === "home" && (
-            <div className="space-y-8">
-              <div>
+            <div className="mx-auto max-w-5xl space-y-8">
+              <div className="text-center">
                 <p className="text-sm text-[#858b94]">
                   Good to see you, {user.username}.
                 </p>
@@ -504,8 +519,8 @@ export default function UserDashboard({
           )}
 
           {view === "files" && (
-            <section>
-              <div className="mb-6">
+            <section className="mx-auto max-w-5xl">
+              <div className="mb-6 text-center">
                 <h1 className="text-2xl font-semibold tracking-[-0.03em]">
                   All files
                 </h1>
@@ -588,8 +603,8 @@ export default function UserDashboard({
           )}
 
           {view === "shared" && (
-            <section className="space-y-6">
-              <div>
+            <section className="mx-auto max-w-5xl space-y-6">
+              <div className="text-center">
                 <h1 className="text-2xl font-semibold tracking-[-0.03em]">
                   Shared links
                 </h1>
@@ -623,19 +638,31 @@ export default function UserDashboard({
                           : ""}{" "}
                         downloads
                       </p>
-                      <button
-                        onClick={() =>
-                          navigator.clipboard
-                            .writeText(
-                              `${window.location.origin}/#f/${link.public_token}`,
-                            )
-                            .then(() => notify("Link copied."))
-                        }
-                        className="mt-4 flex items-center gap-2 text-xs font-medium"
-                      >
-                        <Copy className="h-3.5 w-3.5" />
-                        Copy link
-                      </button>
+                      <div className="mt-4 flex flex-wrap gap-2">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            navigator.clipboard
+                              .writeText(
+                                `${window.location.origin}/#f/${link.public_token}`,
+                              )
+                              .then(() => notify("Link copied."))
+                          }
+                          className="flex cursor-pointer items-center gap-2 rounded-md px-2.5 py-2 text-xs font-medium text-[#737a84] hover:bg-[#f0f2f5] hover:text-[#20242a]"
+                        >
+                          <Copy className="h-3.5 w-3.5" />
+                          Copy link
+                        </button>
+                        <button
+                          type="button"
+                          disabled={!link.is_active}
+                          onClick={() => unshareFile(link)}
+                          className="flex cursor-pointer items-center gap-2 rounded-md px-2.5 py-2 text-xs font-medium text-red-600 hover:bg-[#f0f2f5] hover:text-red-700 disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          <X className="h-3.5 w-3.5" />
+                          Unshare
+                        </button>
+                      </div>
                     </div>
                   );
                 })}
