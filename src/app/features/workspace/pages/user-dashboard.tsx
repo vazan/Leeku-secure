@@ -960,6 +960,30 @@ function FileCard({
   onDelete: () => void;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
+  const menuRef = React.useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!menuOpen) return undefined;
+
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      if (
+        menuRef.current &&
+        !menuRef.current.contains(event.target as Node)
+      ) {
+        setMenuOpen(false);
+      }
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setMenuOpen(false);
+    };
+
+    document.addEventListener("pointerdown", closeOnOutsidePointer);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsidePointer);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [menuOpen]);
 
   return (
     <div className="rounded-xl border border-[#e0e4e9] bg-white p-4">
@@ -976,12 +1000,12 @@ function FileCard({
             iconClassName="h-8 w-8"
           />
         </button>
-        <div className="absolute right-2 top-2">
+        <div ref={menuRef} className="absolute right-2 top-2">
           <button
             aria-label="File options"
             aria-expanded={menuOpen}
             onClick={() => setMenuOpen((open) => !open)}
-            className="rounded-md p-2 text-[#8c929b] hover:bg-[#f2f4f6]"
+            className="rounded-md bg-[#20242a] p-2 text-[#c8cdd4] shadow-sm hover:bg-[#20242a] hover:text-[#e1e5ea]"
           >
             <MoreHorizontal className="h-4 w-4" />
           </button>
