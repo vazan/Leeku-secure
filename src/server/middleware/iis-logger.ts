@@ -262,22 +262,29 @@ export function iisLoggingMiddleware(
 
   const startTime = Date.now();
 
-  // Capture original response.end to log after headers are sent
-  const originalEnd = res.end;
   let responseBytes = 0;
 
   // Track response size by hooking write/end
-  const originalWrite = res.write;
-  res.write = function (...args: any[]): boolean {
-    if (args[0]) {
-      responseBytes += Buffer.byteLength(args[0]);
+  const originalWrite = res.write.bind(res);
+  res.write = function (
+    chunk: any,
+    encoding?: BufferEncoding | ((error: Error | null | undefined) => void),
+    callback?: (error: Error | null | undefined) => void
+  ): boolean {
+    if (chunk) {
+      responseBytes += Buffer.byteLength(chunk);
     }
-    return originalWrite.apply(res, args);
-  };
+    return originalWrite(chunk, encoding as BufferEncoding, callback);
+  } as express.Response['write'];
 
-  res.end = function (...args: any[]): express.Response {
-    if (args[0]) {
-      responseBytes += Buffer.byteLength(args[0]);
+  const originalEnd = res.end.bind(res);
+  res.end = function (
+    chunk?: any,
+    encoding?: BufferEncoding | (() => void),
+    callback?: () => void
+  ): express.Response {
+    if (chunk) {
+      responseBytes += Buffer.byteLength(chunk);
     }
 
     // Log the request
@@ -305,8 +312,8 @@ export function iisLoggingMiddleware(
       duration,
     });
 
-    return originalEnd.apply(res, args);
-  };
+    return originalEnd(chunk, encoding as BufferEncoding, callback);
+  } as express.Response['end'];
 
   next();
 }

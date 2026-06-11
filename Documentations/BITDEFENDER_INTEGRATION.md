@@ -129,6 +129,8 @@ Leeku Secure currently uses a fail-closed upload policy:
 
 This means scanner outages or misconfiguration do not allow uploads to bypass malware controls.
 
+Development exception: when `NODE_ENV=development`, an `Unavailable` scanner result is accepted after heuristic checks so local development works without Bitdefender installed. Set `ALLOW_UNSCANNED_UPLOADS_IN_DEVELOPMENT=false` to force production-style fail-closed behavior locally.
+
 ---
 
 ## Troubleshooting
@@ -142,6 +144,8 @@ This means scanner outages or misconfiguration do not allow uploads to bypass ma
 2. Find the actual path: `Get-ChildItem "C:\Program Files" -Recurse -Filter "bdscan.exe"`
 3. Set `BITDEFENDER_SCAN_CLI_PATH` explicitly in `.env`
 4. Restart the application
+
+For local development without Bitdefender, keep `NODE_ENV=development` and leave `ALLOW_UNSCANNED_UPLOADS_IN_DEVELOPMENT` unset or set to `true`. Do not use that development exception in production.
 
 ### Permission Denied on Scan
 

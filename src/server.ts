@@ -23,25 +23,25 @@ import { GoogleGenAI } from '@google/genai';
 import sql from 'mssql';
 import si from 'systeminformation';
 
-import { getPool, closePool, getRequest } from './src/lib/database.js';
+import { getPool, closePool, getRequest } from './server/db.js';
 import {
   encryptFile, wrapKey, unwrapKey,
   encryptFileStream, decryptFileStream, computeFileChecksum,
   encryptColumn, decryptColumn, hashColumnForLookup,
   hashPassword, verifyPassword, hashSharePassword, verifySharePassword,
   generateSecureToken, validateEncryptionConfig,
-} from './src/lib/encryption.js';
-import { scanFileBuffer, scanFilePath, heuristicPreScan } from './src/lib/scanner.js';
+} from './server/utils/encryption.js';
+import { scanFileBuffer, scanFilePath, heuristicPreScan } from './server/utils/scanner.js';
 import {
   startExpiryCleanup, stopExpiryCleanup,
   computeExpiresAt, isValidTtl,
   type ExpiredFileRecord,
-} from './src/lib/expiry-cleanup.js';
-import { sendVerificationEmail, sendAccountDeletionEmail, validateMxRecord, verifySmtpConnection } from './src/lib/email.js';
+} from './server/utils/expiry-cleanup.js';
+import { sendVerificationEmail, sendAccountDeletionEmail, validateMxRecord, verifySmtpConnection } from './server/utils/email.js';
 import multer from 'multer';
 import os from 'os';
-import { iisLoggingMiddleware, validateIISLoggingConfig } from './src/lib/iis-logger.js';
-import type { Quota, User, FileMetadata, ShareLink, SystemLog, SystemStats } from './src/types.js';
+import { iisLoggingMiddleware, validateIISLoggingConfig } from './server/middleware/iis-logger.js';
+import type { Quota, User, FileMetadata, ShareLink, SystemLog, SystemStats } from './app/shared/types/index.js';
 
 // ──────────────────────────────────────────────────────────────
 // Constants from environment
@@ -52,6 +52,7 @@ const APP_URL            = process.env.APP_URL || `http://localhost:${PORT}`;
 const NODE_ENV           = process.env.NODE_ENV || 'development';
 const FILE_VAULT         = process.env.FILE_STORAGE_UNC_PATH || path.join(process.cwd(), 'vault');
 const UPLOAD_TEMP        = process.env.UPLOAD_TEMP_PATH || path.join(os.tmpdir(), 'leeku-uploads');
+const PROFILE_PICTURE_PATH = process.env.PROFILE_PICTURE_PATH || path.join(FILE_VAULT, 'users');
 const MAX_LOG_ENTRIES    = parseInt(process.env.MAX_LOG_ENTRIES || '500', 10);
 const MAX_LOGIN_ATTEMPTS = parseInt(process.env.MAX_LOGIN_ATTEMPTS || '5', 10);
 const LOCKOUT_DURATION_MS= parseInt(process.env.LOCKOUT_DURATION_MINUTES || '15', 10) * 60_000;
@@ -63,6 +64,8 @@ const JWT_ISSUER         = process.env.JWT_ISSUER   || APP_URL;
 const JWT_AUDIENCE       = process.env.JWT_AUDIENCE || 'leeku-secure-api';
 const SESSION_COOKIE_NAME = process.env.SESSION_COOKIE_NAME || 'leeku_session';
 const CSRF_COOKIE_NAME    = process.env.CSRF_COOKIE_NAME || 'leeku_csrf';
+const ALLOW_UNSCANNED_UPLOADS_IN_DEVELOPMENT =
+  NODE_ENV === 'development' && process.env.ALLOW_UNSCANNED_UPLOADS_IN_DEVELOPMENT !== 'false';
 
 function getJwtSecret(): string {
   const raw = process.env.COOKIE_SECRET_BASE64;
@@ -211,6 +214,37 @@ if (process.env.STORAGE_NET_USE_PATH) {
 if (!FILE_VAULT.startsWith('\\\\') && !fs.existsSync(FILE_VAULT)) {
   fs.mkdirSync(FILE_VAULT, { recursive: true });
   console.log(`[server] Created local vault directory: ${FILE_VAULT}`);
+}
+
+if (!fs.existsSync(PROFILE_PICTURE_PATH)) {
+  fs.mkdirSync(PROFILE_PICTURE_PATH, { recursive: true });
+  console.log(`[server] Created profile picture directory: ${PROFILE_PICTURE_PATH}`);
+}
+
+function detectProfilePictureMime(buffer: Buffer): 'image/jpeg' | 'image/png' | 'image/webp' | null {
+  if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return 'image/jpeg';
+  if (buffer.length >= 8 && buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return 'image/png';
+  if (buffer.length >= 12 && buffer.subarray(0, 4).toString('ascii') === 'RIFF' && buffer.subarray(8, 12).toString('ascii') === 'WEBP') return 'image/webp';
+  return null;
+}
+
+function getProfilePictureDirectory(userId: string): string {
+  return path.join(PROFILE_PICTURE_PATH, userId, 'avatars');
+}
+
+function getProfilePictureFiles(userId: string): string[] {
+  const directory = getProfilePictureDirectory(userId);
+  if (!fs.existsSync(directory)) return [];
+  return fs.readdirSync(directory)
+    .map((name) => path.join(directory, name))
+    .filter((filePath) => fs.statSync(filePath).isFile())
+    .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+}
+
+function getProfilePictureExtension(mimeType: 'image/jpeg' | 'image/png' | 'image/webp'): string {
+  if (mimeType === 'image/jpeg') return 'jpg';
+  if (mimeType === 'image/png') return 'png';
+  return 'webp';
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -556,12 +590,15 @@ app.get('/api/stats', authenticateUser as express.RequestHandler, verifyAdmin as
     );
     const s = stats.recordset[0];
     // Get real Windows Server system stats
-    const [cpuData, memData, diskData, osData] = await Promise.all([
+    const [cpuData, memData, diskData] = await Promise.all([
       si.currentLoad().catch(() => null),
       si.mem().catch(() => null),
       si.fsSize().catch(() => null),
-      si.osInfo().catch(() => null),
     ]);
+    let uptimeSeconds = 0;
+    try {
+      uptimeSeconds = Math.round(si.time().uptime || 0);
+    } catch {}
 
     const systemStats: SystemStats = {
       ...s,
@@ -573,7 +610,7 @@ app.get('/api/stats', authenticateUser as express.RequestHandler, verifyAdmin as
       diskUsagePercent: diskData && diskData[0] ? Math.round(((diskData[0].used || 0) / (diskData[0].size || 1)) * 100) : 0,
       diskUsedGB: diskData && diskData[0] ? Math.round((diskData[0].used || 0) / 1024 / 1024 / 1024) : 0,
       diskTotalGB: diskData && diskData[0] ? Math.round((diskData[0].size || 0) / 1024 / 1024 / 1024) : 0,
-      uptime: osData ? Math.round(osData.uptime || 0) : 0,
+      uptime: uptimeSeconds,
     };
     res.json(systemStats);
   } catch (err) { console.error('[GET /api/stats]', err); res.status(500).json({ error: 'Failed to compute stats.' }); }
@@ -883,6 +920,63 @@ app.post('/api/users/me/update', authenticateUser as express.RequestHandler, asy
     await logSystemEvent(userId, user.username, 'Auth', 'User', userId, req, 'Updated account details.');
     res.json({ success: true, user });
   } catch (err) { console.error('[POST /api/users/me/update]', err); res.status(500).json({ error: 'Failed to update account.' }); }
+});
+
+const profilePictureUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { files: 1, fileSize: 5 * 1024 * 1024 },
+});
+
+app.get('/api/users/me/avatar', authenticateUser as express.RequestHandler, (req: AuthenticatedRequest, res) => {
+  try {
+    const avatarPath = getProfilePictureFiles(req.userId!)[0];
+    if (!avatarPath) return res.status(404).end();
+    const picture = fs.readFileSync(avatarPath);
+    const mimeType = detectProfilePictureMime(picture);
+    if (!mimeType) return res.status(404).end();
+    res.setHeader('Content-Type', mimeType);
+    res.setHeader('Cache-Control', 'private, no-cache');
+    res.send(picture);
+  } catch (err) {
+    console.error('[GET /api/users/me/avatar]', err);
+    res.status(500).json({ error: 'Could not load profile picture.' });
+  }
+});
+
+app.post('/api/users/me/avatar', authenticateUser as express.RequestHandler, profilePictureUpload.single('avatar'), async (req: AuthenticatedRequest, res) => {
+  if (!req.file) return res.status(400).json({ error: 'Choose a profile picture to upload.' });
+  const mimeType = detectProfilePictureMime(req.file.buffer);
+  if (!mimeType) return res.status(400).json({ error: 'Profile pictures must be PNG, JPEG, or WebP.' });
+
+  try {
+    const directory = getProfilePictureDirectory(req.userId!);
+    fs.mkdirSync(directory, { recursive: true });
+    const extension = getProfilePictureExtension(mimeType);
+    const filename = `${Date.now()}-${generateSecureToken(8)}.${extension}`;
+    fs.writeFileSync(path.join(directory, filename), req.file.buffer);
+
+    for (const oldPicture of getProfilePictureFiles(req.userId!).slice(10)) {
+      fs.unlinkSync(oldPicture);
+    }
+
+    await logSystemEvent(req.userId!, req.user!.username, 'Auth', 'User', req.userId!, req, 'Updated profile picture.');
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[POST /api/users/me/avatar]', err);
+    res.status(500).json({ error: 'Could not save profile picture.' });
+  }
+});
+
+app.delete('/api/users/me/avatar', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  try {
+    const directory = getProfilePictureDirectory(req.userId!);
+    if (fs.existsSync(directory)) fs.rmSync(directory, { recursive: true, force: true });
+    await logSystemEvent(req.userId!, req.user!.username, 'Auth', 'User', req.userId!, req, 'Removed profile picture.');
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[DELETE /api/users/me/avatar]', err);
+    res.status(500).json({ error: 'Could not remove profile picture.' });
+  }
 });
 
 // ──────────────────────────────────────────────────────────────
@@ -1221,12 +1315,25 @@ app.post('/api/files/upload', authenticateUser as express.RequestHandler, upload
     currentStage = 'bitdefender_scan';
     const scanResult = await scanFilePath(tempFilePath, size);
     console.info('[upload] Scan completed.', { userId: user.id, originalName: original_name, scanStatus: scanResult.status, scanDurationMs: scanResult.scanDurationMs });
-    if (!scanResult.clean) {
+    const acceptedWithoutScanner =
+      scanResult.status === 'Unavailable' && ALLOW_UNSCANNED_UPLOADS_IN_DEVELOPMENT;
+
+    if (!scanResult.clean && !acceptedWithoutScanner) {
       console.warn('[upload] Rejected by Bitdefender scan.', { userId: user.id, originalName: original_name, scanStatus: scanResult.status });
       const vibe = await generateLeekuVibe(original_name, false);
       await logSystemEvent(user.id, user.username, 'Scan', 'File', 'rejected', req, `AV block: "${original_name}" — ${scanResult.message}`);
       return cleanupAndRespond(res, tempFilePath, 422, vibe || scanResult.message);
     }
+    if (acceptedWithoutScanner) {
+      console.warn('[upload] Bitdefender unavailable; accepting upload because NODE_ENV=development.', {
+        userId: user.id,
+        originalName: original_name,
+      });
+    }
+    const persistedScanResult = acceptedWithoutScanner ? 'Clean' : scanResult.status;
+    const persistedScanMessage = acceptedWithoutScanner
+      ? `Development bypass: Bitdefender scanner unavailable; file was not scanned. ${scanResult.message}`
+      : scanResult.message;
 
     // ── Stream-encrypt directly to vault (constant memory) ─────
     currentStage = 'encrypt_file';
@@ -1258,8 +1365,8 @@ app.post('/api/files/upload', authenticateUser as express.RequestHandler, upload
     fileReq.input('sz',     sql.BigInt,          size);
     fileReq.input('esz',    sql.BigInt,          encryptResult.encryptedSize);
     fileReq.input('chk',    sql.Char(64),        encryptResult.checksum);
-    fileReq.input('scan',   sql.NVarChar(20),    scanResult.status);
-    fileReq.input('smsg',   sql.NVarChar(sql.MAX), scanResult.message);
+    fileReq.input('scan',   sql.NVarChar(20),    persistedScanResult);
+    fileReq.input('smsg',   sql.NVarChar(sql.MAX), persistedScanMessage);
     fileReq.input('vibe',   sql.NVarChar(500),   leekuVibe);
     fileReq.input('ttl',    sql.Int,             ttlH);
     fileReq.input('exp',    sql.DateTimeOffset,  expiresAt);
@@ -1300,11 +1407,11 @@ app.post('/api/files/upload', authenticateUser as express.RequestHandler, upload
 
     currentStage = 'log_upload_event';
     await logSystemEvent(user.id, user.username, 'Upload', 'File', newFile.id, req,
-      `Uploaded "${original_name}" (${Math.round(size/1024)}KB). Scan: ${scanResult.status}.`);
+      `Uploaded "${original_name}" (${Math.round(size/1024)}KB). Scan: ${acceptedWithoutScanner ? 'development bypass (Bitdefender unavailable)' : scanResult.status}.`);
 
     console.info('[upload] Upload completed successfully.', {
       userId: user.id, username: user.username, originalName: original_name,
-      fileId: newFile.id, scanStatus: scanResult.status, storedPath: newFile.stored_path,
+      fileId: newFile.id, scanStatus: scanResult.status, storedScanResult: persistedScanResult, storedPath: newFile.stored_path,
     });
 
     res.json({ success: true, message: 'File approved and encrypted!', file: mapFileRow(newFile, user.username) });
