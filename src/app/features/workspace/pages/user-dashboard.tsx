@@ -508,6 +508,7 @@ export default function UserDashboard({
                     <FileCard
                       key={file.id}
                       file={file}
+                      token={token}
                       onDownload={() => downloadFile(file)}
                       onShare={() => openShare(file)}
                       onDelete={() => deleteFile(file)}
@@ -550,9 +551,12 @@ export default function UserDashboard({
                       <tr key={file.id} className="hover:bg-[#fafbfc]">
                         <td className="px-4 py-3">
                           <div className="flex items-center gap-3">
-                            <div className="grid h-9 w-9 place-items-center rounded-lg bg-[#f0f3f7]">
-                              <FileText className="h-4 w-4" />
-                            </div>
+                            <FileThumbnail
+                              file={file}
+                              token={token}
+                              className="h-9 w-9 rounded-lg"
+                              iconClassName="h-4 w-4"
+                            />
                             <div>
                               <p className="max-w-xs truncate font-medium">
                                 {file.original_name}
@@ -867,13 +871,90 @@ function ProfileAvatar({
   );
 }
 
+function FileThumbnail({
+  file,
+  token,
+  className,
+  iconClassName,
+}: {
+  file: FileMetadata;
+  token: string;
+  className: string;
+  iconClassName: string;
+}) {
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
+  const isImage = file.mime_type.startsWith("image/");
+
+  useEffect(() => {
+    setPreviewUrl(null);
+    setFailed(false);
+    if (!isImage) return undefined;
+
+    const controller = new AbortController();
+    let objectUrl: string | null = null;
+
+    fetch(`/api/files/${file.id}/preview`, {
+      headers: authHeaders(token),
+      signal: controller.signal,
+    })
+      .then((response) => {
+        if (!response.ok) throw new Error("Preview unavailable.");
+        return response.blob();
+      })
+      .then((blob) => {
+        objectUrl = URL.createObjectURL(blob);
+        setPreviewUrl(objectUrl);
+      })
+      .catch((error) => {
+        if (!controller.signal.aborted) {
+          setFailed(true);
+          console.warn("[thumbnail] Preview unavailable.", {
+            fileId: file.id,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      });
+
+    return () => {
+      controller.abort();
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [file.id, isImage, token]);
+
+  const fallbackIcon = fileKind(file) === "Image" ? (
+    <File className={iconClassName} />
+  ) : (
+    <FileText className={iconClassName} />
+  );
+
+  return (
+    <div
+      className={`grid shrink-0 place-items-center overflow-hidden bg-[#eef3f9] text-[#69707a] ${className}`}
+    >
+      {isImage && previewUrl && !failed ? (
+        <img
+          src={previewUrl}
+          alt=""
+          className="h-full w-full object-cover"
+          onError={() => setFailed(true)}
+        />
+      ) : (
+        fallbackIcon
+      )}
+    </div>
+  );
+}
+
 function FileCard({
   file,
+  token,
   onDownload,
   onShare,
   onDelete,
 }: {
   file: FileMetadata;
+  token: string;
   onDownload: () => void;
   onShare: () => void;
   onDelete: () => void;
@@ -882,11 +963,20 @@ function FileCard({
 
   return (
     <div className="rounded-xl border border-[#e0e4e9] bg-white p-4">
-      <div className="flex justify-between">
-        <div className="grid h-10 w-10 place-items-center rounded-lg bg-[#eef3f9]">
-          <File className="h-5 w-5" />
-        </div>
-        <div className="relative">
+      <div className="relative">
+        <button
+          type="button"
+          onClick={onDownload}
+          className="block w-full overflow-hidden rounded-lg text-left"
+        >
+          <FileThumbnail
+            file={file}
+            token={token}
+            className="h-32 w-full rounded-lg"
+            iconClassName="h-8 w-8"
+          />
+        </button>
+        <div className="absolute right-2 top-2">
           <button
             aria-label="File options"
             aria-expanded={menuOpen}
@@ -923,7 +1013,7 @@ function FileCard({
       </div>
       <button
         onClick={onDownload}
-        className="mt-6 block max-w-full truncate text-left text-sm font-medium"
+        className="mt-3 block max-w-full truncate text-left text-sm font-medium"
       >
         {file.original_name}
       </button>

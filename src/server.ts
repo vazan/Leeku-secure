@@ -1479,6 +1479,65 @@ app.post('/api/files/:id/delete', authenticateUser as express.RequestHandler, as
   } catch (err) { console.error('[DELETE /api/files/:id]', err); res.status(500).json({ error: 'Failed to delete file.' }); }
 });
 
+app.get('/api/files/:id/preview', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  const fileId = req.params.id;
+  try {
+    const fileReq = await getRequest();
+    fileReq.input('id', sql.UniqueIdentifier, fileId);
+    const fileResult = await fileReq.query<FileRow>(
+      `SELECT id,owner_user_id,original_name_encrypted,original_name_iv,original_name_auth_tag,
+              stored_path,size_bytes,status,mime_type,encrypted_size_bytes,checksum_sha256,
+              scan_result,scan_message,is_encrypted,leeku_vibe,ttl_hours,expires_at,created_at
+       FROM files WHERE id=@id`
+    );
+    if (!fileResult.recordset.length) return res.status(404).json({ error: 'File not found.' });
+    const file = fileResult.recordset[0];
+    if (file.owner_user_id !== req.userId && req.user!.role !== 'Admin')
+      return res.status(403).json({ error: 'You do not have permission to preview this file.' });
+    if (file.status === 'Blocked')
+      return res.status(410).json({ error: 'Blocked files cannot be previewed.' });
+    if (!file.mime_type.startsWith('image/'))
+      return res.status(415).json({ error: 'Preview is only available for image files.' });
+
+    const vaultPath = path.join(FILE_VAULT, file.stored_path);
+    if (!fs.existsSync(vaultPath)) return res.status(410).json({ error: 'Vault file not found.' });
+
+    const keyReq = await getRequest();
+    keyReq.input('fid', sql.UniqueIdentifier, fileId);
+    const keyRes = await keyReq.query<{ encrypted_key: Buffer; key_iv: Buffer; key_auth_tag: Buffer; file_iv: Buffer; file_auth_tag: Buffer }>(
+      'SELECT encrypted_key,key_iv,key_auth_tag,file_iv,file_auth_tag FROM file_encryption_keys WHERE file_id=@fid'
+    );
+    if (!keyRes.recordset.length) return res.status(500).json({ error: 'Encryption key not found.' });
+
+    const keyRow = keyRes.recordset[0];
+    const fileKey = unwrapKey(keyRow.encrypted_key, keyRow.key_iv, keyRow.key_auth_tag);
+    const tempPath = path.join(os.tmpdir(), `leeku-preview-${fileId}-${Date.now()}.tmp`);
+    await decryptFileStream(vaultPath, tempPath, fileKey, keyRow.file_iv, keyRow.file_auth_tag);
+
+    const actualChecksum = await computeFileChecksum(tempPath);
+    if (actualChecksum !== file.checksum_sha256) {
+      try { fs.unlinkSync(tempPath); } catch {}
+      return res.status(500).json({ error: 'File integrity check failed.' });
+    }
+
+    const originalName = decryptColumn(file.original_name_encrypted, file.original_name_iv, file.original_name_auth_tag);
+    const safeName = originalName.replace(/"/g, '\\"');
+    const stat = fs.statSync(tempPath);
+
+    res.setHeader('Content-Type', file.mime_type);
+    res.setHeader('Content-Disposition', `inline; filename="${safeName}"`);
+    res.setHeader('Content-Length', stat.size.toString());
+    res.setHeader('Cache-Control', 'private, max-age=300');
+
+    const cleanup = () => { try { fs.unlinkSync(tempPath); } catch {} };
+    const readStream = fs.createReadStream(tempPath);
+    readStream.pipe(res);
+    readStream.on('end', cleanup);
+    readStream.on('error', cleanup);
+    res.on('close', cleanup);
+  } catch (err) { console.error('[GET /api/files/:id/preview]', err); res.status(500).json({ error: 'Preview failed.' }); }
+});
+
 app.get('/api/files/:id/download', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
   const fileId = req.params.id;
   try {
