@@ -1409,7 +1409,7 @@ app.get('/api/files', authenticateUser as express.RequestHandler, async (req: Au
                 is_encrypted, leeku_vibe, ttl_hours,
                 client_secret_hash,
                 expires_at, created_at
-         FROM files WHERE owner_user_id=@ownerId AND status!='Expired'
+        FROM files WHERE owner_user_id=@ownerId AND COALESCE(status,'Available')!='Expired'
          ORDER BY created_at DESC`
       );
     } catch (queryErr: any) {
@@ -1427,7 +1427,7 @@ app.get('/api/files', authenticateUser as express.RequestHandler, async (req: Au
                 status, checksum_sha256, scan_result, scan_message,
                 is_encrypted, leeku_vibe, ttl_hours,
                 expires_at, created_at
-         FROM files WHERE owner_user_id=@ownerId AND status!='Expired'
+        FROM files WHERE owner_user_id=@ownerId AND COALESCE(status,'Available')!='Expired'
          ORDER BY created_at DESC`
       );
     }
