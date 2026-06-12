@@ -15,6 +15,7 @@ export function validateProductionConfig(): void {
     'DB_USER',
     'DB_PASSWORD',
     'FILE_STORAGE_UNC_PATH',
+    'UPLOAD_TEMP_PATH',
   ];
   const missing = required.filter((key) => {
     const value = process.env[key];

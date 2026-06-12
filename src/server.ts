@@ -8,7 +8,6 @@
  */
 
 import dotenv from 'dotenv';
-dotenv.config();
 
 import express from 'express';
 import cors from 'cors';
@@ -50,6 +49,26 @@ import { createPublicSharingRouter } from './server/routes/public-sharing.js';
 import { validateProductionConfig } from './server/utils/production.js';
 import type { Quota, User, FileMetadata, ShareLink, SystemLog, SystemStats } from './app/shared/types/index.js';
 
+const runtimeDir = (() => {
+  const moduleUrl = (import.meta as ImportMeta | undefined)?.url;
+  if (moduleUrl) return path.dirname(fileURLToPath(moduleUrl));
+  if (typeof __dirname === 'string') return __dirname;
+  return process.cwd();
+})();
+const envCandidates = [
+  path.resolve(process.cwd(), '.env'),
+  path.resolve(runtimeDir, '../.env'),
+];
+const envPath = envCandidates.find((candidate) => fs.existsSync(candidate));
+
+if (envPath) {
+  dotenv.config({ path: envPath });
+  console.log(`[server] Loaded environment from: ${envPath}`);
+} else {
+  dotenv.config();
+  console.warn('[server] No .env file found in expected locations. Falling back to process-level environment variables.');
+}
+
 // ──────────────────────────────────────────────────────────────
 // Constants from environment
 // ──────────────────────────────────────────────────────────────
@@ -79,6 +98,10 @@ const HTTP_KEEP_ALIVE_TIMEOUT_MS = parseNonNegativeIntEnv('HTTP_KEEP_ALIVE_TIMEO
 const HTTP_SOCKET_TIMEOUT_MS = parseNonNegativeIntEnv('HTTP_SOCKET_TIMEOUT_MS', 0);
 const ALLOW_UNSCANNED_UPLOADS_IN_DEVELOPMENT =
   NODE_ENV === 'development' && process.env.ALLOW_UNSCANNED_UPLOADS_IN_DEVELOPMENT !== 'false';
+
+if (!process.env.UPLOAD_TEMP_PATH) {
+  console.warn(`[server] UPLOAD_TEMP_PATH is not set. Upload temp files will use fallback path: ${UPLOAD_TEMP}`);
+}
 
 function parseNonNegativeIntEnv(name: string, fallback: number): number {
   const raw = process.env[name];
