@@ -661,8 +661,8 @@ export default function UserDashboard({
                     <p className="mt-1 text-xs text-[var(--text-muted)]">
                       PNG, JPEG, or WebP. Up to 5 MB.
                     </p>
-                    <div className="mt-3 flex gap-2">
-                      <label className="inline-flex cursor-pointer items-center gap-2 rounded-lg border border-[var(--border-subtle)] px-3 py-2 text-xs font-medium hover:bg-[var(--bg-hover)]">
+                    <div className="mt-3 flex items-center gap-2">
+                      <label className="inline-flex h-7 cursor-pointer items-center gap-1 rounded-[min(var(--radius-md),12px)] border border-[var(--border-subtle)] px-2.5 text-[0.8rem] font-medium hover:bg-[var(--bg-hover)]">
                         <Camera className="h-3.5 w-3.5" />
                         <input
                           type="file"
