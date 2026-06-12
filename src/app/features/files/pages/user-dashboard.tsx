@@ -64,6 +64,16 @@ const getCsrfToken = () =>
 
 const authHeaders = (_token: string) => ({ "X-CSRF-Token": getCsrfToken() });
 
+type UploadStreamEvent = {
+  type?: "processing" | "complete" | "error";
+  phase?: string;
+  loaded?: number;
+  total?: number;
+  success?: boolean;
+  message?: string;
+  error?: string;
+};
+
 const dashboardViews: DashboardView[] = [
   "home",
   "files",
@@ -284,6 +294,63 @@ export default function UserDashboard({
     formData.append("mime_type", file.type || "application/octet-stream");
     const xhr = new XMLHttpRequest();
     uploadRequestRef.current = xhr;
+    let responseCursor = 0;
+    let responseBuffer = "";
+    let processingStartedAt = 0;
+    let uploadStreamError = "";
+    let uploadStreamComplete = false;
+
+    const handleUploadStreamEvent = (event: UploadStreamEvent) => {
+      if (event.type === "processing") {
+        processingStartedAt ||= Date.now();
+        setTransfer({
+          direction: "upload",
+          name: file.name,
+          loaded: file.size,
+          total: file.size,
+          startedAt,
+          processing: true,
+          processingStartedAt,
+          processingLoaded: event.loaded ?? 0,
+          processingTotal: event.total ?? 0,
+          phaseLabel: event.phase || "Securing file",
+        });
+        return;
+      }
+      if (event.type === "complete") {
+        uploadStreamComplete = true;
+        setTransfer({
+          direction: "upload",
+          name: file.name,
+          loaded: file.size,
+          total: file.size,
+          startedAt,
+          complete: true,
+        });
+        return;
+      }
+      if (event.type === "error") {
+        uploadStreamError = event.error || "Upload failed.";
+      }
+    };
+
+    const readUploadStream = () => {
+      const chunk = xhr.responseText.slice(responseCursor);
+      responseCursor = xhr.responseText.length;
+      if (!chunk) return;
+      responseBuffer += chunk;
+      const lines = responseBuffer.split("\n");
+      responseBuffer = lines.pop() || "";
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          handleUploadStreamEvent(JSON.parse(line) as UploadStreamEvent);
+        } catch {
+          // Non-streaming JSON responses are handled when the request finishes.
+        }
+      }
+    };
+
     xhr.upload.onprogress = (event) => {
       if (event.lengthComputable)
         setUploadProgress(Math.round((event.loaded / event.total) * 100));
@@ -303,19 +370,32 @@ export default function UserDashboard({
         total: file.size,
         startedAt,
         processing: true,
+        processingStartedAt: Date.now(),
+        processingLoaded: 0,
+        processingTotal: 1000,
+        phaseLabel: "Preparing scan",
       });
+    xhr.onprogress = readUploadStream;
     xhr.onload = async () => {
+      readUploadStream();
       setUploading(false);
       uploadRequestRef.current = null;
       if (xhr.status >= 200 && xhr.status < 300) {
-        setTransfer({
-          direction: "upload",
-          name: file.name,
-          loaded: file.size,
-          total: file.size,
-          startedAt,
-          complete: true,
-        });
+        if (uploadStreamError) {
+          setTransfer(null);
+          notifyError(uploadStreamError);
+          return;
+        }
+        if (!uploadStreamComplete) {
+          setTransfer({
+            direction: "upload",
+            name: file.name,
+            loaded: file.size,
+            total: file.size,
+            startedAt,
+            complete: true,
+          });
+        }
         window.setTimeout(
           () =>
             setTransfer((current) =>
@@ -353,6 +433,7 @@ export default function UserDashboard({
       notifyError("Upload interrupted.");
     };
     xhr.open("POST", "/api/files/upload");
+    xhr.setRequestHeader("Accept", "application/x-ndjson");
     xhr.setRequestHeader("X-CSRF-Token", getCsrfToken());
     xhr.send(formData);
   };
