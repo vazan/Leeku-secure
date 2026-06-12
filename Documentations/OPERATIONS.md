@@ -11,6 +11,18 @@ cookies, and Bitdefender CLI are configured. Load balancers should use:
 Readiness requires SQL Server and read/write vault access. In production it also
 requires a discoverable Bitdefender CLI.
 
+## Large uploads
+
+Leeku receives uploads as a single multipart request and streams the file to
+local disk before scanning and vault encryption. For large files, keep
+`HTTP_REQUEST_TIMEOUT_MS=0` so Node.js does not close a valid long-running
+request after its default five-minute deadline.
+
+If a load balancer or reverse proxy sits in front of Node.js, configure its
+request-body and idle timeouts to exceed the longest expected upload duration.
+An upstream close still reaches multer as `Request aborted` even when Node's own
+timeout is disabled.
+
 ## Encrypted backups
 
 Create a SQL Server certificate named `LeekuBackupCertificate`, export that
