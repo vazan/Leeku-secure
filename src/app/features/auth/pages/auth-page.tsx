@@ -59,9 +59,9 @@ export default function AuthPage({
       <aside className="hidden bg-[var(--bg-elevated)] p-12 text-[var(--text-primary)] lg:flex lg:flex-col">
         <button onClick={onCancel} className="flex items-center gap-3 text-sm">
           <div className="grid h-9 w-9 place-items-center rounded-xl bg-[var(--bg-hover)] text-[var(--text-primary)]">
-            <Folder className="h-4 w-4" />
+            <ArrowLeft className="h-4 w-4" />
           </div>
-          Leeku
+          Back To Home
         </button>
         <div className="my-auto max-w-md">
           <p className="text-sm text-[var(--text-muted)]">
