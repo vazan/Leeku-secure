@@ -705,7 +705,7 @@ export function MascotSpeechBubble({
 }
 
 export const QUOTEKU_MESSAGES = {
-  warning80: "You are approaching the edge of the leek field.",
-  warning95: "The vault is almost full.",
-  warning100: "No more leeks can fit.",
+  warning80: "You have used more than 80% of your storage quota.",
+  warning95: "Your storage quota is almost full.",
+  warning100: "Your storage quota is full.",
 };

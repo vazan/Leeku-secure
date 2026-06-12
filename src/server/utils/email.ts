@@ -124,7 +124,7 @@ export async function sendVerificationEmail(to: string, username: string, token:
     Verify Your Identity
   </h1>
   <p style="color:#ccc;text-align:center;font-size:12px;margin:0 0 24px;">
-    Hey <strong style="color:#FF007F;">${username}</strong>, welcome to the bunker!<br/>
+    Hello <strong style="color:#FF007F;">${username}</strong>,<br/>
     One last step before we can let you in.
   </p>
   <div style="text-align:center;margin:32px 0;">
@@ -137,7 +137,7 @@ export async function sendVerificationEmail(to: string, username: string, token:
     Token expires in 24 hours.
   </p>
   <p style="color:#444;text-align:center;font-size:9px;">
-    &mdash; Leeku, your cyber-kawaii guardian
+    &mdash; The Leeku Secure team
   </p>
 </div>`;
 
@@ -186,7 +186,7 @@ export async function sendAccountDeletionEmail(to: string, username: string, tok
     Account Deletion Request
   </h1>
   <p style="color:#ccc;text-align:center;font-size:12px;margin:0 0 24px;">
-    Hey <strong style="color:#00F2FF;">${username}</strong>, we received a request to <strong style="color:#FF007F;">permanently delete</strong> your Leeku Secure account.<br/>
+    Hello <strong style="color:#00F2FF;">${username}</strong>, we received a request to <strong style="color:#FF007F;">permanently delete</strong> your Leeku Secure account.<br/>
     This action will erase all your uploaded files, share links, and encryption keys — <strong>forever</strong>.
   </p>
   <div style="text-align:center;margin:32px 0;">
@@ -199,7 +199,7 @@ export async function sendAccountDeletionEmail(to: string, username: string, tok
     This confirmation token expires in 1 hour.
   </p>
   <p style="color:#444;text-align:center;font-size:9px;">
-    &mdash; Leeku, sad to see you go 🥬💧
+    &mdash; The Leeku Secure team
   </p>
 </div>`;
 

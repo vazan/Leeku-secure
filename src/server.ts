@@ -292,15 +292,15 @@ if (GEMINI_API_KEY && GEMINI_API_KEY !== 'CHANGE_ME') {
 async function generateLeekuVibe(filename: string, clean: boolean): Promise<string> {
   const fallbacks = clean
     ? [
-        'Clean file. Leeku approves.',
-        'No malware detected. Surprisingly.',
-        'Passed digital health exam. Safe inside the virtual container.',
-        'Your file has been blessed by the leek guardian. Zero goblins.',
+        'Security scan completed. No threats were detected.',
+        'File verified and ready to use.',
+        'Upload completed and passed the security scan.',
+        'No malicious content was detected.',
       ]
     : [
-        'Cursed bytes detected. Upload denied.',
-        'Digital goblins found in payload. Rejected.',
-        'Leeku found something suspicious. Access denied.',
+        'Upload blocked because the security scan detected a potential threat.',
+        'File rejected due to suspicious content.',
+        'Security scan failed. Upload denied.',
       ];
 
   if (!genai) {
@@ -309,8 +309,8 @@ async function generateLeekuVibe(filename: string, clean: boolean): Promise<stri
 
   try {
     const prompt = clean
-      ? `Generate a short, funny, cyber-kawaii one-liner (max 80 chars) saying a file named "${filename}" passed security scan. Be witty and use Vocaloid/anime references. No hashtags.`
-      : `Generate a short, funny, cyber-kawaii one-liner (max 80 chars) saying a file named "${filename}" was blocked. Be dramatic and use Vocaloid/anime references. No hashtags.`;
+      ? `Write a concise professional status message, at most 80 characters, confirming that "${filename}" passed its security scan.`
+      : `Write a concise professional status message, at most 80 characters, explaining that "${filename}" was blocked by its security scan.`;
 
     const result = await genai.models.generateContent({ model: 'gemini-2.0-flash', contents: prompt });
     const text = result.text?.trim();

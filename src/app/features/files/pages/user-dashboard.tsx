@@ -37,6 +37,7 @@ import type {
 } from "@/app/shared/types";
 import SessionManager from "@/app/features/files/components/session-manager";
 import ThemeSettings from "@/app/features/files/components/theme-settings";
+import AdminWorkspace from "@/app/features/files/components/admin-workspace";
 import DashboardSidebar, {
   type DashboardNavItem,
   type DashboardView,
@@ -763,50 +764,14 @@ export default function UserDashboard({
           )}
 
           {view === "admin" && user.role === "Admin" && (
-            <section className="space-y-6">
-              <div>
-                <h1 className="text-2xl font-semibold tracking-[-0.03em]">
-                  Admin overview
-                </h1>
-                <p className="mt-1 text-sm text-[var(--text-muted)]">
-                  A concise operational view.
-                </p>
-              </div>
-              <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-                {[
-                  ["Users", stats?.totalUsers || adminUsers.length],
-                  ["Files", stats?.totalFiles || adminFiles.length],
-                  ["Uploads today", stats?.uploadsToday || 0],
-                  ["Blocked", stats?.blockedFiles || 0],
-                ].map(([label, value]) => (
-                  <div
-                    key={label}
-                    className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] p-5 shadow-[var(--shadow-hairline)]"
-                  >
-                    <p className="text-sm text-[var(--text-muted)]">{label}</p>
-                    <p className="mt-2 text-3xl font-semibold">{value}</p>
-                  </div>
-                ))}
-              </div>
-              <div className="grid gap-5 xl:grid-cols-2">
-                <AdminTable
-                  title="Recent users"
-                  rows={adminUsers
-                    .slice(0, 8)
-                    .map((item) => [item.username, item.email, item.status])}
-                />
-                <AdminTable
-                  title="Recent activity"
-                  rows={logs
-                    .slice(0, 8)
-                    .map((item) => [
-                      item.event_type,
-                      item.username || "System",
-                      new Date(item.created_at).toLocaleDateString(),
-                    ])}
-                />
-              </div>
-            </section>
+            <AdminWorkspace
+              users={adminUsers}
+              files={adminFiles}
+              logs={logs}
+              stats={stats}
+              quotas={quotas}
+              onReload={loadAdmin}
+            />
           )}
         </div>
       </main>
@@ -1182,38 +1147,6 @@ function Field({
         className="w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-elevated)] px-3 py-2.5 text-sm text-[var(--text-primary)] outline-none placeholder:text-[var(--text-faint)] focus:border-[var(--accent-linear)]"
       />
     </label>
-  );
-}
-
-function AdminTable({
-  title,
-  rows,
-}: {
-  title: string;
-  rows: Array<Array<string>>;
-}) {
-  return (
-    <div className="overflow-hidden rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] shadow-[var(--shadow-hairline)]">
-      <div className="border-b border-[var(--border-subtle)] px-4 py-3 text-sm font-medium">
-        {title}
-      </div>
-      <div className="divide-y divide-[var(--border-subtle)]">
-        {rows.map((row, index) => (
-          <div key={index} className="grid grid-cols-3 gap-3 px-4 py-3 text-sm">
-            {row.map((cell, cellIndex) => (
-              <span
-                key={cellIndex}
-                className={
-                  cellIndex ? "truncate text-[var(--text-muted)]" : "truncate font-medium"
-                }
-              >
-                {cell}
-              </span>
-            ))}
-          </div>
-        ))}
-      </div>
-    </div>
   );
 }
 
