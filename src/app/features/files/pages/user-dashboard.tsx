@@ -271,13 +271,13 @@ export default function UserDashboard({
     setView(nextView);
   };
 
-  const visibleFiles = useMemo(
-    () =>
-      files.filter((file) =>
-        file.original_name.toLowerCase().includes(search.toLowerCase()),
-      ),
-    [files, search],
-  );
+  const normalizedSearch = search.trim().toLowerCase();
+  const visibleFiles = useMemo(() => {
+    if (!normalizedSearch) return files;
+    return files.filter((file) =>
+      file.original_name.toLowerCase().includes(normalizedSearch),
+    );
+  }, [files, normalizedSearch]);
 
   useEffect(() => {
     if (!uploading) return undefined;
@@ -702,6 +702,7 @@ export default function UserDashboard({
               value={search}
               onChange={(event) => setSearch(event.target.value)}
               placeholder="Search files"
+              autoComplete="off"
               className="h-11 w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-muted)] pl-10 pr-4 text-sm outline-none focus:border-[var(--accent-linear)]"
             />
           </div>
@@ -838,7 +839,13 @@ export default function UserDashboard({
                   All files
                 </h1>
                 <p className="mt-1 text-sm text-[var(--text-muted)]">
-                  {visibleFiles.length} files in your account.
+                  {files.length} files in your account.
+                  {normalizedSearch && (
+                    <>
+                      {" "}
+                      ({visibleFiles.length} matching "{search.trim()}")
+                    </>
+                  )}
                 </p>
               </div>
               {visibleFiles.length === 0 ? (
