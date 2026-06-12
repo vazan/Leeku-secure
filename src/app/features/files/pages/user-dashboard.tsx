@@ -9,6 +9,7 @@ import {
   Folder,
   LayoutGrid,
   Link2,
+  LogOut,
   MoreHorizontal,
   Play,
   Search,
@@ -505,13 +506,13 @@ export default function UserDashboard({
       />
 
       <main className="lg:pl-64">
-        <header className="sticky top-0 z-10 flex h-20 items-center gap-4 border-b border-[var(--border-subtle)] bg-[color-mix(in_srgb,var(--bg-panel)_92%,transparent)] backdrop-blur-[var(--blur-header)] px-5 sm:pr-64 lg:px-8 lg:pr-72">
+        <header className="sticky top-0 z-10 flex min-h-20 flex-wrap items-center gap-3 border-b border-[var(--border-subtle)] bg-[color-mix(in_srgb,var(--bg-panel)_92%,transparent)] px-4 py-3 backdrop-blur-[var(--blur-header)] sm:h-20 sm:flex-nowrap sm:px-5 sm:pr-64 lg:px-8 lg:pr-72">
           <select
             value={view}
             onChange={(event) =>
               navigateDashboard(event.target.value as DashboardView)
             }
-            className="rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-panel)] px-3 py-2.5 text-sm lg:hidden"
+            className="h-11 w-[8.5rem] shrink-0 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-panel)] px-3 text-sm lg:hidden"
           >
             {navItems.map(([id, , label]) => (
               <option key={id} value={id}>
@@ -519,7 +520,7 @@ export default function UserDashboard({
               </option>
             ))}
           </select>
-          <div className="relative w-full max-w-xl">
+          <div className="relative order-3 w-full sm:order-none sm:max-w-xl">
             <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[var(--text-faint)]" />
             <input
               value={search}
@@ -528,7 +529,7 @@ export default function UserDashboard({
               className="h-11 w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-muted)] pl-10 pr-4 text-sm outline-none focus:border-[var(--accent-linear)]"
             />
           </div>
-          <label className="flex h-11 shrink-0 cursor-pointer items-center gap-2 rounded-full bg-[var(--accent-linear)] px-5 text-sm font-medium text-[var(--accent-contrast)] transition-colors hover:bg-[var(--accent-linear-bright)]">
+          <label className="flex h-11 w-11 shrink-0 cursor-pointer items-center justify-center gap-2 rounded-lg bg-[var(--accent-linear)] px-0 text-sm font-medium text-[var(--accent-contrast)] transition-colors hover:bg-[var(--accent-linear-bright)] sm:w-auto sm:rounded-full sm:px-5">
             <input
               type="file"
               className="hidden"
@@ -537,8 +538,17 @@ export default function UserDashboard({
               }
             />
             <Upload className="h-4 w-4" />
-            Upload file
+            <span className="hidden sm:inline">Upload file</span>
           </label>
+          <button
+            type="button"
+            aria-label="Log out"
+            title="Log out"
+            onClick={onLogout}
+            className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg border border-[var(--border-subtle)] text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] lg:hidden"
+          >
+            <LogOut className="h-4 w-4" />
+          </button>
           <div className="absolute right-5 hidden items-center gap-3 sm:flex lg:right-8">
             <ProfileAvatar
               user={user}
@@ -639,7 +649,67 @@ export default function UserDashboard({
                   {visibleFiles.length} files in your account.
                 </p>
               </div>
-              <div className="overflow-hidden rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] shadow-[var(--shadow-hairline)]">
+              {visibleFiles.length === 0 ? (
+                <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] p-8 text-center shadow-[var(--shadow-hairline)]">
+                  <p className="text-sm font-medium">No matching files</p>
+                  <p className="mt-1 text-xs text-[var(--text-muted)]">
+                    Try another search or upload a file.
+                  </p>
+                </div>
+              ) : (
+                <div className="grid gap-3 sm:hidden">
+                  {visibleFiles.map((file) => (
+                    <div
+                      key={file.id}
+                      className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] p-4 shadow-[var(--shadow-hairline)]"
+                    >
+                      <div className="flex min-w-0 items-start gap-3">
+                        <FileThumbnail
+                          file={file}
+                          token={token}
+                          className="h-12 w-12 rounded-lg"
+                          iconClassName="h-5 w-5"
+                        />
+                        <div className="min-w-0 flex-1">
+                          <p className="truncate text-sm font-medium">
+                            {file.original_name}
+                          </p>
+                          <p className="mt-1 text-xs text-[var(--text-muted)]">
+                            {fileKind(file)} · {formatBytes(file.size)}
+                          </p>
+                          <p className="mt-0.5 text-xs text-[var(--text-faint)]">
+                            {file.status} ·{" "}
+                            {new Date(file.created_at).toLocaleDateString()}
+                          </p>
+                        </div>
+                      </div>
+                      <div className="mt-4 grid grid-cols-3 gap-2">
+                        <FileActionButton
+                          label="Download"
+                          onClick={() => downloadFile(file)}
+                        >
+                          <ArrowDownToLine className="h-3.5 w-3.5" />
+                        </FileActionButton>
+                        <FileActionButton
+                          label="Share"
+                          onClick={() => openShare(file)}
+                        >
+                          <Share2 className="h-3.5 w-3.5" />
+                        </FileActionButton>
+                        <FileActionButton
+                          label="Delete"
+                          destructive
+                          onClick={() => deleteFile(file)}
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </FileActionButton>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {visibleFiles.length > 0 && (
+              <div className="hidden overflow-hidden rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] shadow-[var(--shadow-hairline)] sm:block">
                 <table className="w-full text-left text-sm">
                   <thead className="border-b border-[var(--border-subtle)] bg-[var(--bg-muted)] text-xs text-[var(--text-muted)]">
                     <tr>
@@ -713,6 +783,7 @@ export default function UserDashboard({
                   </tbody>
                 </table>
               </div>
+              )}
             </section>
           )}
 
@@ -932,6 +1003,33 @@ function IconButton({
       className="rounded-md p-2 text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
     >
       {children}
+    </button>
+  );
+}
+
+function FileActionButton({
+  label,
+  destructive = false,
+  onClick,
+  children,
+}: {
+  label: string;
+  destructive?: boolean;
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`flex h-10 min-w-0 items-center justify-center gap-1.5 rounded-lg border px-2 text-xs font-medium ${
+        destructive
+          ? "border-[color-mix(in_srgb,var(--error-linear)_42%,transparent)] text-[var(--error-linear)] hover:bg-[color-mix(in_srgb,var(--error-linear)_12%,transparent)]"
+          : "border-[var(--border-subtle)] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+      }`}
+    >
+      {children}
+      <span className="truncate">{label}</span>
     </button>
   );
 }
