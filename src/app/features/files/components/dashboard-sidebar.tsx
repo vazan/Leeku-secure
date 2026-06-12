@@ -34,15 +34,19 @@ export default function DashboardSidebar({
       data-dashboard-sidebar
       className="fixed inset-y-0 left-0 z-20 hidden w-64 border-r border-[var(--border-subtle)] bg-[var(--bg-panel)] p-5 lg:flex lg:flex-col"
     >
-      <div className="flex items-center gap-3 px-2 py-1">
-        <div className="grid h-9 w-9 place-items-center rounded-xl bg-[var(--bg-elevated)] text-[var(--text-primary)]">
-          <Folder className="h-4 w-4" />
+      <div 
+          className="flex items-center gap-3 cursor-pointer group"
+        >
+          <div className="w-10 h-10 bg-[#00F2FF] rounded-sm rotate-12 flex items-center justify-center border-2 border-[#FF007F] font-display font-black text-[#0A0E14] text-xl leading-none shadow-[0_0_15px_rgba(0,242,255,0.4)] group-hover:scale-115 transition-transform duration-300">
+            L
+          </div>
+          <div>
+            <span className="font-display font-black text-2xl tracking-tighter italic text-[#00F2FF] uppercase group-hover:text-white transition-colors">
+              Leeks.<span className="text-[#FF007F]">miku</span>.rip
+            </span>
+            <span className="block font-mono text-[9px] uppercase tracking-wider text-gray-500 font-bold">Miku Bunker Secure</span>
+          </div>
         </div>
-        <div>
-          <p className="text-sm font-semibold">Leeku</p>
-          <p className="text-xs text-[var(--text-muted)]">Secure file sharing</p>
-        </div>
-      </div>
       <nav className="mt-8 space-y-1">
         {navItems.map(([id, icon, label]) => (
           <button

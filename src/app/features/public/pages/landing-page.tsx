@@ -10,7 +10,7 @@ import { useState, useEffect } from 'react';
 import { Shield, Upload, Sparkles, HardDrive, Key, Flame } from 'lucide-react';
 import leekuMascot from '@/app/shared/assets/leeku_mascot.png';
 import { MascotAvatar } from '@/app/shared/components/legacy/mascots';
-import { Quota } from "@/app/shared/types";
+import type { Quota } from "@/app/shared/types";
 
 interface LandingPageProps {
   onGoToAuth: (mode: "login" | "register") => void;
@@ -47,11 +47,18 @@ export default function LandingPage({ onGoToAuth, quotas }: LandingPageProps) {
   return (
     <div className="min-h-screen bg-[var(--bg-primary)] text-[var(--text-primary)]">
       <nav className="mx-auto flex max-w-7xl items-center justify-between px-5 py-5 lg:px-8">
-        <div className="flex items-center gap-3">
-          <div className="grid h-9 w-9 place-items-center rounded-xl bg-[var(--bg-elevated)] text-[var(--text-primary)]">
-            <Folder className="h-4 w-4" />
+        <div 
+          className="flex items-center gap-3 cursor-pointer group"
+        >
+          <div className="w-10 h-10 bg-[#00F2FF] rounded-sm rotate-12 flex items-center justify-center border-2 border-[#FF007F] font-display font-black text-[#0A0E14] text-xl leading-none shadow-[0_0_15px_rgba(0,242,255,0.4)] group-hover:scale-115 transition-transform duration-300">
+            L
           </div>
-          <span className="text-sm font-semibold">Leeku</span>
+          <div>
+            <span className="font-display font-black text-2xl tracking-tighter italic text-[#00F2FF] uppercase group-hover:text-white transition-colors">
+              Leeks.<span className="text-[#FF007F]">miku</span>.rip
+            </span>
+            <span className="block font-mono text-[9px] uppercase tracking-wider text-gray-500 font-bold">Miku Bunker Secure</span>
+          </div>
         </div>
         <div className="flex items-center gap-2">
           <button
