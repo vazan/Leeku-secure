@@ -16,6 +16,7 @@ import rateLimit from 'express-rate-limit';
 import jwt from 'jsonwebtoken';
 import fs from 'fs';
 import path from 'path';
+import http from 'http';
 import https from 'https';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
@@ -71,8 +72,35 @@ const JWT_AUDIENCE       = process.env.JWT_AUDIENCE || 'leeku-secure-api';
 const SESSION_COOKIE_NAME = process.env.SESSION_COOKIE_NAME || 'leeku_session';
 const REFRESH_COOKIE_NAME = process.env.REFRESH_COOKIE_NAME || 'leeku_refresh';
 const CSRF_COOKIE_NAME    = process.env.CSRF_COOKIE_NAME || 'leeku_csrf';
+const HTTP_REQUEST_TIMEOUT_MS = parseNonNegativeIntEnv('HTTP_REQUEST_TIMEOUT_MS', 0);
+const HTTP_HEADERS_TIMEOUT_MS = parseNonNegativeIntEnv('HTTP_HEADERS_TIMEOUT_MS', 60_000);
+const HTTP_KEEP_ALIVE_TIMEOUT_MS = parseNonNegativeIntEnv('HTTP_KEEP_ALIVE_TIMEOUT_MS', 5_000);
+const HTTP_SOCKET_TIMEOUT_MS = parseNonNegativeIntEnv('HTTP_SOCKET_TIMEOUT_MS', 0);
 const ALLOW_UNSCANNED_UPLOADS_IN_DEVELOPMENT =
   NODE_ENV === 'development' && process.env.ALLOW_UNSCANNED_UPLOADS_IN_DEVELOPMENT !== 'false';
+
+function parseNonNegativeIntEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  if (Number.isFinite(parsed) && parsed >= 0) return Math.floor(parsed);
+  console.warn(`[server] Invalid ${name}="${raw}". Using ${fallback}.`);
+  return fallback;
+}
+
+function configureHttpServer(server: http.Server): http.Server {
+  server.requestTimeout = HTTP_REQUEST_TIMEOUT_MS;
+  server.headersTimeout = HTTP_HEADERS_TIMEOUT_MS;
+  server.keepAliveTimeout = HTTP_KEEP_ALIVE_TIMEOUT_MS;
+  server.setTimeout(HTTP_SOCKET_TIMEOUT_MS);
+  console.log('[server] HTTP timeouts configured.', {
+    requestTimeoutMs: server.requestTimeout,
+    headersTimeoutMs: server.headersTimeout,
+    keepAliveTimeoutMs: server.keepAliveTimeout,
+    socketTimeoutMs: server.timeout,
+  });
+  return server;
+}
 
 function getJwtSecret(): string {
   const raw = process.env.COOKIE_SECRET_BASE64;
@@ -1400,11 +1428,35 @@ const upload = multer({
   },
 });
 
+const receiveUpload: express.RequestHandler = (req, res, next) => {
+  upload.single('file')(req, res, (error: unknown) => {
+    if (!error) {
+      next();
+      return;
+    }
+
+    const message = error instanceof Error ? error.message : String(error);
+    if (message === 'Request aborted' || req.destroyed || req.aborted) {
+      console.warn('[upload] Multipart request aborted before the file finished streaming.', {
+        ip: getRequestIp(req),
+        contentLength: req.headers['content-length'] || null,
+        userAgent: req.headers['user-agent'] || null,
+      });
+      if (!res.headersSent && !res.writableEnded && !req.destroyed) {
+        res.status(499).json({ error: 'Upload connection closed before the file finished sending.' });
+      }
+      return;
+    }
+
+    next(error);
+  });
+};
+
 // ──────────────────────────────────────────────────────────────
 // API: Files — Upload (multipart/form-data, streaming)
 // ──────────────────────────────────────────────────────────────
 
-app.post('/api/files/upload', authenticateUser as express.RequestHandler, upload.single('file'), async (req: AuthenticatedRequest, res) => {
+app.post('/api/files/upload', authenticateUser as express.RequestHandler, receiveUpload, async (req: AuthenticatedRequest, res) => {
   const multerFile = req.file;
   if (!multerFile) return res.status(400).json({ error: 'No file attached. Use multipart/form-data with field name "file".' });
 
@@ -2180,13 +2232,13 @@ async function bootstrap() {
     if (process.env.SSL_CIPHERS?.trim()) sslOptions.ciphers = process.env.SSL_CIPHERS;
 
     const sslPort = parseInt(process.env.SSL_PORT || '443', 10);
-    https.createServer(sslOptions, app).listen(sslPort, '0.0.0.0', () => {
+    configureHttpServer(https.createServer(sslOptions, app)).listen(sslPort, '0.0.0.0', () => {
       console.log(`[server] Leeks.miku.rip HTTPS port ${sslPort}`);
     });
   } else {
-    app.listen(PORT, '0.0.0.0', () => {
+    configureHttpServer(app.listen(PORT, '0.0.0.0', () => {
       console.log(`[server] Leeks.miku.rip http://0.0.0.0:${PORT}`);
-    });
+    }));
   }
 
   // 7. Graceful shutdown

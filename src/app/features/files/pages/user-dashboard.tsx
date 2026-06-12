@@ -163,6 +163,8 @@ export default function UserDashboard({
   const [profilePassword, setProfilePassword] = useState("");
   const [avatarVersion, setAvatarVersion] = useState(0);
   const [avatarUploading, setAvatarUploading] = useState(false);
+  const uploadRequestRef = React.useRef<XMLHttpRequest | null>(null);
+  const uploadStoppedRef = React.useRef(false);
 
   const activeQuota =
     quotas.find((quota) => quota.id === user.quota_id) || quotas[0];
@@ -242,8 +244,31 @@ export default function UserDashboard({
     [files, search],
   );
 
+  useEffect(() => {
+    if (!uploading) return undefined;
+
+    const warnBeforeUnload = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue =
+        "An upload is still running. Leaving this page will stop it.";
+    };
+
+    window.addEventListener("beforeunload", warnBeforeUnload);
+    return () => window.removeEventListener("beforeunload", warnBeforeUnload);
+  }, [uploading]);
+
+  const stopUpload = () => {
+    uploadStoppedRef.current = true;
+    uploadRequestRef.current?.abort();
+  };
+
   const uploadFile = (file: globalThis.File) => {
+    if (uploadRequestRef.current) {
+      notifyError("An upload is already running.");
+      return;
+    }
     const startedAt = Date.now();
+    uploadStoppedRef.current = false;
     setUploading(true);
     setUploadProgress(0);
     setTransfer({
@@ -258,6 +283,7 @@ export default function UserDashboard({
     formData.append("original_name", file.name);
     formData.append("mime_type", file.type || "application/octet-stream");
     const xhr = new XMLHttpRequest();
+    uploadRequestRef.current = xhr;
     xhr.upload.onprogress = (event) => {
       if (event.lengthComputable)
         setUploadProgress(Math.round((event.loaded / event.total) * 100));
@@ -280,6 +306,7 @@ export default function UserDashboard({
       });
     xhr.onload = async () => {
       setUploading(false);
+      uploadRequestRef.current = null;
       if (xhr.status >= 200 && xhr.status < 300) {
         setTransfer({
           direction: "upload",
@@ -301,13 +328,28 @@ export default function UserDashboard({
         onTriggerRefreshUser();
       } else {
         setTransfer(null);
-        const data = JSON.parse(xhr.responseText || "{}");
+        let data: { error?: string } = {};
+        try {
+          data = JSON.parse(xhr.responseText || "{}");
+        } catch {
+          data = {};
+        }
         notifyError(data.error || "Upload failed.");
       }
     };
+    xhr.onabort = () => {
+      setUploading(false);
+      setUploadProgress(0);
+      setTransfer(null);
+      uploadRequestRef.current = null;
+      if (uploadStoppedRef.current) notify("Upload stopped.");
+      else notifyError("Upload interrupted.");
+    };
     xhr.onerror = () => {
       setUploading(false);
+      setUploadProgress(0);
       setTransfer(null);
+      uploadRequestRef.current = null;
       notifyError("Upload interrupted.");
     };
     xhr.open("POST", "/api/files/upload");
@@ -533,6 +575,7 @@ export default function UserDashboard({
             <input
               type="file"
               className="hidden"
+              disabled={uploading}
               onChange={(event) =>
                 event.target.files?.[0] && uploadFile(event.target.files[0])
               }
@@ -565,7 +608,12 @@ export default function UserDashboard({
         <div className="mx-auto max-w-7xl p-5 lg:p-8">
           {transfer && (
             <div className="mx-auto mb-6 max-w-5xl">
-              <TransferProgress transfer={transfer} />
+              <TransferProgress
+                transfer={transfer}
+                onCancel={
+                  transfer.direction === "upload" ? stopUpload : undefined
+                }
+              />
             </div>
           )}
           {view === "home" && (

@@ -22,8 +22,10 @@ function formatBytes(bytes: number) {
 
 export default function TransferProgress({
   transfer,
+  onCancel,
 }: {
   transfer: TransferState;
+  onCancel?: () => void;
 }) {
   const percent =
     transfer.total > 0
@@ -66,6 +68,15 @@ export default function TransferProgress({
             )}
           </div>
         </div>
+        {onCancel && !transfer.processing && !transfer.complete && (
+          <button
+            type="button"
+            onClick={onCancel}
+            className="shrink-0 rounded-lg border border-[color-mix(in_srgb,var(--error-linear)_42%,transparent)] px-3 py-2 text-xs font-medium text-[var(--error-linear)] hover:bg-[color-mix(in_srgb,var(--error-linear)_12%,transparent)]"
+          >
+            Stop upload
+          </button>
+        )}
       </div>
       <div className="h-1 bg-[var(--bg-hover)]">
         <div
