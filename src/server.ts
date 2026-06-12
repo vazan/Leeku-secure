@@ -1469,6 +1469,33 @@ app.post('/api/files/upload', authenticateUser as express.RequestHandler, receiv
   const user = req.user!;
   let currentStage = 'quota_lookup';
   let vaultFilePath: string | null = null;
+  const streamsProgress = String(req.headers.accept || '').includes('application/x-ndjson');
+  const processingTotal = 1000;
+  let progressStreamStarted = false;
+
+  const sendUploadProgress = (payload: Record<string, unknown>) => {
+    if (!streamsProgress || res.writableEnded) return;
+    if (!progressStreamStarted) {
+      progressStreamStarted = true;
+      res.status(200);
+      res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('X-Accel-Buffering', 'no');
+      res.flushHeaders?.();
+    }
+    res.write(`${JSON.stringify(payload)}\n`);
+  };
+
+  const finishUploadError = (statusCode: number, message: string) => {
+    try { if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath); } catch {}
+    if (vaultFilePath) try { if (fs.existsSync(vaultFilePath)) fs.unlinkSync(vaultFilePath); } catch {}
+    if (progressStreamStarted) {
+      sendUploadProgress({ type: 'error', error: message });
+      res.end();
+      return;
+    }
+    cleanupAndRespond(res, tempFilePath, statusCode, message);
+  };
 
   try {
     console.info('[upload] Multipart upload received.', {
@@ -1523,7 +1550,19 @@ app.post('/api/files/upload', authenticateUser as express.RequestHandler, receiv
 
     // ── Bitdefender scan (reads the temp file directly from disk) ──
     currentStage = 'bitdefender_scan';
+    sendUploadProgress({
+      type: 'processing',
+      phase: 'Scanning file',
+      loaded: 50,
+      total: processingTotal,
+    });
     const scanResult = await scanFilePath(tempFilePath, size);
+    sendUploadProgress({
+      type: 'processing',
+      phase: 'Scan complete',
+      loaded: 250,
+      total: processingTotal,
+    });
     console.info('[upload] Scan completed.', { userId: user.id, originalName: original_name, scanStatus: scanResult.status, scanDurationMs: scanResult.scanDurationMs });
     const acceptedWithoutScanner =
       scanResult.status === 'Unavailable' && ALLOW_UNSCANNED_UPLOADS_IN_DEVELOPMENT;
@@ -1532,7 +1571,7 @@ app.post('/api/files/upload', authenticateUser as express.RequestHandler, receiv
       console.warn('[upload] Rejected by Bitdefender scan.', { userId: user.id, originalName: original_name, scanStatus: scanResult.status });
       const vibe = await generateLeekuVibe(original_name, false);
       await logSystemEvent(user.id, user.username, 'Scan', 'File', 'rejected', req, `AV block: "${original_name}" — ${scanResult.message}`);
-      return cleanupAndRespond(res, tempFilePath, 422, vibe || scanResult.message);
+      return finishUploadError(422, vibe || scanResult.message);
     }
     if (acceptedWithoutScanner) {
       console.warn('[upload] Bitdefender unavailable; accepting upload because NODE_ENV=development.', {
@@ -1550,8 +1589,28 @@ app.post('/api/files/upload', authenticateUser as express.RequestHandler, receiv
     const vaultFileName = generateSecureToken(16) + '.vault';
     vaultFilePath = path.join(FILE_VAULT, vaultFileName);
 
-    const encryptResult = await encryptFileStream(tempFilePath, vaultFilePath);
+    sendUploadProgress({
+      type: 'processing',
+      phase: 'Encrypting file',
+      loaded: 260,
+      total: processingTotal,
+    });
+    const encryptResult = await encryptFileStream(tempFilePath, vaultFilePath, ({ processedBytes }) => {
+      const encryptedProgress = size > 0 ? Math.min(1, processedBytes / size) : 1;
+      sendUploadProgress({
+        type: 'processing',
+        phase: 'Encrypting file',
+        loaded: 260 + Math.round(encryptedProgress * 620),
+        total: processingTotal,
+      });
+    });
     const wrapped = wrapKey(encryptResult.key);
+    sendUploadProgress({
+      type: 'processing',
+      phase: 'Encryption complete',
+      loaded: 900,
+      total: processingTotal,
+    });
     console.info('[upload] Stream-encrypted to vault.', { userId: user.id, originalName: original_name, vaultFileName, encryptedSizeBytes: encryptResult.encryptedSize });
 
     // ── Clean up the multer temp file ─────────────────────────
@@ -1565,6 +1624,12 @@ app.post('/api/files/upload', authenticateUser as express.RequestHandler, receiv
     const leekuVibe = await generateLeekuVibe(original_name, true);
 
     currentStage = 'insert_file_record';
+    sendUploadProgress({
+      type: 'processing',
+      phase: 'Saving file record',
+      loaded: 940,
+      total: processingTotal,
+    });
     const fileReq = await getRequest();
     fileReq.input('ownerId', sql.UniqueIdentifier, req.userId!);
     fileReq.input('nEnc',   sql.VarBinary(2048), encName.ciphertext);
@@ -1599,6 +1664,12 @@ app.post('/api/files/upload', authenticateUser as express.RequestHandler, receiv
     console.info('[upload] File record inserted.', { userId: user.id, originalName: original_name, fileId: newFile.id });
 
     currentStage = 'insert_key_record';
+    sendUploadProgress({
+      type: 'processing',
+      phase: 'Saving encryption keys',
+      loaded: 970,
+      total: processingTotal,
+    });
     const keyReq = await getRequest();
     keyReq.input('fid',   sql.UniqueIdentifier, newFile.id);
     keyReq.input('encK',  sql.VarBinary(64),    wrapped.encryptedKey);
@@ -1619,12 +1690,26 @@ app.post('/api/files/upload', authenticateUser as express.RequestHandler, receiv
     await logSystemEvent(user.id, user.username, 'Upload', 'File', newFile.id, req,
       `Uploaded "${original_name}" (${Math.round(size/1024)}KB). Scan: ${acceptedWithoutScanner ? 'development bypass (Bitdefender unavailable)' : scanResult.status}.`);
 
+    const mappedFile = mapFileRow(newFile, user.username);
     console.info('[upload] Upload completed successfully.', {
       userId: user.id, username: user.username, originalName: original_name,
       fileId: newFile.id, scanStatus: scanResult.status, storedScanResult: persistedScanResult, storedPath: newFile.stored_path,
     });
 
-    res.json({ success: true, message: 'File approved and encrypted!', file: mapFileRow(newFile, user.username) });
+    if (progressStreamStarted) {
+      sendUploadProgress({
+        type: 'complete',
+        phase: 'Complete',
+        loaded: processingTotal,
+        total: processingTotal,
+        success: true,
+        message: 'File approved and encrypted!',
+        file: mappedFile,
+      });
+      res.end();
+      return;
+    }
+    res.json({ success: true, message: 'File approved and encrypted!', file: mappedFile });
   } catch (err) {
     console.error('[POST /api/files/upload] Upload failed.', {
       userId: user.id, username: user.username, originalName: original_name,
@@ -1635,6 +1720,11 @@ app.post('/api/files/upload', authenticateUser as express.RequestHandler, receiv
     // Clean up: delete vault file if created AND temp upload file
     if (vaultFilePath) try { if (fs.existsSync(vaultFilePath)) fs.unlinkSync(vaultFilePath); } catch {}
     try { if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath); } catch {}
+    if (progressStreamStarted) {
+      sendUploadProgress({ type: 'error', error: 'Upload failed. Please try again.' });
+      res.end();
+      return;
+    }
     res.status(500).json({ error: 'Upload failed. Please try again.' });
   }
 });

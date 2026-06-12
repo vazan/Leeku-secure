@@ -307,6 +307,7 @@ export interface EncryptFileStreamResult {
 export function encryptFileStream(
   srcPath:  string,
   destPath: string,
+  onProgress?: (progress: { processedBytes: number }) => void,
 ): Promise<EncryptFileStreamResult> {
   return new Promise((resolve, reject) => {
     const key = crypto.randomBytes(KEY_LENGTH);
@@ -318,9 +319,12 @@ export function encryptFileStream(
     const writeStream = fs.createWriteStream(destPath);
 
     let encryptedSize = 0;
+    let processedBytes = 0;
 
     readStream.on('data', (chunk) => {
       checksum.update(chunk);
+      processedBytes += Buffer.byteLength(chunk);
+      onProgress?.({ processedBytes });
     });
 
     cipher.on('data', (chunk) => {

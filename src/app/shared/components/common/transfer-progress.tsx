@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import { ArrowDownToLine, Check, LockKeyhole, Upload } from "lucide-react";
 
 export interface TransferState {
@@ -6,6 +7,10 @@ export interface TransferState {
   loaded: number;
   total: number;
   startedAt: number;
+  phaseLabel?: string;
+  processingLoaded?: number;
+  processingTotal?: number;
+  processingStartedAt?: number;
   processing?: boolean;
   complete?: boolean;
 }
@@ -20,6 +25,17 @@ function formatBytes(bytes: number) {
   return `${(bytes / 1024 ** index).toFixed(index > 1 ? 1 : 0)} ${units[index]}`;
 }
 
+function formatDuration(seconds: number) {
+  if (!Number.isFinite(seconds) || seconds < 1) return "Calculating";
+  const rounded = Math.ceil(seconds);
+  const hours = Math.floor(rounded / 3600);
+  const minutes = Math.floor((rounded % 3600) / 60);
+  const remainingSeconds = rounded % 60;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  if (minutes > 0) return `${minutes}m ${remainingSeconds}s`;
+  return `${remainingSeconds}s`;
+}
+
 export default function TransferProgress({
   transfer,
   onCancel,
@@ -27,16 +43,36 @@ export default function TransferProgress({
   transfer: TransferState;
   onCancel?: () => void;
 }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (transfer.complete) return undefined;
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [transfer.complete]);
+
+  const activeLoaded = transfer.processing
+    ? (transfer.processingLoaded ?? 0)
+    : transfer.loaded;
+  const activeTotal = transfer.processing
+    ? (transfer.processingTotal ?? 0)
+    : transfer.total;
+  const activeStartedAt = transfer.processing
+    ? (transfer.processingStartedAt ?? transfer.startedAt)
+    : transfer.startedAt;
   const percent =
-    transfer.total > 0
-      ? Math.min(100, Math.round((transfer.loaded / transfer.total) * 100))
+    activeTotal > 0
+      ? Math.min(100, Math.round((activeLoaded / activeTotal) * 100))
       : 0;
-  const elapsedSeconds = Math.max((Date.now() - transfer.startedAt) / 1000, 1);
-  const speed = transfer.loaded / elapsedSeconds;
+  const elapsedSeconds = Math.max((now - activeStartedAt) / 1000, 1);
+  const speed = activeLoaded / elapsedSeconds;
+  const etaSeconds =
+    activeTotal > 0 && activeLoaded > 0 && speed > 0
+      ? Math.max(0, (activeTotal - activeLoaded) / speed)
+      : Number.NaN;
   const label = transfer.complete
     ? "Transfer complete"
     : transfer.processing
-      ? "Securing file"
+      ? transfer.phaseLabel || "Securing file"
       : transfer.direction === "upload"
         ? "Uploading securely"
         : "Decrypting and downloading";
@@ -52,19 +88,22 @@ export default function TransferProgress({
     <div className="overflow-hidden rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] shadow-[var(--shadow-panel)]">
       <div className="flex items-center gap-3 px-4 py-3">
         <div className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-[var(--bg-hover)] text-[var(--text-secondary)]">
-          <Icon className={`h-4 w-4 ${transfer.processing ? "animate-pulse" : ""}`} />
+          <Icon className="h-4 w-4" />
         </div>
         <div className="min-w-0 flex-1">
           <div className="flex items-center justify-between gap-4">
             <p className="truncate text-sm font-medium">{transfer.name}</p>
             <span className="shrink-0 font-mono text-xs text-[var(--text-muted)]">
-              {transfer.processing ? "Processing" : transfer.complete ? "100%" : transfer.total ? `${percent}%` : "Starting"}
+              {transfer.complete ? "100%" : activeTotal ? `${percent}%` : "Starting"}
             </span>
           </div>
           <div className="mt-1 flex items-center justify-between gap-4 text-xs text-[var(--text-faint)]">
             <span>{label}</span>
-            {!transfer.processing && !transfer.complete && transfer.loaded > 0 && (
-              <span className="shrink-0">{formatBytes(speed)}/s</span>
+            {!transfer.complete && activeLoaded > 0 && (
+              <span className="shrink-0">
+                {transfer.processing ? "ETA " : `${formatBytes(speed)}/s · ETA `}
+                {formatDuration(etaSeconds)}
+              </span>
             )}
           </div>
         </div>
@@ -80,13 +119,23 @@ export default function TransferProgress({
       </div>
       <div className="h-1 bg-[var(--bg-hover)]">
         <div
-          className={`h-full bg-[var(--accent-linear)] transition-[width] duration-150 ${!transfer.total || transfer.processing ? "animate-pulse" : ""}`}
-          style={{ width: `${transfer.processing || transfer.complete ? 100 : Math.max(percent, transfer.loaded ? 2 : 0)}%` }}
+          className="h-full bg-[var(--accent-linear)] transition-[width] duration-150"
+          style={{ width: `${transfer.complete ? 100 : Math.max(percent, activeLoaded ? 2 : 0)}%` }}
         />
       </div>
       <div className="flex justify-between px-4 py-2 font-mono text-[0.68rem] text-[var(--text-faint)]">
-        <span>{formatBytes(transfer.loaded)}</span>
-        <span>{transfer.total ? formatBytes(transfer.total) : "Calculating size"}</span>
+        <span>
+          {transfer.processing
+            ? `${percent}% processing`
+            : formatBytes(transfer.loaded)}
+        </span>
+        <span>
+          {transfer.processing
+            ? `ETA ${formatDuration(etaSeconds)}`
+            : transfer.total
+              ? formatBytes(transfer.total)
+              : "Calculating size"}
+        </span>
       </div>
     </div>
   );
