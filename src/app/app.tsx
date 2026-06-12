@@ -39,6 +39,7 @@ export default function App() {
       userRef.current = data.user;
       setUser(data.user);
       setToken("cookie");
+      window.dispatchEvent(new Event("leeku:session-rotated"));
       return data.user as User;
     }
     return null;

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Laptop, LogOut, RefreshCw, ShieldCheck } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/app/shared/components/ui/button";
@@ -47,7 +47,7 @@ export default function SessionManager() {
   const [sessions, setSessions] = useState<ActiveSession[]>([]);
   const [loading, setLoading] = useState(true);
 
-  const load = async () => {
+  const load = useCallback(async () => {
     setLoading(true);
     try {
       const response = await fetch("/api/auth/sessions");
@@ -59,14 +59,20 @@ export default function SessionManager() {
     } finally {
       setLoading(false);
     }
-  };
-
-  useEffect(() => {
-    load();
   }, []);
 
+  useEffect(() => {
+    const reloadSessions = () => {
+      void load();
+    };
+    void load();
+    window.addEventListener("leeku:session-rotated", reloadSessions);
+    return () =>
+      window.removeEventListener("leeku:session-rotated", reloadSessions);
+  }, [load]);
+
   const revoke = async (session: ActiveSession) => {
-    const response = await fetch(`/api/auth/sessions/${session.id}/revoke`, {
+    const response = await fetch(session.is_current ? "/api/auth/sessions/current/revoke" : `/api/auth/sessions/${session.id}/revoke`, {
       method: "POST",
       headers: { "X-CSRF-Token": getCsrfToken() },
     });
@@ -88,7 +94,7 @@ export default function SessionManager() {
       headers: { "X-CSRF-Token": getCsrfToken() },
     });
     if (response.ok) {
-      setSessions((current) => current.filter((session) => session.is_current));
+      await load();
       toast.success("Other sessions signed out.");
     } else {
       toast.error(await readError(response, "Could not revoke sessions."));
