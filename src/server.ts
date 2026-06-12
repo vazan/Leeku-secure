@@ -1766,7 +1766,7 @@ app.get('/api/sharing/links', authenticateUser as express.RequestHandler, async 
   } catch (err) { console.error('[GET /api/sharing/links]', err); res.status(500).json({ error: 'Failed to load share links.' }); }
 });
 
-app.delete('/api/sharing/links/:id', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+const removeSharingLink = async (req: AuthenticatedRequest, res: express.Response) => {
   const linkId = req.params.id;
   try {
     const findRequest = await getRequest();
@@ -1787,8 +1787,12 @@ app.delete('/api/sharing/links/:id', authenticateUser as express.RequestHandler,
 
     await logSystemEvent(req.userId!, req.user!.username, 'Delete', 'ShareLink', linkId, req, `Removed share link for file ${link.file_id}.`);
     res.json({ success: true });
-  } catch (err) { console.error('[DELETE /api/sharing/links/:id]', err); res.status(500).json({ error: 'Failed to remove share link.' }); }
-});
+  } catch (err) { console.error('[remove sharing link]', err); res.status(500).json({ error: 'Failed to remove share link.' }); }
+};
+
+// Keep DELETE for API clients, and provide POST for IIS installations that filter DELETE verbs.
+app.delete('/api/sharing/links/:id', authenticateUser as express.RequestHandler, removeSharingLink);
+app.post('/api/sharing/links/:id/remove', authenticateUser as express.RequestHandler, removeSharingLink);
 
 app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
   const fileId = req.params.id;

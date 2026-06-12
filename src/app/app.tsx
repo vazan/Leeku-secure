@@ -60,7 +60,7 @@ export default function App() {
       setCurrentView("auth");
       return;
     }
-    if (hash === "#dashboard" && userRef.current) {
+    if (hash.startsWith("#dashboard") && userRef.current) {
       setDownloadToken(null);
       setCurrentView("dashboard");
       return;
@@ -181,11 +181,9 @@ export default function App() {
         {currentView === "landing" && (
           <div>
             <LandingPage
-              quotas={quotas}
               onGoToAuth={(mode) => {
                 window.location.hash = `auth/${mode}`;
               }}
-              onSetView={(view) => setCurrentView(view as any)}
             />
           </div>
         )}
@@ -194,7 +192,10 @@ export default function App() {
             <AuthPage
               initialMode={authMode}
               onAuthSuccess={handleAuthSuccess}
-              onCancel={() => window.history.back()}
+              onCancel={() => {
+                window.history.replaceState(null, "", window.location.pathname);
+                setCurrentView(user ? "dashboard" : "landing");
+              }}
             />
           </div>
         )}

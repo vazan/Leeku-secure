@@ -58,9 +58,11 @@ export default function DashboardSidebar({
       </nav>
       <div className="mt-auto">
         <div className="mb-4 rounded-xl border border-[var(--border-subtle)] p-3">
-          <div className="mb-2 flex justify-between text-xs">
+          <div className="mb-2 text-xs">
             <span className="text-[var(--text-muted)]">Storage</span>
-            <span>{formatBytes(user.storage_used)} / {formatBytes(storageLimit)}</span>
+            <span className="mt-1 block text-[var(--text-secondary)]">
+              {formatBytes(user.storage_used)} / {formatBytes(storageLimit)}
+            </span>
           </div>
           <div className="h-1.5 overflow-hidden rounded-full bg-[var(--bg-hover)]">
             <div

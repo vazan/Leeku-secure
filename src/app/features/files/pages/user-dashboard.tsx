@@ -42,6 +42,10 @@ import DashboardSidebar, {
   type DashboardNavItem,
   type DashboardView,
 } from "@/app/features/files/components/dashboard-sidebar";
+import TransferProgress, {
+  type TransferState,
+} from "@/app/shared/components/common/transfer-progress";
+import { downloadWithProgress } from "@/app/shared/utils/download-with-progress";
 
 interface UserDashboardProps {
   user: User;
@@ -68,6 +72,14 @@ const dashboardViews: DashboardView[] = [
 ];
 
 function getSavedDashboardView(user: User): DashboardView {
+  const hashView = window.location.hash.match(/^#dashboard\/([^/]+)$/)?.[1];
+  if (
+    dashboardViews.includes(hashView as DashboardView) &&
+    (hashView !== "admin" || user.role === "Admin")
+  ) {
+    return hashView as DashboardView;
+  }
+  if (window.location.hash === "#dashboard") return "home";
   const savedView = localStorage.getItem(`dashboard-view:${user.id}`);
   if (
     dashboardViews.includes(savedView as DashboardView) &&
@@ -137,6 +149,7 @@ export default function UserDashboard({
   const [search, setSearch] = useState("");
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
+  const [transfer, setTransfer] = useState<TransferState | null>(null);
   const [dragging, setDragging] = useState(false);
   const [shareFile, setShareFile] = useState<FileMetadata | null>(null);
   const [videoFile, setVideoFile] = useState<FileMetadata | null>(null);
@@ -195,6 +208,31 @@ export default function UserDashboard({
     localStorage.setItem(`dashboard-view:${user.id}`, view);
   }, [user.id, view]);
 
+  useEffect(() => {
+    const syncDashboardView = () => {
+      const hashView = window.location.hash.match(/^#dashboard\/([^/]+)$/)?.[1];
+      if (
+        dashboardViews.includes(hashView as DashboardView) &&
+        (hashView !== "admin" || user.role === "Admin")
+      ) {
+        setView(hashView as DashboardView);
+      } else if (
+        window.location.hash === "#dashboard" ||
+        window.location.hash === ""
+      ) {
+        setView("home");
+      }
+    };
+    window.addEventListener("hashchange", syncDashboardView);
+    return () => window.removeEventListener("hashchange", syncDashboardView);
+  }, [user.role]);
+
+  const navigateDashboard = (nextView: DashboardView) => {
+    const nextHash = nextView === "home" ? "#dashboard" : `#dashboard/${nextView}`;
+    if (window.location.hash !== nextHash) window.location.hash = nextHash;
+    setView(nextView);
+  };
+
   const visibleFiles = useMemo(
     () =>
       files.filter((file) =>
@@ -204,29 +242,71 @@ export default function UserDashboard({
   );
 
   const uploadFile = (file: globalThis.File) => {
+    const startedAt = Date.now();
     setUploading(true);
     setUploadProgress(0);
+    setTransfer({
+      direction: "upload",
+      name: file.name,
+      loaded: 0,
+      total: file.size,
+      startedAt,
+    });
     const formData = new FormData();
     formData.append("file", file);
     formData.append("original_name", file.name);
     formData.append("mime_type", file.type || "application/octet-stream");
     const xhr = new XMLHttpRequest();
-    xhr.upload.onprogress = (event) =>
-      event.lengthComputable &&
-      setUploadProgress(Math.round((event.loaded / event.total) * 100));
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable)
+        setUploadProgress(Math.round((event.loaded / event.total) * 100));
+      setTransfer({
+        direction: "upload",
+        name: file.name,
+        loaded: event.loaded,
+        total: event.lengthComputable ? event.total : file.size,
+        startedAt,
+      });
+    };
+    xhr.upload.onload = () =>
+      setTransfer({
+        direction: "upload",
+        name: file.name,
+        loaded: file.size,
+        total: file.size,
+        startedAt,
+        processing: true,
+      });
     xhr.onload = async () => {
       setUploading(false);
       if (xhr.status >= 200 && xhr.status < 300) {
+        setTransfer({
+          direction: "upload",
+          name: file.name,
+          loaded: file.size,
+          total: file.size,
+          startedAt,
+          complete: true,
+        });
+        window.setTimeout(
+          () =>
+            setTransfer((current) =>
+              current?.startedAt === startedAt ? null : current,
+            ),
+          1800,
+        );
         notify("Upload complete.");
         await loadFilesAndLinks();
         onTriggerRefreshUser();
       } else {
+        setTransfer(null);
         const data = JSON.parse(xhr.responseText || "{}");
         notifyError(data.error || "Upload failed.");
       }
     };
     xhr.onerror = () => {
       setUploading(false);
+      setTransfer(null);
       notifyError("Upload interrupted.");
     };
     xhr.open("POST", "/api/files/upload");
@@ -235,16 +315,45 @@ export default function UserDashboard({
   };
 
   const downloadFile = async (file: FileMetadata) => {
-    const response = await fetch(`/api/files/${file.id}/download`, {
-      headers: authHeaders(token),
+    const startedAt = Date.now();
+    setTransfer({
+      direction: "download",
+      name: file.original_name,
+      loaded: 0,
+      total: file.size,
+      startedAt,
     });
-    if (!response.ok) return notifyError("Download unavailable.");
-    const url = URL.createObjectURL(await response.blob());
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = file.original_name;
-    anchor.click();
-    URL.revokeObjectURL(url);
+    try {
+      await downloadWithProgress(`/api/files/${file.id}/download`, file.original_name, {
+        headers: authHeaders(token),
+        onProgress: ({ loaded, total }) =>
+          setTransfer({
+            direction: "download",
+            name: file.original_name,
+            loaded,
+            total: total || file.size,
+            startedAt,
+          }),
+      });
+      setTransfer({
+        direction: "download",
+        name: file.original_name,
+        loaded: file.size,
+        total: file.size,
+        startedAt,
+        complete: true,
+      });
+      window.setTimeout(
+        () =>
+          setTransfer((current) =>
+            current?.startedAt === startedAt ? null : current,
+          ),
+        1800,
+      );
+    } catch (reason) {
+      setTransfer(null);
+      notifyError(reason instanceof Error ? reason.message : "Download unavailable.");
+    }
   };
 
   const deleteFile = async (file: FileMetadata) => {
@@ -304,8 +413,8 @@ export default function UserDashboard({
       )
     )
       return;
-    const response = await fetch(`/api/sharing/links/${link.id}`, {
-      method: "DELETE",
+    const response = await fetch(`/api/sharing/links/${link.id}/remove`, {
+      method: "POST",
       headers: authHeaders(token),
     });
     if (response.ok) {
@@ -391,7 +500,7 @@ export default function UserDashboard({
         view={view}
         navItems={navItems}
         storageLimit={storageLimit}
-        onView={setView}
+        onView={navigateDashboard}
         onLogout={onLogout}
       />
 
@@ -399,7 +508,9 @@ export default function UserDashboard({
         <header className="sticky top-0 z-10 flex h-20 items-center gap-4 border-b border-[var(--border-subtle)] bg-[color-mix(in_srgb,var(--bg-panel)_92%,transparent)] backdrop-blur-[var(--blur-header)] px-5 sm:pr-64 lg:px-8 lg:pr-72">
           <select
             value={view}
-            onChange={(event) => setView(event.target.value as DashboardView)}
+            onChange={(event) =>
+              navigateDashboard(event.target.value as DashboardView)
+            }
             className="rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-panel)] px-3 py-2.5 text-sm lg:hidden"
           >
             {navItems.map(([id, , label]) => (
@@ -442,6 +553,11 @@ export default function UserDashboard({
         </header>
 
         <div className="mx-auto max-w-7xl p-5 lg:p-8">
+          {transfer && (
+            <div className="mx-auto mb-6 max-w-5xl">
+              <TransferProgress transfer={transfer} />
+            </div>
+          )}
           {view === "home" && (
             <div className="mx-auto max-w-5xl space-y-8">
               <div className="text-center">
@@ -480,14 +596,6 @@ export default function UserDashboard({
                     ? "We will let you know when it is ready."
                     : `One file at a time, up to ${formatBytes(activeQuota?.max_file_size_bytes || 0)}.`}
                 </p>
-                {uploading && (
-                  <div className="mx-auto mt-4 h-1.5 max-w-sm overflow-hidden rounded-full bg-[var(--bg-hover)]">
-                    <div
-                      className="h-full bg-[var(--accent-linear)]"
-                      style={{ width: `${uploadProgress}%` }}
-                    />
-                  </div>
-                )}
               </div>
               <section>
                 <div className="mb-4 flex items-end justify-between">
@@ -498,7 +606,7 @@ export default function UserDashboard({
                     </p>
                   </div>
                   <button
-                    onClick={() => setView("files")}
+                    onClick={() => navigateDashboard("files")}
                     className="text-sm font-medium text-[var(--text-secondary)]"
                   >
                     See all

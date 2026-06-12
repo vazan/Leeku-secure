@@ -9,6 +9,10 @@ import {
   Lock,
 } from "lucide-react";
 import ErrorScreen from "@/app/shared/components/common/error-screen";
+import TransferProgress, {
+  type TransferState,
+} from "@/app/shared/components/common/transfer-progress";
+import { downloadWithProgress } from "@/app/shared/utils/download-with-progress";
 
 interface PublicDownloadPageProps {
   token: string;
@@ -44,6 +48,7 @@ export default function PublicDownloadPage({
   const [password, setPassword] = useState("");
   const [downloading, setDownloading] = useState(false);
   const [done, setDone] = useState(false);
+  const [transfer, setTransfer] = useState<TransferState | null>(null);
 
   useEffect(() => {
     fetch(`/api/public/share/${token}`)
@@ -61,24 +66,41 @@ export default function PublicDownloadPage({
     event.preventDefault();
     setDownloading(true);
     setError("");
+    setDone(false);
+    const startedAt = Date.now();
+    const fileName = meta?.file_name || "download";
+    setTransfer({
+      direction: "download",
+      name: fileName,
+      loaded: 0,
+      total: meta?.size || 0,
+      startedAt,
+    });
     try {
-      const response = await fetch(`/api/public/share/${token}/download`, {
+      await downloadWithProgress(`/api/public/share/${token}/download`, fileName, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ password }),
+        onProgress: ({ loaded, total }) =>
+          setTransfer({
+            direction: "download",
+            name: fileName,
+            loaded,
+            total: total || meta?.size || 0,
+            startedAt,
+          }),
       });
-      if (!response.ok)
-        throw new Error(
-          (await response.json()).error || "Download unavailable.",
-        );
-      const url = URL.createObjectURL(await response.blob());
-      const anchor = document.createElement("a");
-      anchor.href = url;
-      anchor.download = meta?.file_name || "download";
-      anchor.click();
-      URL.revokeObjectURL(url);
+      setTransfer({
+        direction: "download",
+        name: fileName,
+        loaded: meta?.size || 0,
+        total: meta?.size || 0,
+        startedAt,
+        complete: true,
+      });
       setDone(true);
     } catch (reason: any) {
+      setTransfer(null);
       setError(reason.message);
     } finally {
       setDownloading(false);
@@ -159,6 +181,7 @@ export default function PublicDownloadPage({
                 {error}
               </p>
             )}
+            {transfer && <TransferProgress transfer={transfer} />}
             {done && (
               <p className="flex items-center gap-2 text-sm text-[var(--text-muted)]">
                 <Check className="h-4 w-4" />
