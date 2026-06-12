@@ -49,7 +49,7 @@ export function createSessionRouter(options: SessionRouteOptions): express.Route
     }
   });
 
-  router.delete('/:id', async (req: SessionRequest, res) => {
+  const revokeSession = async (req: SessionRequest, res: express.Response) => {
     try {
       const request = await getRequest();
       request.input('uid', sql.UniqueIdentifier, req.userId!);
@@ -62,10 +62,13 @@ export function createSessionRouter(options: SessionRouteOptions): express.Route
       if (!result.rowsAffected[0]) return res.status(404).json({ error: 'Active session not found.' });
       res.json({ success: true });
     } catch (error) {
-      console.error('[DELETE /api/users/me/sessions/:id]', error);
+      console.error('[revoke session]', error);
       res.status(500).json({ error: 'Could not revoke session.' });
     }
-  });
+  };
+
+  router.delete('/:id', revokeSession);
+  router.post('/:id/revoke', revokeSession);
 
   router.post('/revoke-others', async (req: SessionRequest, res) => {
     try {

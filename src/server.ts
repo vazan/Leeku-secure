@@ -1119,17 +1119,20 @@ app.post('/api/users/me/avatar', authenticateUser as express.RequestHandler, pro
   }
 });
 
-app.delete('/api/users/me/avatar', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+const removeProfilePicture = async (req: AuthenticatedRequest, res: express.Response) => {
   try {
     const directory = getProfilePictureDirectory(req.userId!);
     if (fs.existsSync(directory)) fs.rmSync(directory, { recursive: true, force: true });
     await logSystemEvent(req.userId!, req.user!.username, 'Auth', 'User', req.userId!, req, 'Removed profile picture.');
     res.json({ success: true });
   } catch (err) {
-    console.error('[DELETE /api/users/me/avatar]', err);
+    console.error('[remove profile picture]', err);
     res.status(500).json({ error: 'Could not remove profile picture.' });
   }
-});
+};
+
+app.delete('/api/users/me/avatar', authenticateUser as express.RequestHandler, removeProfilePicture);
+app.post('/api/users/me/avatar/remove', authenticateUser as express.RequestHandler, removeProfilePicture);
 
 // ──────────────────────────────────────────────────────────────
 // API: User — Request Account Deletion (Step 1: generate token & email)

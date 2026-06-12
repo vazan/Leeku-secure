@@ -181,6 +181,7 @@ export default function App() {
         {currentView === "landing" && (
           <div>
             <LandingPage
+              quotas={quotas}
               onGoToAuth={(mode) => {
                 window.location.hash = `auth/${mode}`;
               }}

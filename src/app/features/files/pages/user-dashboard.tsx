@@ -470,8 +470,8 @@ export default function UserDashboard({
   };
 
   const removeAvatar = async () => {
-    const response = await fetch("/api/users/me/avatar", {
-      method: "DELETE",
+    const response = await fetch("/api/users/me/avatar/remove", {
+      method: "POST",
       headers: authHeaders(token),
     });
     if (response.ok) {

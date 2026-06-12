@@ -58,8 +58,8 @@ export default function SessionManager() {
   }, []);
 
   const revoke = async (session: ActiveSession) => {
-    const response = await fetch(`/api/users/me/sessions/${session.id}`, {
-      method: "DELETE",
+    const response = await fetch(`/api/users/me/sessions/${session.id}/revoke`, {
+      method: "POST",
       headers: { "X-CSRF-Token": getCsrfToken() },
     });
     if (response.ok) {
