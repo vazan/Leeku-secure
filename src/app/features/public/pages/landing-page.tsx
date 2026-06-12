@@ -26,8 +26,10 @@ const LEEKU_QUOTES = [
   "I blocked some malware with my giant combat leek today."
 ];
 
+
 export default function LandingPage({ onGoToAuth, quotas }: LandingPageProps) {
   const [mascotQuote, setMascotQuote] = useState(LEEKU_QUOTES[0]);
+  const [isMobile, setIsMobile] = useState<boolean>(false);
 
   // Rotate mascot quotes periodically for micro-interaction amusement
   useEffect(() => {
@@ -36,6 +38,14 @@ export default function LandingPage({ onGoToAuth, quotas }: LandingPageProps) {
       setMascotQuote(LEEKU_QUOTES[idx]);
     }, 8000);
     return () => clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
+    const userAgent = navigator.userAgent || navigator.vendor || (window as any).opera;
+    // Expanded regex to catch iOS, Android, and other mobile platforms
+    if (/android|iphone|ipad|ipod|blackberry|iemobile|opera mini/i.test(userAgent)) {
+      setIsMobile(true);
+    }
   }, []);
 
   const formatSize = (bytes: number) => {
@@ -54,9 +64,17 @@ export default function LandingPage({ onGoToAuth, quotas }: LandingPageProps) {
             L
           </div>
           <div>
-            <span className="font-display font-black text-2xl tracking-tighter italic text-[#00F2FF] uppercase group-hover:text-white transition-colors">
-              Leeks.<span className="text-[#FF007F]">miku</span>.rip
-            </span>
+          <span className="font-display font-black text-2xl tracking-tighter italic text-[#00F2FF] uppercase group-hover:text-white transition-colors">
+            {isMobile ? (
+              <>
+                <span className="text-[#FF007F]">miku</span>.rip
+              </>
+            ) : (
+              <>
+                Leeks.<span className="text-[#FF007F]">miku</span>.rip
+              </>
+            )}
+          </span>
             <span className="block font-mono text-[9px] uppercase tracking-wider text-gray-500 font-bold">Miku Bunker Secure</span>
           </div>
         </div>
