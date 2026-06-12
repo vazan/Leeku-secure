@@ -126,12 +126,12 @@ export default function PublicDownloadPage({
             </div>
             <span className="text-sm font-semibold">Leeku</span>
           </div>
-          <div className="mt-10 flex gap-4">
+          <div className="mt-10 flex items-start gap-4">
             <div className="grid h-12 w-12 flex-none place-items-center rounded-xl bg-[var(--bg-hover)]">
               <FileText className="h-5 w-5" />
             </div>
-            <div className="min-w-0">
-              <h1 className="truncate text-xl font-semibold">
+            <div className="min-w-0 flex-1">
+              <h1 className="break-all text-xl font-semibold leading-snug">
                 {meta.file_name}
               </h1>
               <p className="mt-1 text-sm text-[var(--text-muted)]">

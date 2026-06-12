@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Laptop, LogOut, RefreshCw, ShieldCheck } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/app/shared/components/ui/button";
@@ -9,6 +9,14 @@ const getCsrfToken = () =>
     .split("; ")
     .find((row) => row.startsWith("leeku_csrf="))
     ?.split("=")[1] || "";
+
+async function readError(response: Response, fallback: string) {
+  try {
+    return (await response.json()).error || fallback;
+  } catch {
+    return fallback;
+  }
+}
 
 function describeDevice(userAgent: string | null) {
   if (!userAgent) return "Unknown device";
@@ -39,10 +47,10 @@ export default function SessionManager() {
   const [sessions, setSessions] = useState<ActiveSession[]>([]);
   const [loading, setLoading] = useState(true);
 
-  const load = async () => {
+  const load = useCallback(async () => {
     setLoading(true);
     try {
-      const response = await fetch("/api/users/me/sessions");
+      const response = await fetch("/api/auth/sessions");
       const data = await response.json();
       if (!response.ok) throw new Error(data.error);
       setSessions(data.sessions || []);
@@ -51,46 +59,56 @@ export default function SessionManager() {
     } finally {
       setLoading(false);
     }
-  };
-
-  useEffect(() => {
-    load();
   }, []);
 
-  const revoke = async (session: ActiveSession) => {
-    const response = await fetch(`/api/users/me/sessions/${session.id}`, {
-      method: "DELETE",
-      headers: { "X-CSRF-Token": getCsrfToken() },
-    });
-    if (response.ok) {
-      setSessions((current) => current.filter((item) => item.id !== session.id));
-      toast.success("Session signed out.");
-    } else {
-      toast.error((await response.json()).error || "Could not revoke session.");
-    }
-  };
+  useEffect(() => {
+    const reloadSessions = () => {
+      void load();
+    };
+    void load();
+    window.addEventListener("leeku:session-rotated", reloadSessions);
+    return () =>
+      window.removeEventListener("leeku:session-rotated", reloadSessions);
+  }, [load]);
 
-  const revokeOthers = async () => {
-    const response = await fetch("/api/users/me/sessions/revoke-others", {
+  const revoke = async (session: ActiveSession) => {
+    const response = await fetch(session.is_current ? "/api/auth/sessions/current/revoke" : `/api/auth/sessions/${session.id}/revoke`, {
       method: "POST",
       headers: { "X-CSRF-Token": getCsrfToken() },
     });
     if (response.ok) {
-      setSessions((current) => current.filter((session) => session.is_current));
+      if (session.is_current) {
+        window.location.assign("/");
+        return;
+      }
+      setSessions((current) => current.filter((item) => item.id !== session.id));
+      toast.success("Session signed out.");
+    } else {
+      toast.error(await readError(response, "Could not revoke session."));
+    }
+  };
+
+  const revokeOthers = async () => {
+    const response = await fetch("/api/auth/sessions/revoke-others", {
+      method: "POST",
+      headers: { "X-CSRF-Token": getCsrfToken() },
+    });
+    if (response.ok) {
+      await load();
       toast.success("Other sessions signed out.");
     } else {
-      toast.error((await response.json()).error || "Could not revoke sessions.");
+      toast.error(await readError(response, "Could not revoke sessions."));
     }
   };
 
   const revokeAll = async () => {
     if (!window.confirm("Sign out every active session, including this one?")) return;
-    const response = await fetch("/api/users/me/sessions/revoke-all", {
+    const response = await fetch("/api/auth/sessions/revoke-all", {
       method: "POST",
       headers: { "X-CSRF-Token": getCsrfToken() },
     });
     if (response.ok) window.location.assign("/");
-    else toast.error((await response.json()).error || "Could not revoke sessions.");
+    else toast.error(await readError(response, "Could not revoke sessions."));
   };
 
   return (
@@ -134,7 +152,9 @@ export default function SessionManager() {
               <p className="truncate text-sm font-medium">
                 {describeDevice(session.user_agent)}
                 {session.is_current && (
-                  <span className="ml-2 text-xs text-[var(--accent-linear)]">Current</span>
+                  <span className="ml-2 text-xs text-[var(--accent-linear)]">
+                    Current session
+                  </span>
                 )}
               </p>
               <p className="mt-0.5 truncate text-xs text-[var(--text-muted)]">
@@ -142,11 +162,9 @@ export default function SessionManager() {
                 {new Date(session.created_at).toLocaleString()}
               </p>
             </div>
-            {!session.is_current && (
-              <Button type="button" variant="ghost" size="sm" onClick={() => revoke(session)}>
-                Sign out
-              </Button>
-            )}
+            <Button type="button" variant="ghost" size="sm" onClick={() => revoke(session)}>
+              Sign out
+            </Button>
           </div>
         ))}
       </div>

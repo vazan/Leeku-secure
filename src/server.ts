@@ -1008,14 +1008,17 @@ app.post('/api/auth/logout', async (req, res) => {
   res.json({ success: true });
 });
 
-app.use('/api/users/me/sessions', createSessionRouter({
+const sessionRouteOptions = {
   authenticate: authenticateUser as express.RequestHandler,
   getCurrentRefreshTokenHash: (req) => {
     const token = getCookieValue(req, REFRESH_COOKIE_NAME);
     return token ? hashRefreshToken(token) : null;
   },
   clearAuth: clearAuthCookie,
-}));
+};
+
+app.use('/api/auth/sessions', createSessionRouter(sessionRouteOptions));
+app.use('/api/users/me/sessions', createSessionRouter(sessionRouteOptions));
 
 app.post('/api/users/me/update', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
   const { username, email, password } = req.body;
@@ -1119,17 +1122,20 @@ app.post('/api/users/me/avatar', authenticateUser as express.RequestHandler, pro
   }
 });
 
-app.delete('/api/users/me/avatar', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+const removeProfilePicture = async (req: AuthenticatedRequest, res: express.Response) => {
   try {
     const directory = getProfilePictureDirectory(req.userId!);
     if (fs.existsSync(directory)) fs.rmSync(directory, { recursive: true, force: true });
     await logSystemEvent(req.userId!, req.user!.username, 'Auth', 'User', req.userId!, req, 'Removed profile picture.');
     res.json({ success: true });
   } catch (err) {
-    console.error('[DELETE /api/users/me/avatar]', err);
+    console.error('[remove profile picture]', err);
     res.status(500).json({ error: 'Could not remove profile picture.' });
   }
-});
+};
+
+app.delete('/api/users/me/avatar', authenticateUser as express.RequestHandler, removeProfilePicture);
+app.post('/api/users/me/avatar/remove', authenticateUser as express.RequestHandler, removeProfilePicture);
 
 // ──────────────────────────────────────────────────────────────
 // API: User — Request Account Deletion (Step 1: generate token & email)

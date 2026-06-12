@@ -39,6 +39,7 @@ export default function App() {
       userRef.current = data.user;
       setUser(data.user);
       setToken("cookie");
+      window.dispatchEvent(new Event("leeku:session-rotated"));
       return data.user as User;
     }
     return null;
@@ -181,6 +182,7 @@ export default function App() {
         {currentView === "landing" && (
           <div>
             <LandingPage
+              quotas={quotas}
               onGoToAuth={(mode) => {
                 window.location.hash = `auth/${mode}`;
               }}

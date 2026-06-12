@@ -49,23 +49,28 @@ export function createSessionRouter(options: SessionRouteOptions): express.Route
     }
   });
 
-  router.delete('/:id', async (req: SessionRequest, res) => {
+  const revokeSession = async (req: SessionRequest, res: express.Response) => {
     try {
+      const currentHash = options.getCurrentRefreshTokenHash(req);
       const request = await getRequest();
       request.input('uid', sql.UniqueIdentifier, req.userId!);
       request.input('id', sql.UniqueIdentifier, req.params.id);
-      const result = await request.query(
+      request.input('currentHash', sql.Char(64), currentHash);
+      const result = await request.query<{ revoked_current: boolean }>(
         `UPDATE refresh_tokens
          SET revoked_at=COALESCE(revoked_at,SYSDATETIMEOFFSET())
+         OUTPUT CAST(CASE WHEN INSERTED.token_hash=@currentHash THEN 1 ELSE 0 END AS bit) AS revoked_current
          WHERE id=@id AND user_id=@uid AND revoked_at IS NULL`
       );
       if (!result.rowsAffected[0]) return res.status(404).json({ error: 'Active session not found.' });
-      res.json({ success: true });
+      const revokedCurrent = !!result.recordset[0]?.revoked_current;
+      if (revokedCurrent) options.clearAuth(res);
+      res.json({ success: true, revoked_current: revokedCurrent });
     } catch (error) {
-      console.error('[DELETE /api/users/me/sessions/:id]', error);
+      console.error('[revoke session]', error);
       res.status(500).json({ error: 'Could not revoke session.' });
     }
-  });
+  };
 
   router.post('/revoke-others', async (req: SessionRequest, res) => {
     try {
@@ -85,6 +90,30 @@ export function createSessionRouter(options: SessionRouteOptions): express.Route
       res.status(500).json({ error: 'Could not revoke other sessions.' });
     }
   });
+
+  router.post('/current/revoke', async (req: SessionRequest, res) => {
+    try {
+      const currentHash = options.getCurrentRefreshTokenHash(req);
+      if (!currentHash) return res.status(400).json({ error: 'Current refresh session not found.' });
+      const request = await getRequest();
+      request.input('uid', sql.UniqueIdentifier, req.userId!);
+      request.input('currentHash', sql.Char(64), currentHash);
+      const result = await request.query(
+        `UPDATE refresh_tokens
+         SET revoked_at=COALESCE(revoked_at,SYSDATETIMEOFFSET())
+         WHERE user_id=@uid AND token_hash=@currentHash AND revoked_at IS NULL`
+      );
+      if (!result.rowsAffected[0]) return res.status(404).json({ error: 'Current refresh session not found.' });
+      options.clearAuth(res);
+      res.json({ success: true, revoked_current: true });
+    } catch (error) {
+      console.error('[POST /api/users/me/sessions/current/revoke]', error);
+      res.status(500).json({ error: 'Could not revoke current session.' });
+    }
+  });
+
+  router.delete('/:id', revokeSession);
+  router.post('/:id/revoke', revokeSession);
 
   router.post('/revoke-all', async (req: SessionRequest, res) => {
     try {
