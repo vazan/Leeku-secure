@@ -381,7 +381,7 @@ export default function UserDashboard({
               className="h-11 w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-muted)] pl-10 pr-4 text-sm outline-none focus:border-[var(--accent-linear)]"
             />
           </div>
-          <label className="flex h-11 shrink-0 cursor-pointer items-center rounded-lg bg-[var(--accent-linear)] px-4 text-sm font-medium text-[var(--text-primary)] hover:bg-[var(--accent-linear-bright)]">
+          <label className="flex h-11 shrink-0 cursor-pointer items-center rounded-full bg-white px-5 text-sm font-medium text-black shadow-[var(--shadow-hairline)] hover:bg-[#e7e7e7]">
             <input
               type="file"
               className="hidden"

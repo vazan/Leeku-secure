@@ -35,13 +35,13 @@ export default function LandingPage({ onGoToAuth }: LandingPageProps) {
         <div className="flex items-center gap-2">
           <button
             onClick={() => onGoToAuth("login")}
-            className="rounded-lg px-4 py-2 text-sm font-medium text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+            className="rounded-full px-4 py-2 text-sm font-medium text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
           >
             Log in
           </button>
           <button
             onClick={() => onGoToAuth("register")}
-            className="rounded-lg bg-[var(--accent-linear)] px-4 py-2 text-sm font-medium text-[var(--text-primary)] hover:bg-[var(--accent-linear-bright)]"
+            className="rounded-full bg-white px-4 py-2 text-sm font-medium text-black shadow-[var(--shadow-hairline)] hover:bg-[#e7e7e7]"
           >
             Create account
           </button>
@@ -131,7 +131,7 @@ function FileSharingPreview() {
           <Search className="h-3.5 w-3.5" />
           Search
         </div>
-        <div className="rounded-lg bg-[var(--accent-linear)] px-3 py-2 text-xs font-medium text-[var(--text-primary)]">
+        <div className="rounded-full bg-white px-3 py-2 text-xs font-medium text-black shadow-[var(--shadow-hairline)]">
           Upload file
         </div>
       </div>
