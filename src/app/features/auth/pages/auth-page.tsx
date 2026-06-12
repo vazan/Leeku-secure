@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import { ArrowLeft, Check, Folder, Loader2 } from "lucide-react";
 import type { User } from "@/app/shared/types";
 
@@ -19,6 +19,11 @@ export default function AuthPage({
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState("");
+
+  useEffect(() => {
+    setMode(initialMode);
+    setMessage("");
+  }, [initialMode]);
 
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -131,7 +136,9 @@ export default function AuthPage({
           </form>
           <button
             onClick={() => {
-              setMode(mode === "login" ? "register" : "login");
+              const nextMode = mode === "login" ? "register" : "login";
+              setMode(nextMode);
+              window.location.hash = `auth/${nextMode}`;
               setMessage("");
             }}
             className="mt-6 text-sm text-[var(--text-muted)]"

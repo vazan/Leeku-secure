@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import AuthPage from "@/app/features/auth/pages/auth-page";
 import LandingPage from "@/app/features/public/pages/landing-page";
 import PublicDownloadPage from "@/app/features/sharing/pages/public-download-page";
@@ -16,6 +16,11 @@ export default function App() {
   const [authMode, setAuthMode] = useState<"login" | "register">("login");
   const [downloadToken, setDownloadToken] = useState<string | null>(null);
   const [quotas, setQuotas] = useState<Quota[]>([]);
+  const userRef = useRef<User | null>(null);
+
+  useEffect(() => {
+    userRef.current = user;
+  }, [user]);
 
   const getCsrfToken = () =>
     document.cookie
@@ -31,6 +36,7 @@ export default function App() {
     if (!response.ok) return null;
     const data = await response.json();
     if (data.user) {
+      userRef.current = data.user;
       setUser(data.user);
       setToken("cookie");
       return data.user as User;
@@ -48,8 +54,19 @@ export default function App() {
         return;
       }
     }
+    if (hash === "#auth/login" || hash === "#auth/register") {
+      setAuthMode(hash.endsWith("register") ? "register" : "login");
+      setDownloadToken(null);
+      setCurrentView("auth");
+      return;
+    }
+    if (hash === "#dashboard" && userRef.current) {
+      setDownloadToken(null);
+      setCurrentView("dashboard");
+      return;
+    }
     setDownloadToken(null);
-    setCurrentView(user ? "dashboard" : "landing");
+    setCurrentView(userRef.current ? "dashboard" : "landing");
   };
 
   useEffect(() => {
@@ -63,13 +80,22 @@ export default function App() {
         const sessionData = await sessionResponse.json();
         if (quotasResponse.ok) setQuotas(quotasData.quotas || []);
         if (sessionResponse.ok && sessionData.user) {
+          userRef.current = sessionData.user;
           setUser(sessionData.user);
           setToken("cookie");
-          if (!window.location.hash.startsWith("#f/"))
+          if (
+            !window.location.hash.startsWith("#f/") &&
+            !window.location.hash.startsWith("#auth/")
+          )
             setCurrentView("dashboard");
         } else {
           const refreshedUser = await refreshSession();
-          if (refreshedUser && !window.location.hash.startsWith("#f/"))
+          if (refreshedUser) userRef.current = refreshedUser;
+          if (
+            refreshedUser &&
+            !window.location.hash.startsWith("#f/") &&
+            !window.location.hash.startsWith("#auth/")
+          )
             setCurrentView("dashboard");
         }
       } catch (error) {
@@ -110,9 +136,15 @@ export default function App() {
   };
 
   const handleAuthSuccess = (_newToken: string, authenticatedUser: User) => {
+    userRef.current = authenticatedUser;
     setToken("cookie");
     setUser(authenticatedUser);
-    setCurrentView(downloadToken ? "download" : "dashboard");
+    if (downloadToken) {
+      setCurrentView("download");
+    } else {
+      window.history.replaceState(null, "", "#dashboard");
+      setCurrentView("dashboard");
+    }
   };
 
   const handleLogout = async () => {
@@ -129,7 +161,8 @@ export default function App() {
     }
     setToken("");
     setUser(null);
-    window.location.hash = "";
+    userRef.current = null;
+    window.history.replaceState(null, "", window.location.pathname);
     setCurrentView("landing");
   };
 
@@ -150,8 +183,7 @@ export default function App() {
             <LandingPage
               quotas={quotas}
               onGoToAuth={(mode) => {
-                setAuthMode(mode);
-                setCurrentView("auth");
+                window.location.hash = `auth/${mode}`;
               }}
               onSetView={(view) => setCurrentView(view as any)}
             />
@@ -162,7 +194,7 @@ export default function App() {
             <AuthPage
               initialMode={authMode}
               onAuthSuccess={handleAuthSuccess}
-              onCancel={() => setCurrentView(user ? "dashboard" : "landing")}
+              onCancel={() => window.history.back()}
             />
           </div>
         )}

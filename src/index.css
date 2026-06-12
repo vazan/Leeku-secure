@@ -281,13 +281,13 @@ a {
   border-color: rgba(0, 238, 244, 0.42);
 }
 
-.leeku aside {
+.leeku [data-dashboard-sidebar] {
   position: fixed;
   border-color: #00eaf0;
   box-shadow: none;
 }
 
-.leeku aside::after {
+.leeku [data-dashboard-sidebar]::after {
   position: absolute;
   top: 0;
   right: -3px;
@@ -298,7 +298,7 @@ a {
   pointer-events: none;
 }
 
-.leeku aside nav button[aria-current="page"] {
+.leeku [data-dashboard-sidebar] nav button[aria-current="page"] {
   background: #00eaf0;
   color: #071014;
   font-weight: 700;
