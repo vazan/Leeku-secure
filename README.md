@@ -8,6 +8,8 @@ Leeku Secure is a secure file-sharing platform with:
 - Per-file key wrapping and integrity checksum verification
 - Malware scanning pipeline with fail-closed upload policy
 - Sharing links with optional password protection and limits
+- Active-device session management and revocation
+- Production health probes and encrypted backup tooling
 - IIS W3C logging integration and SQL-backed audit logs
 
 ## Requirements
@@ -91,6 +93,7 @@ npm run lint
 ## Security Notes
 
 - Upload scanning is fail-closed in production: any non-clean AV result blocks upload.
+- Production startup fails when Bitdefender, secure cookies, required secrets, database configuration, or vault access are unavailable.
 - In `NODE_ENV=development`, uploads continue when the Bitdefender CLI is unavailable unless `ALLOW_UNSCANNED_UPLOADS_IN_DEVELOPMENT=false`.
 - Session cookie is httpOnly with SameSite=Lax and secure in production.
 - Browser localStorage persistence for auth tokens is removed from App flow.
@@ -104,8 +107,8 @@ npm run lint
 - Shared frontend modules: `src/app/shared`
 - Security/debt tracker: `Documentations/SECURITY_TECHNICAL_DEBT_ANALYSIS.md`
 - AV integration guide: `Documentations/BITDEFENDER_INTEGRATION.md`
+- Production operations, backups, and master-key rotation: `Documentations/OPERATIONS.md`
 
 ## Current Known Gaps
 
-- SQL documentation scripts are currently absent from `Documentations/SQL` in this workspace snapshot.
 - Session model is cookie-enabled but still supports bearer header compatibility during migration.

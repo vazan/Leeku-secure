@@ -58,7 +58,7 @@ export default function LandingPage({ onGoToAuth }: LandingPageProps) {
               Share files securely without losing control of them.
             </h1>
             <p className="mt-6 max-w-lg text-base leading-7 text-[var(--text-muted)]">
-              Upload, organize, and share the things your team needs. Leeku
+              Upload, organize, and share the files that matter. Leeku
               keeps the details tidy so you can stay focused on the work.
             </p>
             <div className="mt-8 flex flex-wrap gap-3">

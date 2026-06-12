@@ -9,7 +9,6 @@ import {
   Folder,
   LayoutGrid,
   Link2,
-  LogOut,
   MoreHorizontal,
   Search,
   Settings,
@@ -35,6 +34,11 @@ import type {
   SystemStats,
   User,
 } from "@/app/shared/types";
+import SessionManager from "@/app/features/files/components/session-manager";
+import DashboardSidebar, {
+  type DashboardNavItem,
+  type DashboardView,
+} from "@/app/features/files/components/dashboard-sidebar";
 
 interface UserDashboardProps {
   user: User;
@@ -43,8 +47,6 @@ interface UserDashboardProps {
   quotas: Quota[];
   onTriggerRefreshUser: () => void;
 }
-
-type View = "home" | "files" | "shared" | "settings" | "admin";
 
 const getCsrfToken = () =>
   document.cookie
@@ -101,7 +103,7 @@ export default function UserDashboard({
   quotas,
   onTriggerRefreshUser,
 }: UserDashboardProps) {
-  const [view, setView] = useState<View>("home");
+  const [view, setView] = useState<DashboardView>("home");
   const [files, setFiles] = useState<FileMetadata[]>([]);
   const [links, setLinks] = useState<ShareLink[]>([]);
   const [adminUsers, setAdminUsers] = useState<User[]>([]);
@@ -126,10 +128,6 @@ export default function UserDashboard({
   const activeQuota =
     quotas.find((quota) => quota.id === user.quota_id) || quotas[0];
   const storageLimit = activeQuota?.storage_limit_bytes || 1;
-  const storagePercent = Math.min(
-    100,
-    (user.storage_used / storageLimit) * 100,
-  );
 
   const notify = (message: string) => toast(message);
   const notifyError = (message: string) => toast.error(message);
@@ -341,7 +339,7 @@ export default function UserDashboard({
     }
   };
 
-  const navItems: Array<[View, React.ReactNode, string]> = [
+  const navItems: DashboardNavItem[] = [
     ["home", <LayoutGrid className="h-4 w-4" />, "Home"],
     ["files", <Folder className="h-4 w-4" />, "All files"],
     ["shared", <Share2 className="h-4 w-4" />, "Shared"],
@@ -352,60 +350,20 @@ export default function UserDashboard({
 
   return (
     <div className="min-h-screen bg-[var(--bg-primary)] text-[var(--text-primary)]">
-      <aside className="fixed inset-y-0 left-0 z-20 hidden w-64 border-r border-[var(--border-subtle)] bg-[var(--bg-panel)] p-5 lg:flex lg:flex-col">
-        <div className="flex items-center gap-3 px-2 py-1">
-          <div className="grid h-9 w-9 place-items-center rounded-xl bg-[var(--bg-elevated)] text-[var(--text-primary)]">
-            <Folder className="h-4 w-4" />
-          </div>
-          <div>
-            <p className="text-sm font-semibold">Leeku</p>
-            <p className="text-xs text-[var(--text-muted)]">
-              Secure file sharing
-            </p>
-          </div>
-        </div>
-        <nav className="mt-8 space-y-1">
-          {navItems.map(([id, icon, label]) => (
-            <button
-              key={id}
-              onClick={() => setView(id)}
-              className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm ${view === id ? "bg-[var(--bg-hover)] font-medium" : "text-[var(--text-muted)] hover:bg-[var(--bg-hover)]"}`}
-            >
-              {icon}
-              {label}
-            </button>
-          ))}
-        </nav>
-        <div className="mt-auto">
-          <div className="mb-4 rounded-xl border border-[var(--border-subtle)] p-3">
-            <div className="mb-2 flex justify-between text-xs">
-              <span className="text-[var(--text-muted)]">Storage</span>
-              <span>
-                {formatBytes(user.storage_used)} / {formatBytes(storageLimit)}
-              </span>
-            </div>
-            <div className="h-1.5 overflow-hidden rounded-full bg-[var(--bg-hover)]">
-              <div
-                className="h-full rounded-full bg-[var(--accent-linear)]"
-                style={{ width: `${storagePercent}%` }}
-              />
-            </div>
-          </div>
-          <button
-            onClick={onLogout}
-            className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm text-[var(--text-muted)] hover:bg-[var(--bg-hover)]"
-          >
-            <LogOut className="h-4 w-4" />
-            Log out
-          </button>
-        </div>
-      </aside>
+      <DashboardSidebar
+        user={user}
+        view={view}
+        navItems={navItems}
+        storageLimit={storageLimit}
+        onView={setView}
+        onLogout={onLogout}
+      />
 
       <main className="lg:pl-64">
         <header className="sticky top-0 z-10 flex h-20 items-center gap-4 border-b border-[var(--border-subtle)] bg-[color-mix(in_srgb,var(--bg-panel)_92%,transparent)] backdrop-blur-[var(--blur-header)] px-5 sm:pr-64 lg:px-8 lg:pr-72">
           <select
             value={view}
-            onChange={(event) => setView(event.target.value as View)}
+            onChange={(event) => setView(event.target.value as DashboardView)}
             className="rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-panel)] px-3 py-2.5 text-sm lg:hidden"
           >
             {navItems.map(([id, , label]) => (
@@ -751,6 +709,7 @@ export default function UserDashboard({
                   Save changes
                 </Button>
               </form>
+              <SessionManager />
             </section>
           )}
 
@@ -1132,9 +1091,27 @@ function ShareDialog(props: {
     ? `${pad2(selectedExpiresDate.getHours())}:${pad2(selectedExpiresDate.getMinutes())}`
     : "23:59";
 
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") props.onClose();
+    };
+    document.addEventListener("keydown", closeOnEscape);
+    return () => document.removeEventListener("keydown", closeOnEscape);
+  }, [props.onClose]);
+
   return (
-    <div className="fixed inset-0 z-50 grid place-items-center bg-black/60 backdrop-blur-sm p-4">
-      <div className="w-full max-w-lg rounded-2xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] p-6 shadow-[var(--shadow-panel)]">
+    <div
+      className="fixed inset-0 z-50 grid place-items-center bg-black/60 backdrop-blur-sm p-4"
+      onPointerDown={(event) => {
+        if (event.target === event.currentTarget) props.onClose();
+      }}
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        className="w-full max-w-lg rounded-2xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] p-6 shadow-[var(--shadow-panel)]"
+        onPointerDown={(event) => event.stopPropagation()}
+      >
         <div className="flex items-start justify-between">
           <div>
             <h2 className="text-lg font-semibold">

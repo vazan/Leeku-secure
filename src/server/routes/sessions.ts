@@ -1,0 +1,107 @@
+import express from 'express';
+import sql from 'mssql';
+import { getRequest } from '../db.js';
+
+export interface SessionRequest extends express.Request {
+  userId?: string;
+}
+
+export interface SessionRouteOptions {
+  authenticate: express.RequestHandler;
+  getCurrentRefreshTokenHash: (req: express.Request) => string | null;
+  clearAuth: (res: express.Response) => void;
+}
+
+export function createSessionRouter(options: SessionRouteOptions): express.Router {
+  const router = express.Router();
+  router.use(options.authenticate);
+
+  router.get('/', async (req: SessionRequest, res) => {
+    try {
+      const currentHash = options.getCurrentRefreshTokenHash(req);
+      const request = await getRequest();
+      request.input('uid', sql.UniqueIdentifier, req.userId!);
+      request.input('currentHash', sql.Char(64), currentHash);
+      const result = await request.query<{
+        id: string;
+        ip_address: string | null;
+        user_agent: string | null;
+        created_at: Date;
+        expires_at: Date;
+        is_current: boolean;
+      }>(
+        `SELECT id,ip_address,user_agent,created_at,expires_at,
+                CAST(CASE WHEN token_hash=@currentHash THEN 1 ELSE 0 END AS bit) AS is_current
+         FROM refresh_tokens
+         WHERE user_id=@uid AND revoked_at IS NULL AND expires_at>SYSDATETIMEOFFSET()
+         ORDER BY created_at DESC`
+      );
+      res.json({
+        sessions: result.recordset.map((session) => ({
+          ...session,
+          created_at: session.created_at.toISOString(),
+          expires_at: session.expires_at.toISOString(),
+        })),
+      });
+    } catch (error) {
+      console.error('[GET /api/users/me/sessions]', error);
+      res.status(500).json({ error: 'Could not load active sessions.' });
+    }
+  });
+
+  router.delete('/:id', async (req: SessionRequest, res) => {
+    try {
+      const request = await getRequest();
+      request.input('uid', sql.UniqueIdentifier, req.userId!);
+      request.input('id', sql.UniqueIdentifier, req.params.id);
+      const result = await request.query(
+        `UPDATE refresh_tokens
+         SET revoked_at=COALESCE(revoked_at,SYSDATETIMEOFFSET())
+         WHERE id=@id AND user_id=@uid AND revoked_at IS NULL`
+      );
+      if (!result.rowsAffected[0]) return res.status(404).json({ error: 'Active session not found.' });
+      res.json({ success: true });
+    } catch (error) {
+      console.error('[DELETE /api/users/me/sessions/:id]', error);
+      res.status(500).json({ error: 'Could not revoke session.' });
+    }
+  });
+
+  router.post('/revoke-others', async (req: SessionRequest, res) => {
+    try {
+      const currentHash = options.getCurrentRefreshTokenHash(req);
+      if (!currentHash) return res.status(400).json({ error: 'Current refresh session not found.' });
+      const request = await getRequest();
+      request.input('uid', sql.UniqueIdentifier, req.userId!);
+      request.input('currentHash', sql.Char(64), currentHash);
+      await request.query(
+        `UPDATE refresh_tokens
+         SET revoked_at=COALESCE(revoked_at,SYSDATETIMEOFFSET())
+         WHERE user_id=@uid AND token_hash<>@currentHash AND revoked_at IS NULL`
+      );
+      res.json({ success: true });
+    } catch (error) {
+      console.error('[POST /api/users/me/sessions/revoke-others]', error);
+      res.status(500).json({ error: 'Could not revoke other sessions.' });
+    }
+  });
+
+  router.post('/revoke-all', async (req: SessionRequest, res) => {
+    try {
+      const request = await getRequest();
+      request.input('uid', sql.UniqueIdentifier, req.userId!);
+      await request.query(
+        `UPDATE refresh_tokens
+         SET revoked_at=COALESCE(revoked_at,SYSDATETIMEOFFSET())
+         WHERE user_id=@uid AND revoked_at IS NULL`
+      );
+      options.clearAuth(res);
+      res.json({ success: true });
+    } catch (error) {
+      console.error('[POST /api/users/me/sessions/revoke-all]', error);
+      res.status(500).json({ error: 'Could not revoke all sessions.' });
+    }
+  });
+
+  return router;
+}

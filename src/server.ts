@@ -42,6 +42,10 @@ import { sendVerificationEmail, sendAccountDeletionEmail, validateMxRecord, veri
 import multer from 'multer';
 import os from 'os';
 import { iisLoggingMiddleware, validateIISLoggingConfig } from './server/middleware/iis-logger.js';
+import { createSessionRouter } from './server/routes/sessions.js';
+import { createHealthRouter } from './server/routes/health.js';
+import { createPublicSharingRouter } from './server/routes/public-sharing.js';
+import { validateProductionConfig } from './server/utils/production.js';
 import type { Quota, User, FileMetadata, ShareLink, SystemLog, SystemStats } from './app/shared/types/index.js';
 
 // ──────────────────────────────────────────────────────────────
@@ -170,6 +174,10 @@ function getOrCreateCsrfToken(req: express.Request, res: express.Response): stri
 
 function requireCsrfForCookieSession(req: express.Request, res: express.Response, next: express.NextFunction): void {
   if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') {
+    next();
+    return;
+  }
+  if (req.path.startsWith('/public/')) {
     next();
     return;
   }
@@ -358,6 +366,12 @@ const apiLimiter = rateLimit({
 
 app.use('/api/auth', authLimiter);
 app.use('/api', apiLimiter);
+app.use('/api/public/share', rateLimit({
+  windowMs: 60_000,
+  max: parseInt(process.env.PUBLIC_SHARE_RATE_LIMIT_RPM || '60', 10),
+  standardHeaders: true, legacyHeaders: false,
+  message: { error: 'Too many shared-link requests. Please wait before trying again.' },
+}));
 
 // ──────────────────────────────────────────────────────────────
 // JWT helpers
@@ -993,6 +1007,15 @@ app.post('/api/auth/logout', async (req, res) => {
   }
   res.json({ success: true });
 });
+
+app.use('/api/users/me/sessions', createSessionRouter({
+  authenticate: authenticateUser as express.RequestHandler,
+  getCurrentRefreshTokenHash: (req) => {
+    const token = getCookieValue(req, REFRESH_COOKIE_NAME);
+    return token ? hashRefreshToken(token) : null;
+  },
+  clearAuth: clearAuthCookie,
+}));
 
 app.post('/api/users/me/update', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
   const { username, email, password } = req.body;
@@ -1781,6 +1804,10 @@ app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, asy
       shareRow = existing.recordset[0];
       const sets: string[] = [];
       const upReq = await getRequest(); upReq.input('id', sql.UniqueIdentifier, shareRow.id);
+      if (is_active === true && !shareRow.is_active) {
+        upReq.input('newToken', sql.Char(32), generateSecureToken(16));
+        sets.push('public_token=@newToken', 'download_count=0');
+      }
       if (password !== undefined) { upReq.input('pw', sql.NVarChar(256), password ? await hashSharePassword(password) : null); sets.push('password_hash=@pw'); }
       if (expires_at !== undefined) { upReq.input('exp', sql.DateTimeOffset, expires_at||null); sets.push('expires_at=@exp'); }
       if (max_downloads !== undefined) { upReq.input('md', sql.Int, max_downloads ? Number(max_downloads) : null); sets.push('max_downloads=@md'); }
@@ -1801,112 +1828,11 @@ app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, asy
   } catch (err) { console.error('[POST /api/files/:id/share]', err); res.status(500).json({ error: 'Failed to configure share link.' }); }
 });
 
-// ──────────────────────────────────────────────────────────────
-// API: Public Download
-// ──────────────────────────────────────────────────────────────
-
-app.get('/api/public/share/:token', async (req, res) => {
-  const token = req.params.token;
-  try {
-    const request = await getRequest(); request.input('tok', sql.Char(32), token);
-    const result = await request.query<ShareRow & {
-      file_status: string; leeku_vibe: string|null; mime_type: string;
-      size_bytes: number; file_created_at: Date;
-      owner_username_encrypted: Buffer; owner_username_iv: Buffer; owner_username_auth_tag: Buffer;
-    }>(
-      `SELECT sl.id,sl.file_id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.created_at,
-              f.status AS file_status,f.leeku_vibe,f.mime_type,f.size_bytes,f.created_at AS file_created_at,
-              u.username_encrypted AS owner_username_encrypted, u.username_iv AS owner_username_iv, u.username_auth_tag AS owner_username_auth_tag
-       FROM share_links sl
-       INNER JOIN files f ON sl.file_id=f.id
-       INNER JOIN users u ON f.owner_user_id=u.id
-       WHERE sl.public_token=@tok`
-    );
-    if (!result.recordset.length) return res.status(404).json({ error: 'Share link not found.' });
-    const row = result.recordset[0];
-    if (!row.is_active)                                                    return res.status(404).json({ error: 'Share link inactive.' });
-    if (row.file_status === 'Blocked')                                     return res.status(410).json({ error: 'File has been blocked.' });
-    if (row.expires_at && new Date(row.expires_at) < new Date())           return res.status(410).json({ error: 'Share link has expired.' });
-    if (row.max_downloads && row.download_count >= row.max_downloads)      return res.status(410).json({ error: 'Download limit reached.' });
-
-    const ownerUsername = decryptColumn(row.owner_username_encrypted, row.owner_username_iv, row.owner_username_auth_tag);
-    res.json({
-      token: row.public_token, mime_type: row.mime_type, size: row.size_bytes,
-      created_at: row.file_created_at?.toISOString(), protected: !!row.password_hash,
-      uploader: ownerUsername, leeku_vibe: row.leeku_vibe||'',
-      downloads_current: row.download_count, downloads_max: row.max_downloads,
-    });
-  } catch (err) { console.error('[GET /api/public/share/:token]', err); res.status(500).json({ error: 'Failed to load share info.' }); }
-});
-
-app.post('/api/public/share/:token/download', async (req, res) => {
-  const token = req.params.token;
-  const { password } = req.body;
-  try {
-    const request = await getRequest(); request.input('tok', sql.Char(32), token);
-    const result = await request.query<ShareRow & {
-      file_status: string; stored_path: string;
-      original_name_encrypted: Buffer; original_name_iv: Buffer; original_name_auth_tag: Buffer;
-      mime_type: string; checksum_sha256: string; file_id_join: string;
-      encrypted_key: Buffer; key_iv: Buffer; key_auth_tag: Buffer; file_iv: Buffer; file_auth_tag: Buffer;
-    }>(
-      `SELECT sl.id,sl.file_id AS file_id_join,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.created_at,
-              f.status AS file_status,f.stored_path,f.mime_type,f.checksum_sha256,
-              f.original_name_encrypted,f.original_name_iv,f.original_name_auth_tag,
-              k.encrypted_key,k.key_iv,k.key_auth_tag,k.file_iv,k.file_auth_tag
-       FROM share_links sl
-       INNER JOIN files f ON sl.file_id=f.id
-       INNER JOIN file_encryption_keys k ON f.id=k.file_id
-       WHERE sl.public_token=@tok`
-    );
-    if (!result.recordset.length) return res.status(404).json({ error: 'Share link not found.' });
-    const row = result.recordset[0];
-    if (!row.is_active)                                               return res.status(404).json({ error: 'Share link inactive.' });
-    if (row.file_status === 'Blocked')                                return res.status(410).json({ error: 'File has been blocked.' });
-    if (row.expires_at && new Date(row.expires_at) < new Date())      return res.status(410).json({ error: 'Link expired.' });
-    if (row.max_downloads && row.download_count >= row.max_downloads) return res.status(410).json({ error: 'Download limit reached.' });
-
-    if (row.password_hash) {
-      if (!password) return res.status(403).json({ error: 'Password required.' });
-      const valid = await verifySharePassword(password, row.password_hash);
-      if (!valid) return res.status(403).json({ error: 'Incorrect vault password.' });
-    }
-
-    const vaultPath = path.join(FILE_VAULT, row.stored_path);
-    if (!fs.existsSync(vaultPath)) return res.status(410).json({ error: 'Vault file not found.' });
-
-    // ── Streaming decrypt to temp file (avoids 2 GiB Buffer limit) ──
-    const tempPath = path.join(os.tmpdir(), `leeku-share-${token}-${Date.now()}.tmp`);
-    const fileKey   = unwrapKey(row.encrypted_key, row.key_iv, row.key_auth_tag);
-    await decryptFileStream(vaultPath, tempPath, fileKey, row.file_iv, row.file_auth_tag);
-
-    // Verify checksum via streaming (constant memory)
-    const actualChecksum = await computeFileChecksum(tempPath);
-    if (actualChecksum !== row.checksum_sha256) {
-      try { fs.unlinkSync(tempPath); } catch {}
-      return res.status(500).json({ error: 'File integrity check failed.' });
-    }
-
-    const dlReq = await getRequest(); dlReq.input('id', sql.UniqueIdentifier, row.id);
-    await dlReq.query('UPDATE share_links SET download_count=download_count+1 WHERE id=@id');
-
-    const originalName = decryptColumn(row.original_name_encrypted, row.original_name_iv, row.original_name_auth_tag);
-    const safeName = originalName.replace(/"/g, '\\"');
-    const stat = fs.statSync(tempPath);
-
-    await logSystemEvent(null, 'Anonymous', 'Download', 'File', row.file_id_join, req,
-      `Anonymous download of "${originalName}" via token ${token}.`);
-
-    res.setHeader('Content-Type', row.mime_type || 'application/octet-stream');
-    res.setHeader('Content-Disposition', `attachment; filename="${safeName}"`);
-    res.setHeader('Content-Length', stat.size.toString());
-
-    const readStream = fs.createReadStream(tempPath);
-    readStream.pipe(res);
-    readStream.on('end',   () => { try { fs.unlinkSync(tempPath); } catch {} });
-    readStream.on('error', () => { try { fs.unlinkSync(tempPath); } catch {} });
-  } catch (err) { console.error('[POST /api/public/share/:token/download]', err); res.status(500).json({ error: 'Download failed.' }); }
-});
+app.use('/api/public/share', createPublicSharingRouter({
+  vaultPath: FILE_VAULT,
+  logDownload: (req, fileId, originalName, token) =>
+    logSystemEvent(null, 'Anonymous', 'Download', 'File', fileId, req, `Anonymous download of "${originalName}" via token ${token}.`),
+}));
 
 // ──────────────────────────────────────────────────────────────
 // API: Admin
@@ -2158,12 +2084,15 @@ async function logExpiredFile(file: ExpiredFileRecord): Promise<void> {
 // ──────────────────────────────────────────────────────────────
 
 async function bootstrap() {
-  // 1. Validate master encryption key
+  // 1. Validate production requirements and master encryption key
+  validateProductionConfig();
   validateEncryptionConfig();
 
   // 2. Connect SQL Server
   await getPool();
   console.log('[server] SQL Server connection pool ready.');
+
+  app.use('/api/health', createHealthRouter(FILE_VAULT, NODE_ENV === 'production'));
 
   // 3. Validate IIS logging config
   validateIISLoggingConfig();

@@ -9,7 +9,7 @@ Scope: Backend API, frontend auth/session handling, and documentation consistenc
 - TypeScript validation is currently clean.
   - Command: npm run lint
   - Result: tsc --noEmit passed
-- Documentations/SQL scripts were intentionally removed from this workspace; SQL-script revalidation is now marked as not applicable for this snapshot.
+- Database scripts are currently absent from this repository.
 
 ## Remediation Tracker
 
@@ -85,7 +85,7 @@ Scope: Backend API, frontend auth/session handling, and documentation consistenc
 
 ### Pending
 
-None for this workspace snapshot.
+None for this repository snapshot.
 
 ## Updated Priority Plan
 
@@ -95,7 +95,7 @@ None for this workspace snapshot.
 
 ### Short Term
 
-- No SQL-script validation tasks remain in this workspace snapshot (scripts intentionally removed).
+- Add reviewed administrator migrations when future schema changes require them.
 
 ### Medium Term
 
@@ -103,4 +103,4 @@ None for this workspace snapshot.
 
 ## Final Assessment
 
-Core high-risk and medium-risk actionable items from this plan are implemented and validated for the current workspace snapshot.
+Core high-risk and medium-risk actionable items from this plan are implemented and validated for the current repository snapshot.

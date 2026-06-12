@@ -51,6 +51,15 @@ export interface ShareLink {
   created_at: string;
 }
 
+export interface ActiveSession {
+  id: string;
+  ip_address: string | null;
+  user_agent: string | null;
+  created_at: string;
+  expires_at: string;
+  is_current: boolean;
+}
+
 export interface SystemLog {
   id: string;
   user_id: string | null;
