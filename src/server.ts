@@ -112,6 +112,11 @@ function parseNonNegativeIntEnv(name: string, fallback: number): number {
   return fallback;
 }
 
+function buildUniqueTempFilePath(baseDir: string, prefix: string, id: string): string {
+  const unique = crypto.randomBytes(8).toString('hex');
+  return path.join(baseDir, `${prefix}-${id}-${Date.now()}-${unique}.tmp`);
+}
+
 function configureHttpServer(server: http.Server): http.Server {
   server.requestTimeout = HTTP_REQUEST_TIMEOUT_MS;
   server.headersTimeout = HTTP_HEADERS_TIMEOUT_MS;
@@ -1905,7 +1910,7 @@ app.get('/api/files/:id/preview', authenticateUser as express.RequestHandler, as
 
     const keyRow = keyRes.recordset[0];
     const fileKey = unwrapKey(keyRow.encrypted_key, keyRow.key_iv, keyRow.key_auth_tag);
-    const tempPath = path.join(UPLOAD_TEMP, `leeku-preview-${fileId}-${Date.now()}.tmp`);
+    const tempPath = buildUniqueTempFilePath(UPLOAD_TEMP, 'leeku-preview', fileId);
     await decryptFileStream(vaultPath, tempPath, fileKey, keyRow.file_iv, keyRow.file_auth_tag);
 
     const actualChecksum = await computeFileChecksum(tempPath);
@@ -1928,6 +1933,7 @@ app.get('/api/files/:id/preview', authenticateUser as express.RequestHandler, as
     readStream.pipe(res);
     readStream.on('end', cleanup);
     readStream.on('error', cleanup);
+    res.on('finish', cleanup);
     res.on('close', cleanup);
   } catch (err) { console.error('[GET /api/files/:id/preview]', err); res.status(500).json({ error: 'Preview failed.' }); }
 });
@@ -1975,7 +1981,7 @@ app.get('/api/files/:id/download', authenticateUser as express.RequestHandler, a
     }
 
     // ── Streaming decrypt to temp file (avoids 2 GiB Buffer limit) ──
-    const tempPath = path.join(UPLOAD_TEMP, `leeku-dl-${fileId}-${Date.now()}.tmp`);
+    const tempPath = buildUniqueTempFilePath(UPLOAD_TEMP, 'leeku-dl', fileId);
     await decryptFileStream(vaultPath, tempPath, fileKey, keyRow.file_iv, keyRow.file_auth_tag);
 
     // Verify checksum via streaming (constant memory)
@@ -2014,8 +2020,10 @@ app.get('/api/files/:id/download', authenticateUser as express.RequestHandler, a
 
     const readStream = fs.createReadStream(tempPath);
     readStream.pipe(res);
-    readStream.on('end',  () => { try { fs.unlinkSync(tempPath); } catch {} });
-    readStream.on('error', () => { try { fs.unlinkSync(tempPath); } catch {} });
+    readStream.on('end',    () => { try { fs.unlinkSync(tempPath); } catch {} });
+    readStream.on('error',  () => { try { fs.unlinkSync(tempPath); } catch {} });
+    res.on('finish',        () => { try { fs.unlinkSync(tempPath); } catch {} });
+    res.on('close',         () => { try { fs.unlinkSync(tempPath); } catch {} });
   } catch (err) { console.error('[GET /api/files/:id/download]', err); res.status(500).json({ error: 'Download failed.' }); }
 });
 

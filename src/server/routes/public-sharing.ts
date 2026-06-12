@@ -1,5 +1,6 @@
 import express from 'express';
 import rateLimit from 'express-rate-limit';
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import sql from 'mssql';
@@ -35,6 +36,11 @@ export function createPublicSharingRouter(options: {
   if (!fs.existsSync(options.tempPath)) {
     fs.mkdirSync(options.tempPath, { recursive: true });
   }
+
+  const buildUniqueTempFilePath = (prefix: string, id: string): string => {
+    const unique = crypto.randomBytes(8).toString('hex');
+    return path.join(options.tempPath, `${prefix}-${id}-${Date.now()}-${unique}.tmp`);
+  };
 
   router.get('/:token', async (req, res) => {
     try {
@@ -127,7 +133,7 @@ export function createPublicSharingRouter(options: {
       }
       const vaultFile = path.join(options.vaultPath, row.stored_path);
       if (!fs.existsSync(vaultFile)) return res.status(410).json({ error: 'Vault file not found.' });
-      const tempFile = path.join(options.tempPath, `leeku-share-${token}-${Date.now()}.tmp`);
+      const tempFile = buildUniqueTempFilePath('leeku-share', token);
       const fileKey = unwrapKey(row.encrypted_key, row.key_iv, row.key_auth_tag);
       await decryptFileStream(vaultFile, tempFile, fileKey, row.file_iv, row.file_auth_tag);
       if ((await computeFileChecksum(tempFile)) !== row.checksum_sha256) {
@@ -175,8 +181,10 @@ export function createPublicSharingRouter(options: {
       res.setHeader('Content-Length', fs.statSync(tempFile).size.toString());
       const stream = fs.createReadStream(tempFile);
       stream.pipe(res);
-      stream.on('end', () => { try { fs.unlinkSync(tempFile); } catch {} });
+      stream.on('end',   () => { try { fs.unlinkSync(tempFile); } catch {} });
       stream.on('error', () => { try { fs.unlinkSync(tempFile); } catch {} });
+      res.on('finish',   () => { try { fs.unlinkSync(tempFile); } catch {} });
+      res.on('close',    () => { try { fs.unlinkSync(tempFile); } catch {} });
     } catch (error) {
       console.error('[POST /api/public/share/:token/download]', error);
       res.status(500).json({ error: 'Download failed.' });
@@ -235,7 +243,7 @@ export function createPublicSharingRouter(options: {
       );
       if (!reservation.rowsAffected[0]) return res.status(410).json({ error: 'Download limit reached or link expired.' });
 
-      const tempFile = path.join(options.tempPath, `leeku-embed-${token}-${Date.now()}.tmp`);
+      const tempFile = buildUniqueTempFilePath('leeku-embed', token);
       const fileKey = unwrapKey(row.encrypted_key, row.key_iv, row.key_auth_tag);
       await decryptFileStream(vaultFile, tempFile, fileKey, row.file_iv, row.file_auth_tag);
       if ((await computeFileChecksum(tempFile)) !== row.checksum_sha256) {
@@ -270,6 +278,7 @@ export function createPublicSharingRouter(options: {
           const partial = fs.createReadStream(tempFile, { start, end });
           partial.on('close', cleanup);
           partial.on('error', cleanup);
+          res.on('finish', cleanup);
           res.on('close', cleanup);
           partial.pipe(res);
           return;
@@ -280,6 +289,7 @@ export function createPublicSharingRouter(options: {
       const stream = fs.createReadStream(tempFile);
       stream.on('close', cleanup);
       stream.on('error', cleanup);
+      res.on('finish', cleanup);
       res.on('close', cleanup);
       stream.pipe(res);
     } catch (error) {
