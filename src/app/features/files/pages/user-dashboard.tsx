@@ -750,7 +750,11 @@ export default function UserDashboard({
                             <Link2 className="h-4 w-4" />
                           </div>
                           <span className="text-xs text-[var(--text-muted)]">
-                            {link.is_active ? "Active" : "Paused"}
+                            {link.is_available === false
+                              ? "Unavailable"
+                              : link.is_active
+                                ? "Active"
+                                : "Paused"}
                           </span>
                         </div>
                         <p className="mt-4 truncate text-sm font-medium">
@@ -766,6 +770,7 @@ export default function UserDashboard({
                         <div className="mt-4 flex flex-nowrap items-center gap-1">
                           <button
                             type="button"
+                            disabled={link.is_available === false}
                             onClick={() =>
                               navigator.clipboard
                                 .writeText(
@@ -773,7 +778,7 @@ export default function UserDashboard({
                                 )
                                 .then(() => notify("Link copied."))
                             }
-                            className="flex shrink-0 cursor-pointer items-center gap-1.5 whitespace-nowrap rounded-md px-2 py-2 text-xs font-medium tracking-normal text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+                            className="flex shrink-0 cursor-pointer items-center gap-1.5 whitespace-nowrap rounded-md px-2 py-2 text-xs font-medium tracking-normal text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] disabled:cursor-not-allowed disabled:opacity-40"
                           >
                             <Copy className="h-3.5 w-3.5" />
                             Copy link

@@ -28,12 +28,12 @@ export function createPublicSharingRouter(options: {
       const request = await getRequest(); request.input('tok', sql.Char(32), req.params.token);
       const result = await request.query<ShareRow & {
         file_status: string; leeku_vibe: string|null; mime_type: string;
-        size_bytes: number; file_created_at: Date;
+        size_bytes: number; file_created_at: Date; stored_path: string;
         original_name_encrypted: Buffer; original_name_iv: Buffer; original_name_auth_tag: Buffer;
         owner_username_encrypted: Buffer; owner_username_iv: Buffer; owner_username_auth_tag: Buffer;
       }>(
         `SELECT sl.id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,
-                f.status AS file_status,f.leeku_vibe,f.mime_type,f.size_bytes,f.created_at AS file_created_at,
+                f.status AS file_status,f.leeku_vibe,f.mime_type,f.size_bytes,f.created_at AS file_created_at,f.stored_path,
                 f.original_name_encrypted,f.original_name_iv,f.original_name_auth_tag,
                 u.username_encrypted AS owner_username_encrypted,u.username_iv AS owner_username_iv,u.username_auth_tag AS owner_username_auth_tag
          FROM share_links sl
@@ -47,6 +47,7 @@ export function createPublicSharingRouter(options: {
       if (row.file_status === 'Blocked') return res.status(410).json({ error: 'File has been blocked.' });
       if (row.expires_at && new Date(row.expires_at) < new Date()) return res.status(410).json({ error: 'Share link has expired.' });
       if (row.max_downloads && row.download_count >= row.max_downloads) return res.status(410).json({ error: 'Download limit reached.' });
+      if (!fs.existsSync(path.join(options.vaultPath, row.stored_path))) return res.status(410).json({ error: 'The shared file is no longer available.' });
       res.json({
         token: row.public_token,
         file_name: decryptColumn(row.original_name_encrypted, row.original_name_iv, row.original_name_auth_tag),

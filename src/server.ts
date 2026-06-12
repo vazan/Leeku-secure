@@ -1757,12 +1757,17 @@ app.get('/api/sharing/links', authenticateUser as express.RequestHandler, async 
   try {
     const request = await getRequest();
     request.input('ownerId', sql.UniqueIdentifier, req.userId!);
-    const result = await request.query<ShareRow>(
-      `SELECT sl.id,sl.file_id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.created_at
+    const result = await request.query<ShareRow & { stored_path: string }>(
+      `SELECT sl.id,sl.file_id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.created_at,f.stored_path
        FROM share_links sl INNER JOIN files f ON sl.file_id=f.id
        WHERE f.owner_user_id=@ownerId ORDER BY sl.created_at DESC`
     );
-    res.json({ links: result.recordset.map(mapShareRow) });
+    res.json({
+      links: result.recordset.map((row) => ({
+        ...mapShareRow(row),
+        is_available: fs.existsSync(path.join(FILE_VAULT, row.stored_path)),
+      })),
+    });
   } catch (err) { console.error('[GET /api/sharing/links]', err); res.status(500).json({ error: 'Failed to load share links.' }); }
 });
 
@@ -1799,12 +1804,14 @@ app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, asy
   const { password, expires_at, max_downloads, is_active } = req.body;
   try {
     const fReq = await getRequest(); fReq.input('id', sql.UniqueIdentifier, fileId);
-    const fRes = await fReq.query<{owner_user_id:string;status:string}>('SELECT owner_user_id,status FROM files WHERE id=@id');
+    const fRes = await fReq.query<{owner_user_id:string;status:string;stored_path:string}>('SELECT owner_user_id,status,stored_path FROM files WHERE id=@id');
     if (!fRes.recordset.length) return res.status(404).json({ error: 'File not found.' });
     const file = fRes.recordset[0];
     if (file.owner_user_id !== req.userId && req.user!.role !== 'Admin')
       return res.status(403).json({ error: 'Only the file owner can manage share links.' });
     if (file.status === 'Blocked') return res.status(400).json({ error: 'Blocked files cannot be shared.' });
+    if (!fs.existsSync(path.join(FILE_VAULT, file.stored_path)))
+      return res.status(410).json({ error: 'This file is no longer available in the vault.' });
 
     const exReq = await getRequest(); exReq.input('fid', sql.UniqueIdentifier, fileId);
     const existing = await exReq.query<ShareRow>(

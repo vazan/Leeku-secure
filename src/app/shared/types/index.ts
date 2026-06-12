@@ -48,6 +48,7 @@ export interface ShareLink {
   max_downloads: number | null;
   download_count: number;
   is_active: boolean;
+  is_available?: boolean;
   created_at: string;
 }
 
