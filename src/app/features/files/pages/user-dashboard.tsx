@@ -36,6 +36,7 @@ import type {
   User,
 } from "@/app/shared/types";
 import SessionManager from "@/app/features/files/components/session-manager";
+import ThemeSettings from "@/app/features/files/components/theme-settings";
 import DashboardSidebar, {
   type DashboardNavItem,
   type DashboardView,
@@ -56,6 +57,25 @@ const getCsrfToken = () =>
     ?.split("=")[1] || "";
 
 const authHeaders = (_token: string) => ({ "X-CSRF-Token": getCsrfToken() });
+
+const dashboardViews: DashboardView[] = [
+  "home",
+  "files",
+  "shared",
+  "settings",
+  "admin",
+];
+
+function getSavedDashboardView(user: User): DashboardView {
+  const savedView = localStorage.getItem(`dashboard-view:${user.id}`);
+  if (
+    dashboardViews.includes(savedView as DashboardView) &&
+    (savedView !== "admin" || user.role === "Admin")
+  ) {
+    return savedView as DashboardView;
+  }
+  return "home";
+}
 
 function formatBytes(bytes: number) {
   if (!bytes) return "0 B";
@@ -104,7 +124,9 @@ export default function UserDashboard({
   quotas,
   onTriggerRefreshUser,
 }: UserDashboardProps) {
-  const [view, setView] = useState<DashboardView>("home");
+  const [view, setView] = useState<DashboardView>(() =>
+    getSavedDashboardView(user),
+  );
   const [files, setFiles] = useState<FileMetadata[]>([]);
   const [links, setLinks] = useState<ShareLink[]>([]);
   const [adminUsers, setAdminUsers] = useState<User[]>([]);
@@ -167,6 +189,10 @@ export default function UserDashboard({
     );
     loadAdmin().catch(() => notifyError("Could not refresh admin data."));
   }, []);
+
+  useEffect(() => {
+    localStorage.setItem(`dashboard-view:${user.id}`, view);
+  }, [user.id, view]);
 
   const visibleFiles = useMemo(
     () =>
@@ -383,7 +409,7 @@ export default function UserDashboard({
               className="h-11 w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-muted)] pl-10 pr-4 text-sm outline-none focus:border-[var(--accent-linear)]"
             />
           </div>
-          <label className="flex h-11 shrink-0 cursor-pointer items-center rounded-full bg-white px-5 text-sm font-medium text-black shadow-[var(--shadow-hairline)] hover:bg-[#e7e7e7]">
+          <label className="flex h-11 shrink-0 cursor-pointer items-center gap-2 rounded-full bg-[var(--accent-linear)] px-5 text-sm font-medium text-[var(--accent-contrast)] transition-colors hover:bg-[var(--accent-linear-bright)]">
             <input
               type="file"
               className="hidden"
@@ -391,6 +417,7 @@ export default function UserDashboard({
                 event.target.files?.[0] && uploadFile(event.target.files[0])
               }
             />
+            <Upload className="h-4 w-4" />
             Upload file
           </label>
           <div className="absolute right-5 hidden items-center gap-3 sm:flex lg:right-8">
@@ -712,6 +739,7 @@ export default function UserDashboard({
                   Save changes
                 </Button>
               </form>
+              <ThemeSettings />
               <SessionManager />
             </section>
           )}
@@ -1362,7 +1390,7 @@ function ShareDialog(props: {
           </button>
           <button
             onClick={props.onSave}
-            className="rounded-lg bg-[var(--accent-linear)] px-4 py-2.5 text-sm font-medium text-[var(--text-primary)] hover:bg-[var(--accent-linear-bright)]"
+            className="rounded-lg bg-[var(--accent-linear)] px-4 py-2.5 text-sm font-medium text-[var(--accent-contrast)] hover:bg-[var(--accent-linear-bright)]"
           >
             Create link
           </button>

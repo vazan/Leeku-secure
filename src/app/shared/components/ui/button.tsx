@@ -10,7 +10,7 @@ const buttonVariants = cva(
     variants: {
       variant: {
         default:
-          "bg-[var(--accent-linear)] text-[var(--text-primary)] shadow-[var(--shadow-hairline)] hover:bg-[var(--accent-linear-bright)]",
+          "bg-[var(--accent-linear)] text-[var(--accent-contrast)] hover:bg-[var(--accent-linear-bright)]",
         outline:
           "border-[var(--border-subtle)] bg-[var(--bg-panel)] text-[var(--text-secondary)] shadow-[var(--shadow-hairline)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] aria-expanded:bg-[var(--bg-hover)] aria-expanded:text-[var(--text-primary)]",
         secondary:

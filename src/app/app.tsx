@@ -142,7 +142,7 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-screen bg-[var(--bg-primary)] text-[var(--text-primary)] selection:bg-[var(--accent-linear)] selection:text-[var(--text-primary)]">
+    <div className="min-h-screen bg-[var(--bg-primary)] text-[var(--text-primary)] selection:bg-[var(--accent-linear)] selection:text-[var(--accent-contrast)]">
       <Toaster />
       <main>
         {currentView === "landing" && (

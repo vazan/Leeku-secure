@@ -119,7 +119,7 @@ export default function AuthPage({
             />
             <button
               disabled={loading}
-              className="flex w-full items-center justify-center gap-2 rounded-lg bg-[var(--accent-linear)] px-4 py-3 text-sm font-medium text-[var(--text-primary)] hover:bg-[var(--accent-linear-bright)]"
+              className="flex w-full items-center justify-center gap-2 rounded-lg bg-[var(--accent-linear)] px-4 py-3 text-sm font-medium text-[var(--accent-contrast)] hover:bg-[var(--accent-linear-bright)]"
             >
               {loading && <Loader2 className="h-4 w-4 animate-spin" />}
               {loading

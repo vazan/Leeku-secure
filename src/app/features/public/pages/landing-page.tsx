@@ -64,7 +64,7 @@ export default function LandingPage({ onGoToAuth }: LandingPageProps) {
             <div className="mt-8 flex flex-wrap gap-3">
               <button
                 onClick={() => onGoToAuth("register")}
-                className="flex items-center gap-2 rounded-lg bg-[var(--accent-linear)] px-5 py-3 text-sm font-medium text-[var(--text-primary)] hover:bg-[var(--accent-linear-bright)]"
+                className="flex items-center gap-2 rounded-lg bg-[var(--accent-linear)] px-5 py-3 text-sm font-medium text-[var(--accent-contrast)] hover:bg-[var(--accent-linear-bright)]"
               >
                 Create an account <ArrowRight className="h-4 w-4" />
               </button>

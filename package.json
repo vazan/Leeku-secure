@@ -4,7 +4,7 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "cross-env NODE_ENV=development vite build && cross-env NODE_ENV=development tsx watch src/server.ts",
+    "dev": "concurrently --kill-others --names client,server \"vite --host 0.0.0.0\" \"cross-env NODE_ENV=development tsx watch src/server.ts\"",
     "build": "cross-env NODE_ENV=production vite build && esbuild src/server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
     "preview": "cross-env NODE_ENV=production node dist/server.cjs",
     "start": "cross-env NODE_ENV=production node dist/server.cjs",
@@ -57,6 +57,7 @@
     "@types/react-dom": "^19.2.3",
     "@types/systeminformation": "^3.23.1",
     "autoprefixer": "^10.4.21",
+    "concurrently": "^10.0.3",
     "cross-env": "^10.1.0",
     "esbuild": "^0.25.0",
     "rimraf": "^6.1.3",
