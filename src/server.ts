@@ -1008,14 +1008,17 @@ app.post('/api/auth/logout', async (req, res) => {
   res.json({ success: true });
 });
 
-app.use('/api/users/me/sessions', createSessionRouter({
+const sessionRouteOptions = {
   authenticate: authenticateUser as express.RequestHandler,
   getCurrentRefreshTokenHash: (req) => {
     const token = getCookieValue(req, REFRESH_COOKIE_NAME);
     return token ? hashRefreshToken(token) : null;
   },
   clearAuth: clearAuthCookie,
-}));
+};
+
+app.use('/api/auth/sessions', createSessionRouter(sessionRouteOptions));
+app.use('/api/users/me/sessions', createSessionRouter(sessionRouteOptions));
 
 app.post('/api/users/me/update', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
   const { username, email, password } = req.body;

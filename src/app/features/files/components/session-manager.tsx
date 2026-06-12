@@ -50,7 +50,7 @@ export default function SessionManager() {
   const load = async () => {
     setLoading(true);
     try {
-      const response = await fetch("/api/users/me/sessions");
+      const response = await fetch("/api/auth/sessions");
       const data = await response.json();
       if (!response.ok) throw new Error(data.error);
       setSessions(data.sessions || []);
@@ -66,7 +66,7 @@ export default function SessionManager() {
   }, []);
 
   const revoke = async (session: ActiveSession) => {
-    const response = await fetch(`/api/users/me/sessions/${session.id}/revoke`, {
+    const response = await fetch(`/api/auth/sessions/${session.id}/revoke`, {
       method: "POST",
       headers: { "X-CSRF-Token": getCsrfToken() },
     });
@@ -83,7 +83,7 @@ export default function SessionManager() {
   };
 
   const revokeOthers = async () => {
-    const response = await fetch("/api/users/me/sessions/revoke-others", {
+    const response = await fetch("/api/auth/sessions/revoke-others", {
       method: "POST",
       headers: { "X-CSRF-Token": getCsrfToken() },
     });
@@ -97,7 +97,7 @@ export default function SessionManager() {
 
   const revokeAll = async () => {
     if (!window.confirm("Sign out every active session, including this one?")) return;
-    const response = await fetch("/api/users/me/sessions/revoke-all", {
+    const response = await fetch("/api/auth/sessions/revoke-all", {
       method: "POST",
       headers: { "X-CSRF-Token": getCsrfToken() },
     });
@@ -146,7 +146,9 @@ export default function SessionManager() {
               <p className="truncate text-sm font-medium">
                 {describeDevice(session.user_agent)}
                 {session.is_current && (
-                  <span className="ml-2 text-xs text-[var(--accent-linear)]">Current</span>
+                  <span className="ml-2 text-xs text-[var(--accent-linear)]">
+                    Current session
+                  </span>
                 )}
               </p>
               <p className="mt-0.5 truncate text-xs text-[var(--text-muted)]">
