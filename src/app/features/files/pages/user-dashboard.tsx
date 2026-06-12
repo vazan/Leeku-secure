@@ -191,8 +191,31 @@ export default function UserDashboard({
       fetch("/api/files", { headers: authHeaders(token) }),
       fetch("/api/sharing/links", { headers: authHeaders(token) }),
     ]);
-    if (filesResponse.ok) setFiles((await filesResponse.json()).files || []);
-    if (linksResponse.ok) setLinks((await linksResponse.json()).links || []);
+    if (filesResponse.ok) {
+      setFiles((await filesResponse.json()).files || []);
+    } else {
+      let message = "Could not load your files.";
+      try {
+        const payload = await filesResponse.json();
+        message = payload?.error || message;
+      } catch {
+        // Keep generic message when response is not JSON.
+      }
+      notifyError(message);
+    }
+
+    if (linksResponse.ok) {
+      setLinks((await linksResponse.json()).links || []);
+    } else {
+      let message = "Could not load sharing links.";
+      try {
+        const payload = await linksResponse.json();
+        message = payload?.error || message;
+      } catch {
+        // Keep generic message when response is not JSON.
+      }
+      notifyError(message);
+    }
   };
 
   const loadAdmin = async () => {

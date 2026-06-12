@@ -1399,17 +1399,38 @@ app.get('/api/files', authenticateUser as express.RequestHandler, async (req: Au
   try {
     const request = await getRequest();
     request.input('ownerId', sql.UniqueIdentifier, req.userId!);
-    const result = await request.query<FileRow>(
-      `SELECT id, owner_user_id,
-              original_name_encrypted, original_name_iv, original_name_auth_tag,
-              stored_path, mime_type, size_bytes, encrypted_size_bytes,
-              status, checksum_sha256, scan_result, scan_message,
-              is_encrypted, leeku_vibe, ttl_hours,
-              client_secret_hash,
-              expires_at, created_at
-       FROM files WHERE owner_user_id=@ownerId AND status!='Expired'
-       ORDER BY created_at DESC`
-    );
+    let result;
+    try {
+      result = await request.query<FileRow>(
+        `SELECT id, owner_user_id,
+                original_name_encrypted, original_name_iv, original_name_auth_tag,
+                stored_path, mime_type, size_bytes, encrypted_size_bytes,
+                status, checksum_sha256, scan_result, scan_message,
+                is_encrypted, leeku_vibe, ttl_hours,
+                client_secret_hash,
+                expires_at, created_at
+         FROM files WHERE owner_user_id=@ownerId AND status!='Expired'
+         ORDER BY created_at DESC`
+      );
+    } catch (queryErr: any) {
+      const isMissingSecretColumn =
+        queryErr?.number === 207 &&
+        typeof queryErr?.message === 'string' &&
+        queryErr.message.includes('client_secret_hash');
+      if (!isMissingSecretColumn) throw queryErr;
+
+      console.warn('[GET /api/files] client_secret_hash column missing, using legacy query fallback.');
+      result = await request.query<FileRow>(
+        `SELECT id, owner_user_id,
+                original_name_encrypted, original_name_iv, original_name_auth_tag,
+                stored_path, mime_type, size_bytes, encrypted_size_bytes,
+                status, checksum_sha256, scan_result, scan_message,
+                is_encrypted, leeku_vibe, ttl_hours,
+                expires_at, created_at
+         FROM files WHERE owner_user_id=@ownerId AND status!='Expired'
+         ORDER BY created_at DESC`
+      );
+    }
     res.json({ files: result.recordset.map(r => mapFileRow(r, req.user!.username)) });
   } catch (err) { console.error('[GET /api/files]', err); res.status(500).json({ error: 'Failed to load files.' }); }
 });
