@@ -523,7 +523,6 @@ export default function UserDashboard({
                               token={token}
                               className="h-9 w-9 rounded-lg"
                               iconClassName="h-4 w-4"
-                              onOpenVideo={() => setVideoFile(file)}
                             />
                             <div>
                               <p className="max-w-xs truncate font-medium">
@@ -849,12 +848,14 @@ function FileThumbnail({
   className,
   iconClassName,
   onOpenVideo,
+  interactiveVideo = false,
 }: {
   file: FileMetadata;
   token: string;
   className: string;
   iconClassName: string;
   onOpenVideo?: () => void;
+  interactiveVideo?: boolean;
 }) {
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
@@ -935,13 +936,13 @@ function FileThumbnail({
 
   return (
     <div
-      role={isMp4 && onOpenVideo ? "button" : undefined}
-      tabIndex={isMp4 && onOpenVideo ? 0 : undefined}
-      aria-label={isMp4 && onOpenVideo ? `Play ${file.original_name}` : undefined}
-      className={`group/preview relative grid shrink-0 place-items-center overflow-hidden bg-[var(--bg-hover)] text-[var(--text-muted)] ${isMp4 && onOpenVideo ? "cursor-pointer" : ""} ${className}`}
-      onClick={isMp4 ? onOpenVideo : undefined}
+      role={isMp4 && interactiveVideo && onOpenVideo ? "button" : undefined}
+      tabIndex={isMp4 && interactiveVideo && onOpenVideo ? 0 : undefined}
+      aria-label={isMp4 && interactiveVideo && onOpenVideo ? `Play ${file.original_name}` : undefined}
+      className={`group/preview relative grid shrink-0 place-items-center overflow-hidden bg-[var(--bg-hover)] text-[var(--text-muted)] ${isMp4 && interactiveVideo && onOpenVideo ? "cursor-pointer" : ""} ${className}`}
+      onClick={isMp4 && interactiveVideo ? onOpenVideo : undefined}
       onKeyDown={
-        isMp4 && onOpenVideo
+        isMp4 && interactiveVideo && onOpenVideo
           ? (event) => {
               if (event.key === "Enter" || event.key === " ") {
                 event.preventDefault();
@@ -951,7 +952,7 @@ function FileThumbnail({
           : undefined
       }
       onPointerEnter={
-        isMp4
+        isMp4 && interactiveVideo
           ? () => {
               setHovering(true);
               void playVideo();
@@ -959,7 +960,7 @@ function FileThumbnail({
           : undefined
       }
       onPointerLeave={
-        isMp4
+        isMp4 && interactiveVideo
           ? () => {
               setHovering(false);
               stopVideo();
@@ -991,13 +992,15 @@ function FileThumbnail({
             }}
             onError={() => setFailed(true)}
           />
-          <span
-            className={`pointer-events-none absolute inset-0 grid place-items-center transition-opacity duration-150 ${playing ? "opacity-0" : "opacity-100"}`}
-          >
-            <span className="grid h-10 w-10 place-items-center rounded-full bg-black/70 text-white shadow-[var(--shadow-panel)] backdrop-blur-sm">
-              <Play className="ml-0.5 h-4 w-4 fill-current" />
+          {interactiveVideo && (
+            <span
+              className={`pointer-events-none absolute inset-0 grid place-items-center transition-opacity duration-150 ${playing ? "opacity-0" : "opacity-100"}`}
+            >
+              <span className="grid h-10 w-10 place-items-center rounded-full bg-black/70 text-white shadow-[var(--shadow-panel)] backdrop-blur-sm">
+                <Play className="ml-0.5 h-4 w-4 fill-current" />
+              </span>
             </span>
-          </span>
+          )}
         </>
       ) : (
         fallbackIcon
@@ -1056,6 +1059,7 @@ function FileCard({
           className="h-32 w-full rounded-lg"
           iconClassName="h-8 w-8"
           onOpenVideo={onOpenVideo}
+          interactiveVideo
         />
         <div ref={menuRef} className="absolute right-2 top-2">
           <button
