@@ -17,6 +17,7 @@ import jwt from 'jsonwebtoken';
 import fs from 'fs';
 import path from 'path';
 import https from 'https';
+import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { execFileSync } from 'child_process';
 import { GoogleGenAI } from '@google/genai';
@@ -60,9 +61,11 @@ const PROXY_TRUST_HOPS   = parseInt(process.env.PROXY_TRUST_HOPS || '0', 10);
 const SMTP_ENABLED       = !!process.env.SMTP_HOST && !!process.env.SMTP_USER && !!process.env.SMTP_PASSWORD;
 const GEMINI_API_KEY     = process.env.GEMINI_API_KEY;
 const JWT_EXPIRY         = parseInt(process.env.JWT_ACCESS_EXPIRY_SECONDS || '900', 10);
+const REFRESH_EXPIRY     = parseInt(process.env.JWT_REFRESH_EXPIRY_SECONDS || '604800', 10);
 const JWT_ISSUER         = process.env.JWT_ISSUER   || APP_URL;
 const JWT_AUDIENCE       = process.env.JWT_AUDIENCE || 'leeku-secure-api';
 const SESSION_COOKIE_NAME = process.env.SESSION_COOKIE_NAME || 'leeku_session';
+const REFRESH_COOKIE_NAME = process.env.REFRESH_COOKIE_NAME || 'leeku_refresh';
 const CSRF_COOKIE_NAME    = process.env.CSRF_COOKIE_NAME || 'leeku_csrf';
 const ALLOW_UNSCANNED_UPLOADS_IN_DEVELOPMENT =
   NODE_ENV === 'development' && process.env.ALLOW_UNSCANNED_UPLOADS_IN_DEVELOPMENT !== 'false';
@@ -92,6 +95,16 @@ function getSessionCookieOptions(): express.CookieOptions {
   };
 }
 
+function getRefreshCookieOptions(): express.CookieOptions {
+  return {
+    httpOnly: true,
+    secure: NODE_ENV === 'production',
+    sameSite: 'lax',
+    path: '/api/auth',
+    maxAge: REFRESH_EXPIRY * 1000,
+  };
+}
+
 function setAuthCookie(res: express.Response, token: string): void {
   res.cookie(SESSION_COOKIE_NAME, token, getSessionCookieOptions());
   res.cookie(CSRF_COOKIE_NAME, generateSecureToken(24), {
@@ -99,8 +112,12 @@ function setAuthCookie(res: express.Response, token: string): void {
     secure: NODE_ENV === 'production',
     sameSite: 'lax',
     path: '/',
-    maxAge: JWT_EXPIRY * 1000,
+    maxAge: REFRESH_EXPIRY * 1000,
   });
+}
+
+function setRefreshCookie(res: express.Response, token: string): void {
+  res.cookie(REFRESH_COOKIE_NAME, token, getRefreshCookieOptions());
 }
 
 function clearAuthCookie(res: express.Response): void {
@@ -115,6 +132,12 @@ function clearAuthCookie(res: express.Response): void {
     secure: NODE_ENV === 'production',
     sameSite: 'lax',
     path: '/',
+  });
+  res.clearCookie(REFRESH_COOKIE_NAME, {
+    httpOnly: true,
+    secure: NODE_ENV === 'production',
+    sameSite: 'lax',
+    path: '/api/auth',
   });
 }
 
@@ -140,7 +163,7 @@ function getOrCreateCsrfToken(req: express.Request, res: express.Response): stri
     secure: NODE_ENV === 'production',
     sameSite: 'lax',
     path: '/',
-    maxAge: JWT_EXPIRY * 1000,
+    maxAge: REFRESH_EXPIRY * 1000,
   });
   return token;
 }
@@ -152,7 +175,8 @@ function requireCsrfForCookieSession(req: express.Request, res: express.Response
   }
 
   const sessionCookie = getCookieValue(req, SESSION_COOKIE_NAME);
-  if (!sessionCookie) {
+  const refreshCookie = getCookieValue(req, REFRESH_COOKIE_NAME);
+  if (!sessionCookie && !refreshCookie) {
     next();
     return;
   }
@@ -355,6 +379,86 @@ function verifyToken(token: string): JwtPayload | null {
       issuer: JWT_ISSUER, audience: JWT_AUDIENCE,
     }) as JwtPayload;
   } catch { return null; }
+}
+
+function hashRefreshToken(token: string): string {
+  return crypto.createHash('sha256').update(token).digest('hex');
+}
+
+function getRequestIp(req: express.Request): string {
+  return String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '127.0.0.1')
+    .split(',')[0].trim().substring(0, 45);
+}
+
+async function issueRefreshSession(
+  userId: string,
+  req: express.Request,
+  res: express.Response,
+): Promise<void> {
+  const token = generateSecureToken(48);
+  const expiresAt = new Date(Date.now() + REFRESH_EXPIRY * 1000);
+  const request = await getRequest();
+  request.input('uid', sql.UniqueIdentifier, userId);
+  request.input('hash', sql.Char(64), hashRefreshToken(token));
+  request.input('exp', sql.DateTimeOffset, expiresAt);
+  request.input('ip', sql.NVarChar(45), getRequestIp(req));
+  request.input('ua', sql.NVarChar(500), String(req.headers['user-agent'] || '').substring(0, 500) || null);
+  await request.query(
+    `DELETE FROM refresh_tokens
+     WHERE user_id=@uid AND (expires_at<=SYSDATETIMEOFFSET() OR revoked_at<DATEADD(day,-1,SYSDATETIMEOFFSET()));
+     INSERT INTO refresh_tokens (id,user_id,token_hash,expires_at,created_at,revoked_at,ip_address,user_agent)
+     VALUES (NEWID(),@uid,@hash,@exp,SYSDATETIMEOFFSET(),NULL,@ip,@ua)`
+  );
+  setRefreshCookie(res, token);
+}
+
+async function revokeRefreshSession(token: string): Promise<void> {
+  if (!token) return;
+  const request = await getRequest();
+  request.input('hash', sql.Char(64), hashRefreshToken(token));
+  await request.query(
+    `UPDATE refresh_tokens SET revoked_at=COALESCE(revoked_at,SYSDATETIMEOFFSET()) WHERE token_hash=@hash`
+  );
+}
+
+async function revokeAllRefreshSessions(userId: string): Promise<void> {
+  const request = await getRequest();
+  request.input('uid', sql.UniqueIdentifier, userId);
+  await request.query(
+    `UPDATE refresh_tokens SET revoked_at=COALESCE(revoked_at,SYSDATETIMEOFFSET())
+     WHERE user_id=@uid`
+  );
+}
+
+async function rotateRefreshSession(
+  req: express.Request,
+  res: express.Response,
+): Promise<{ user: User; accessToken: string } | null> {
+  const token = getCookieValue(req, REFRESH_COOKIE_NAME);
+  if (!token) return null;
+
+  const request = await getRequest();
+  request.input('hash', sql.Char(64), hashRefreshToken(token));
+  const result = await request.query<UserRow>(
+    `SELECT u.id,u.email_encrypted,u.email_iv,u.email_auth_tag,
+            u.username_encrypted,u.username_iv,u.username_auth_tag,
+            u.role,u.quota_id,u.storage_used_bytes,u.status,u.created_at,
+            u.failed_login_count,u.locked_until
+     FROM refresh_tokens rt
+     JOIN users u ON u.id=rt.user_id
+     WHERE rt.token_hash=@hash AND rt.revoked_at IS NULL
+       AND rt.expires_at>SYSDATETIMEOFFSET() AND u.status='Active'`
+  );
+  if (!result.recordset.length) {
+    return null;
+  }
+
+  await revokeRefreshSession(token);
+  const user = mapUserRow(result.recordset[0]);
+  const accessToken = signToken(user.id, user.role);
+  setAuthCookie(res, accessToken);
+  await issueRefreshSession(user.id, req, res);
+  return { user, accessToken };
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -710,7 +814,8 @@ app.post('/api/auth/register', async (req, res) => {
       // Dev mode — auto-verified, log them in
       const token = signToken(user.id, user.role);
       setAuthCookie(res, token);
-      res.json({ token, user });
+      await issueRefreshSession(user.id, req, res);
+      res.json({ user });
     }
   } catch (err) { console.error('[POST /api/auth/register]', err); res.status(500).json({ error: 'Registration failed.' }); }
 });
@@ -846,8 +951,9 @@ app.post('/api/auth/login', async (req, res) => {
     const user  = mapUserRow(row);
     const token = signToken(user.id, user.role);
     setAuthCookie(res, token);
+    await issueRefreshSession(user.id, req, res);
     await logSystemEvent(user.id, user.username, 'Auth', 'User', user.id, req, 'User logged in.');
-    res.json({ token, user });
+    res.json({ user });
   } catch (err) { console.error('[POST /api/auth/login]', err); res.status(500).json({ error: 'Login service unavailable.' }); }
 });
 
@@ -865,8 +971,26 @@ app.get('/api/auth/csrf', (req, res) => {
   res.json({ csrfToken });
 });
 
-app.post('/api/auth/logout', (req, res) => {
-  clearAuthCookie(res);
+app.post('/api/auth/refresh', async (req, res) => {
+  try {
+    const session = await rotateRefreshSession(req, res);
+    if (!session) return res.status(401).json({ error: 'Refresh session expired. Please log in again.' });
+    const csrfToken = getOrCreateCsrfToken(req, res);
+    res.json({ user: session.user, csrfToken });
+  } catch (err) {
+    console.error('[POST /api/auth/refresh]', err);
+    res.status(500).json({ error: 'Session refresh unavailable.' });
+  }
+});
+
+app.post('/api/auth/logout', async (req, res) => {
+  try {
+    await revokeRefreshSession(getCookieValue(req, REFRESH_COOKIE_NAME));
+  } catch (err) {
+    console.error('[POST /api/auth/logout] Failed to revoke refresh session:', err);
+  } finally {
+    clearAuthCookie(res);
+  }
   res.json({ success: true });
 });
 
@@ -917,6 +1041,11 @@ app.post('/api/users/me/update', authenticateUser as express.RequestHandler, asy
        WHERE id=@id`
     );
     const user = mapUserRow(updated.recordset[0]);
+    if (password?.trim()) {
+      await revokeAllRefreshSessions(userId);
+      await issueRefreshSession(userId, req, res);
+      setAuthCookie(res, signToken(user.id, user.role));
+    }
     await logSystemEvent(userId, user.username, 'Auth', 'User', userId, req, 'Updated account details.');
     res.json({ success: true, user });
   } catch (err) { console.error('[POST /api/users/me/update]', err); res.status(500).json({ error: 'Failed to update account.' }); }

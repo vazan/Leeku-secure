@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import AuthPage from "@/app/features/auth/pages/auth-page";
 import LandingPage from "@/app/features/public/pages/landing-page";
 import PublicDownloadPage from "@/app/features/sharing/pages/public-download-page";
-import UserDashboard from "@/app/features/workspace/pages/user-dashboard";
+import UserDashboard from "@/app/features/files/pages/user-dashboard";
 import { Toaster } from "@/app/shared/components/ui/sonner";
 import type { Quota, User } from "@/app/shared/types";
 
@@ -16,6 +16,27 @@ export default function App() {
   const [authMode, setAuthMode] = useState<"login" | "register">("login");
   const [downloadToken, setDownloadToken] = useState<string | null>(null);
   const [quotas, setQuotas] = useState<Quota[]>([]);
+
+  const getCsrfToken = () =>
+    document.cookie
+      .split("; ")
+      .find((row) => row.startsWith("leeku_csrf="))
+      ?.split("=")[1] || "";
+
+  const refreshSession = async () => {
+    const response = await fetch("/api/auth/refresh", {
+      method: "POST",
+      headers: { "X-CSRF-Token": getCsrfToken() },
+    });
+    if (!response.ok) return null;
+    const data = await response.json();
+    if (data.user) {
+      setUser(data.user);
+      setToken("cookie");
+      return data.user as User;
+    }
+    return null;
+  };
 
   const handleHashChange = () => {
     const hash = window.location.hash;
@@ -46,6 +67,10 @@ export default function App() {
           setToken("cookie");
           if (!window.location.hash.startsWith("#f/"))
             setCurrentView("dashboard");
+        } else {
+          const refreshedUser = await refreshSession();
+          if (refreshedUser && !window.location.hash.startsWith("#f/"))
+            setCurrentView("dashboard");
         }
       } catch (error) {
         console.error("Unable to initialise the application.", error);
@@ -57,14 +82,25 @@ export default function App() {
     initialise();
     window.addEventListener("hashchange", handleHashChange);
     handleHashChange();
-    return () => window.removeEventListener("hashchange", handleHashChange);
+    const refreshInterval = window.setInterval(() => {
+      if (document.visibilityState === "visible") refreshSession().catch(() => null);
+    }, 10 * 60 * 1000);
+    const refreshOnVisible = () => {
+      if (document.visibilityState === "visible") refreshSession().catch(() => null);
+    };
+    document.addEventListener("visibilitychange", refreshOnVisible);
+    return () => {
+      window.removeEventListener("hashchange", handleHashChange);
+      window.clearInterval(refreshInterval);
+      document.removeEventListener("visibilitychange", refreshOnVisible);
+    };
   }, []);
 
   const handleRefreshUser = async () => {
     if (!user) return;
     try {
       const response = await fetch("/api/auth/me", {
-        headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+        headers: { "X-CSRF-Token": getCsrfToken() },
       });
       const data = await response.json();
       if (response.ok && data.user) setUser(data.user);
@@ -73,23 +109,19 @@ export default function App() {
     }
   };
 
-  const handleAuthSuccess = (newToken: string, authenticatedUser: User) => {
-    setToken(newToken);
+  const handleAuthSuccess = (_newToken: string, authenticatedUser: User) => {
+    setToken("cookie");
     setUser(authenticatedUser);
     setCurrentView(downloadToken ? "download" : "dashboard");
   };
 
   const handleLogout = async () => {
-    const csrfToken = document.cookie
-      .split("; ")
-      .find((row) => row.startsWith("leeku_csrf="))
-      ?.split("=")[1];
     try {
       await fetch("/api/auth/logout", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "X-CSRF-Token": csrfToken || "",
+          "X-CSRF-Token": getCsrfToken(),
         },
       });
     } catch {
@@ -103,14 +135,14 @@ export default function App() {
 
   if (loading) {
     return (
-      <div className="grid min-h-screen place-items-center bg-[#f5f6f8]">
-        <div className="h-5 w-5 animate-spin rounded-full border border-[#d8dde3] border-t-[#59616b]" />
+      <div className="grid min-h-screen place-items-center bg-[var(--bg-primary)]">
+        <div className="h-5 w-5 animate-spin rounded-full border border-[var(--border-subtle)] border-t-[var(--accent-linear)]" />
       </div>
     );
   }
 
   return (
-    <div className="min-h-screen bg-[#f5f6f8] text-[#17191d] selection:bg-[#dce9fa] selection:text-[#17191d]">
+    <div className="min-h-screen bg-[var(--bg-primary)] text-[var(--text-primary)] selection:bg-[var(--accent-linear)] selection:text-[var(--text-primary)]">
       <Toaster />
       <main>
         {currentView === "landing" && (

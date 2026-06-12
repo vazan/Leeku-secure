@@ -40,7 +40,7 @@ export default function AuthPage({
       const data = await response.json();
       if (!response.ok)
         throw new Error(data.error || "Could not complete that request.");
-      if (data.token && data.user) onAuthSuccess(data.token, data.user);
+      if (data.user) onAuthSuccess("cookie", data.user);
       else setMessage(data.message || "Check your email to continue.");
     } catch (error: any) {
       setMessage(error.message);
@@ -50,26 +50,26 @@ export default function AuthPage({
   };
 
   return (
-    <div className="grid min-h-screen bg-[#f5f6f8] lg:grid-cols-2">
-      <aside className="hidden bg-[#17191d] p-12 text-white lg:flex lg:flex-col">
+    <div className="grid min-h-screen bg-[var(--bg-primary)] lg:grid-cols-2">
+      <aside className="hidden bg-[var(--bg-elevated)] p-12 text-[var(--text-primary)] lg:flex lg:flex-col">
         <button onClick={onCancel} className="flex items-center gap-3 text-sm">
-          <div className="grid h-9 w-9 place-items-center rounded-xl bg-white text-[#17191d]">
+          <div className="grid h-9 w-9 place-items-center rounded-xl bg-[var(--bg-hover)] text-[var(--text-primary)]">
             <Folder className="h-4 w-4" />
           </div>
           Leeku
         </button>
         <div className="my-auto max-w-md">
-          <p className="text-sm text-white/55">
-            Your work, gathered thoughtfully.
+          <p className="text-sm text-[var(--text-muted)]">
+            Your files, protected and ready to share.
           </p>
           <h1 className="mt-4 text-5xl font-semibold leading-[1.02] tracking-[-0.06em]">
             A calmer way to keep files close.
           </h1>
-          <div className="mt-10 space-y-4 text-sm text-white/65">
+          <div className="mt-10 space-y-4 text-sm text-[var(--text-secondary)]">
             {[
               "Everything has one clear home.",
               "Sharing stays deliberate and easy.",
-              "Your workspace stays out of the way.",
+              "Your account keeps sharing under control.",
             ].map((item) => (
               <p key={item} className="flex items-center gap-3">
                 <Check className="h-4 w-4" />
@@ -83,21 +83,21 @@ export default function AuthPage({
         <div className="w-full max-w-md">
           <button
             onClick={onCancel}
-            className="mb-10 flex items-center gap-2 text-sm text-[#747b84] lg:hidden"
+            className="mb-10 flex items-center gap-2 text-sm text-[var(--text-muted)] lg:hidden"
           >
             <ArrowLeft className="h-4 w-4" />
             Back
           </button>
           <h2 className="text-3xl font-semibold tracking-[-0.04em]">
-            {mode === "login" ? "Welcome back" : "Create your workspace"}
+            {mode === "login" ? "Welcome back" : "Create your account"}
           </h2>
-          <p className="mt-2 text-sm text-[#7e858e]">
+          <p className="mt-2 text-sm text-[var(--text-muted)]">
             {mode === "login"
               ? "Pick up where you left off."
               : "A few details and you are ready to begin."}
           </p>
           {message && (
-            <div className="mt-5 rounded-lg border border-[#dfe3e8] bg-white p-3 text-sm text-[#606770]">
+            <div className="mt-5 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-panel)] p-3 text-sm text-[var(--text-muted)] shadow-[var(--shadow-hairline)]">
               {message}
             </div>
           )}
@@ -119,14 +119,14 @@ export default function AuthPage({
             />
             <button
               disabled={loading}
-              className="flex w-full items-center justify-center gap-2 rounded-lg bg-[#2f7ee6] px-4 py-3 text-sm font-medium text-white"
+              className="flex w-full items-center justify-center gap-2 rounded-lg bg-[var(--accent-linear)] px-4 py-3 text-sm font-medium text-[var(--text-primary)] hover:bg-[var(--accent-linear-bright)]"
             >
               {loading && <Loader2 className="h-4 w-4 animate-spin" />}
               {loading
                 ? "Please wait"
                 : mode === "login"
                   ? "Log in"
-                  : "Create workspace"}
+                  : "Create account"}
             </button>
           </form>
           <button
@@ -134,11 +134,11 @@ export default function AuthPage({
               setMode(mode === "login" ? "register" : "login");
               setMessage("");
             }}
-            className="mt-6 text-sm text-[#6f7680]"
+            className="mt-6 text-sm text-[var(--text-muted)]"
           >
             {mode === "login"
-              ? "Need a workspace? Create one"
-              : "Already have a workspace? Log in"}
+              ? "Need an account? Create one"
+              : "Already have an account? Log in"}
           </button>
         </div>
       </main>
@@ -165,7 +165,7 @@ function Field({
         type={type}
         value={value}
         onChange={(event) => onChange(event.target.value)}
-        className="w-full rounded-lg border border-[#d8dde3] bg-white px-3 py-3 text-sm outline-none focus:border-[#9ba3ad]"
+        className="w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-elevated)] px-3 py-3 text-sm text-[var(--text-primary)] outline-none placeholder:text-[var(--text-faint)] focus:border-[var(--accent-linear)]"
       />
     </label>
   );

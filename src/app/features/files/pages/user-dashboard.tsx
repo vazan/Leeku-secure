@@ -46,7 +46,13 @@ interface UserDashboardProps {
 
 type View = "home" | "files" | "shared" | "settings" | "admin";
 
-const authHeaders = (token: string) => ({ Authorization: `Bearer ${token}` });
+const getCsrfToken = () =>
+  document.cookie
+    .split("; ")
+    .find((row) => row.startsWith("leeku_csrf="))
+    ?.split("=")[1] || "";
+
+const authHeaders = (_token: string) => ({ "X-CSRF-Token": getCsrfToken() });
 
 function formatBytes(bytes: number) {
   if (!bytes) return "0 B";
@@ -128,7 +134,7 @@ export default function UserDashboard({
   const notify = (message: string) => toast(message);
   const notifyError = (message: string) => toast.error(message);
 
-  const loadWorkspace = async () => {
+  const loadFilesAndLinks = async () => {
     const [filesResponse, linksResponse] = await Promise.all([
       fetch("/api/files", { headers: authHeaders(token) }),
       fetch("/api/sharing/links", { headers: authHeaders(token) }),
@@ -156,8 +162,8 @@ export default function UserDashboard({
   };
 
   useEffect(() => {
-    loadWorkspace().catch(() =>
-      notifyError("Could not refresh the workspace."),
+    loadFilesAndLinks().catch(() =>
+      notifyError("Could not refresh your files."),
     );
     loadAdmin().catch(() => notifyError("Could not refresh admin data."));
   }, []);
@@ -185,7 +191,7 @@ export default function UserDashboard({
       setUploading(false);
       if (xhr.status >= 200 && xhr.status < 300) {
         notify("Upload complete.");
-        await loadWorkspace();
+        await loadFilesAndLinks();
         onTriggerRefreshUser();
       } else {
         const data = JSON.parse(xhr.responseText || "{}");
@@ -197,7 +203,7 @@ export default function UserDashboard({
       notifyError("Upload interrupted.");
     };
     xhr.open("POST", "/api/files/upload");
-    xhr.setRequestHeader("Authorization", `Bearer ${token}`);
+    xhr.setRequestHeader("X-CSRF-Token", getCsrfToken());
     xhr.send(formData);
   };
 
@@ -225,7 +231,7 @@ export default function UserDashboard({
     });
     if (response.ok) {
       notify("File deleted.");
-      await loadWorkspace();
+      await loadFilesAndLinks();
       onTriggerRefreshUser();
     } else notifyError("Could not delete the file.");
   };
@@ -258,7 +264,7 @@ export default function UserDashboard({
     const data = await response.json();
     if (response.ok) {
       setShareUrl(`${window.location.origin}/#f/${data.link.public_token}`);
-      await loadWorkspace();
+      await loadFilesAndLinks();
       notify("Share link ready.");
     } else notifyError(data.error || "Could not create the share link.");
   };
@@ -272,7 +278,7 @@ export default function UserDashboard({
     });
     if (response.ok) {
       notify(`Stopped sharing ${file?.original_name || "file"}.`);
-      await loadWorkspace();
+      await loadFilesAndLinks();
     } else {
       notifyError("Could not unshare the file.");
     }
@@ -345,16 +351,16 @@ export default function UserDashboard({
     navItems.push(["admin", <Shield className="h-4 w-4" />, "Admin"]);
 
   return (
-    <div className="min-h-screen bg-[#f5f6f8] text-[#17191d]">
-      <aside className="fixed inset-y-0 left-0 z-20 hidden w-64 border-r border-[#e1e4e9] bg-white p-5 lg:flex lg:flex-col">
+    <div className="min-h-screen bg-[var(--bg-primary)] text-[var(--text-primary)]">
+      <aside className="fixed inset-y-0 left-0 z-20 hidden w-64 border-r border-[var(--border-subtle)] bg-[var(--bg-panel)] p-5 lg:flex lg:flex-col">
         <div className="flex items-center gap-3 px-2 py-1">
-          <div className="grid h-9 w-9 place-items-center rounded-xl bg-[#17191d] text-white">
+          <div className="grid h-9 w-9 place-items-center rounded-xl bg-[var(--bg-elevated)] text-[var(--text-primary)]">
             <Folder className="h-4 w-4" />
           </div>
           <div>
             <p className="text-sm font-semibold">Leeku</p>
-            <p className="text-xs text-[#8a9099]">
-              A quiet place for your work
+            <p className="text-xs text-[var(--text-muted)]">
+              Secure file sharing
             </p>
           </div>
         </div>
@@ -363,7 +369,7 @@ export default function UserDashboard({
             <button
               key={id}
               onClick={() => setView(id)}
-              className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm ${view === id ? "bg-[#f0f2f5] font-medium" : "text-[#676d76] hover:bg-[#f6f7f9]"}`}
+              className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm ${view === id ? "bg-[var(--bg-hover)] font-medium" : "text-[var(--text-muted)] hover:bg-[var(--bg-hover)]"}`}
             >
               {icon}
               {label}
@@ -371,23 +377,23 @@ export default function UserDashboard({
           ))}
         </nav>
         <div className="mt-auto">
-          <div className="mb-4 rounded-xl border border-[#e2e5ea] p-3">
+          <div className="mb-4 rounded-xl border border-[var(--border-subtle)] p-3">
             <div className="mb-2 flex justify-between text-xs">
-              <span className="text-[#777d86]">Storage</span>
+              <span className="text-[var(--text-muted)]">Storage</span>
               <span>
                 {formatBytes(user.storage_used)} / {formatBytes(storageLimit)}
               </span>
             </div>
-            <div className="h-1.5 overflow-hidden rounded-full bg-[#eceff3]">
+            <div className="h-1.5 overflow-hidden rounded-full bg-[var(--bg-hover)]">
               <div
-                className="h-full rounded-full bg-[#2f7ee6]"
+                className="h-full rounded-full bg-[var(--accent-linear)]"
                 style={{ width: `${storagePercent}%` }}
               />
             </div>
           </div>
           <button
             onClick={onLogout}
-            className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm text-[#676d76] hover:bg-[#f6f7f9]"
+            className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm text-[var(--text-muted)] hover:bg-[var(--bg-hover)]"
           >
             <LogOut className="h-4 w-4" />
             Log out
@@ -396,11 +402,11 @@ export default function UserDashboard({
       </aside>
 
       <main className="lg:pl-64">
-        <header className="sticky top-0 z-10 flex h-20 items-center gap-4 border-b border-[#e1e4e9] bg-white/95 px-5 sm:pr-64 lg:px-8 lg:pr-72">
+        <header className="sticky top-0 z-10 flex h-20 items-center gap-4 border-b border-[var(--border-subtle)] bg-[color-mix(in_srgb,var(--bg-panel)_92%,transparent)] backdrop-blur-[var(--blur-header)] px-5 sm:pr-64 lg:px-8 lg:pr-72">
           <select
             value={view}
             onChange={(event) => setView(event.target.value as View)}
-            className="rounded-lg border border-[#dfe3e8] bg-white px-3 py-2.5 text-sm lg:hidden"
+            className="rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-panel)] px-3 py-2.5 text-sm lg:hidden"
           >
             {navItems.map(([id, , label]) => (
               <option key={id} value={id}>
@@ -409,15 +415,15 @@ export default function UserDashboard({
             ))}
           </select>
           <div className="relative w-full max-w-xl">
-            <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[#9aa0a9]" />
+            <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[var(--text-faint)]" />
             <input
               value={search}
               onChange={(event) => setSearch(event.target.value)}
               placeholder="Search files"
-              className="h-11 w-full rounded-lg border border-[#dfe3e8] bg-[#fafbfc] pl-10 pr-4 text-sm outline-none focus:border-[#aab1bb]"
+              className="h-11 w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-muted)] pl-10 pr-4 text-sm outline-none focus:border-[var(--accent-linear)]"
             />
           </div>
-          <label className="flex h-11 shrink-0 cursor-pointer items-center rounded-lg bg-[#2f7ee6] px-4 text-sm font-medium text-white hover:bg-[#276fca]">
+          <label className="flex h-11 shrink-0 cursor-pointer items-center rounded-lg bg-[var(--accent-linear)] px-4 text-sm font-medium text-[var(--text-primary)] hover:bg-[var(--accent-linear-bright)]">
             <input
               type="file"
               className="hidden"
@@ -435,7 +441,7 @@ export default function UserDashboard({
             />
             <div>
               <p className="text-sm font-medium">{user.username}</p>
-              <p className="text-xs text-[#8a9099]">{user.role}</p>
+              <p className="text-xs text-[var(--text-muted)]">{user.role}</p>
             </div>
           </div>
         </header>
@@ -444,7 +450,7 @@ export default function UserDashboard({
           {view === "home" && (
             <div className="mx-auto max-w-5xl space-y-8">
               <div className="text-center">
-                <p className="text-sm text-[#858b94]">
+                <p className="text-sm text-[var(--text-muted)]">
                   Good to see you, {user.username}.
                 </p>
                 <h1 className="mt-1 text-3xl font-semibold tracking-[-0.04em]">
@@ -464,25 +470,25 @@ export default function UserDashboard({
                   event.dataTransfer.files[0] &&
                     uploadFile(event.dataTransfer.files[0]);
                 }}
-                className={`rounded-2xl border border-dashed p-8 text-center ${dragging ? "border-[#2f7ee6] bg-[#f2f7fe]" : "border-[#cfd4dc] bg-white"}`}
+                className={`rounded-2xl border border-dashed p-8 text-center ${dragging ? "border-[var(--accent-linear)] bg-[color-mix(in_srgb,var(--accent-linear)_14%,transparent)]" : "border-[var(--border-subtle)] bg-[var(--bg-panel)]"}`}
               >
-                <div className="mx-auto grid h-11 w-11 place-items-center rounded-xl bg-[#f0f3f7]">
+                <div className="mx-auto grid h-11 w-11 place-items-center rounded-xl bg-[var(--bg-hover)]">
                   <Upload className="h-5 w-5" />
                 </div>
                 <p className="mt-4 text-sm font-medium">
                   {uploading
                     ? `Uploading · ${uploadProgress}%`
-                    : "Drop a file here to add it to your workspace"}
+                    : "Drop a file here to upload it securely"}
                 </p>
-                <p className="mt-1 text-xs text-[#8a9099]">
+                <p className="mt-1 text-xs text-[var(--text-muted)]">
                   {uploading
                     ? "We will let you know when it is ready."
                     : `One file at a time, up to ${formatBytes(activeQuota?.max_file_size_bytes || 0)}.`}
                 </p>
                 {uploading && (
-                  <div className="mx-auto mt-4 h-1.5 max-w-sm overflow-hidden rounded-full bg-[#edf0f4]">
+                  <div className="mx-auto mt-4 h-1.5 max-w-sm overflow-hidden rounded-full bg-[var(--bg-hover)]">
                     <div
-                      className="h-full bg-[#2f7ee6]"
+                      className="h-full bg-[var(--accent-linear)]"
                       style={{ width: `${uploadProgress}%` }}
                     />
                   </div>
@@ -492,13 +498,13 @@ export default function UserDashboard({
                 <div className="mb-4 flex items-end justify-between">
                   <div>
                     <h2 className="text-lg font-semibold">Recent files</h2>
-                    <p className="text-sm text-[#8a9099]">
-                      The last things you worked with.
+                    <p className="text-sm text-[var(--text-muted)]">
+                      Your most recently uploaded files.
                     </p>
                   </div>
                   <button
                     onClick={() => setView("files")}
-                    className="text-sm font-medium text-[#4e5661]"
+                    className="text-sm font-medium text-[var(--text-secondary)]"
                   >
                     See all
                   </button>
@@ -525,13 +531,13 @@ export default function UserDashboard({
                 <h1 className="text-2xl font-semibold tracking-[-0.03em]">
                   All files
                 </h1>
-                <p className="mt-1 text-sm text-[#8a9099]">
-                  {visibleFiles.length} items in your workspace.
+                <p className="mt-1 text-sm text-[var(--text-muted)]">
+                  {visibleFiles.length} files in your account.
                 </p>
               </div>
-              <div className="overflow-hidden rounded-xl border border-[#e0e4e9] bg-white">
+              <div className="overflow-hidden rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] shadow-[var(--shadow-hairline)]">
                 <table className="w-full text-left text-sm">
-                  <thead className="border-b border-[#e5e8ed] bg-[#fafbfc] text-xs text-[#7d838c]">
+                  <thead className="border-b border-[var(--border-subtle)] bg-[var(--bg-muted)] text-xs text-[var(--text-muted)]">
                     <tr>
                       <th className="px-4 py-3 font-medium">Name</th>
                       <th className="hidden px-4 py-3 font-medium md:table-cell">
@@ -546,9 +552,9 @@ export default function UserDashboard({
                       <th className="px-4 py-3" />
                     </tr>
                   </thead>
-                  <tbody className="divide-y divide-[#edf0f3]">
+                  <tbody className="divide-y divide-[var(--border-subtle)]">
                     {visibleFiles.map((file) => (
-                      <tr key={file.id} className="hover:bg-[#fafbfc]">
+                      <tr key={file.id} className="hover:bg-[var(--bg-muted)]">
                         <td className="px-4 py-3">
                           <div className="flex items-center gap-3">
                             <FileThumbnail
@@ -561,19 +567,19 @@ export default function UserDashboard({
                               <p className="max-w-xs truncate font-medium">
                                 {file.original_name}
                               </p>
-                              <p className="text-xs text-[#9197a0]">
+                              <p className="text-xs text-[var(--text-faint)]">
                                 {file.status}
                               </p>
                             </div>
                           </div>
                         </td>
-                        <td className="hidden px-4 py-3 text-[#69707a] md:table-cell">
+                        <td className="hidden px-4 py-3 text-[var(--text-muted)] md:table-cell">
                           {fileKind(file)}
                         </td>
-                        <td className="hidden px-4 py-3 text-[#69707a] sm:table-cell">
+                        <td className="hidden px-4 py-3 text-[var(--text-muted)] sm:table-cell">
                           {formatBytes(file.size)}
                         </td>
-                        <td className="hidden px-4 py-3 text-[#69707a] lg:table-cell">
+                        <td className="hidden px-4 py-3 text-[var(--text-muted)] lg:table-cell">
                           {new Date(file.created_at).toLocaleDateString()}
                         </td>
                         <td className="px-4 py-3">
@@ -612,8 +618,8 @@ export default function UserDashboard({
                 <h1 className="text-2xl font-semibold tracking-[-0.03em]">
                   Shared links
                 </h1>
-                <p className="mt-1 text-sm text-[#8a9099]">
-                  A simple view of what is available outside your workspace.
+                <p className="mt-1 text-sm text-[var(--text-muted)]">
+                  Files currently available through shared links.
                 </p>
               </div>
               <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
@@ -622,20 +628,20 @@ export default function UserDashboard({
                   return (
                     <div
                       key={link.id}
-                      className="rounded-xl border border-[#e0e4e9] bg-white p-4"
+                      className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] p-4 shadow-[var(--shadow-hairline)]"
                     >
                       <div className="flex items-start justify-between">
-                        <div className="grid h-9 w-9 place-items-center rounded-lg bg-[#f0f3f7]">
+                        <div className="grid h-9 w-9 place-items-center rounded-lg bg-[var(--bg-hover)]">
                           <Link2 className="h-4 w-4" />
                         </div>
-                        <span className="text-xs text-[#8b919a]">
+                        <span className="text-xs text-[var(--text-muted)]">
                           {link.is_active ? "Active" : "Paused"}
                         </span>
                       </div>
                       <p className="mt-4 truncate text-sm font-medium">
                         {file?.original_name || "Shared file"}
                       </p>
-                      <p className="mt-1 text-xs text-[#8b919a]">
+                      <p className="mt-1 text-xs text-[var(--text-muted)]">
                         {link.download_count}
                         {link.max_downloads
                           ? ` of ${link.max_downloads}`
@@ -652,7 +658,7 @@ export default function UserDashboard({
                               )
                               .then(() => notify("Link copied."))
                           }
-                          className="flex cursor-pointer items-center gap-2 rounded-md px-2.5 py-2 text-xs font-medium text-[#737a84] hover:bg-[#f0f2f5] hover:text-[#20242a]"
+                          className="flex cursor-pointer items-center gap-2 rounded-md px-2.5 py-2 text-xs font-medium text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
                         >
                           <Copy className="h-3.5 w-3.5" />
                           Copy link
@@ -661,7 +667,7 @@ export default function UserDashboard({
                           type="button"
                           disabled={!link.is_active}
                           onClick={() => unshareFile(link)}
-                          className="flex cursor-pointer items-center gap-2 rounded-md px-2.5 py-2 text-xs font-medium text-red-600 hover:bg-[#f0f2f5] hover:text-red-700 disabled:cursor-not-allowed disabled:opacity-50"
+                          className="flex cursor-pointer items-center gap-2 rounded-md px-2.5 py-2 text-xs font-medium text-[var(--error-linear)] hover:bg-[var(--bg-hover)] hover:text-[var(--error-linear)] disabled:cursor-not-allowed disabled:opacity-50"
                         >
                           <X className="h-3.5 w-3.5" />
                           Unshare
@@ -679,14 +685,14 @@ export default function UserDashboard({
               <h1 className="text-2xl font-semibold tracking-[-0.03em]">
                 Account settings
               </h1>
-              <p className="mt-1 text-sm text-[#8a9099]">
+              <p className="mt-1 text-sm text-[var(--text-muted)]">
                 Keep your sign-in details current.
               </p>
               <form
                 onSubmit={saveProfile}
-                className="mt-6 space-y-5 rounded-xl border border-[#e0e4e9] bg-white p-6"
+                className="mt-6 space-y-5 rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] p-6 shadow-[var(--shadow-hairline)]"
               >
-                <div className="flex items-center gap-4 border-b border-[#e8ebef] pb-5">
+                <div className="flex items-center gap-4 border-b border-[var(--border-subtle)] pb-5">
                   <ProfileAvatar
                     user={user}
                     version={avatarVersion}
@@ -694,11 +700,11 @@ export default function UserDashboard({
                   />
                   <div>
                     <p className="text-sm font-medium">Profile picture</p>
-                    <p className="mt-1 text-xs text-[#8a9099]">
+                    <p className="mt-1 text-xs text-[var(--text-muted)]">
                       PNG, JPEG, or WebP. Up to 5 MB.
                     </p>
                     <div className="mt-3 flex gap-2">
-                      <label className="inline-flex cursor-pointer items-center gap-2 rounded-lg border border-[#dfe3e8] px-3 py-2 text-xs font-medium hover:bg-[#f6f7f9]">
+                      <label className="inline-flex cursor-pointer items-center gap-2 rounded-lg border border-[var(--border-subtle)] px-3 py-2 text-xs font-medium hover:bg-[var(--bg-hover)]">
                         <Camera className="h-3.5 w-3.5" />
                         <input
                           type="file"
@@ -754,7 +760,7 @@ export default function UserDashboard({
                 <h1 className="text-2xl font-semibold tracking-[-0.03em]">
                   Admin overview
                 </h1>
-                <p className="mt-1 text-sm text-[#8a9099]">
+                <p className="mt-1 text-sm text-[var(--text-muted)]">
                   A concise operational view.
                 </p>
               </div>
@@ -767,9 +773,9 @@ export default function UserDashboard({
                 ].map(([label, value]) => (
                   <div
                     key={label}
-                    className="rounded-xl border border-[#e0e4e9] bg-white p-5"
+                    className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] p-5 shadow-[var(--shadow-hairline)]"
                   >
-                    <p className="text-sm text-[#818790]">{label}</p>
+                    <p className="text-sm text-[var(--text-muted)]">{label}</p>
                     <p className="mt-2 text-3xl font-semibold">{value}</p>
                   </div>
                 ))}
@@ -834,7 +840,7 @@ function IconButton({
       aria-label={label}
       title={label}
       onClick={onClick}
-      className="rounded-md p-2 text-[#737a84] hover:bg-[#f0f2f5] hover:text-[#20242a]"
+      className="rounded-md p-2 text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
     >
       {children}
     </button>
@@ -855,7 +861,7 @@ function ProfileAvatar({
 
   return (
     <div
-      className={`grid shrink-0 place-items-center overflow-hidden rounded-full bg-[#eef1f5] font-semibold ${className}`}
+      className={`grid shrink-0 place-items-center overflow-hidden rounded-full bg-[var(--bg-hover)] font-semibold ${className}`}
     >
       {!failed ? (
         <img
@@ -930,7 +936,7 @@ function FileThumbnail({
 
   return (
     <div
-      className={`grid shrink-0 place-items-center overflow-hidden bg-[#eef3f9] text-[#69707a] ${className}`}
+      className={`grid shrink-0 place-items-center overflow-hidden bg-[var(--bg-hover)] text-[var(--text-muted)] ${className}`}
     >
       {isImage && previewUrl && !failed ? (
         <img
@@ -986,7 +992,7 @@ function FileCard({
   }, [menuOpen]);
 
   return (
-    <div className="rounded-xl border border-[#e0e4e9] bg-white p-4">
+    <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] p-4 shadow-[var(--shadow-hairline)]">
       <div className="relative">
         <button
           type="button"
@@ -1005,18 +1011,18 @@ function FileCard({
             aria-label="File options"
             aria-expanded={menuOpen}
             onClick={() => setMenuOpen((open) => !open)}
-            className="rounded-md bg-[#20242a] p-2 text-[#c8cdd4] shadow-sm hover:bg-[#20242a] hover:text-[#e1e5ea]"
+            className="rounded-md bg-[var(--bg-elevated)] p-2 text-[var(--text-secondary)] shadow-[var(--shadow-hairline)] hover:bg-[var(--bg-elevated)] hover:text-[var(--text-primary)]"
           >
             <MoreHorizontal className="h-4 w-4" />
           </button>
           {menuOpen && (
-            <div className="absolute right-0 z-20 mt-1 w-36 overflow-hidden rounded-lg border border-[#e0e4e9] bg-white py-1 text-sm shadow-lg">
+            <div className="absolute right-0 z-20 mt-1 w-36 overflow-hidden rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-panel)] py-1 text-sm shadow-[var(--shadow-panel)]">
               <button
                 onClick={() => {
                   setMenuOpen(false);
                   onShare();
                 }}
-                className="flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-[#f6f7f9]"
+                className="flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-[var(--bg-hover)]"
               >
                 <Share2 className="h-3.5 w-3.5" />
                 Share
@@ -1026,7 +1032,7 @@ function FileCard({
                   setMenuOpen(false);
                   onDelete();
                 }}
-                className="flex w-full items-center gap-2 px-3 py-2 text-left text-red-600 hover:bg-red-50"
+                className="flex w-full items-center gap-2 px-3 py-2 text-left text-[var(--error-linear)] hover:bg-[color-mix(in_srgb,var(--error-linear)_12%,transparent)]"
               >
                 <Trash2 className="h-3.5 w-3.5" />
                 Delete
@@ -1041,7 +1047,7 @@ function FileCard({
       >
         {file.original_name}
       </button>
-      <p className="mt-1 text-xs text-[#8d939c]">
+      <p className="mt-1 text-xs text-[var(--text-muted)]">
         {formatBytes(file.size)} ·{" "}
         {new Date(file.created_at).toLocaleDateString()}
       </p>
@@ -1070,7 +1076,7 @@ function Field({
         value={value}
         onChange={(event) => onChange(event.target.value)}
         placeholder={placeholder}
-        className="w-full rounded-lg border border-[#dfe3e8] px-3 py-2.5 text-sm outline-none focus:border-[#a9b0ba]"
+        className="w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-elevated)] px-3 py-2.5 text-sm text-[var(--text-primary)] outline-none placeholder:text-[var(--text-faint)] focus:border-[var(--accent-linear)]"
       />
     </label>
   );
@@ -1084,18 +1090,18 @@ function AdminTable({
   rows: Array<Array<string>>;
 }) {
   return (
-    <div className="overflow-hidden rounded-xl border border-[#e0e4e9] bg-white">
-      <div className="border-b border-[#e7eaee] px-4 py-3 text-sm font-medium">
+    <div className="overflow-hidden rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] shadow-[var(--shadow-hairline)]">
+      <div className="border-b border-[var(--border-subtle)] px-4 py-3 text-sm font-medium">
         {title}
       </div>
-      <div className="divide-y divide-[#edf0f3]">
+      <div className="divide-y divide-[var(--border-subtle)]">
         {rows.map((row, index) => (
           <div key={index} className="grid grid-cols-3 gap-3 px-4 py-3 text-sm">
             {row.map((cell, cellIndex) => (
               <span
                 key={cellIndex}
                 className={
-                  cellIndex ? "truncate text-[#777e88]" : "truncate font-medium"
+                  cellIndex ? "truncate text-[var(--text-muted)]" : "truncate font-medium"
                 }
               >
                 {cell}
@@ -1127,20 +1133,20 @@ function ShareDialog(props: {
     : "23:59";
 
   return (
-    <div className="fixed inset-0 z-50 grid place-items-center bg-black/25 p-4">
-      <div className="w-full max-w-lg rounded-2xl border border-[#dde1e7] bg-white p-6">
+    <div className="fixed inset-0 z-50 grid place-items-center bg-black/60 backdrop-blur-sm p-4">
+      <div className="w-full max-w-lg rounded-2xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] p-6 shadow-[var(--shadow-panel)]">
         <div className="flex items-start justify-between">
           <div>
             <h2 className="text-lg font-semibold">
               Share {props.file.original_name}
             </h2>
-            <p className="mt-1 text-sm text-[#858b94]">
+            <p className="mt-1 text-sm text-[var(--text-muted)]">
               Choose how long the link should stay useful.
             </p>
           </div>
           <button
             onClick={props.onClose}
-            className="rounded-md p-2 hover:bg-[#f2f4f6]"
+            className="rounded-md p-2 hover:bg-[var(--bg-hover)]"
           >
             <X className="h-4 w-4" />
           </button>
@@ -1180,8 +1186,8 @@ function ShareDialog(props: {
                   disabled={{ before: new Date() }}
                   captionLayout="dropdown"
                 />
-                <div className="border-t border-[#e8ebef] p-3">
-                  <label className="block text-xs font-medium text-[#6f7680]">
+                <div className="border-t border-[var(--border-subtle)] p-3">
+                  <label className="block text-xs font-medium text-[var(--text-muted)]">
                     Time
                     <input
                       type="time"
@@ -1192,13 +1198,13 @@ function ShareDialog(props: {
                           combineDateAndTime(date, event.target.value),
                         );
                       }}
-                      className="mt-1 w-full rounded-lg border border-[#dfe3e8] px-3 py-2 text-sm outline-none focus:border-[#a9b0ba]"
+                      className="mt-1 w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-elevated)] px-3 py-2 text-sm text-[var(--text-primary)] outline-none focus:border-[var(--accent-linear)]"
                     />
                   </label>
                   <button
                     type="button"
                     onClick={() => props.onExpires("")}
-                    className="mt-2 text-xs font-medium text-[#6f7680] hover:text-[#20242a]"
+                    className="mt-2 text-xs font-medium text-[var(--text-muted)] hover:text-[var(--text-primary)]"
                   >
                     Clear expiration
                   </button>
@@ -1218,11 +1224,11 @@ function ShareDialog(props: {
             <input
               readOnly
               value={props.url}
-              className="min-w-0 flex-1 rounded-lg border border-[#dfe3e8] px-3 py-2 text-sm"
+              className="min-w-0 flex-1 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-elevated)] px-3 py-2 text-sm text-[var(--text-primary)]"
             />
             <button
               onClick={props.onCopy}
-              className="rounded-lg border border-[#dfe3e8] px-3"
+              className="rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-elevated)] px-3 hover:bg-[var(--bg-hover)]"
             >
               <Copy className="h-4 w-4" />
             </button>
@@ -1231,13 +1237,13 @@ function ShareDialog(props: {
         <div className="mt-6 flex justify-end gap-2">
           <button
             onClick={props.onClose}
-            className="rounded-lg px-4 py-2.5 text-sm"
+            className="rounded-lg px-4 py-2.5 text-sm text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
           >
             Cancel
           </button>
           <button
             onClick={props.onSave}
-            className="rounded-lg bg-[#2f7ee6] px-4 py-2.5 text-sm font-medium text-white"
+            className="rounded-lg bg-[var(--accent-linear)] px-4 py-2.5 text-sm font-medium text-[var(--text-primary)] hover:bg-[var(--accent-linear-bright)]"
           >
             Create link
           </button>
