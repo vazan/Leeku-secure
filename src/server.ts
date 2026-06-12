@@ -1766,6 +1766,30 @@ app.get('/api/sharing/links', authenticateUser as express.RequestHandler, async 
   } catch (err) { console.error('[GET /api/sharing/links]', err); res.status(500).json({ error: 'Failed to load share links.' }); }
 });
 
+app.delete('/api/sharing/links/:id', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  const linkId = req.params.id;
+  try {
+    const findRequest = await getRequest();
+    findRequest.input('id', sql.UniqueIdentifier, linkId);
+    const result = await findRequest.query<{file_id:string;owner_user_id:string}>(
+      `SELECT sl.file_id,f.owner_user_id
+       FROM share_links sl INNER JOIN files f ON sl.file_id=f.id
+       WHERE sl.id=@id`
+    );
+    if (!result.recordset.length) return res.status(404).json({ error: 'Share link not found.' });
+    const link = result.recordset[0];
+    if (link.owner_user_id !== req.userId && req.user!.role !== 'Admin')
+      return res.status(403).json({ error: 'Only the file owner can remove share links.' });
+
+    const deleteRequest = await getRequest();
+    deleteRequest.input('id', sql.UniqueIdentifier, linkId);
+    await deleteRequest.query('DELETE FROM share_links WHERE id=@id');
+
+    await logSystemEvent(req.userId!, req.user!.username, 'Delete', 'ShareLink', linkId, req, `Removed share link for file ${link.file_id}.`);
+    res.json({ success: true });
+  } catch (err) { console.error('[DELETE /api/sharing/links/:id]', err); res.status(500).json({ error: 'Failed to remove share link.' }); }
+});
+
 app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
   const fileId = req.params.id;
   const { password, expires_at, max_downloads, is_active } = req.body;

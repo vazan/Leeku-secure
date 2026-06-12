@@ -9,11 +9,12 @@ import {
 } from "lucide-react";
 
 const Toaster = ({ ...props }: ToasterProps) => {
-  const { theme = "light" } = useTheme();
+  const { resolvedTheme = "light" } = useTheme();
+  const toasterTheme = resolvedTheme === "light" ? "light" : "dark";
 
   return (
     <Sonner
-      theme={theme as ToasterProps["theme"]}
+      theme={toasterTheme}
       position="bottom-right"
       closeButton
       className="toaster group"

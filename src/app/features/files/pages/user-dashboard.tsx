@@ -295,18 +295,25 @@ export default function UserDashboard({
     } else notifyError(data.error || "Could not create the share link.");
   };
 
-  const unshareFile = async (link: ShareLink) => {
+  const removeSharedLink = async (link: ShareLink) => {
     const file = files.find((item) => item.id === link.file_id);
-    const response = await fetch(`/api/files/${link.file_id}/share`, {
-      method: "POST",
-      headers: { ...authHeaders(token), "Content-Type": "application/json" },
-      body: JSON.stringify({ is_active: false }),
+    if (
+      !window.confirm(
+        `Remove the shared link for "${file?.original_name || "this file"}"? This cannot be undone.`,
+      )
+    )
+      return;
+    const response = await fetch(`/api/sharing/links/${link.id}`, {
+      method: "DELETE",
+      headers: authHeaders(token),
     });
     if (response.ok) {
-      notify(`Stopped sharing ${file?.original_name || "file"}.`);
-      await loadFilesAndLinks();
+      setLinks((current) => current.filter((item) => item.id !== link.id));
+      notify(`Removed shared link for ${file?.original_name || "file"}.`);
     } else {
-      notifyError("Could not unshare the file.");
+      notifyError(
+        (await response.json()).error || "Could not remove the shared link.",
+      );
     }
   };
 
@@ -610,61 +617,72 @@ export default function UserDashboard({
                   Files currently available through shared links.
                 </p>
               </div>
-              <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-                {links.map((link) => {
-                  const file = files.find((item) => item.id === link.file_id);
-                  return (
-                    <div
-                      key={link.id}
-                      className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] p-4 shadow-[var(--shadow-hairline)]"
-                    >
-                      <div className="flex items-start justify-between">
-                        <div className="grid h-9 w-9 place-items-center rounded-lg bg-[var(--bg-hover)]">
-                          <Link2 className="h-4 w-4" />
+              {links.length === 0 ? (
+                <div className="flex flex-col items-center py-16 text-center">
+                  <div className="grid h-11 w-11 place-items-center rounded-xl bg-[var(--bg-hover)] text-[var(--text-muted)]">
+                    <Link2 className="h-4 w-4" />
+                  </div>
+                  <p className="mt-4 text-sm font-medium">No shared links</p>
+                  <p className="mt-1 text-xs text-[var(--text-muted)]">
+                    Share a file to create a link.
+                  </p>
+                </div>
+              ) : (
+                <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+                  {links.map((link) => {
+                    const file = files.find((item) => item.id === link.file_id);
+                    return (
+                      <div
+                        key={link.id}
+                        className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] p-4 shadow-[var(--shadow-hairline)]"
+                      >
+                        <div className="flex items-start justify-between">
+                          <div className="grid h-9 w-9 place-items-center rounded-lg bg-[var(--bg-hover)]">
+                            <Link2 className="h-4 w-4" />
+                          </div>
+                          <span className="text-xs text-[var(--text-muted)]">
+                            {link.is_active ? "Active" : "Paused"}
+                          </span>
                         </div>
-                        <span className="text-xs text-[var(--text-muted)]">
-                          {link.is_active ? "Active" : "Paused"}
-                        </span>
+                        <p className="mt-4 truncate text-sm font-medium">
+                          {file?.original_name || "Shared file"}
+                        </p>
+                        <p className="mt-1 text-xs text-[var(--text-muted)]">
+                          {link.download_count}
+                          {link.max_downloads
+                            ? ` of ${link.max_downloads}`
+                            : ""}{" "}
+                          downloads
+                        </p>
+                        <div className="mt-4 flex flex-wrap gap-2">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              navigator.clipboard
+                                .writeText(
+                                  `${window.location.origin}/#f/${link.public_token}`,
+                                )
+                                .then(() => notify("Link copied."))
+                            }
+                            className="flex cursor-pointer items-center gap-2 rounded-md px-2.5 py-2 text-xs font-medium text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+                          >
+                            <Copy className="h-3.5 w-3.5" />
+                            Copy link
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => removeSharedLink(link)}
+                            className="flex cursor-pointer items-center gap-2 rounded-md px-2.5 py-2 text-xs font-medium text-[var(--error-linear)] hover:bg-[var(--bg-hover)] hover:text-[var(--error-linear)]"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                            Remove shared link
+                          </button>
+                        </div>
                       </div>
-                      <p className="mt-4 truncate text-sm font-medium">
-                        {file?.original_name || "Shared file"}
-                      </p>
-                      <p className="mt-1 text-xs text-[var(--text-muted)]">
-                        {link.download_count}
-                        {link.max_downloads
-                          ? ` of ${link.max_downloads}`
-                          : ""}{" "}
-                        downloads
-                      </p>
-                      <div className="mt-4 flex flex-wrap gap-2">
-                        <button
-                          type="button"
-                          onClick={() =>
-                            navigator.clipboard
-                              .writeText(
-                                `${window.location.origin}/#f/${link.public_token}`,
-                              )
-                              .then(() => notify("Link copied."))
-                          }
-                          className="flex cursor-pointer items-center gap-2 rounded-md px-2.5 py-2 text-xs font-medium text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
-                        >
-                          <Copy className="h-3.5 w-3.5" />
-                          Copy link
-                        </button>
-                        <button
-                          type="button"
-                          disabled={!link.is_active}
-                          onClick={() => unshareFile(link)}
-                          className="flex cursor-pointer items-center gap-2 rounded-md px-2.5 py-2 text-xs font-medium text-[var(--error-linear)] hover:bg-[var(--bg-hover)] hover:text-[var(--error-linear)] disabled:cursor-not-allowed disabled:opacity-50"
-                        >
-                          <X className="h-3.5 w-3.5" />
-                          Unshare
-                        </button>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
+                    );
+                  })}
+                </div>
+              )}
             </section>
           )}
 

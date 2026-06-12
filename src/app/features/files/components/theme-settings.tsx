@@ -1,4 +1,4 @@
-import { ChevronDown, Laptop, Moon, Palette, Sun } from "lucide-react";
+import { ChevronDown, Laptop, Moon, Palette, Sparkles, Sun } from "lucide-react";
 import { useTheme } from "next-themes";
 import { Button } from "@/app/shared/components/ui/button";
 import {
@@ -13,6 +13,7 @@ const themes = [
   { value: "system", label: "System", icon: Laptop },
   { value: "light", label: "Light", icon: Sun },
   { value: "dark", label: "Dark", icon: Moon },
+  { value: "leeku", label: "Leeku", icon: Sparkles },
 ] as const;
 
 export default function ThemeSettings() {

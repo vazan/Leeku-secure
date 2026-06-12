@@ -45,6 +45,7 @@ export default function DashboardSidebar({
           <button
             key={id}
             onClick={() => onView(id)}
+            aria-current={view === id ? "page" : undefined}
             className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm ${view === id ? "bg-[var(--bg-hover)] font-medium" : "text-[var(--text-muted)] hover:bg-[var(--bg-hover)]"}`}
           >
             {icon}

@@ -195,6 +195,151 @@ a {
   color-scheme: dark;
 }
 
+.leeku {
+  color-scheme: dark;
+  background: #10151b;
+
+  --bg-primary: transparent;
+  --bg-panel: rgba(27, 32, 39, 0.94);
+  --bg-elevated: rgba(15, 20, 26, 0.96);
+  --bg-muted: rgba(0, 238, 244, 0.035);
+  --bg-hover: rgba(0, 238, 244, 0.09);
+  --bg-active: rgba(0, 238, 244, 0.15);
+  --text-primary: #f5f6f2;
+  --text-strong: #e7ebeb;
+  --text-secondary: #c9d1d5;
+  --text-muted: #9aa2ad;
+  --text-faint: #687483;
+  --accent-linear: #e6007e;
+  --accent-linear-bright: #cf0071;
+  --accent-contrast: #ffffff;
+  --border-subtle: rgba(0, 238, 244, 0.34);
+  --border-strong: #00eaf0;
+  --success-linear: #00f52f;
+  --error-linear: #ff008c;
+  --warning-linear: #f4f600;
+  --gradient-header-glass: linear-gradient(rgba(16, 21, 27, 0.92) 0px, rgba(16, 21, 27, 0.84) 100%);
+  --gradient-stripes-x: repeating-linear-gradient(to right, #00eaf0 0px, #00eaf0 3px, transparent 3px, transparent 7px);
+  --gradient-soft-glow: radial-gradient(circle, rgba(0, 238, 244, 0.13) 0px, transparent 55%);
+  --shadow-hairline: rgba(0, 238, 244, 0.2) 0px 1px 0px 0px;
+  --shadow-panel: #ff008c 7px 7px 0 -2px, #00eaf0 0px 0px 0px 1px;
+  --shadow-popover: rgba(0, 0, 0, 0.55) 0px 5px 14px 0px;
+
+  --background: #10151b;
+  --foreground: #f5f6f2;
+  --card: #20242a;
+  --card-foreground: #f5f6f2;
+  --popover: #20242a;
+  --popover-foreground: #f5f6f2;
+  --primary: #e6007e;
+  --primary-foreground: #ffffff;
+  --secondary: rgba(0, 238, 244, 0.09);
+  --secondary-foreground: #c9d1d5;
+  --muted: rgba(0, 238, 244, 0.09);
+  --muted-foreground: #9aa2ad;
+  --accent: rgba(0, 238, 244, 0.12);
+  --accent-foreground: #f5f6f2;
+  --destructive: #ff008c;
+  --border: rgba(0, 238, 244, 0.24);
+  --input: rgba(0, 238, 244, 0.28);
+  --ring: #00eaf0;
+  --chart-1: #00eaf0;
+  --chart-2: #ff008c;
+  --chart-3: #00f52f;
+  --chart-4: #f4f600;
+  --chart-5: #ff4fb1;
+  --sidebar: #151a20;
+  --sidebar-foreground: #f5f6f2;
+  --sidebar-primary: #e6007e;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: rgba(0, 238, 244, 0.09);
+  --sidebar-accent-foreground: #f5f6f2;
+  --sidebar-border: rgba(0, 238, 244, 0.3);
+  --sidebar-ring: #00eaf0;
+  --radius: 0.125rem;
+}
+
+.leeku body {
+  background:
+    linear-gradient(90deg, rgba(0, 238, 244, 0.1) 0%, transparent 34%, transparent 66%, rgba(255, 0, 140, 0.11) 100%),
+    radial-gradient(circle at 8% 12%, rgba(0, 238, 244, 0.18), transparent 32%),
+    radial-gradient(circle at 92% 82%, rgba(255, 0, 140, 0.18), transparent 38%),
+    #10151b;
+  background-attachment: fixed;
+}
+
+.leeku [class~="rounded-xl"],
+.leeku [class~="rounded-2xl"] {
+  border-radius: 1px;
+}
+
+.leeku [class~="rounded-lg"] {
+  border-radius: 1px;
+}
+
+.leeku [class*="border-[var(--border-subtle)]"][class*="bg-[var(--bg-panel)]"] {
+  border-color: rgba(0, 238, 244, 0.42);
+}
+
+.leeku aside {
+  position: fixed;
+  border-color: #00eaf0;
+  box-shadow: none;
+}
+
+.leeku aside::after {
+  position: absolute;
+  top: 0;
+  right: -3px;
+  bottom: 0;
+  width: 3px;
+  background: #ff008c;
+  content: "";
+  pointer-events: none;
+}
+
+.leeku aside nav button[aria-current="page"] {
+  background: #00eaf0;
+  color: #071014;
+  font-weight: 700;
+}
+
+.leeku header {
+  border-color: #00eaf0;
+}
+
+.leeku input:focus,
+.leeku select:focus {
+  box-shadow: 3px 3px 0 rgba(255, 0, 140, 0.8);
+}
+
+h1,
+h2,
+h3 {
+  letter-spacing: -0.025em;
+  text-transform: uppercase;
+}
+
+button,
+[role="button"],
+select,
+label,
+th {
+  border-radius: 2px;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  font-weight: 650;
+  letter-spacing: 0.055em;
+  text-transform: uppercase;
+}
+
+input,
+textarea,
+option {
+  font-family: var(--font-mono);
+  letter-spacing: 0.025em;
+}
+
 @layer base {
   * {
     @apply border-border outline-ring/50;
@@ -207,6 +352,6 @@ a {
     cursor: pointer;
   }
   html {
-    @apply font-sans;
+    font-family: var(--font-mono);
   }
 }
