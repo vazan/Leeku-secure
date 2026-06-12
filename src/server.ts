@@ -1905,7 +1905,7 @@ app.get('/api/files/:id/preview', authenticateUser as express.RequestHandler, as
 
     const keyRow = keyRes.recordset[0];
     const fileKey = unwrapKey(keyRow.encrypted_key, keyRow.key_iv, keyRow.key_auth_tag);
-    const tempPath = path.join(os.tmpdir(), `leeku-preview-${fileId}-${Date.now()}.tmp`);
+    const tempPath = path.join(UPLOAD_TEMP, `leeku-preview-${fileId}-${Date.now()}.tmp`);
     await decryptFileStream(vaultPath, tempPath, fileKey, keyRow.file_iv, keyRow.file_auth_tag);
 
     const actualChecksum = await computeFileChecksum(tempPath);
@@ -1975,7 +1975,7 @@ app.get('/api/files/:id/download', authenticateUser as express.RequestHandler, a
     }
 
     // ── Streaming decrypt to temp file (avoids 2 GiB Buffer limit) ──
-    const tempPath = path.join(os.tmpdir(), `leeku-dl-${fileId}-${Date.now()}.tmp`);
+    const tempPath = path.join(UPLOAD_TEMP, `leeku-dl-${fileId}-${Date.now()}.tmp`);
     await decryptFileStream(vaultPath, tempPath, fileKey, keyRow.file_iv, keyRow.file_auth_tag);
 
     // Verify checksum via streaming (constant memory)
@@ -2166,6 +2166,7 @@ app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, asy
 
 app.use('/api/public/share', createPublicSharingRouter({
   vaultPath: FILE_VAULT,
+  tempPath: UPLOAD_TEMP,
   logDownload: (req, fileId, originalName, token) =>
     logSystemEvent(null, 'Anonymous', 'Download', 'File', fileId, req, `Anonymous download of "${originalName}" via token ${token}.`),
 }));

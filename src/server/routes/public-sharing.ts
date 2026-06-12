@@ -1,7 +1,6 @@
 import express from 'express';
 import rateLimit from 'express-rate-limit';
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
 import sql from 'mssql';
 import { getRequest } from '../db.js';
@@ -28,9 +27,14 @@ interface ShareRow {
 
 export function createPublicSharingRouter(options: {
   vaultPath: string;
+  tempPath: string;
   logDownload: (req: express.Request, fileId: string, originalName: string, token: string) => Promise<void>;
 }): express.Router {
   const router = express.Router();
+
+  if (!fs.existsSync(options.tempPath)) {
+    fs.mkdirSync(options.tempPath, { recursive: true });
+  }
 
   router.get('/:token', async (req, res) => {
     try {
@@ -123,7 +127,7 @@ export function createPublicSharingRouter(options: {
       }
       const vaultFile = path.join(options.vaultPath, row.stored_path);
       if (!fs.existsSync(vaultFile)) return res.status(410).json({ error: 'Vault file not found.' });
-      const tempFile = path.join(os.tmpdir(), `leeku-share-${token}-${Date.now()}.tmp`);
+      const tempFile = path.join(options.tempPath, `leeku-share-${token}-${Date.now()}.tmp`);
       const fileKey = unwrapKey(row.encrypted_key, row.key_iv, row.key_auth_tag);
       await decryptFileStream(vaultFile, tempFile, fileKey, row.file_iv, row.file_auth_tag);
       if ((await computeFileChecksum(tempFile)) !== row.checksum_sha256) {
@@ -231,7 +235,7 @@ export function createPublicSharingRouter(options: {
       );
       if (!reservation.rowsAffected[0]) return res.status(410).json({ error: 'Download limit reached or link expired.' });
 
-      const tempFile = path.join(os.tmpdir(), `leeku-embed-${token}-${Date.now()}.tmp`);
+      const tempFile = path.join(options.tempPath, `leeku-embed-${token}-${Date.now()}.tmp`);
       const fileKey = unwrapKey(row.encrypted_key, row.key_iv, row.key_auth_tag);
       await decryptFileStream(vaultFile, tempFile, fileKey, row.file_iv, row.file_auth_tag);
       if ((await computeFileChecksum(tempFile)) !== row.checksum_sha256) {
