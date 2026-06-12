@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useId, useRef, useState } from "react";
 import {
   ArrowLeft,
   Check,
@@ -9,10 +9,6 @@ import {
   Lock,
 } from "lucide-react";
 import ErrorScreen from "@/app/shared/components/common/error-screen";
-import TransferProgress, {
-  type TransferState,
-} from "@/app/shared/components/common/transfer-progress";
-import { downloadWithProgress } from "@/app/shared/utils/download-with-progress";
 
 interface PublicDownloadPageProps {
   token: string;
@@ -48,7 +44,8 @@ export default function PublicDownloadPage({
   const [password, setPassword] = useState("");
   const [downloading, setDownloading] = useState(false);
   const [done, setDone] = useState(false);
-  const [transfer, setTransfer] = useState<TransferState | null>(null);
+  const downloadTarget = useId().replace(/:/g, "");
+  const doneTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     fetch(`/api/public/share/${token}`)
@@ -62,49 +59,46 @@ export default function PublicDownloadPage({
       .finally(() => setLoading(false));
   }, [token]);
 
-  const download = async (event: React.FormEvent) => {
+  useEffect(
+    () => () => {
+      if (doneTimerRef.current) window.clearTimeout(doneTimerRef.current);
+    },
+    [],
+  );
+
+  const handleDownloadFrameLoad = (
+    event: React.SyntheticEvent<HTMLIFrameElement>,
+  ) => {
+    const text =
+      event.currentTarget.contentDocument?.body?.textContent?.trim() || "";
+    if (!text) return;
+
+    try {
+      const data = JSON.parse(text);
+      if (data.error) {
+        if (doneTimerRef.current) window.clearTimeout(doneTimerRef.current);
+        setError(data.error);
+        setDone(false);
+        setDownloading(false);
+      }
+    } catch {
+      // Successful attachment downloads do not render JSON into the iframe.
+    }
+  };
+
+  const download = (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     setDownloading(true);
     setError("");
     setDone(false);
-    const startedAt = Date.now();
-    const fileName = meta?.file_name || "download";
-    setTransfer({
-      direction: "download",
-      name: fileName,
-      loaded: 0,
-      total: meta?.size || 0,
-      startedAt,
-    });
-    try {
-      await downloadWithProgress(`/api/public/share/${token}/download`, fileName, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ password }),
-        onProgress: ({ loaded, total }) =>
-          setTransfer({
-            direction: "download",
-            name: fileName,
-            loaded,
-            total: total || meta?.size || 0,
-            startedAt,
-          }),
-      });
-      setTransfer({
-        direction: "download",
-        name: fileName,
-        loaded: meta?.size || 0,
-        total: meta?.size || 0,
-        startedAt,
-        complete: true,
-      });
+
+    const form = event.currentTarget;
+    if (doneTimerRef.current) window.clearTimeout(doneTimerRef.current);
+    doneTimerRef.current = window.setTimeout(() => {
       setDone(true);
-    } catch (reason: any) {
-      setTransfer(null);
-      setError(reason.message);
-    } finally {
       setDownloading(false);
-    }
+    }, 1200);
+    form.submit();
   };
 
   if (loading)
@@ -160,7 +154,19 @@ export default function PublicDownloadPage({
               </p>
             </div>
           </div>
-          <form onSubmit={download} className="mt-6 space-y-4">
+          <iframe
+            name={downloadTarget}
+            title="Shared file download"
+            onLoad={handleDownloadFrameLoad}
+            className="hidden"
+          />
+          <form
+            method="POST"
+            action={`/api/public/share/${token}/download`}
+            target={downloadTarget}
+            onSubmit={download}
+            className="mt-6 space-y-4"
+          >
             {meta.protected && (
               <label className="block">
                 <span className="mb-2 flex items-center gap-2 text-sm font-medium">
@@ -176,16 +182,16 @@ export default function PublicDownloadPage({
                 />
               </label>
             )}
+            <input type="hidden" name="password" value={password} />
             {error && (
               <p className="rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-muted)] p-3 text-sm text-[var(--text-muted)]">
                 {error}
               </p>
             )}
-            {transfer && <TransferProgress transfer={transfer} />}
             {done && (
               <p className="flex items-center gap-2 text-sm text-[var(--text-muted)]">
                 <Check className="h-4 w-4" />
-                Your download has started.
+                Your browser download has started.
               </p>
             )}
             <button
