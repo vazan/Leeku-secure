@@ -232,11 +232,10 @@ export default function UserDashboard({
         (hashView !== "admin" || user.role === "Admin")
       ) {
         setView(hashView as DashboardView);
-      } else if (
-        window.location.hash === "#dashboard" ||
-        window.location.hash === ""
-      ) {
+      } else if (window.location.hash === "#dashboard") {
         setView("home");
+      } else if (window.location.hash === "") {
+        setView(getSavedDashboardView(user));
       }
     };
     window.addEventListener("hashchange", syncDashboardView);
