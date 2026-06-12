@@ -1648,8 +1648,9 @@ app.get('/api/files/:id/preview', authenticateUser as express.RequestHandler, as
       return res.status(403).json({ error: 'You do not have permission to preview this file.' });
     if (file.status === 'Blocked')
       return res.status(410).json({ error: 'Blocked files cannot be previewed.' });
-    if (!file.mime_type.startsWith('image/'))
-      return res.status(415).json({ error: 'Preview is only available for image files.' });
+    const previewable = file.mime_type.startsWith('image/') || file.mime_type === 'video/mp4';
+    if (!previewable)
+      return res.status(415).json({ error: 'Preview is only available for images and MP4 videos.' });
 
     const vaultPath = path.join(FILE_VAULT, file.stored_path);
     if (!fs.existsSync(vaultPath)) return res.status(410).json({ error: 'Vault file not found.' });

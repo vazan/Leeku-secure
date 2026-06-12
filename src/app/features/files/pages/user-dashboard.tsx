@@ -10,6 +10,7 @@ import {
   LayoutGrid,
   Link2,
   MoreHorizontal,
+  Play,
   Search,
   Settings,
   Share2,
@@ -115,6 +116,7 @@ export default function UserDashboard({
   const [uploadProgress, setUploadProgress] = useState(0);
   const [dragging, setDragging] = useState(false);
   const [shareFile, setShareFile] = useState<FileMetadata | null>(null);
+  const [videoFile, setVideoFile] = useState<FileMetadata | null>(null);
   const [sharePassword, setSharePassword] = useState("");
   const [shareExpires, setShareExpires] = useState("");
   const [shareMaxDownloads, setShareMaxDownloads] = useState("");
@@ -474,6 +476,7 @@ export default function UserDashboard({
                       file={file}
                       token={token}
                       onDownload={() => downloadFile(file)}
+                      onOpenVideo={() => setVideoFile(file)}
                       onShare={() => openShare(file)}
                       onDelete={() => deleteFile(file)}
                     />
@@ -520,6 +523,7 @@ export default function UserDashboard({
                               token={token}
                               className="h-9 w-9 rounded-lg"
                               iconClassName="h-4 w-4"
+                              onOpenVideo={() => setVideoFile(file)}
                             />
                             <div>
                               <p className="max-w-xs truncate font-medium">
@@ -781,6 +785,9 @@ export default function UserDashboard({
           }
         />
       )}
+      {videoFile && (
+        <VideoPlayer file={videoFile} onClose={() => setVideoFile(null)} />
+      )}
     </div>
   );
 }
@@ -841,20 +848,28 @@ function FileThumbnail({
   token,
   className,
   iconClassName,
+  onOpenVideo,
 }: {
   file: FileMetadata;
   token: string;
   className: string;
   iconClassName: string;
+  onOpenVideo?: () => void;
 }) {
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
+  const [playing, setPlaying] = useState(false);
+  const [hovering, setHovering] = useState(false);
+  const videoRef = React.useRef<HTMLVideoElement>(null);
   const isImage = file.mime_type.startsWith("image/");
+  const isMp4 = file.mime_type === "video/mp4";
+  const isPreviewable = isImage || isMp4;
 
   useEffect(() => {
     setPreviewUrl(null);
     setFailed(false);
-    if (!isImage) return undefined;
+    setPlaying(false);
+    if (!isPreviewable) return undefined;
 
     const controller = new AbortController();
     let objectUrl: string | null = null;
@@ -885,7 +900,32 @@ function FileThumbnail({
       controller.abort();
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [file.id, isImage, token]);
+  }, [file.id, isPreviewable, token]);
+
+  const playVideo = async () => {
+    const video = videoRef.current;
+    if (!video) return;
+    video.muted = false;
+    try {
+      await video.play();
+    } catch {
+      video.muted = true;
+      try {
+        await video.play();
+      } catch {
+        setPlaying(false);
+      }
+    }
+  };
+
+  const stopVideo = () => {
+    const video = videoRef.current;
+    if (!video) return;
+    video.pause();
+    video.currentTime = 0;
+    video.muted = true;
+    setPlaying(false);
+  };
 
   const fallbackIcon = fileKind(file) === "Image" ? (
     <File className={iconClassName} />
@@ -895,7 +935,37 @@ function FileThumbnail({
 
   return (
     <div
-      className={`grid shrink-0 place-items-center overflow-hidden bg-[var(--bg-hover)] text-[var(--text-muted)] ${className}`}
+      role={isMp4 && onOpenVideo ? "button" : undefined}
+      tabIndex={isMp4 && onOpenVideo ? 0 : undefined}
+      aria-label={isMp4 && onOpenVideo ? `Play ${file.original_name}` : undefined}
+      className={`group/preview relative grid shrink-0 place-items-center overflow-hidden bg-[var(--bg-hover)] text-[var(--text-muted)] ${isMp4 && onOpenVideo ? "cursor-pointer" : ""} ${className}`}
+      onClick={isMp4 ? onOpenVideo : undefined}
+      onKeyDown={
+        isMp4 && onOpenVideo
+          ? (event) => {
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                onOpenVideo();
+              }
+            }
+          : undefined
+      }
+      onPointerEnter={
+        isMp4
+          ? () => {
+              setHovering(true);
+              void playVideo();
+            }
+          : undefined
+      }
+      onPointerLeave={
+        isMp4
+          ? () => {
+              setHovering(false);
+              stopVideo();
+            }
+          : undefined
+      }
     >
       {isImage && previewUrl && !failed ? (
         <img
@@ -904,6 +974,31 @@ function FileThumbnail({
           className="h-full w-full object-cover"
           onError={() => setFailed(true)}
         />
+      ) : isMp4 && previewUrl && !failed ? (
+        <>
+          <video
+            ref={videoRef}
+            src={previewUrl}
+            preload="auto"
+            playsInline
+            loop
+            muted
+            className="h-full w-full object-cover"
+            onPlay={() => setPlaying(true)}
+            onPause={() => setPlaying(false)}
+            onCanPlay={() => {
+              if (hovering) void playVideo();
+            }}
+            onError={() => setFailed(true)}
+          />
+          <span
+            className={`pointer-events-none absolute inset-0 grid place-items-center transition-opacity duration-150 ${playing ? "opacity-0" : "opacity-100"}`}
+          >
+            <span className="grid h-10 w-10 place-items-center rounded-full bg-black/70 text-white shadow-[var(--shadow-panel)] backdrop-blur-sm">
+              <Play className="ml-0.5 h-4 w-4 fill-current" />
+            </span>
+          </span>
+        </>
       ) : (
         fallbackIcon
       )}
@@ -915,12 +1010,14 @@ function FileCard({
   file,
   token,
   onDownload,
+  onOpenVideo,
   onShare,
   onDelete,
 }: {
   file: FileMetadata;
   token: string;
   onDownload: () => void;
+  onOpenVideo: () => void;
   onShare: () => void;
   onDelete: () => void;
 }) {
@@ -953,18 +1050,13 @@ function FileCard({
   return (
     <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] p-4 shadow-[var(--shadow-hairline)]">
       <div className="relative">
-        <button
-          type="button"
-          onClick={onDownload}
-          className="block w-full overflow-hidden rounded-lg text-left"
-        >
-          <FileThumbnail
-            file={file}
-            token={token}
-            className="h-32 w-full rounded-lg"
-            iconClassName="h-8 w-8"
-          />
-        </button>
+        <FileThumbnail
+          file={file}
+          token={token}
+          className="h-32 w-full rounded-lg"
+          iconClassName="h-8 w-8"
+          onOpenVideo={onOpenVideo}
+        />
         <div ref={menuRef} className="absolute right-2 top-2">
           <button
             aria-label="File options"
@@ -1000,12 +1092,14 @@ function FileCard({
           )}
         </div>
       </div>
-      <button
-        onClick={onDownload}
-        className="mt-3 block max-w-full truncate text-left text-sm font-medium"
-      >
-        {file.original_name}
-      </button>
+      <div className="mt-3 flex items-center gap-2">
+        <p className="min-w-0 flex-1 truncate text-sm font-medium">
+          {file.original_name}
+        </p>
+        <IconButton label={`Download ${file.original_name}`} onClick={onDownload}>
+          <ArrowDownToLine className="h-4 w-4" />
+        </IconButton>
+      </div>
       <p className="mt-1 text-xs text-[var(--text-muted)]">
         {formatBytes(file.size)} ·{" "}
         {new Date(file.created_at).toLocaleDateString()}
@@ -1069,6 +1163,50 @@ function AdminTable({
           </div>
         ))}
       </div>
+    </div>
+  );
+}
+
+function VideoPlayer({
+  file,
+  onClose,
+}: {
+  file: FileMetadata;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", closeOnEscape);
+    return () => document.removeEventListener("keydown", closeOnEscape);
+  }, [onClose]);
+
+  return (
+    <div
+      className="fixed inset-0 z-[60] flex flex-col bg-black/95 p-4 backdrop-blur-md"
+      onPointerDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      <div className="mb-3 flex items-center justify-between gap-4 text-white">
+        <p className="min-w-0 truncate text-sm font-medium">{file.original_name}</p>
+        <button
+          type="button"
+          aria-label="Close video"
+          onClick={onClose}
+          className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-white/10 hover:bg-white/20"
+        >
+          <X className="h-4 w-4" />
+        </button>
+      </div>
+      <video
+        src={`/api/files/${file.id}/preview`}
+        controls
+        autoPlay
+        playsInline
+        className="min-h-0 w-full flex-1 object-contain"
+      />
     </div>
   );
 }
