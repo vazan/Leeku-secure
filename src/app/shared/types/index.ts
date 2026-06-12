@@ -44,6 +44,7 @@ export interface ShareLink {
   id: string;
   file_id: string;
   public_token: string;
+  allow_external_preview?: boolean;
   password?: string; // Optional password
   expires_at: string | null; // expiration date
   max_downloads: number | null;

@@ -122,6 +122,12 @@ function fileKind(file: FileMetadata) {
   return "Document";
 }
 
+function supportsExternalPreview(file: FileMetadata) {
+  return (
+    file.mime_type.startsWith("image/") || file.mime_type.startsWith("video/")
+  );
+}
+
 function pad2(value: number) {
   return String(value).padStart(2, "0");
 }
@@ -170,6 +176,8 @@ export default function UserDashboard({
   const [sharePassword, setSharePassword] = useState("");
   const [shareExpires, setShareExpires] = useState("");
   const [shareMaxDownloads, setShareMaxDownloads] = useState("");
+  const [shareAllowExternalPreview, setShareAllowExternalPreview] =
+    useState(false);
   const [shareUrl, setShareUrl] = useState("");
   const [profileUsername, setProfileUsername] = useState(user.username);
   const [profileEmail, setProfileEmail] = useState(user.email);
@@ -549,16 +557,26 @@ export default function UserDashboard({
     } else notifyError("Could not delete the file.");
   };
 
+  const toShareUrl = (publicToken: string, allowExternalPreview: boolean) =>
+    allowExternalPreview
+      ? `${window.location.origin}/api/public/share/${publicToken}/embed`
+      : `${window.location.origin}/#f/${publicToken}`;
+
   const openShare = (file: FileMetadata) => {
     const existing = links.find((link) => link.file_id === file.id);
+    const allowExternalPreview =
+      !!existing?.allow_external_preview && supportsExternalPreview(file);
     setShareFile(file);
     setSharePassword("");
     setShareExpires(existing?.expires_at?.substring(0, 16) || "");
     setShareMaxDownloads(
       existing?.max_downloads ? String(existing.max_downloads) : "",
     );
+    setShareAllowExternalPreview(allowExternalPreview);
     setShareUrl(
-      existing ? `${window.location.origin}/#f/${existing.public_token}` : "",
+      existing
+        ? toShareUrl(existing.public_token, allowExternalPreview)
+        : "",
     );
   };
 
@@ -571,12 +589,13 @@ export default function UserDashboard({
         password: sharePassword || undefined,
         expires_at: shareExpires ? new Date(shareExpires).toISOString() : null,
         max_downloads: shareMaxDownloads ? Number(shareMaxDownloads) : null,
+        allow_external_preview: shareAllowExternalPreview,
         is_active: true,
       }),
     });
     const data = await response.json();
     if (response.ok) {
-      setShareUrl(`${window.location.origin}/#f/${data.link.public_token}`);
+      setShareUrl(toShareUrl(data.link.public_token, shareAllowExternalPreview));
       await loadFilesAndLinks();
       notify("Share link ready.");
     } else notifyError(data.error || "Could not create the share link.");
@@ -1055,7 +1074,10 @@ export default function UserDashboard({
                             onClick={() =>
                               navigator.clipboard
                                 .writeText(
-                                  `${window.location.origin}/#f/${link.public_token}`,
+                                  toShareUrl(
+                                    link.public_token,
+                                    !!link.allow_external_preview,
+                                  ),
                                 )
                                 .then(() => notify("Link copied."))
                             }
@@ -1176,10 +1198,12 @@ export default function UserDashboard({
           password={sharePassword}
           expires={shareExpires}
           maxDownloads={shareMaxDownloads}
+          allowExternalPreview={shareAllowExternalPreview}
           url={shareUrl}
           onPassword={setSharePassword}
           onExpires={setShareExpires}
           onMaxDownloads={setShareMaxDownloads}
+          onAllowExternalPreview={setShareAllowExternalPreview}
           onSave={saveShare}
           onClose={() => setShareFile(null)}
           onCopy={() =>
@@ -1623,10 +1647,12 @@ function ShareDialog(props: {
   password: string;
   expires: string;
   maxDownloads: string;
+  allowExternalPreview: boolean;
   url: string;
   onPassword: (value: string) => void;
   onExpires: (value: string) => void;
   onMaxDownloads: (value: string) => void;
+  onAllowExternalPreview: (value: boolean) => void;
   onSave: () => void;
   onClose: () => void;
   onCopy: () => void;
@@ -1741,6 +1767,26 @@ function ShareDialog(props: {
             placeholder="Optional"
           />
         </div>
+        {supportsExternalPreview(props.file) && (
+          <label className="mt-4 flex cursor-pointer items-start gap-3 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-muted)] p-3 text-sm">
+            <input
+              type="checkbox"
+              checked={props.allowExternalPreview}
+              onChange={(event) =>
+                props.onAllowExternalPreview(event.target.checked)
+              }
+              className="mt-0.5 h-4 w-4 rounded border-[var(--border-subtle)]"
+            />
+            <span>
+              <span className="block font-medium text-[var(--text-primary)]">
+                Allow external preview
+              </span>
+              <span className="mt-1 block text-xs text-[var(--text-muted)]">
+                Generates a media embed link for image/video playback outside Leeku.
+              </span>
+            </span>
+          </label>
+        )}
         {props.url && (
           <div className="mt-5 flex gap-2">
             <input

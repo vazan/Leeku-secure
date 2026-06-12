@@ -21,6 +21,7 @@ interface PublicFileMeta {
   created_at: string;
   protected: boolean;
   requires_secret_key: boolean;
+  allow_external_preview?: boolean;
   uploader: string;
   downloads_current: number;
   downloads_max: number | null;

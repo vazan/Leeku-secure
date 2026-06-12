@@ -537,7 +537,7 @@ interface FileRow {
 interface ShareRow {
   id: string; file_id: string; public_token: string; password_hash: string | null;
   expires_at: Date | null; max_downloads: number | null; download_count: number;
-  is_active: boolean; created_at: Date;
+  is_active: boolean; allow_external_preview: boolean; created_at: Date;
 }
 
 interface LogRow {
@@ -587,6 +587,7 @@ function mapShareRow(row: ShareRow): ShareLink {
     id:             row.id,
     file_id:        row.file_id,
     public_token:   row.public_token,
+    allow_external_preview: !!row.allow_external_preview,
     password:       row.password_hash ? '[protected]' : undefined,
     expires_at:     row.expires_at ? row.expires_at.toISOString() : null,
     max_downloads:  row.max_downloads,
@@ -2004,7 +2005,7 @@ app.get('/api/sharing/links', authenticateUser as express.RequestHandler, async 
     const request = await getRequest();
     request.input('ownerId', sql.UniqueIdentifier, req.userId!);
     const result = await request.query<ShareRow & { stored_path: string }>(
-      `SELECT sl.id,sl.file_id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.created_at,f.stored_path
+      `SELECT sl.id,sl.file_id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.allow_external_preview,sl.created_at,f.stored_path
        FROM share_links sl INNER JOIN files f ON sl.file_id=f.id
        WHERE f.owner_user_id=@ownerId ORDER BY sl.created_at DESC`
     );
@@ -2047,10 +2048,12 @@ app.post('/api/sharing/links/:id/remove', authenticateUser as express.RequestHan
 
 app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
   const fileId = req.params.id;
-  const { password, expires_at, max_downloads, is_active } = req.body;
+  const { password, expires_at, max_downloads, is_active, allow_external_preview } = req.body;
   try {
     const fReq = await getRequest(); fReq.input('id', sql.UniqueIdentifier, fileId);
-    const fRes = await fReq.query<{owner_user_id:string;status:string;stored_path:string}>('SELECT owner_user_id,status,stored_path FROM files WHERE id=@id');
+    const fRes = await fReq.query<{owner_user_id:string;status:string;stored_path:string;mime_type:string;client_secret_hash:string|null}>(
+      'SELECT owner_user_id,status,stored_path,mime_type,client_secret_hash FROM files WHERE id=@id'
+    );
     if (!fRes.recordset.length) return res.status(404).json({ error: 'File not found.' });
     const file = fRes.recordset[0];
     if (file.owner_user_id !== req.userId && req.user!.role !== 'Admin')
@@ -2061,11 +2064,20 @@ app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, asy
 
     const exReq = await getRequest(); exReq.input('fid', sql.UniqueIdentifier, fileId);
     const existing = await exReq.query<ShareRow>(
-      'SELECT id,file_id,public_token,password_hash,expires_at,max_downloads,download_count,is_active,created_at FROM share_links WHERE file_id=@fid'
+      'SELECT id,file_id,public_token,password_hash,expires_at,max_downloads,download_count,is_active,allow_external_preview,created_at FROM share_links WHERE file_id=@fid'
     );
 
     let shareRow: ShareRow;
     if (!existing.recordset.length) {
+      const allowExternalPreview = !!allow_external_preview;
+      if (allowExternalPreview) {
+        if (!file.mime_type.startsWith('image/') && !file.mime_type.startsWith('video/'))
+          return res.status(400).json({ error: 'External preview is only supported for image and video files.' });
+        if (password)
+          return res.status(400).json({ error: 'External preview links cannot use a share password.' });
+        if (file.client_secret_hash)
+          return res.status(400).json({ error: 'Files protected with a secret key cannot use external preview.' });
+      }
       const token = generateSecureToken(16);
       const pwH   = password ? await hashSharePassword(password) : null;
       const insReq = await getRequest();
@@ -2075,17 +2087,32 @@ app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, asy
       insReq.input('exp',   sql.DateTimeOffset,   expires_at || null);
       insReq.input('md',    sql.Int,              max_downloads ? Number(max_downloads) : null);
       insReq.input('act',   sql.Bit,              is_active !== undefined ? (is_active ? 1 : 0) : 1);
+      insReq.input('allowExternalPreview', sql.Bit, allowExternalPreview ? 1 : 0);
       const insRes = await insReq.query<ShareRow>(
-        `INSERT INTO share_links (file_id,public_token,password_hash,expires_at,max_downloads,is_active)
+        `INSERT INTO share_links (file_id,public_token,password_hash,expires_at,max_downloads,is_active,allow_external_preview)
          OUTPUT INSERTED.id,INSERTED.file_id,INSERTED.public_token,INSERTED.password_hash,
-                INSERTED.expires_at,INSERTED.max_downloads,INSERTED.download_count,INSERTED.is_active,INSERTED.created_at
-         VALUES (@fid,@tok,@pwH,@exp,@md,@act)`
+                INSERTED.expires_at,INSERTED.max_downloads,INSERTED.download_count,INSERTED.is_active,INSERTED.allow_external_preview,INSERTED.created_at
+         VALUES (@fid,@tok,@pwH,@exp,@md,@act,@allowExternalPreview)`
       );
       shareRow = insRes.recordset[0];
     } else {
       shareRow = existing.recordset[0];
       const sets: string[] = [];
       const upReq = await getRequest(); upReq.input('id', sql.UniqueIdentifier, shareRow.id);
+      const nextPasswordProtected =
+        password !== undefined ? !!password : !!shareRow.password_hash;
+      const nextAllowExternalPreview =
+        allow_external_preview !== undefined
+          ? !!allow_external_preview
+          : !!shareRow.allow_external_preview;
+      if (nextAllowExternalPreview) {
+        if (!file.mime_type.startsWith('image/') && !file.mime_type.startsWith('video/'))
+          return res.status(400).json({ error: 'External preview is only supported for image and video files.' });
+        if (nextPasswordProtected)
+          return res.status(400).json({ error: 'External preview links cannot use a share password.' });
+        if (file.client_secret_hash)
+          return res.status(400).json({ error: 'Files protected with a secret key cannot use external preview.' });
+      }
       if (is_active === true && !shareRow.is_active) {
         upReq.input('newToken', sql.Char(32), generateSecureToken(16));
         sets.push('public_token=@newToken', 'download_count=0');
@@ -2094,11 +2121,15 @@ app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, asy
       if (expires_at !== undefined) { upReq.input('exp', sql.DateTimeOffset, expires_at||null); sets.push('expires_at=@exp'); }
       if (max_downloads !== undefined) { upReq.input('md', sql.Int, max_downloads ? Number(max_downloads) : null); sets.push('max_downloads=@md'); }
       if (is_active !== undefined) { upReq.input('act', sql.Bit, is_active ? 1 : 0); sets.push('is_active=@act'); }
+      if (allow_external_preview !== undefined) {
+        upReq.input('allowExternalPreview', sql.Bit, allow_external_preview ? 1 : 0);
+        sets.push('allow_external_preview=@allowExternalPreview');
+      }
       if (sets.length) {
         const upRes = await upReq.query<ShareRow>(
           `UPDATE share_links SET ${sets.join(',')}
            OUTPUT INSERTED.id,INSERTED.file_id,INSERTED.public_token,INSERTED.password_hash,
-                  INSERTED.expires_at,INSERTED.max_downloads,INSERTED.download_count,INSERTED.is_active,INSERTED.created_at
+                  INSERTED.expires_at,INSERTED.max_downloads,INSERTED.download_count,INSERTED.is_active,INSERTED.allow_external_preview,INSERTED.created_at
            WHERE id=@id`
         );
         shareRow = upRes.recordset[0];
@@ -2379,6 +2410,14 @@ async function ensureOptionalFileSecretColumns(): Promise<void> {
   `);
 }
 
+async function ensureOptionalShareLinkColumns(): Promise<void> {
+  const request = await getRequest();
+  await request.query(`
+    IF COL_LENGTH('share_links', 'allow_external_preview') IS NULL
+      ALTER TABLE share_links ADD allow_external_preview BIT NOT NULL CONSTRAINT DF_share_links_allow_external_preview DEFAULT(0);
+  `);
+}
+
 async function bootstrap() {
   // 1. Validate production requirements and master encryption key
   validateProductionConfig();
@@ -2390,6 +2429,7 @@ async function bootstrap() {
 
   // 2b. Lightweight schema migration for optional user-provided file secrets.
   await ensureOptionalFileSecretColumns();
+  await ensureOptionalShareLinkColumns();
 
   app.use('/api/health', createHealthRouter(FILE_VAULT, NODE_ENV === 'production'));
 
