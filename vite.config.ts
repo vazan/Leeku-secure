@@ -8,7 +8,7 @@ export default defineConfig(() => {
     plugins: [react(), tailwindcss()],
     resolve: {
       alias: {
-        '@': path.resolve(__dirname, '.'),
+        '@': path.resolve(__dirname, './src'),
       },
     },
     build: {
@@ -17,8 +17,16 @@ export default defineConfig(() => {
     },
     server: {
       allowedHosts: ['localhost', '127.0.0.1', 'leeks.miku.rip'],
-      hmr: false,
-      watch: null,
+      proxy: {
+        '/api': {
+          target: 'http://127.0.0.1:3000',
+          configure: (proxy) => {
+            proxy.on('proxyReq', (proxyRequest) => {
+              proxyRequest.removeHeader('origin');
+            });
+          },
+        },
+      },
     },
   };
 });

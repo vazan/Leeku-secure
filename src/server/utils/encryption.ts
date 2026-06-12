@@ -269,7 +269,7 @@ export function computeFileChecksum(filePath: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const hash = crypto.createHash('sha256');
     const stream = fs.createReadStream(filePath);
-    stream.on('data', (chunk: Buffer) => hash.update(chunk));
+    stream.on('data', (chunk) => hash.update(chunk));
     stream.on('end', () => resolve(hash.digest('hex')));
     stream.on('error', reject);
   });
@@ -319,12 +319,12 @@ export function encryptFileStream(
 
     let encryptedSize = 0;
 
-    readStream.on('data', (chunk: Buffer) => {
+    readStream.on('data', (chunk) => {
       checksum.update(chunk);
     });
 
-    cipher.on('data', (chunk: Buffer) => {
-      encryptedSize += chunk.length;
+    cipher.on('data', (chunk) => {
+      encryptedSize += Buffer.byteLength(chunk);
     });
 
     readStream

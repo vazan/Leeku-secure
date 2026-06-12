@@ -73,7 +73,7 @@ export interface ScanResult {
  *
  * Returns null if no scanner is found (graceful degradation).
  */
-function getScanCliPath(): string | null {
+export function getScanCliPath(): string | null {
   // 1. Check explicit env var first
   if (process.env.BITDEFENDER_SCAN_CLI_PATH) {
     return process.env.BITDEFENDER_SCAN_CLI_PATH;
@@ -98,6 +98,11 @@ function getScanCliPath(): string | null {
   }
 
   return null;
+}
+
+export function isScannerAvailable(): boolean {
+  const cliPath = getScanCliPath();
+  return !!cliPath && fs.existsSync(cliPath);
 }
 
 function getScanTimeoutMs(): number {

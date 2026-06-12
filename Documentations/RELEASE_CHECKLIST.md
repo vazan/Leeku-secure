@@ -1,7 +1,7 @@
 # Leeku Secure - Release Checklist
 
 Date: 2026-06-08
-Scope: Workspace snapshot after security and technical-debt remediation pass.
+Scope: Repository state after security and technical-debt remediation pass.
 
 ## 1. Pre-Release Validation
 
@@ -81,8 +81,3 @@ Scope: Workspace snapshot after security and technical-debt remediation pass.
 - [ ] Verify CSRF rejection behavior in deployed environment.
 - [ ] Verify AV fail-closed behavior in deployed environment.
 - [ ] Verify logs show expected request/audit events.
-
-## Notes
-
-- `Documentations/SQL` scripts and `leeks_db.json` are intentionally deleted in this workspace snapshot.
-- If SQL scripts are later restored, run a separate SQL migration/grants consistency review before release.

@@ -48,7 +48,17 @@ export interface ShareLink {
   max_downloads: number | null;
   download_count: number;
   is_active: boolean;
+  is_available?: boolean;
   created_at: string;
+}
+
+export interface ActiveSession {
+  id: string;
+  ip_address: string | null;
+  user_agent: string | null;
+  created_at: string;
+  expires_at: string;
+  is_current: boolean;
 }
 
 export interface SystemLog {

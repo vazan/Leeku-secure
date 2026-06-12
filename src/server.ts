@@ -17,31 +17,36 @@ import jwt from 'jsonwebtoken';
 import fs from 'fs';
 import path from 'path';
 import https from 'https';
+import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import { execFileSync } from 'child_process';
 import { GoogleGenAI } from '@google/genai';
 import sql from 'mssql';
 import si from 'systeminformation';
 
-import { getPool, closePool, getRequest } from './src/lib/database.js';
+import { getPool, closePool, getRequest } from './server/db.js';
 import {
   encryptFile, wrapKey, unwrapKey,
   encryptFileStream, decryptFileStream, computeFileChecksum,
   encryptColumn, decryptColumn, hashColumnForLookup,
   hashPassword, verifyPassword, hashSharePassword, verifySharePassword,
   generateSecureToken, validateEncryptionConfig,
-} from './src/lib/encryption.js';
-import { scanFileBuffer, scanFilePath, heuristicPreScan } from './src/lib/scanner.js';
+} from './server/utils/encryption.js';
+import { scanFileBuffer, scanFilePath, heuristicPreScan } from './server/utils/scanner.js';
 import {
   startExpiryCleanup, stopExpiryCleanup,
   computeExpiresAt, isValidTtl,
   type ExpiredFileRecord,
-} from './src/lib/expiry-cleanup.js';
-import { sendVerificationEmail, sendAccountDeletionEmail, validateMxRecord, verifySmtpConnection } from './src/lib/email.js';
+} from './server/utils/expiry-cleanup.js';
+import { sendVerificationEmail, sendAccountDeletionEmail, validateMxRecord, verifySmtpConnection } from './server/utils/email.js';
 import multer from 'multer';
 import os from 'os';
-import { iisLoggingMiddleware, validateIISLoggingConfig } from './src/lib/iis-logger.js';
-import type { Quota, User, FileMetadata, ShareLink, SystemLog, SystemStats } from './src/types.js';
+import { iisLoggingMiddleware, validateIISLoggingConfig } from './server/middleware/iis-logger.js';
+import { createSessionRouter } from './server/routes/sessions.js';
+import { createHealthRouter } from './server/routes/health.js';
+import { createPublicSharingRouter } from './server/routes/public-sharing.js';
+import { validateProductionConfig } from './server/utils/production.js';
+import type { Quota, User, FileMetadata, ShareLink, SystemLog, SystemStats } from './app/shared/types/index.js';
 
 // ──────────────────────────────────────────────────────────────
 // Constants from environment
@@ -52,6 +57,7 @@ const APP_URL            = process.env.APP_URL || `http://localhost:${PORT}`;
 const NODE_ENV           = process.env.NODE_ENV || 'development';
 const FILE_VAULT         = process.env.FILE_STORAGE_UNC_PATH || path.join(process.cwd(), 'vault');
 const UPLOAD_TEMP        = process.env.UPLOAD_TEMP_PATH || path.join(os.tmpdir(), 'leeku-uploads');
+const PROFILE_PICTURE_PATH = process.env.PROFILE_PICTURE_PATH || path.join(FILE_VAULT, 'users');
 const MAX_LOG_ENTRIES    = parseInt(process.env.MAX_LOG_ENTRIES || '500', 10);
 const MAX_LOGIN_ATTEMPTS = parseInt(process.env.MAX_LOGIN_ATTEMPTS || '5', 10);
 const LOCKOUT_DURATION_MS= parseInt(process.env.LOCKOUT_DURATION_MINUTES || '15', 10) * 60_000;
@@ -59,10 +65,14 @@ const PROXY_TRUST_HOPS   = parseInt(process.env.PROXY_TRUST_HOPS || '0', 10);
 const SMTP_ENABLED       = !!process.env.SMTP_HOST && !!process.env.SMTP_USER && !!process.env.SMTP_PASSWORD;
 const GEMINI_API_KEY     = process.env.GEMINI_API_KEY;
 const JWT_EXPIRY         = parseInt(process.env.JWT_ACCESS_EXPIRY_SECONDS || '900', 10);
+const REFRESH_EXPIRY     = parseInt(process.env.JWT_REFRESH_EXPIRY_SECONDS || '604800', 10);
 const JWT_ISSUER         = process.env.JWT_ISSUER   || APP_URL;
 const JWT_AUDIENCE       = process.env.JWT_AUDIENCE || 'leeku-secure-api';
 const SESSION_COOKIE_NAME = process.env.SESSION_COOKIE_NAME || 'leeku_session';
+const REFRESH_COOKIE_NAME = process.env.REFRESH_COOKIE_NAME || 'leeku_refresh';
 const CSRF_COOKIE_NAME    = process.env.CSRF_COOKIE_NAME || 'leeku_csrf';
+const ALLOW_UNSCANNED_UPLOADS_IN_DEVELOPMENT =
+  NODE_ENV === 'development' && process.env.ALLOW_UNSCANNED_UPLOADS_IN_DEVELOPMENT !== 'false';
 
 function getJwtSecret(): string {
   const raw = process.env.COOKIE_SECRET_BASE64;
@@ -89,6 +99,16 @@ function getSessionCookieOptions(): express.CookieOptions {
   };
 }
 
+function getRefreshCookieOptions(): express.CookieOptions {
+  return {
+    httpOnly: true,
+    secure: NODE_ENV === 'production',
+    sameSite: 'lax',
+    path: '/api/auth',
+    maxAge: REFRESH_EXPIRY * 1000,
+  };
+}
+
 function setAuthCookie(res: express.Response, token: string): void {
   res.cookie(SESSION_COOKIE_NAME, token, getSessionCookieOptions());
   res.cookie(CSRF_COOKIE_NAME, generateSecureToken(24), {
@@ -96,8 +116,12 @@ function setAuthCookie(res: express.Response, token: string): void {
     secure: NODE_ENV === 'production',
     sameSite: 'lax',
     path: '/',
-    maxAge: JWT_EXPIRY * 1000,
+    maxAge: REFRESH_EXPIRY * 1000,
   });
+}
+
+function setRefreshCookie(res: express.Response, token: string): void {
+  res.cookie(REFRESH_COOKIE_NAME, token, getRefreshCookieOptions());
 }
 
 function clearAuthCookie(res: express.Response): void {
@@ -112,6 +136,12 @@ function clearAuthCookie(res: express.Response): void {
     secure: NODE_ENV === 'production',
     sameSite: 'lax',
     path: '/',
+  });
+  res.clearCookie(REFRESH_COOKIE_NAME, {
+    httpOnly: true,
+    secure: NODE_ENV === 'production',
+    sameSite: 'lax',
+    path: '/api/auth',
   });
 }
 
@@ -137,7 +167,7 @@ function getOrCreateCsrfToken(req: express.Request, res: express.Response): stri
     secure: NODE_ENV === 'production',
     sameSite: 'lax',
     path: '/',
-    maxAge: JWT_EXPIRY * 1000,
+    maxAge: REFRESH_EXPIRY * 1000,
   });
   return token;
 }
@@ -147,9 +177,14 @@ function requireCsrfForCookieSession(req: express.Request, res: express.Response
     next();
     return;
   }
+  if (req.path.startsWith('/public/')) {
+    next();
+    return;
+  }
 
   const sessionCookie = getCookieValue(req, SESSION_COOKIE_NAME);
-  if (!sessionCookie) {
+  const refreshCookie = getCookieValue(req, REFRESH_COOKIE_NAME);
+  if (!sessionCookie && !refreshCookie) {
     next();
     return;
   }
@@ -213,6 +248,37 @@ if (!FILE_VAULT.startsWith('\\\\') && !fs.existsSync(FILE_VAULT)) {
   console.log(`[server] Created local vault directory: ${FILE_VAULT}`);
 }
 
+if (!fs.existsSync(PROFILE_PICTURE_PATH)) {
+  fs.mkdirSync(PROFILE_PICTURE_PATH, { recursive: true });
+  console.log(`[server] Created profile picture directory: ${PROFILE_PICTURE_PATH}`);
+}
+
+function detectProfilePictureMime(buffer: Buffer): 'image/jpeg' | 'image/png' | 'image/webp' | null {
+  if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return 'image/jpeg';
+  if (buffer.length >= 8 && buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return 'image/png';
+  if (buffer.length >= 12 && buffer.subarray(0, 4).toString('ascii') === 'RIFF' && buffer.subarray(8, 12).toString('ascii') === 'WEBP') return 'image/webp';
+  return null;
+}
+
+function getProfilePictureDirectory(userId: string): string {
+  return path.join(PROFILE_PICTURE_PATH, userId, 'avatars');
+}
+
+function getProfilePictureFiles(userId: string): string[] {
+  const directory = getProfilePictureDirectory(userId);
+  if (!fs.existsSync(directory)) return [];
+  return fs.readdirSync(directory)
+    .map((name) => path.join(directory, name))
+    .filter((filePath) => fs.statSync(filePath).isFile())
+    .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+}
+
+function getProfilePictureExtension(mimeType: 'image/jpeg' | 'image/png' | 'image/webp'): string {
+  if (mimeType === 'image/jpeg') return 'jpg';
+  if (mimeType === 'image/png') return 'png';
+  return 'webp';
+}
+
 // ──────────────────────────────────────────────────────────────
 // Gemini AI (optional)
 // ──────────────────────────────────────────────────────────────
@@ -226,15 +292,15 @@ if (GEMINI_API_KEY && GEMINI_API_KEY !== 'CHANGE_ME') {
 async function generateLeekuVibe(filename: string, clean: boolean): Promise<string> {
   const fallbacks = clean
     ? [
-        'Clean file. Leeku approves.',
-        'No malware detected. Surprisingly.',
-        'Passed digital health exam. Safe inside the virtual container.',
-        'Your file has been blessed by the leek guardian. Zero goblins.',
+        'Security scan completed. No threats were detected.',
+        'File verified and ready to use.',
+        'Upload completed and passed the security scan.',
+        'No malicious content was detected.',
       ]
     : [
-        'Cursed bytes detected. Upload denied.',
-        'Digital goblins found in payload. Rejected.',
-        'Leeku found something suspicious. Access denied.',
+        'Upload blocked because the security scan detected a potential threat.',
+        'File rejected due to suspicious content.',
+        'Security scan failed. Upload denied.',
       ];
 
   if (!genai) {
@@ -243,8 +309,8 @@ async function generateLeekuVibe(filename: string, clean: boolean): Promise<stri
 
   try {
     const prompt = clean
-      ? `Generate a short, funny, cyber-kawaii one-liner (max 80 chars) saying a file named "${filename}" passed security scan. Be witty and use Vocaloid/anime references. No hashtags.`
-      : `Generate a short, funny, cyber-kawaii one-liner (max 80 chars) saying a file named "${filename}" was blocked. Be dramatic and use Vocaloid/anime references. No hashtags.`;
+      ? `Write a concise professional status message, at most 80 characters, confirming that "${filename}" passed its security scan.`
+      : `Write a concise professional status message, at most 80 characters, explaining that "${filename}" was blocked by its security scan.`;
 
     const result = await genai.models.generateContent({ model: 'gemini-2.0-flash', contents: prompt });
     const text = result.text?.trim();
@@ -300,6 +366,12 @@ const apiLimiter = rateLimit({
 
 app.use('/api/auth', authLimiter);
 app.use('/api', apiLimiter);
+app.use('/api/public/share', rateLimit({
+  windowMs: 60_000,
+  max: parseInt(process.env.PUBLIC_SHARE_RATE_LIMIT_RPM || '60', 10),
+  standardHeaders: true, legacyHeaders: false,
+  message: { error: 'Too many shared-link requests. Please wait before trying again.' },
+}));
 
 // ──────────────────────────────────────────────────────────────
 // JWT helpers
@@ -321,6 +393,86 @@ function verifyToken(token: string): JwtPayload | null {
       issuer: JWT_ISSUER, audience: JWT_AUDIENCE,
     }) as JwtPayload;
   } catch { return null; }
+}
+
+function hashRefreshToken(token: string): string {
+  return crypto.createHash('sha256').update(token).digest('hex');
+}
+
+function getRequestIp(req: express.Request): string {
+  return String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '127.0.0.1')
+    .split(',')[0].trim().substring(0, 45);
+}
+
+async function issueRefreshSession(
+  userId: string,
+  req: express.Request,
+  res: express.Response,
+): Promise<void> {
+  const token = generateSecureToken(48);
+  const expiresAt = new Date(Date.now() + REFRESH_EXPIRY * 1000);
+  const request = await getRequest();
+  request.input('uid', sql.UniqueIdentifier, userId);
+  request.input('hash', sql.Char(64), hashRefreshToken(token));
+  request.input('exp', sql.DateTimeOffset, expiresAt);
+  request.input('ip', sql.NVarChar(45), getRequestIp(req));
+  request.input('ua', sql.NVarChar(500), String(req.headers['user-agent'] || '').substring(0, 500) || null);
+  await request.query(
+    `DELETE FROM refresh_tokens
+     WHERE user_id=@uid AND (expires_at<=SYSDATETIMEOFFSET() OR revoked_at<DATEADD(day,-1,SYSDATETIMEOFFSET()));
+     INSERT INTO refresh_tokens (id,user_id,token_hash,expires_at,created_at,revoked_at,ip_address,user_agent)
+     VALUES (NEWID(),@uid,@hash,@exp,SYSDATETIMEOFFSET(),NULL,@ip,@ua)`
+  );
+  setRefreshCookie(res, token);
+}
+
+async function revokeRefreshSession(token: string): Promise<void> {
+  if (!token) return;
+  const request = await getRequest();
+  request.input('hash', sql.Char(64), hashRefreshToken(token));
+  await request.query(
+    `UPDATE refresh_tokens SET revoked_at=COALESCE(revoked_at,SYSDATETIMEOFFSET()) WHERE token_hash=@hash`
+  );
+}
+
+async function revokeAllRefreshSessions(userId: string): Promise<void> {
+  const request = await getRequest();
+  request.input('uid', sql.UniqueIdentifier, userId);
+  await request.query(
+    `UPDATE refresh_tokens SET revoked_at=COALESCE(revoked_at,SYSDATETIMEOFFSET())
+     WHERE user_id=@uid`
+  );
+}
+
+async function rotateRefreshSession(
+  req: express.Request,
+  res: express.Response,
+): Promise<{ user: User; accessToken: string } | null> {
+  const token = getCookieValue(req, REFRESH_COOKIE_NAME);
+  if (!token) return null;
+
+  const request = await getRequest();
+  request.input('hash', sql.Char(64), hashRefreshToken(token));
+  const result = await request.query<UserRow>(
+    `SELECT u.id,u.email_encrypted,u.email_iv,u.email_auth_tag,
+            u.username_encrypted,u.username_iv,u.username_auth_tag,
+            u.role,u.quota_id,u.storage_used_bytes,u.status,u.created_at,
+            u.failed_login_count,u.locked_until
+     FROM refresh_tokens rt
+     JOIN users u ON u.id=rt.user_id
+     WHERE rt.token_hash=@hash AND rt.revoked_at IS NULL
+       AND rt.expires_at>SYSDATETIMEOFFSET() AND u.status='Active'`
+  );
+  if (!result.recordset.length) {
+    return null;
+  }
+
+  await revokeRefreshSession(token);
+  const user = mapUserRow(result.recordset[0]);
+  const accessToken = signToken(user.id, user.role);
+  setAuthCookie(res, accessToken);
+  await issueRefreshSession(user.id, req, res);
+  return { user, accessToken };
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -556,12 +708,15 @@ app.get('/api/stats', authenticateUser as express.RequestHandler, verifyAdmin as
     );
     const s = stats.recordset[0];
     // Get real Windows Server system stats
-    const [cpuData, memData, diskData, osData] = await Promise.all([
+    const [cpuData, memData, diskData] = await Promise.all([
       si.currentLoad().catch(() => null),
       si.mem().catch(() => null),
       si.fsSize().catch(() => null),
-      si.osInfo().catch(() => null),
     ]);
+    let uptimeSeconds = 0;
+    try {
+      uptimeSeconds = Math.round(si.time().uptime || 0);
+    } catch {}
 
     const systemStats: SystemStats = {
       ...s,
@@ -573,7 +728,7 @@ app.get('/api/stats', authenticateUser as express.RequestHandler, verifyAdmin as
       diskUsagePercent: diskData && diskData[0] ? Math.round(((diskData[0].used || 0) / (diskData[0].size || 1)) * 100) : 0,
       diskUsedGB: diskData && diskData[0] ? Math.round((diskData[0].used || 0) / 1024 / 1024 / 1024) : 0,
       diskTotalGB: diskData && diskData[0] ? Math.round((diskData[0].size || 0) / 1024 / 1024 / 1024) : 0,
-      uptime: osData ? Math.round(osData.uptime || 0) : 0,
+      uptime: uptimeSeconds,
     };
     res.json(systemStats);
   } catch (err) { console.error('[GET /api/stats]', err); res.status(500).json({ error: 'Failed to compute stats.' }); }
@@ -673,7 +828,8 @@ app.post('/api/auth/register', async (req, res) => {
       // Dev mode — auto-verified, log them in
       const token = signToken(user.id, user.role);
       setAuthCookie(res, token);
-      res.json({ token, user });
+      await issueRefreshSession(user.id, req, res);
+      res.json({ user });
     }
   } catch (err) { console.error('[POST /api/auth/register]', err); res.status(500).json({ error: 'Registration failed.' }); }
 });
@@ -809,8 +965,9 @@ app.post('/api/auth/login', async (req, res) => {
     const user  = mapUserRow(row);
     const token = signToken(user.id, user.role);
     setAuthCookie(res, token);
+    await issueRefreshSession(user.id, req, res);
     await logSystemEvent(user.id, user.username, 'Auth', 'User', user.id, req, 'User logged in.');
-    res.json({ token, user });
+    res.json({ user });
   } catch (err) { console.error('[POST /api/auth/login]', err); res.status(500).json({ error: 'Login service unavailable.' }); }
 });
 
@@ -828,10 +985,37 @@ app.get('/api/auth/csrf', (req, res) => {
   res.json({ csrfToken });
 });
 
-app.post('/api/auth/logout', (req, res) => {
-  clearAuthCookie(res);
+app.post('/api/auth/refresh', async (req, res) => {
+  try {
+    const session = await rotateRefreshSession(req, res);
+    if (!session) return res.status(401).json({ error: 'Refresh session expired. Please log in again.' });
+    const csrfToken = getOrCreateCsrfToken(req, res);
+    res.json({ user: session.user, csrfToken });
+  } catch (err) {
+    console.error('[POST /api/auth/refresh]', err);
+    res.status(500).json({ error: 'Session refresh unavailable.' });
+  }
+});
+
+app.post('/api/auth/logout', async (req, res) => {
+  try {
+    await revokeRefreshSession(getCookieValue(req, REFRESH_COOKIE_NAME));
+  } catch (err) {
+    console.error('[POST /api/auth/logout] Failed to revoke refresh session:', err);
+  } finally {
+    clearAuthCookie(res);
+  }
   res.json({ success: true });
 });
+
+app.use('/api/users/me/sessions', createSessionRouter({
+  authenticate: authenticateUser as express.RequestHandler,
+  getCurrentRefreshTokenHash: (req) => {
+    const token = getCookieValue(req, REFRESH_COOKIE_NAME);
+    return token ? hashRefreshToken(token) : null;
+  },
+  clearAuth: clearAuthCookie,
+}));
 
 app.post('/api/users/me/update', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
   const { username, email, password } = req.body;
@@ -880,9 +1064,71 @@ app.post('/api/users/me/update', authenticateUser as express.RequestHandler, asy
        WHERE id=@id`
     );
     const user = mapUserRow(updated.recordset[0]);
+    if (password?.trim()) {
+      await revokeAllRefreshSessions(userId);
+      await issueRefreshSession(userId, req, res);
+      setAuthCookie(res, signToken(user.id, user.role));
+    }
     await logSystemEvent(userId, user.username, 'Auth', 'User', userId, req, 'Updated account details.');
     res.json({ success: true, user });
   } catch (err) { console.error('[POST /api/users/me/update]', err); res.status(500).json({ error: 'Failed to update account.' }); }
+});
+
+const profilePictureUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { files: 1, fileSize: 5 * 1024 * 1024 },
+});
+
+app.get('/api/users/me/avatar', authenticateUser as express.RequestHandler, (req: AuthenticatedRequest, res) => {
+  try {
+    const avatarPath = getProfilePictureFiles(req.userId!)[0];
+    if (!avatarPath) return res.status(404).end();
+    const picture = fs.readFileSync(avatarPath);
+    const mimeType = detectProfilePictureMime(picture);
+    if (!mimeType) return res.status(404).end();
+    res.setHeader('Content-Type', mimeType);
+    res.setHeader('Cache-Control', 'private, no-cache');
+    res.send(picture);
+  } catch (err) {
+    console.error('[GET /api/users/me/avatar]', err);
+    res.status(500).json({ error: 'Could not load profile picture.' });
+  }
+});
+
+app.post('/api/users/me/avatar', authenticateUser as express.RequestHandler, profilePictureUpload.single('avatar'), async (req: AuthenticatedRequest, res) => {
+  if (!req.file) return res.status(400).json({ error: 'Choose a profile picture to upload.' });
+  const mimeType = detectProfilePictureMime(req.file.buffer);
+  if (!mimeType) return res.status(400).json({ error: 'Profile pictures must be PNG, JPEG, or WebP.' });
+
+  try {
+    const directory = getProfilePictureDirectory(req.userId!);
+    fs.mkdirSync(directory, { recursive: true });
+    const extension = getProfilePictureExtension(mimeType);
+    const filename = `${Date.now()}-${generateSecureToken(8)}.${extension}`;
+    fs.writeFileSync(path.join(directory, filename), req.file.buffer);
+
+    for (const oldPicture of getProfilePictureFiles(req.userId!).slice(10)) {
+      fs.unlinkSync(oldPicture);
+    }
+
+    await logSystemEvent(req.userId!, req.user!.username, 'Auth', 'User', req.userId!, req, 'Updated profile picture.');
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[POST /api/users/me/avatar]', err);
+    res.status(500).json({ error: 'Could not save profile picture.' });
+  }
+});
+
+app.delete('/api/users/me/avatar', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  try {
+    const directory = getProfilePictureDirectory(req.userId!);
+    if (fs.existsSync(directory)) fs.rmSync(directory, { recursive: true, force: true });
+    await logSystemEvent(req.userId!, req.user!.username, 'Auth', 'User', req.userId!, req, 'Removed profile picture.');
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[DELETE /api/users/me/avatar]', err);
+    res.status(500).json({ error: 'Could not remove profile picture.' });
+  }
 });
 
 // ──────────────────────────────────────────────────────────────
@@ -1221,12 +1467,25 @@ app.post('/api/files/upload', authenticateUser as express.RequestHandler, upload
     currentStage = 'bitdefender_scan';
     const scanResult = await scanFilePath(tempFilePath, size);
     console.info('[upload] Scan completed.', { userId: user.id, originalName: original_name, scanStatus: scanResult.status, scanDurationMs: scanResult.scanDurationMs });
-    if (!scanResult.clean) {
+    const acceptedWithoutScanner =
+      scanResult.status === 'Unavailable' && ALLOW_UNSCANNED_UPLOADS_IN_DEVELOPMENT;
+
+    if (!scanResult.clean && !acceptedWithoutScanner) {
       console.warn('[upload] Rejected by Bitdefender scan.', { userId: user.id, originalName: original_name, scanStatus: scanResult.status });
       const vibe = await generateLeekuVibe(original_name, false);
       await logSystemEvent(user.id, user.username, 'Scan', 'File', 'rejected', req, `AV block: "${original_name}" — ${scanResult.message}`);
       return cleanupAndRespond(res, tempFilePath, 422, vibe || scanResult.message);
     }
+    if (acceptedWithoutScanner) {
+      console.warn('[upload] Bitdefender unavailable; accepting upload because NODE_ENV=development.', {
+        userId: user.id,
+        originalName: original_name,
+      });
+    }
+    const persistedScanResult = acceptedWithoutScanner ? 'Clean' : scanResult.status;
+    const persistedScanMessage = acceptedWithoutScanner
+      ? `Development bypass: Bitdefender scanner unavailable; file was not scanned. ${scanResult.message}`
+      : scanResult.message;
 
     // ── Stream-encrypt directly to vault (constant memory) ─────
     currentStage = 'encrypt_file';
@@ -1258,8 +1517,8 @@ app.post('/api/files/upload', authenticateUser as express.RequestHandler, upload
     fileReq.input('sz',     sql.BigInt,          size);
     fileReq.input('esz',    sql.BigInt,          encryptResult.encryptedSize);
     fileReq.input('chk',    sql.Char(64),        encryptResult.checksum);
-    fileReq.input('scan',   sql.NVarChar(20),    scanResult.status);
-    fileReq.input('smsg',   sql.NVarChar(sql.MAX), scanResult.message);
+    fileReq.input('scan',   sql.NVarChar(20),    persistedScanResult);
+    fileReq.input('smsg',   sql.NVarChar(sql.MAX), persistedScanMessage);
     fileReq.input('vibe',   sql.NVarChar(500),   leekuVibe);
     fileReq.input('ttl',    sql.Int,             ttlH);
     fileReq.input('exp',    sql.DateTimeOffset,  expiresAt);
@@ -1300,11 +1559,11 @@ app.post('/api/files/upload', authenticateUser as express.RequestHandler, upload
 
     currentStage = 'log_upload_event';
     await logSystemEvent(user.id, user.username, 'Upload', 'File', newFile.id, req,
-      `Uploaded "${original_name}" (${Math.round(size/1024)}KB). Scan: ${scanResult.status}.`);
+      `Uploaded "${original_name}" (${Math.round(size/1024)}KB). Scan: ${acceptedWithoutScanner ? 'development bypass (Bitdefender unavailable)' : scanResult.status}.`);
 
     console.info('[upload] Upload completed successfully.', {
       userId: user.id, username: user.username, originalName: original_name,
-      fileId: newFile.id, scanStatus: scanResult.status, storedPath: newFile.stored_path,
+      fileId: newFile.id, scanStatus: scanResult.status, storedScanResult: persistedScanResult, storedPath: newFile.stored_path,
     });
 
     res.json({ success: true, message: 'File approved and encrypted!', file: mapFileRow(newFile, user.username) });
@@ -1370,6 +1629,66 @@ app.post('/api/files/:id/delete', authenticateUser as express.RequestHandler, as
     await logSystemEvent(req.userId!, req.user!.username, 'Delete', 'File', fileId, req, `Deleted "${originalName}".`);
     res.json({ success: true, message: 'File deleted from vault.' });
   } catch (err) { console.error('[DELETE /api/files/:id]', err); res.status(500).json({ error: 'Failed to delete file.' }); }
+});
+
+app.get('/api/files/:id/preview', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  const fileId = req.params.id;
+  try {
+    const fileReq = await getRequest();
+    fileReq.input('id', sql.UniqueIdentifier, fileId);
+    const fileResult = await fileReq.query<FileRow>(
+      `SELECT id,owner_user_id,original_name_encrypted,original_name_iv,original_name_auth_tag,
+              stored_path,size_bytes,status,mime_type,encrypted_size_bytes,checksum_sha256,
+              scan_result,scan_message,is_encrypted,leeku_vibe,ttl_hours,expires_at,created_at
+       FROM files WHERE id=@id`
+    );
+    if (!fileResult.recordset.length) return res.status(404).json({ error: 'File not found.' });
+    const file = fileResult.recordset[0];
+    if (file.owner_user_id !== req.userId && req.user!.role !== 'Admin')
+      return res.status(403).json({ error: 'You do not have permission to preview this file.' });
+    if (file.status === 'Blocked')
+      return res.status(410).json({ error: 'Blocked files cannot be previewed.' });
+    const previewable = file.mime_type.startsWith('image/') || file.mime_type === 'video/mp4';
+    if (!previewable)
+      return res.status(415).json({ error: 'Preview is only available for images and MP4 videos.' });
+
+    const vaultPath = path.join(FILE_VAULT, file.stored_path);
+    if (!fs.existsSync(vaultPath)) return res.status(410).json({ error: 'Vault file not found.' });
+
+    const keyReq = await getRequest();
+    keyReq.input('fid', sql.UniqueIdentifier, fileId);
+    const keyRes = await keyReq.query<{ encrypted_key: Buffer; key_iv: Buffer; key_auth_tag: Buffer; file_iv: Buffer; file_auth_tag: Buffer }>(
+      'SELECT encrypted_key,key_iv,key_auth_tag,file_iv,file_auth_tag FROM file_encryption_keys WHERE file_id=@fid'
+    );
+    if (!keyRes.recordset.length) return res.status(500).json({ error: 'Encryption key not found.' });
+
+    const keyRow = keyRes.recordset[0];
+    const fileKey = unwrapKey(keyRow.encrypted_key, keyRow.key_iv, keyRow.key_auth_tag);
+    const tempPath = path.join(os.tmpdir(), `leeku-preview-${fileId}-${Date.now()}.tmp`);
+    await decryptFileStream(vaultPath, tempPath, fileKey, keyRow.file_iv, keyRow.file_auth_tag);
+
+    const actualChecksum = await computeFileChecksum(tempPath);
+    if (actualChecksum !== file.checksum_sha256) {
+      try { fs.unlinkSync(tempPath); } catch {}
+      return res.status(500).json({ error: 'File integrity check failed.' });
+    }
+
+    const originalName = decryptColumn(file.original_name_encrypted, file.original_name_iv, file.original_name_auth_tag);
+    const safeName = originalName.replace(/"/g, '\\"');
+    const stat = fs.statSync(tempPath);
+
+    res.setHeader('Content-Type', file.mime_type);
+    res.setHeader('Content-Disposition', `inline; filename="${safeName}"`);
+    res.setHeader('Content-Length', stat.size.toString());
+    res.setHeader('Cache-Control', 'private, max-age=300');
+
+    const cleanup = () => { try { fs.unlinkSync(tempPath); } catch {} };
+    const readStream = fs.createReadStream(tempPath);
+    readStream.pipe(res);
+    readStream.on('end', cleanup);
+    readStream.on('error', cleanup);
+    res.on('close', cleanup);
+  } catch (err) { console.error('[GET /api/files/:id/preview]', err); res.status(500).json({ error: 'Preview failed.' }); }
 });
 
 app.get('/api/files/:id/download', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
@@ -1438,26 +1757,61 @@ app.get('/api/sharing/links', authenticateUser as express.RequestHandler, async 
   try {
     const request = await getRequest();
     request.input('ownerId', sql.UniqueIdentifier, req.userId!);
-    const result = await request.query<ShareRow>(
-      `SELECT sl.id,sl.file_id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.created_at
+    const result = await request.query<ShareRow & { stored_path: string }>(
+      `SELECT sl.id,sl.file_id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.created_at,f.stored_path
        FROM share_links sl INNER JOIN files f ON sl.file_id=f.id
        WHERE f.owner_user_id=@ownerId ORDER BY sl.created_at DESC`
     );
-    res.json({ links: result.recordset.map(mapShareRow) });
+    res.json({
+      links: result.recordset.map((row) => ({
+        ...mapShareRow(row),
+        is_available: fs.existsSync(path.join(FILE_VAULT, row.stored_path)),
+      })),
+    });
   } catch (err) { console.error('[GET /api/sharing/links]', err); res.status(500).json({ error: 'Failed to load share links.' }); }
 });
+
+const removeSharingLink = async (req: AuthenticatedRequest, res: express.Response) => {
+  const linkId = req.params.id;
+  try {
+    const findRequest = await getRequest();
+    findRequest.input('id', sql.UniqueIdentifier, linkId);
+    const result = await findRequest.query<{file_id:string;owner_user_id:string}>(
+      `SELECT sl.file_id,f.owner_user_id
+       FROM share_links sl INNER JOIN files f ON sl.file_id=f.id
+       WHERE sl.id=@id`
+    );
+    if (!result.recordset.length) return res.status(404).json({ error: 'Share link not found.' });
+    const link = result.recordset[0];
+    if (link.owner_user_id !== req.userId && req.user!.role !== 'Admin')
+      return res.status(403).json({ error: 'Only the file owner can remove share links.' });
+
+    const deleteRequest = await getRequest();
+    deleteRequest.input('id', sql.UniqueIdentifier, linkId);
+    await deleteRequest.query('DELETE FROM share_links WHERE id=@id');
+
+    await logSystemEvent(req.userId!, req.user!.username, 'Delete', 'ShareLink', linkId, req, `Removed share link for file ${link.file_id}.`);
+    res.json({ success: true });
+  } catch (err) { console.error('[remove sharing link]', err); res.status(500).json({ error: 'Failed to remove share link.' }); }
+};
+
+// Keep DELETE for API clients, and provide POST for IIS installations that filter DELETE verbs.
+app.delete('/api/sharing/links/:id', authenticateUser as express.RequestHandler, removeSharingLink);
+app.post('/api/sharing/links/:id/remove', authenticateUser as express.RequestHandler, removeSharingLink);
 
 app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
   const fileId = req.params.id;
   const { password, expires_at, max_downloads, is_active } = req.body;
   try {
     const fReq = await getRequest(); fReq.input('id', sql.UniqueIdentifier, fileId);
-    const fRes = await fReq.query<{owner_user_id:string;status:string}>('SELECT owner_user_id,status FROM files WHERE id=@id');
+    const fRes = await fReq.query<{owner_user_id:string;status:string;stored_path:string}>('SELECT owner_user_id,status,stored_path FROM files WHERE id=@id');
     if (!fRes.recordset.length) return res.status(404).json({ error: 'File not found.' });
     const file = fRes.recordset[0];
     if (file.owner_user_id !== req.userId && req.user!.role !== 'Admin')
       return res.status(403).json({ error: 'Only the file owner can manage share links.' });
     if (file.status === 'Blocked') return res.status(400).json({ error: 'Blocked files cannot be shared.' });
+    if (!fs.existsSync(path.join(FILE_VAULT, file.stored_path)))
+      return res.status(410).json({ error: 'This file is no longer available in the vault.' });
 
     const exReq = await getRequest(); exReq.input('fid', sql.UniqueIdentifier, fileId);
     const existing = await exReq.query<ShareRow>(
@@ -1486,6 +1840,10 @@ app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, asy
       shareRow = existing.recordset[0];
       const sets: string[] = [];
       const upReq = await getRequest(); upReq.input('id', sql.UniqueIdentifier, shareRow.id);
+      if (is_active === true && !shareRow.is_active) {
+        upReq.input('newToken', sql.Char(32), generateSecureToken(16));
+        sets.push('public_token=@newToken', 'download_count=0');
+      }
       if (password !== undefined) { upReq.input('pw', sql.NVarChar(256), password ? await hashSharePassword(password) : null); sets.push('password_hash=@pw'); }
       if (expires_at !== undefined) { upReq.input('exp', sql.DateTimeOffset, expires_at||null); sets.push('expires_at=@exp'); }
       if (max_downloads !== undefined) { upReq.input('md', sql.Int, max_downloads ? Number(max_downloads) : null); sets.push('max_downloads=@md'); }
@@ -1506,112 +1864,11 @@ app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, asy
   } catch (err) { console.error('[POST /api/files/:id/share]', err); res.status(500).json({ error: 'Failed to configure share link.' }); }
 });
 
-// ──────────────────────────────────────────────────────────────
-// API: Public Download
-// ──────────────────────────────────────────────────────────────
-
-app.get('/api/public/share/:token', async (req, res) => {
-  const token = req.params.token;
-  try {
-    const request = await getRequest(); request.input('tok', sql.Char(32), token);
-    const result = await request.query<ShareRow & {
-      file_status: string; leeku_vibe: string|null; mime_type: string;
-      size_bytes: number; file_created_at: Date;
-      owner_username_encrypted: Buffer; owner_username_iv: Buffer; owner_username_auth_tag: Buffer;
-    }>(
-      `SELECT sl.id,sl.file_id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.created_at,
-              f.status AS file_status,f.leeku_vibe,f.mime_type,f.size_bytes,f.created_at AS file_created_at,
-              u.username_encrypted AS owner_username_encrypted, u.username_iv AS owner_username_iv, u.username_auth_tag AS owner_username_auth_tag
-       FROM share_links sl
-       INNER JOIN files f ON sl.file_id=f.id
-       INNER JOIN users u ON f.owner_user_id=u.id
-       WHERE sl.public_token=@tok`
-    );
-    if (!result.recordset.length) return res.status(404).json({ error: 'Share link not found.' });
-    const row = result.recordset[0];
-    if (!row.is_active)                                                    return res.status(404).json({ error: 'Share link inactive.' });
-    if (row.file_status === 'Blocked')                                     return res.status(410).json({ error: 'File has been blocked.' });
-    if (row.expires_at && new Date(row.expires_at) < new Date())           return res.status(410).json({ error: 'Share link has expired.' });
-    if (row.max_downloads && row.download_count >= row.max_downloads)      return res.status(410).json({ error: 'Download limit reached.' });
-
-    const ownerUsername = decryptColumn(row.owner_username_encrypted, row.owner_username_iv, row.owner_username_auth_tag);
-    res.json({
-      token: row.public_token, mime_type: row.mime_type, size: row.size_bytes,
-      created_at: row.file_created_at?.toISOString(), protected: !!row.password_hash,
-      uploader: ownerUsername, leeku_vibe: row.leeku_vibe||'',
-      downloads_current: row.download_count, downloads_max: row.max_downloads,
-    });
-  } catch (err) { console.error('[GET /api/public/share/:token]', err); res.status(500).json({ error: 'Failed to load share info.' }); }
-});
-
-app.post('/api/public/share/:token/download', async (req, res) => {
-  const token = req.params.token;
-  const { password } = req.body;
-  try {
-    const request = await getRequest(); request.input('tok', sql.Char(32), token);
-    const result = await request.query<ShareRow & {
-      file_status: string; stored_path: string;
-      original_name_encrypted: Buffer; original_name_iv: Buffer; original_name_auth_tag: Buffer;
-      mime_type: string; checksum_sha256: string; file_id_join: string;
-      encrypted_key: Buffer; key_iv: Buffer; key_auth_tag: Buffer; file_iv: Buffer; file_auth_tag: Buffer;
-    }>(
-      `SELECT sl.id,sl.file_id AS file_id_join,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.created_at,
-              f.status AS file_status,f.stored_path,f.mime_type,f.checksum_sha256,
-              f.original_name_encrypted,f.original_name_iv,f.original_name_auth_tag,
-              k.encrypted_key,k.key_iv,k.key_auth_tag,k.file_iv,k.file_auth_tag
-       FROM share_links sl
-       INNER JOIN files f ON sl.file_id=f.id
-       INNER JOIN file_encryption_keys k ON f.id=k.file_id
-       WHERE sl.public_token=@tok`
-    );
-    if (!result.recordset.length) return res.status(404).json({ error: 'Share link not found.' });
-    const row = result.recordset[0];
-    if (!row.is_active)                                               return res.status(404).json({ error: 'Share link inactive.' });
-    if (row.file_status === 'Blocked')                                return res.status(410).json({ error: 'File has been blocked.' });
-    if (row.expires_at && new Date(row.expires_at) < new Date())      return res.status(410).json({ error: 'Link expired.' });
-    if (row.max_downloads && row.download_count >= row.max_downloads) return res.status(410).json({ error: 'Download limit reached.' });
-
-    if (row.password_hash) {
-      if (!password) return res.status(403).json({ error: 'Password required.' });
-      const valid = await verifySharePassword(password, row.password_hash);
-      if (!valid) return res.status(403).json({ error: 'Incorrect vault password.' });
-    }
-
-    const vaultPath = path.join(FILE_VAULT, row.stored_path);
-    if (!fs.existsSync(vaultPath)) return res.status(410).json({ error: 'Vault file not found.' });
-
-    // ── Streaming decrypt to temp file (avoids 2 GiB Buffer limit) ──
-    const tempPath = path.join(os.tmpdir(), `leeku-share-${token}-${Date.now()}.tmp`);
-    const fileKey   = unwrapKey(row.encrypted_key, row.key_iv, row.key_auth_tag);
-    await decryptFileStream(vaultPath, tempPath, fileKey, row.file_iv, row.file_auth_tag);
-
-    // Verify checksum via streaming (constant memory)
-    const actualChecksum = await computeFileChecksum(tempPath);
-    if (actualChecksum !== row.checksum_sha256) {
-      try { fs.unlinkSync(tempPath); } catch {}
-      return res.status(500).json({ error: 'File integrity check failed.' });
-    }
-
-    const dlReq = await getRequest(); dlReq.input('id', sql.UniqueIdentifier, row.id);
-    await dlReq.query('UPDATE share_links SET download_count=download_count+1 WHERE id=@id');
-
-    const originalName = decryptColumn(row.original_name_encrypted, row.original_name_iv, row.original_name_auth_tag);
-    const safeName = originalName.replace(/"/g, '\\"');
-    const stat = fs.statSync(tempPath);
-
-    await logSystemEvent(null, 'Anonymous', 'Download', 'File', row.file_id_join, req,
-      `Anonymous download of "${originalName}" via token ${token}.`);
-
-    res.setHeader('Content-Type', row.mime_type || 'application/octet-stream');
-    res.setHeader('Content-Disposition', `attachment; filename="${safeName}"`);
-    res.setHeader('Content-Length', stat.size.toString());
-
-    const readStream = fs.createReadStream(tempPath);
-    readStream.pipe(res);
-    readStream.on('end',   () => { try { fs.unlinkSync(tempPath); } catch {} });
-    readStream.on('error', () => { try { fs.unlinkSync(tempPath); } catch {} });
-  } catch (err) { console.error('[POST /api/public/share/:token/download]', err); res.status(500).json({ error: 'Download failed.' }); }
-});
+app.use('/api/public/share', createPublicSharingRouter({
+  vaultPath: FILE_VAULT,
+  logDownload: (req, fileId, originalName, token) =>
+    logSystemEvent(null, 'Anonymous', 'Download', 'File', fileId, req, `Anonymous download of "${originalName}" via token ${token}.`),
+}));
 
 // ──────────────────────────────────────────────────────────────
 // API: Admin
@@ -1863,12 +2120,15 @@ async function logExpiredFile(file: ExpiredFileRecord): Promise<void> {
 // ──────────────────────────────────────────────────────────────
 
 async function bootstrap() {
-  // 1. Validate master encryption key
+  // 1. Validate production requirements and master encryption key
+  validateProductionConfig();
   validateEncryptionConfig();
 
   // 2. Connect SQL Server
   await getPool();
   console.log('[server] SQL Server connection pool ready.');
+
+  app.use('/api/health', createHealthRouter(FILE_VAULT, NODE_ENV === 'production'));
 
   // 3. Validate IIS logging config
   validateIISLoggingConfig();
