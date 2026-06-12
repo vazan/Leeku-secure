@@ -718,13 +718,6 @@ export default function UserDashboard({
             <Upload className="h-4 w-4" />
             <span className="hidden sm:inline">Upload file</span>
           </label>
-          <input
-            type="password"
-            value={uploadSecretKey}
-            onChange={(event) => setUploadSecretKey(event.target.value)}
-            placeholder="Optional upload secret key"
-            className="h-11 w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-muted)] px-3 text-sm outline-none focus:border-[var(--accent-linear)] sm:max-w-56"
-          />
           <button
             type="button"
             aria-label="Log out"
@@ -797,8 +790,20 @@ export default function UserDashboard({
                     : `One file at a time, up to ${formatBytes(activeQuota?.max_file_size_bytes || 0)}.`}
                 </p>
                 <p className="mt-2 text-xs text-[var(--text-faint)]">
-                  Optional: set an upload secret key in the header for an extra encryption layer.
+                  Optional: set an upload secret key for an extra encryption layer.
                 </p>
+                <div className="mx-auto mt-3 w-full max-w-md text-left">
+                  <label className="mb-1 block text-xs font-medium text-[var(--text-muted)]">
+                    Optional upload secret key
+                  </label>
+                  <input
+                    type="password"
+                    value={uploadSecretKey}
+                    onChange={(event) => setUploadSecretKey(event.target.value)}
+                    placeholder="Enter a secret key for this upload"
+                    className="h-10 w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-muted)] px-3 text-sm outline-none focus:border-[var(--accent-linear)]"
+                  />
+                </div>
               </div>
               <section>
                 <div className="mb-4 flex items-end justify-between">
