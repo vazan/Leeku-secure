@@ -5,7 +5,15 @@ import os from 'os';
 import path from 'path';
 import sql from 'mssql';
 import { getRequest } from '../db.js';
-import { computeFileChecksum, decryptColumn, decryptFileStream, unwrapKey, verifySharePassword } from '../utils/encryption.js';
+import {
+  computeFileChecksum,
+  decryptClientProtectedPayload,
+  decryptColumn,
+  decryptFileStream,
+  unwrapKey,
+  verifyFileSecret,
+  verifySharePassword,
+} from '../utils/encryption.js';
 
 interface ShareRow {
   id: string;
@@ -29,11 +37,12 @@ export function createPublicSharingRouter(options: {
       const result = await request.query<ShareRow & {
         file_status: string; leeku_vibe: string|null; mime_type: string;
         size_bytes: number; file_created_at: Date; stored_path: string;
+        client_secret_hash: string | null;
         original_name_encrypted: Buffer; original_name_iv: Buffer; original_name_auth_tag: Buffer;
         owner_username_encrypted: Buffer; owner_username_iv: Buffer; owner_username_auth_tag: Buffer;
       }>(
         `SELECT sl.id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,
-                f.status AS file_status,f.leeku_vibe,f.mime_type,f.size_bytes,f.created_at AS file_created_at,f.stored_path,
+                f.status AS file_status,f.leeku_vibe,f.mime_type,f.size_bytes,f.created_at AS file_created_at,f.stored_path,f.client_secret_hash,
                 f.original_name_encrypted,f.original_name_iv,f.original_name_auth_tag,
                 u.username_encrypted AS owner_username_encrypted,u.username_iv AS owner_username_iv,u.username_auth_tag AS owner_username_auth_tag
          FROM share_links sl
@@ -55,6 +64,7 @@ export function createPublicSharingRouter(options: {
         size: row.size_bytes,
         created_at: row.file_created_at?.toISOString(),
         protected: !!row.password_hash,
+        requires_secret_key: !!row.client_secret_hash,
         uploader: decryptColumn(row.owner_username_encrypted, row.owner_username_iv, row.owner_username_auth_tag),
         leeku_vibe: row.leeku_vibe || '',
         downloads_current: row.download_count,
@@ -73,17 +83,19 @@ export function createPublicSharingRouter(options: {
     message: { error: 'Too many download or password attempts. Please wait before trying again.' },
   }), async (req, res) => {
     const token = req.params.token;
-    const { password } = req.body;
+    const { password, secret_key } = req.body;
     try {
       const request = await getRequest(); request.input('tok', sql.Char(32), token);
       const result = await request.query<ShareRow & {
         file_status: string; stored_path: string;
+        client_secret_hash: string | null; client_crypto_salt: Buffer | null; client_crypto_iv: Buffer | null; client_crypto_iterations: number | null;
         original_name_encrypted: Buffer; original_name_iv: Buffer; original_name_auth_tag: Buffer;
         mime_type: string; checksum_sha256: string; file_id_join: string;
         encrypted_key: Buffer; key_iv: Buffer; key_auth_tag: Buffer; file_iv: Buffer; file_auth_tag: Buffer;
       }>(
         `SELECT sl.id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,
                 f.id AS file_id_join,f.status AS file_status,f.stored_path,f.mime_type,f.checksum_sha256,
+                f.client_secret_hash,f.client_crypto_salt,f.client_crypto_iv,f.client_crypto_iterations,
                 f.original_name_encrypted,f.original_name_iv,f.original_name_auth_tag,
                 k.encrypted_key,k.key_iv,k.key_auth_tag,k.file_iv,k.file_auth_tag
          FROM share_links sl
@@ -100,6 +112,13 @@ export function createPublicSharingRouter(options: {
       if (row.password_hash && (!password || !(await verifySharePassword(password, row.password_hash)))) {
         return res.status(403).json({ error: password ? 'Incorrect vault password.' : 'Password required.' });
       }
+      if (row.client_secret_hash) {
+        const providedSecret = typeof secret_key === 'string' ? secret_key.trim() : '';
+        if (!providedSecret) return res.status(403).json({ error: 'Secret key required.' });
+        if (!(await verifyFileSecret(providedSecret, row.client_secret_hash))) {
+          return res.status(403).json({ error: 'Incorrect secret key.' });
+        }
+      }
       const vaultFile = path.join(options.vaultPath, row.stored_path);
       if (!fs.existsSync(vaultFile)) return res.status(410).json({ error: 'Vault file not found.' });
       const tempFile = path.join(os.tmpdir(), `leeku-share-${token}-${Date.now()}.tmp`);
@@ -108,6 +127,28 @@ export function createPublicSharingRouter(options: {
       if ((await computeFileChecksum(tempFile)) !== row.checksum_sha256) {
         try { fs.unlinkSync(tempFile); } catch {}
         return res.status(500).json({ error: 'File integrity check failed.' });
+      }
+
+      if (row.client_secret_hash) {
+        if (!row.client_crypto_salt || !row.client_crypto_iv || !row.client_crypto_iterations) {
+          try { fs.unlinkSync(tempFile); } catch {}
+          return res.status(500).json({ error: 'Secret-key metadata is missing for this file.' });
+        }
+        const protectedPayload = fs.readFileSync(tempFile);
+        const providedSecret = typeof secret_key === 'string' ? secret_key.trim() : '';
+        try {
+          const plaintext = decryptClientProtectedPayload(
+            protectedPayload,
+            providedSecret,
+            row.client_crypto_salt,
+            row.client_crypto_iv,
+            row.client_crypto_iterations,
+          );
+          fs.writeFileSync(tempFile, plaintext);
+        } catch {
+          try { fs.unlinkSync(tempFile); } catch {}
+          return res.status(403).json({ error: 'Incorrect secret key.' });
+        }
       }
 
       const reserve = await getRequest(); reserve.input('id', sql.UniqueIdentifier, row.id);

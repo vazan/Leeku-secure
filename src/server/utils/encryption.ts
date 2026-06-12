@@ -47,7 +47,16 @@ const ARGON2_OPTIONS: argon2.Options = {
   parallelism: 4,
 };
 
+/** Argon2i parameters dedicated to optional per-file secret keys. */
+const ARGON2_FILE_SECRET_OPTIONS: argon2.Options = {
+  type:        argon2.argon2i,
+  memoryCost:  65536,
+  timeCost:    3,
+  parallelism: 4,
+};
+
 const BCRYPT_ROUNDS = 12;
+const CLIENT_FILE_SECRET_KEY_LENGTH = 32;
 
 // ──────────────────────────────────────────────────────────────
 // Internal: Master key & HKDF sub-key derivation
@@ -239,6 +248,58 @@ export async function hashSharePassword(password: string): Promise<string> {
 /** Verifies a share link password against its bcrypt hash. */
 export async function verifySharePassword(password: string, hash: string): Promise<boolean> {
   return bcrypt.compare(password, hash);
+}
+
+// ──────────────────────────────────────────────────────────────
+// Optional File Secret Key Hashing (Argon2i)
+// ──────────────────────────────────────────────────────────────
+
+/** Hashes an optional per-file secret key with Argon2i. */
+export async function hashFileSecret(secret: string): Promise<string> {
+  return argon2.hash(secret, ARGON2_FILE_SECRET_OPTIONS);
+}
+
+/** Verifies a per-file secret key against its Argon2i hash. */
+export async function verifyFileSecret(secret: string, hash: string): Promise<boolean> {
+  try {
+    return await argon2.verify(hash, secret);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Decrypts bytes that were encrypted client-side with:
+ *   AES-256-GCM + PBKDF2-SHA256(secret, salt, iterations)
+ * The input buffer must contain ciphertext with the 16-byte auth tag appended.
+ */
+export function decryptClientProtectedPayload(
+  encryptedWithTag: Buffer,
+  secret: string,
+  salt: Buffer,
+  iv: Buffer,
+  iterations: number,
+): Buffer {
+  if (encryptedWithTag.length <= TAG_LENGTH) {
+    throw new Error('Invalid encrypted payload.');
+  }
+  if (iterations < 100_000 || iterations > 1_000_000) {
+    throw new Error('Invalid key-derivation iteration count.');
+  }
+
+  const authTag = encryptedWithTag.subarray(encryptedWithTag.length - TAG_LENGTH);
+  const ciphertext = encryptedWithTag.subarray(0, encryptedWithTag.length - TAG_LENGTH);
+  const key = crypto.pbkdf2Sync(
+    secret,
+    salt,
+    iterations,
+    CLIENT_FILE_SECRET_KEY_LENGTH,
+    'sha256'
+  );
+
+  const decipher = crypto.createDecipheriv(ALGORITHM, key, iv, { authTagLength: TAG_LENGTH });
+  decipher.setAuthTag(authTag);
+  return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
 }
 
 // ──────────────────────────────────────────────────────────────

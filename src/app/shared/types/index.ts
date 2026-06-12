@@ -36,6 +36,7 @@ export interface FileMetadata {
   checksum: string;
   leeku_vibe: string; // Funny approve comments
   is_encrypted: boolean;
+  has_user_secret: boolean;
   created_at: string;
 }
 

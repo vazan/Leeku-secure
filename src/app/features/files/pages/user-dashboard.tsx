@@ -9,6 +9,7 @@ import {
   Folder,
   LayoutGrid,
   Link2,
+  Lock,
   LogOut,
   MoreHorizontal,
   Play,
@@ -47,6 +48,7 @@ import TransferProgress, {
   type TransferState,
 } from "@/app/shared/components/common/transfer-progress";
 import { downloadWithProgress } from "@/app/shared/utils/download-with-progress";
+import { encryptFileForUploadWithSecret } from "@/app/shared/utils/client-file-secret";
 
 interface UserDashboardProps {
   user: User;
@@ -160,6 +162,7 @@ export default function UserDashboard({
   const [search, setSearch] = useState("");
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
+  const [uploadSecretKey, setUploadSecretKey] = useState("");
   const [transfer, setTransfer] = useState<TransferState | null>(null);
   const [dragging, setDragging] = useState(false);
   const [shareFile, setShareFile] = useState<FileMetadata | null>(null);
@@ -272,7 +275,7 @@ export default function UserDashboard({
     uploadRequestRef.current?.abort();
   };
 
-  const uploadFile = (file: globalThis.File) => {
+  const uploadFile = async (file: globalThis.File) => {
     if (uploadRequestRef.current) {
       notifyError("An upload is already running.");
       return;
@@ -288,8 +291,26 @@ export default function UserDashboard({
       total: file.size,
       startedAt,
     });
+
     const formData = new FormData();
-    formData.append("file", file);
+    let uploadTargetFile: globalThis.File = file;
+    try {
+      if (uploadSecretKey.trim()) {
+        const encrypted = await encryptFileForUploadWithSecret(file, uploadSecretKey);
+        uploadTargetFile = encrypted.encryptedFile;
+        formData.append("upload_secret_key", uploadSecretKey.trim());
+        formData.append("upload_secret_salt_b64", encrypted.saltBase64);
+        formData.append("upload_secret_iv_b64", encrypted.ivBase64);
+        formData.append("upload_secret_iterations", String(encrypted.iterations));
+      }
+    } catch (reason) {
+      setUploading(false);
+      setTransfer(null);
+      notifyError(reason instanceof Error ? reason.message : "Could not encrypt the file with your secret key.");
+      return;
+    }
+
+    formData.append("file", uploadTargetFile);
     formData.append("original_name", file.name);
     formData.append("mime_type", file.type || "application/octet-stream");
     const xhr = new XMLHttpRequest();
@@ -439,6 +460,13 @@ export default function UserDashboard({
   };
 
   const downloadFile = async (file: FileMetadata) => {
+    const secretKey = file.has_user_secret
+      ? window.prompt(`Enter the secret key for "${file.original_name}"`)?.trim() || ""
+      : "";
+    if (file.has_user_secret && !secretKey) {
+      notifyError("Download cancelled. This file requires its secret key.");
+      return;
+    }
     const startedAt = Date.now();
     setTransfer({
       direction: "download",
@@ -449,7 +477,10 @@ export default function UserDashboard({
     });
     try {
       await downloadWithProgress(`/api/files/${file.id}/download`, file.original_name, {
-        headers: authHeaders(token),
+        headers: {
+          ...authHeaders(token),
+          ...(secretKey ? { "X-File-Secret": secretKey } : {}),
+        },
         onProgress: ({ loaded, total }) =>
           setTransfer({
             direction: "download",
@@ -664,6 +695,13 @@ export default function UserDashboard({
             <Upload className="h-4 w-4" />
             <span className="hidden sm:inline">Upload file</span>
           </label>
+          <input
+            type="password"
+            value={uploadSecretKey}
+            onChange={(event) => setUploadSecretKey(event.target.value)}
+            placeholder="Optional upload secret key"
+            className="h-11 w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-muted)] px-3 text-sm outline-none focus:border-[var(--accent-linear)] sm:max-w-56"
+          />
           <button
             type="button"
             aria-label="Log out"
@@ -735,6 +773,9 @@ export default function UserDashboard({
                     ? "We will let you know when it is ready."
                     : `One file at a time, up to ${formatBytes(activeQuota?.max_file_size_bytes || 0)}.`}
                 </p>
+                <p className="mt-2 text-xs text-[var(--text-faint)]">
+                  Optional: set an upload secret key in the header for an extra encryption layer.
+                </p>
               </div>
               <section>
                 <div className="mb-4 flex items-end justify-between">
@@ -800,8 +841,11 @@ export default function UserDashboard({
                           iconClassName="h-5 w-5"
                         />
                         <div className="min-w-0 flex-1">
-                          <p className="truncate text-sm font-medium">
-                            {file.original_name}
+                          <p className="flex items-center gap-1 truncate text-sm font-medium">
+                            <span className="truncate">{file.original_name}</span>
+                            {file.has_user_secret && (
+                              <Lock className="h-3.5 w-3.5 shrink-0 text-[var(--text-faint)]" aria-label="Secret key required" />
+                            )}
                           </p>
                           <p className="mt-1 text-xs text-[var(--text-muted)]">
                             {fileKind(file)} · {formatBytes(file.size)}
@@ -867,8 +911,11 @@ export default function UserDashboard({
                               iconClassName="h-4 w-4"
                             />
                             <div>
-                              <p className="max-w-xs truncate font-medium">
-                                {file.original_name}
+                              <p className="flex max-w-xs items-center gap-1 truncate font-medium">
+                                <span className="truncate">{file.original_name}</span>
+                                {file.has_user_secret && (
+                                  <Lock className="h-3.5 w-3.5 shrink-0 text-[var(--text-faint)]" aria-label="Secret key required" />
+                                )}
                               </p>
                               <p className="text-xs text-[var(--text-faint)]">
                                 {file.status}
@@ -1448,8 +1495,11 @@ function FileCard({
         </div>
       </div>
       <div className="mt-3 flex items-center gap-2">
-        <p className="min-w-0 flex-1 truncate text-sm font-medium">
-          {file.original_name}
+        <p className="min-w-0 flex flex-1 items-center gap-1 truncate text-sm font-medium">
+          <span className="truncate">{file.original_name}</span>
+          {file.has_user_secret && (
+            <Lock className="h-3.5 w-3.5 shrink-0 text-[var(--text-faint)]" aria-label="Secret key required" />
+          )}
         </p>
         <IconButton label={`Download ${file.original_name}`} onClick={onDownload}>
           <ArrowDownToLine className="h-4 w-4" />

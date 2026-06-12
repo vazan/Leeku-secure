@@ -31,6 +31,7 @@ import {
   encryptFileStream, decryptFileStream, computeFileChecksum,
   encryptColumn, decryptColumn, hashColumnForLookup,
   hashPassword, verifyPassword, hashSharePassword, verifySharePassword,
+  hashFileSecret, verifyFileSecret, decryptClientProtectedPayload,
   generateSecureToken, validateEncryptionConfig,
 } from './server/utils/encryption.js';
 import { scanFileBuffer, scanFilePath, heuristicPreScan } from './server/utils/scanner.js';
@@ -526,6 +527,10 @@ interface FileRow {
   stored_path: string; mime_type: string; size_bytes: number; encrypted_size_bytes: number;
   status: string; checksum_sha256: string; scan_result: string | null; scan_message: string | null;
   is_encrypted: boolean; leeku_vibe: string | null; ttl_hours: number | null;
+  client_secret_hash?: string | null;
+  client_crypto_salt?: Buffer | null;
+  client_crypto_iv?: Buffer | null;
+  client_crypto_iterations?: number | null;
   expires_at: Date | null; created_at: Date;
 }
 
@@ -567,6 +572,7 @@ function mapFileRow(row: FileRow, ownerUsername: string): FileMetadata {
     stored_name:    row.stored_path,
     mime_type:      row.mime_type,
     size:           Number(row.size_bytes),
+    has_user_secret: !!row.client_secret_hash,
     encrypted_size: Number(row.encrypted_size_bytes),
     status:         row.status as 'Available' | 'Blocked',
     checksum:       row.checksum_sha256,
@@ -1398,7 +1404,9 @@ app.get('/api/files', authenticateUser as express.RequestHandler, async (req: Au
               original_name_encrypted, original_name_iv, original_name_auth_tag,
               stored_path, mime_type, size_bytes, encrypted_size_bytes,
               status, checksum_sha256, scan_result, scan_message,
-              is_encrypted, leeku_vibe, ttl_hours, expires_at, created_at
+              is_encrypted, leeku_vibe, ttl_hours,
+              client_secret_hash,
+              expires_at, created_at
        FROM files WHERE owner_user_id=@ownerId AND status!='Expired'
        ORDER BY created_at DESC`
     );
@@ -1486,6 +1494,11 @@ app.post('/api/files/upload', authenticateUser as express.RequestHandler, receiv
     res.write(`${JSON.stringify(payload)}\n`);
   };
 
+  let uploadSecretHash: string | null = null;
+  let uploadSecretSalt: Buffer | null = null;
+  let uploadSecretIv: Buffer | null = null;
+  let uploadSecretIterations: number | null = null;
+
   const finishUploadError = (statusCode: number, message: string) => {
     try { if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath); } catch {}
     if (vaultFilePath) try { if (fs.existsSync(vaultFilePath)) fs.unlinkSync(vaultFilePath); } catch {}
@@ -1505,8 +1518,31 @@ app.post('/api/files/upload', authenticateUser as express.RequestHandler, receiv
       mimeType: mime_type,
       declaredSize: size,
       ttlHours: ttl_hours ?? null,
+      hasUploadSecret: (req.body.upload_secret_key || '').length > 0,
       tempPath: tempFilePath,
     });
+
+    // ── Optional client-side file secret metadata ─────────────
+    currentStage = 'validate_upload_secret';
+    const uploadSecretRaw = typeof req.body.upload_secret_key === 'string' ? req.body.upload_secret_key.trim() : '';
+    const uploadSecretSaltB64 = typeof req.body.upload_secret_salt_b64 === 'string' ? req.body.upload_secret_salt_b64 : '';
+    const uploadSecretIvB64 = typeof req.body.upload_secret_iv_b64 === 'string' ? req.body.upload_secret_iv_b64 : '';
+    const uploadSecretIterationsRaw = typeof req.body.upload_secret_iterations === 'string' ? req.body.upload_secret_iterations : '';
+    if (uploadSecretRaw.length > 0) {
+      if (uploadSecretRaw.length < 8) return finishUploadError(400, 'Secret key must contain at least 8 characters.');
+      if (!uploadSecretSaltB64 || !uploadSecretIvB64 || !uploadSecretIterationsRaw) return finishUploadError(400, 'Missing client encryption metadata for secret-protected upload.');
+      const parsedIterations = Number(uploadSecretIterationsRaw);
+      if (!Number.isInteger(parsedIterations) || parsedIterations < 100000 || parsedIterations > 1000000) return finishUploadError(400, 'Invalid client encryption iteration count.');
+      const parsedSalt = Buffer.from(uploadSecretSaltB64, 'base64');
+      const parsedIv   = Buffer.from(uploadSecretIvB64,   'base64');
+      if (parsedSalt.length !== 16 || parsedIv.length !== 12) return finishUploadError(400, 'Invalid client encryption salt or IV.');
+      uploadSecretIterations = parsedIterations;
+      uploadSecretSalt = parsedSalt;
+      uploadSecretIv   = parsedIv;
+      uploadSecretHash = await hashFileSecret(uploadSecretRaw);
+    } else if (uploadSecretSaltB64 || uploadSecretIvB64 || uploadSecretIterationsRaw) {
+      return finishUploadError(400, 'Secret metadata provided without a secret key.');
+    }
 
     // ── Quota checks ──────────────────────────────────────────
     currentStage = 'quota_lookup';
@@ -1645,20 +1681,30 @@ app.post('/api/files/upload', authenticateUser as express.RequestHandler, receiv
     fileReq.input('vibe',   sql.NVarChar(500),   leekuVibe);
     fileReq.input('ttl',    sql.Int,             ttlH);
     fileReq.input('exp',    sql.DateTimeOffset,  expiresAt);
+    fileReq.input('clientSecretHash', sql.NVarChar(512), uploadSecretHash);
+    fileReq.input('clientCryptoSalt', sql.VarBinary(32), uploadSecretSalt);
+    fileReq.input('clientCryptoIv',   sql.VarBinary(16), uploadSecretIv);
+    fileReq.input('clientCryptoIterations', sql.Int, uploadSecretIterations);
 
     const fileResult = await fileReq.query<FileRow>(
       `INSERT INTO files (
          owner_user_id, original_name_encrypted, original_name_iv, original_name_auth_tag,
          stored_path, mime_type, size_bytes, encrypted_size_bytes,
          checksum_sha256, scan_result, scan_message, scanned_at,
-         leeku_vibe, ttl_hours, expires_at, is_encrypted
+         leeku_vibe, ttl_hours,
+         client_secret_hash, client_crypto_salt, client_crypto_iv, client_crypto_iterations,
+         expires_at, is_encrypted
        )
        OUTPUT INSERTED.id, INSERTED.owner_user_id,
               INSERTED.original_name_encrypted, INSERTED.original_name_iv, INSERTED.original_name_auth_tag,
               INSERTED.stored_path, INSERTED.mime_type, INSERTED.size_bytes, INSERTED.encrypted_size_bytes,
               INSERTED.status, INSERTED.checksum_sha256, INSERTED.scan_result, INSERTED.scan_message,
-              INSERTED.is_encrypted, INSERTED.leeku_vibe, INSERTED.ttl_hours, INSERTED.expires_at, INSERTED.created_at
-       VALUES (@ownerId,@nEnc,@nIv,@nTag, @spath,@mime,@sz,@esz, @chk,@scan,@smsg,SYSDATETIMEOFFSET(), @vibe,@ttl,@exp,1)`
+              INSERTED.is_encrypted, INSERTED.leeku_vibe, INSERTED.ttl_hours,
+              INSERTED.client_secret_hash, INSERTED.client_crypto_salt, INSERTED.client_crypto_iv, INSERTED.client_crypto_iterations,
+              INSERTED.expires_at, INSERTED.created_at
+       VALUES (@ownerId,@nEnc,@nIv,@nTag, @spath,@mime,@sz,@esz, @chk,@scan,@smsg,SYSDATETIMEOFFSET(), @vibe,@ttl,
+               @clientSecretHash,@clientCryptoSalt,@clientCryptoIv,@clientCryptoIterations,
+               @exp,1)`
     );
     const newFile = fileResult.recordset[0];
     console.info('[upload] File record inserted.', { userId: user.id, originalName: original_name, fileId: newFile.id });
@@ -1796,6 +1842,8 @@ app.get('/api/files/:id/preview', authenticateUser as express.RequestHandler, as
       return res.status(403).json({ error: 'You do not have permission to preview this file.' });
     if (file.status === 'Blocked')
       return res.status(410).json({ error: 'Blocked files cannot be previewed.' });
+    if (file.client_secret_hash)
+      return res.status(403).json({ error: 'This file requires its secret key and cannot be previewed inline.' });
     const previewable = file.mime_type.startsWith('image/') || file.mime_type === 'video/mp4';
     if (!previewable)
       return res.status(415).json({ error: 'Preview is only available for images and MP4 videos.' });
@@ -1847,7 +1895,9 @@ app.get('/api/files/:id/download', authenticateUser as express.RequestHandler, a
     const fileResult = await fileReq.query<FileRow>(
       `SELECT id,owner_user_id,original_name_encrypted,original_name_iv,original_name_auth_tag,
               stored_path,size_bytes,status,mime_type,encrypted_size_bytes,checksum_sha256,
-              scan_result,scan_message,is_encrypted,leeku_vibe,ttl_hours,expires_at,created_at
+              scan_result,scan_message,is_encrypted,leeku_vibe,ttl_hours,
+              client_secret_hash,client_crypto_salt,client_crypto_iv,client_crypto_iterations,
+              expires_at,created_at
        FROM files WHERE id=@id`
     );
     if (!fileResult.recordset.length) return res.status(404).json({ error: 'File not found.' });
@@ -1869,6 +1919,15 @@ app.get('/api/files/:id/download', authenticateUser as express.RequestHandler, a
 
     const keyRow = keyRes.recordset[0];
     const fileKey = unwrapKey(keyRow.encrypted_key, keyRow.key_iv, keyRow.key_auth_tag);
+    const secretHeaderRaw = req.headers['x-file-secret'];
+    const providedSecret = Array.isArray(secretHeaderRaw)
+      ? String(secretHeaderRaw[0] || '').trim()
+      : String(secretHeaderRaw || '').trim();
+    if (file.client_secret_hash) {
+      if (!providedSecret) return res.status(403).json({ error: 'This file requires a secret key to download.' });
+      if (!(await verifyFileSecret(providedSecret, file.client_secret_hash)))
+        return res.status(403).json({ error: 'Incorrect secret key.' });
+    }
 
     // ── Streaming decrypt to temp file (avoids 2 GiB Buffer limit) ──
     const tempPath = path.join(os.tmpdir(), `leeku-dl-${fileId}-${Date.now()}.tmp`);
@@ -1879,6 +1938,24 @@ app.get('/api/files/:id/download', authenticateUser as express.RequestHandler, a
     if (actualChecksum !== file.checksum_sha256) {
       try { fs.unlinkSync(tempPath); } catch {}
       return res.status(500).json({ error: 'File integrity check failed.' });
+    }
+
+    if (file.client_secret_hash) {
+      if (!file.client_crypto_salt || !file.client_crypto_iv || !file.client_crypto_iterations) {
+        try { fs.unlinkSync(tempPath); } catch {}
+        return res.status(500).json({ error: 'Secret-key metadata is missing for this file.' });
+      }
+      const protectedPayload = fs.readFileSync(tempPath);
+      try {
+        const plaintext = decryptClientProtectedPayload(
+          protectedPayload, providedSecret,
+          file.client_crypto_salt, file.client_crypto_iv, file.client_crypto_iterations,
+        );
+        fs.writeFileSync(tempPath, plaintext);
+      } catch {
+        try { fs.unlinkSync(tempPath); } catch {}
+        return res.status(403).json({ error: 'Incorrect secret key.' });
+      }
     }
 
     const originalName = decryptColumn(file.original_name_encrypted, file.original_name_iv, file.original_name_auth_tag);
@@ -2267,6 +2344,20 @@ async function logExpiredFile(file: ExpiredFileRecord): Promise<void> {
 // Bootstrap
 // ──────────────────────────────────────────────────────────────
 
+async function ensureOptionalFileSecretColumns(): Promise<void> {
+  const request = await getRequest();
+  await request.query(`
+    IF COL_LENGTH('files', 'client_secret_hash') IS NULL
+      ALTER TABLE files ADD client_secret_hash NVARCHAR(512) NULL;
+    IF COL_LENGTH('files', 'client_crypto_salt') IS NULL
+      ALTER TABLE files ADD client_crypto_salt VARBINARY(32) NULL;
+    IF COL_LENGTH('files', 'client_crypto_iv') IS NULL
+      ALTER TABLE files ADD client_crypto_iv VARBINARY(16) NULL;
+    IF COL_LENGTH('files', 'client_crypto_iterations') IS NULL
+      ALTER TABLE files ADD client_crypto_iterations INT NULL;
+  `);
+}
+
 async function bootstrap() {
   // 1. Validate production requirements and master encryption key
   validateProductionConfig();
@@ -2275,6 +2366,9 @@ async function bootstrap() {
   // 2. Connect SQL Server
   await getPool();
   console.log('[server] SQL Server connection pool ready.');
+
+  // 2b. Lightweight schema migration for optional user-provided file secrets.
+  await ensureOptionalFileSecretColumns();
 
   app.use('/api/health', createHealthRouter(FILE_VAULT, NODE_ENV === 'production'));
 

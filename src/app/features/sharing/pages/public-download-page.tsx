@@ -20,6 +20,7 @@ interface PublicFileMeta {
   size: number;
   created_at: string;
   protected: boolean;
+  requires_secret_key: boolean;
   uploader: string;
   downloads_current: number;
   downloads_max: number | null;
@@ -42,6 +43,7 @@ export default function PublicDownloadPage({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [password, setPassword] = useState("");
+  const [secretKey, setSecretKey] = useState("");
   const [downloading, setDownloading] = useState(false);
   const [done, setDone] = useState(false);
   const downloadTarget = useId().replace(/:/g, "");
@@ -182,7 +184,23 @@ export default function PublicDownloadPage({
                 />
               </label>
             )}
+            {meta.requires_secret_key && (
+              <label className="block">
+                <span className="mb-2 flex items-center gap-2 text-sm font-medium">
+                  <Lock className="h-4 w-4" />
+                  Secret key
+                </span>
+                <input
+                  required
+                  type="password"
+                  value={secretKey}
+                  onChange={(event) => setSecretKey(event.target.value)}
+                  className="w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-elevated)] px-3 py-3 text-sm text-[var(--text-primary)] outline-none focus:border-[var(--accent-linear)]"
+                />
+              </label>
+            )}
             <input type="hidden" name="password" value={password} />
+            <input type="hidden" name="secret_key" value={secretKey} />
             {error && (
               <p className="rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-muted)] p-3 text-sm text-[var(--text-muted)]">
                 {error}
