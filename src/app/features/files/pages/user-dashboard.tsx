@@ -654,7 +654,7 @@ export default function UserDashboard({
                             : ""}{" "}
                           downloads
                         </p>
-                        <div className="mt-4 flex flex-wrap gap-2">
+                        <div className="mt-4 flex flex-nowrap items-center gap-1">
                           <button
                             type="button"
                             onClick={() =>
@@ -664,7 +664,7 @@ export default function UserDashboard({
                                 )
                                 .then(() => notify("Link copied."))
                             }
-                            className="flex cursor-pointer items-center gap-2 rounded-md px-2.5 py-2 text-xs font-medium text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+                            className="flex shrink-0 cursor-pointer items-center gap-1.5 whitespace-nowrap rounded-md px-2 py-2 text-xs font-medium tracking-normal text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
                           >
                             <Copy className="h-3.5 w-3.5" />
                             Copy link
@@ -672,7 +672,7 @@ export default function UserDashboard({
                           <button
                             type="button"
                             onClick={() => removeSharedLink(link)}
-                            className="flex cursor-pointer items-center gap-2 rounded-md px-2.5 py-2 text-xs font-medium text-[var(--error-linear)] hover:bg-[var(--bg-hover)] hover:text-[var(--error-linear)]"
+                            className="flex shrink-0 cursor-pointer items-center gap-1.5 whitespace-nowrap rounded-md px-2 py-2 text-xs font-medium tracking-normal text-[var(--error-linear)] hover:bg-[var(--bg-hover)] hover:text-[var(--error-linear)]"
                           >
                             <Trash2 className="h-3.5 w-3.5" />
                             Remove shared link
