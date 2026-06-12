@@ -10,6 +10,14 @@ const getCsrfToken = () =>
     .find((row) => row.startsWith("leeku_csrf="))
     ?.split("=")[1] || "";
 
+async function readError(response: Response, fallback: string) {
+  try {
+    return (await response.json()).error || fallback;
+  } catch {
+    return fallback;
+  }
+}
+
 function describeDevice(userAgent: string | null) {
   if (!userAgent) return "Unknown device";
   const browser = /Edg\//.test(userAgent)
@@ -63,10 +71,14 @@ export default function SessionManager() {
       headers: { "X-CSRF-Token": getCsrfToken() },
     });
     if (response.ok) {
+      if (session.is_current) {
+        window.location.assign("/");
+        return;
+      }
       setSessions((current) => current.filter((item) => item.id !== session.id));
       toast.success("Session signed out.");
     } else {
-      toast.error((await response.json()).error || "Could not revoke session.");
+      toast.error(await readError(response, "Could not revoke session."));
     }
   };
 
@@ -79,7 +91,7 @@ export default function SessionManager() {
       setSessions((current) => current.filter((session) => session.is_current));
       toast.success("Other sessions signed out.");
     } else {
-      toast.error((await response.json()).error || "Could not revoke sessions.");
+      toast.error(await readError(response, "Could not revoke sessions."));
     }
   };
 
@@ -90,7 +102,7 @@ export default function SessionManager() {
       headers: { "X-CSRF-Token": getCsrfToken() },
     });
     if (response.ok) window.location.assign("/");
-    else toast.error((await response.json()).error || "Could not revoke sessions.");
+    else toast.error(await readError(response, "Could not revoke sessions."));
   };
 
   return (
@@ -142,11 +154,9 @@ export default function SessionManager() {
                 {new Date(session.created_at).toLocaleString()}
               </p>
             </div>
-            {!session.is_current && (
-              <Button type="button" variant="ghost" size="sm" onClick={() => revoke(session)}>
-                Sign out
-              </Button>
-            )}
+            <Button type="button" variant="ghost" size="sm" onClick={() => revoke(session)}>
+              Sign out
+            </Button>
           </div>
         ))}
       </div>

@@ -51,16 +51,21 @@ export function createSessionRouter(options: SessionRouteOptions): express.Route
 
   const revokeSession = async (req: SessionRequest, res: express.Response) => {
     try {
+      const currentHash = options.getCurrentRefreshTokenHash(req);
       const request = await getRequest();
       request.input('uid', sql.UniqueIdentifier, req.userId!);
       request.input('id', sql.UniqueIdentifier, req.params.id);
-      const result = await request.query(
+      request.input('currentHash', sql.Char(64), currentHash);
+      const result = await request.query<{ revoked_current: boolean }>(
         `UPDATE refresh_tokens
          SET revoked_at=COALESCE(revoked_at,SYSDATETIMEOFFSET())
+         OUTPUT CAST(CASE WHEN INSERTED.token_hash=@currentHash THEN 1 ELSE 0 END AS bit) AS revoked_current
          WHERE id=@id AND user_id=@uid AND revoked_at IS NULL`
       );
       if (!result.rowsAffected[0]) return res.status(404).json({ error: 'Active session not found.' });
-      res.json({ success: true });
+      const revokedCurrent = !!result.recordset[0]?.revoked_current;
+      if (revokedCurrent) options.clearAuth(res);
+      res.json({ success: true, revoked_current: revokedCurrent });
     } catch (error) {
       console.error('[revoke session]', error);
       res.status(500).json({ error: 'Could not revoke session.' });
