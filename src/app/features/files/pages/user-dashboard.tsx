@@ -861,28 +861,36 @@ export default function UserDashboard({
               </option>
             ))}
           </select>
+          {(view === "files" || view === "home") && (
+            <>
+              <label className="flex h-11 w-11 shrink-0 cursor-pointer items-center justify-center gap-2 rounded-lg bg-[var(--accent-linear)] px-0 text-sm font-medium text-[var(--accent-contrast)] transition-colors hover:bg-[var(--accent-linear-bright)] sm:w-auto sm:rounded-full sm:px-5">
+                <input
+                  type="file"
+                  className="hidden"
+                  disabled={uploading}
+                  onChange={(event) =>
+                    event.target.files?.[0] && uploadFile(event.target.files[0])
+                  }
+                />
+                <Upload className="h-4 w-4" />
+                <span className="hidden sm:inline">Upload file</span>
+              </label>
+            </>
+          )}
           <div className="relative order-3 w-full sm:order-none sm:max-w-xl">
-            <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[var(--text-faint)]" />
-            <input
-              value={search}
-              onChange={(event) => setSearch(event.target.value)}
-              placeholder="Search files"
-              autoComplete="off"
-              className="h-11 w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-muted)] pl-10 pr-4 text-sm outline-none focus:border-[var(--accent-linear)]"
-            />
+          {view === "files" && (
+            <>
+              <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[var(--text-faint)]" />
+              <input
+                value={search}
+                onChange={(event) => setSearch(event.target.value)}
+                placeholder="Search files"
+                autoComplete="off"
+                className="h-11 w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-muted)] pl-10 pr-4 text-sm outline-none focus:border-[var(--accent-linear)]"
+              />
+            </>
+          )}
           </div>
-          <label className="flex h-11 w-11 shrink-0 cursor-pointer items-center justify-center gap-2 rounded-lg bg-[var(--accent-linear)] px-0 text-sm font-medium text-[var(--accent-contrast)] transition-colors hover:bg-[var(--accent-linear-bright)] sm:w-auto sm:rounded-full sm:px-5">
-            <input
-              type="file"
-              className="hidden"
-              disabled={uploading}
-              onChange={(event) =>
-                event.target.files?.[0] && uploadFile(event.target.files[0])
-              }
-            />
-            <Upload className="h-4 w-4" />
-            <span className="hidden sm:inline">Upload file</span>
-          </label>
           <button
             type="button"
             aria-label="Log out"
