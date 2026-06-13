@@ -117,14 +117,42 @@ export function createPublicSharingRouter(options: {
           throw new Error('File integrity check failed.');
         }
 
-        try {
-          fs.renameSync(partPath, cachePath);
-        } catch {
-          if (fs.existsSync(cachePath)) {
-            try { fs.unlinkSync(partPath); } catch {}
-          } else {
-            throw new Error('Failed to finalize embed cache file.');
+        let finalized = false;
+        let lastFinalizeError: unknown = null;
+
+        for (let attempt = 0; attempt < 5 && !finalized; attempt += 1) {
+          try {
+            fs.renameSync(partPath, cachePath);
+            finalized = true;
+            break;
+          } catch (err) {
+            lastFinalizeError = err;
+
+            if (fs.existsSync(cachePath)) {
+              finalized = true;
+              break;
+            }
+
+            try {
+              fs.copyFileSync(partPath, cachePath);
+              finalized = true;
+              break;
+            } catch (copyErr) {
+              lastFinalizeError = copyErr;
+              if (fs.existsSync(cachePath)) {
+                finalized = true;
+                break;
+              }
+            }
           }
+        }
+
+        if (!finalized) {
+          const message =
+            lastFinalizeError instanceof Error
+              ? lastFinalizeError.message
+              : String(lastFinalizeError ?? 'unknown error');
+          throw new Error(`Failed to finalize embed cache file: ${message}`);
         }
 
         return cachePath;
