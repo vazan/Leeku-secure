@@ -1020,7 +1020,7 @@ export default function UserDashboard({
                     type={isReadOnly ? "text" : "password"}
                     value={uploadSecretKey}
                     onChange={(event) => setUploadSecretKey(event.target.value)}
-                    placeholder="Enter a secret key for this upload"
+                    placeholder="Ex.: Leeku-secret-1"
                     className="h-10 w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-muted)] px-3 text-sm outline-none focus:border-[var(--accent-linear)]"
                   />
                 </div>
