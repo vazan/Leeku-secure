@@ -110,65 +110,108 @@ export function createPublicSharingRouter(options: {
 
     const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-    const buildPromise = (async () => {
-      const partPath = `${cachePath}.part-${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+const buildPromise = (async () => {
+  const partPath = `${cachePath}.part-${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+  try {
+    await decryptFileStream(vaultFile, partPath, fileKey, fileIv, fileAuthTag);
+    const checksum = await computeFileChecksum(partPath);
+    if (checksum !== expectedChecksum) {
+      throw new Error('File integrity check failed.');
+    }
+
+    await sleep(100);
+
+    let finalized = false;
+    let lastFinalizeError: unknown = null;
+
+    for (let attempt = 0; attempt < 8 && !finalized; attempt += 1) {
+      if (attempt > 0) {
+        const backoffMs = Math.min(1000, 50 * Math.pow(2, attempt - 1));
+        await sleep(backoffMs);
+      }
+
       try {
-        await decryptFileStream(vaultFile, partPath, fileKey, fileIv, fileAuthTag);
-        const checksum = await computeFileChecksum(partPath);
-        if (checksum !== expectedChecksum) {
-          throw new Error('File integrity check failed.');
-        }
-
-        await sleep(100);
-
-        let finalized = false;
-        let lastFinalizeError: unknown = null;
-
-        for (let attempt = 0; attempt < 8 && !finalized; attempt += 1) {
-          if (attempt > 0) {
-            const backoffMs = Math.min(1000, 50 * Math.pow(2, attempt - 1));
-            await sleep(backoffMs);
-          }
-
-          try {
-            fs.renameSync(partPath, cachePath);
-            finalized = true;
-            break;
-          } catch (err) {
-            lastFinalizeError = err;
-
-            if (fs.existsSync(cachePath)) {
-              finalized = true;
-              break;
-            }
-
+        // 1. Prioritize checking if another thread already created the file
+        if (fs.existsSync(cachePath)) {
+          try { fs.unlinkSync(partPath); } catch (_) {}
+          
+          // WINDOWS LOCK CHECK: Ensure the other thread is done writing before we read it
+          let isLocked = true;
+          for (let readAttempt = 0; readAttempt < 15; readAttempt++) {
             try {
-              fs.copyFileSync(partPath, cachePath);
-              finalized = true;
-              break;
-            } catch (copyErr) {
-              lastFinalizeError = copyErr;
-              if (fs.existsSync(cachePath)) {
-                finalized = true;
+              const handle = fs.openSync(cachePath, 'r');
+              fs.closeSync(handle);
+              isLocked = false;
+              break; 
+            } catch (lockErr: any) {
+              if (['EPERM', 'EACCES', 'EBUSY'].includes(lockErr.code)) {
+                await sleep(150); 
+              } else {
                 break;
               }
             }
           }
+          
+          finalized = true;
+          break; 
         }
 
-        if (!finalized) {
-          const message =
-            lastFinalizeError instanceof Error
-              ? lastFinalizeError.message
-              : String(lastFinalizeError ?? 'unknown error');
-          throw new Error(`Failed to finalize embed cache file: ${message}`);
-        }
+        // 2. Try the atomic swap if it doesn't exist yet
+        fs.renameSync(partPath, cachePath);
+        finalized = true;
+        break;
 
-        return cachePath;
-      } finally {
-        try { if (fs.existsSync(partPath)) fs.unlinkSync(partPath); } catch {}
+      } catch (err: any) {
+        lastFinalizeError = err;
+        const windowsLockingCodes = ['EPERM', 'EEXIST', 'EACCES', 'EBUSY', 'ENOTEMPTY'];
+
+        if (windowsLockingCodes.includes(err.code)) {
+          console.log(`[Cache Sync] Handled concurrent write collision for: ${partPath} (${err.code})`);
+          
+          if (fs.existsSync(partPath)) {
+            try { fs.unlinkSync(partPath); } catch (_) {}
+          }
+          
+          // WINDOWS LOCK CHECK FOR COLLISION: Wait until the winning thread finishes writing
+          let isLocked = true;
+          for (let readAttempt = 0; readAttempt < 15; readAttempt++) {
+            try {
+              const handle = fs.openSync(cachePath, 'r');
+              fs.closeSync(handle);
+              isLocked = false;
+              break; 
+            } catch (lockErr: any) {
+              if (['EPERM', 'EACCES', 'EBUSY'].includes(lockErr.code)) {
+                await sleep(150); 
+              } else {
+                break;
+              }
+            }
+          }
+          
+          finalized = true; 
+          break; 
+        }
+        
+        throw err; 
       }
-    })();
+    }
+
+    if (!finalized) {
+      const message =
+        lastFinalizeError instanceof Error
+          ? lastFinalizeError.message
+          : String(lastFinalizeError ?? 'unknown error');
+      throw new Error(`Failed to finalize embed cache file: ${message}`);
+    }
+
+    return cachePath;
+  } finally {
+    // This finally block is now perfectly paired to the root try block on line 5
+    try { if (fs.existsSync(partPath)) fs.unlinkSync(partPath); } catch {}
+  }
+})();
+
 
     embedCacheInflight.set(cacheKey, buildPromise);
     try {
@@ -312,13 +355,43 @@ export function createPublicSharingRouter(options: {
 
       const originalName = decryptColumn(row.original_name_encrypted, row.original_name_iv, row.original_name_auth_tag);
       await options.logDownload(req, row.file_id_join, originalName, token);
+
+      // 1. Fetch file stats safely
+      let fileSize = '0';
+      try {
+        fileSize = fs.statSync(tempFile).size.toString();
+      } catch (statErr) {
+        console.error('[Download] Failed to stat cache file:', statErr.message);
+        return res.status(500).send('File access error.');
+      }
+
       res.setHeader('Content-Type', row.mime_type || 'application/octet-stream');
       res.setHeader('Content-Disposition', `attachment; filename="${originalName.replace(/"/g, '\\"')}"`);
-      res.setHeader('Content-Length', fs.statSync(tempFile).size.toString());
+      res.setHeader('Content-Length', fileSize);
+
+      // 2. Instantiate the stream
       const stream = fs.createReadStream(tempFile);
+
+      // 3. CRITICAL WINDOWS FIX: Register the error handler BEFORE piping
+      stream.on('error', (streamErr) => {
+        console.error('[Stream Error] Prevented crash on locked cache file:', streamErr.message);
+        
+        // Clean up stream resources safely
+        stream.destroy();
+        
+        if (!res.headersSent) {
+          res.status(503).send('Media stream temporary lock. Please try again.');
+        }
+      });
+
+      // 4. Now it is completely safe to pipe the data
       stream.pipe(res);
+
+      // 5. CACHE CLEANUP SAFETY NOTE:
+      // If "tempFile" is a global shared cache file (e.g. leeku-embed-cache-XYZ.tmp), 
+      // DO NOT delete it when a single user closes or finishes their download.
+      // If it is an isolated file intended for one-time use only, leave these listeners active:
       stream.on('end',   () => { try { fs.unlinkSync(tempFile); } catch {} });
-      stream.on('error', () => { try { fs.unlinkSync(tempFile); } catch {} });
       res.on('finish',   () => { try { fs.unlinkSync(tempFile); } catch {} });
       res.on('close',    () => { try { fs.unlinkSync(tempFile); } catch {} });
     } catch (error) {
@@ -386,6 +459,7 @@ export function createPublicSharingRouter(options: {
       sweepEmbedCache();
       const cachePath = getEmbedCachePath(token, row.file_id_join);
       const cacheKey = `${token}:${row.file_id_join}`;
+      
       await ensureEmbedCacheFile(
         cachePath,
         cacheKey,
@@ -397,36 +471,96 @@ export function createPublicSharingRouter(options: {
         row.checksum_sha256,
       );
 
-      const stat = fs.statSync(cachePath);
+      // ==========================================
+      // CRITICAL WINDOWS FIX: SAFE FILE DESCRIPTOR OPEN
+      // ==========================================
+      let fileHandle: fs.promises.FileHandle | null = null;
+      let fileSize = 0;
+
+      try {
+        // Open the file in read-only mode. If locked, this throws a caught error instead of crashing.
+        fileHandle = await fs.promises.open(cachePath, 'r');
+        const stat = await fileHandle.stat();
+        fileSize = stat.size;
+      } catch (lockErr: any) {
+        console.error('[Embed Lock] Safe open failed or file locked:', lockErr.message);
+        if (fileHandle) await fileHandle.close().catch(() => {});
+        
+        if (!res.headersSent) {
+          res.status(503).setHeader('Retry-After', '1');
+          return res.json({ error: 'Video cache temporarily locked. Please refresh.' });
+        }
+        return;
+      }
+
       const rangeHeader = typeof req.headers.range === 'string' ? req.headers.range.trim() : '';
 
       res.setHeader('Content-Type', row.mime_type || 'application/octet-stream');
       res.setHeader('Content-Disposition', `inline; filename="${originalName.replace(/"/g, '\\"')}"`);
       res.setHeader('Accept-Ranges', 'bytes');
 
+      // ------------------------------------------
+      // CASE 1: Handle HTTP Range Requests (Seeking/Buffering)
+      // ------------------------------------------
       if (rangeHeader.startsWith('bytes=')) {
         const [startRaw, endRaw] = rangeHeader.slice(6).split('-');
         const start = Number(startRaw);
-        const end = endRaw ? Number(endRaw) : stat.size - 1;
+        const end = endRaw ? Number(endRaw) : fileSize - 1;
 
-        if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end < start || end >= stat.size) {
+        if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end < start || end >= fileSize) {
+          await fileHandle.close().catch(() => {});
           res.status(416);
-          res.setHeader('Content-Range', `bytes */${stat.size}`);
+          res.setHeader('Content-Range', `bytes */${fileSize}`);
           return res.json({ error: 'Requested range is not satisfiable.' });
         }
 
         res.status(206);
-        res.setHeader('Content-Range', `bytes ${start}-${end}/${stat.size}`);
+        res.setHeader('Content-Range', `bytes ${start}-${end}/${fileSize}`);
         res.setHeader('Content-Length', String(end - start + 1));
-        return fs.createReadStream(cachePath, { start, end }).pipe(res);
+
+        // Create stream using the safe, pre-verified file descriptor
+        const stream = fs.createReadStream('', { fd: fileHandle.fd, start, end });
+        
+        stream.on('error', (streamErr) => {
+          console.error('[Stream Error] Range stream failed mid-flight:', streamErr.message);
+          stream.destroy();
+        });
+
+        // Ensure the system file handle closes when the stream finishes or user disconnects
+        res.on('close', async () => { if (fileHandle) await fileHandle.close().catch(() => {}); });
+        res.on('finish', async () => { if (fileHandle) await fileHandle.close().catch(() => {}); });
+
+        stream.pipe(res);
+        return;
       }
 
-      res.setHeader('Content-Length', String(stat.size));
-      return fs.createReadStream(cachePath).pipe(res);
+      // ------------------------------------------
+      // CASE 2: Handle Full File Request
+      // ------------------------------------------
+      res.setHeader('Content-Length', String(fileSize));
+      
+      // Create stream using the safe, pre-verified file descriptor
+      const stream = fs.createReadStream('', { fd: fileHandle.fd });
+
+      stream.on('error', (streamErr) => {
+        console.error('[Stream Error] Full stream failed mid-flight:', streamErr.message);
+        stream.destroy();
+      });
+
+      // Ensure the system file handle closes when the stream finishes or user disconnects
+      res.on('close', async () => { if (fileHandle) await fileHandle.close().catch(() => {}); });
+      res.on('finish', async () => { if (fileHandle) await fileHandle.close().catch(() => {}); });
+
+      stream.pipe(res);
+      return;
+
     } catch (error) {
       console.error('[GET /api/public/share/:token/embed]', error);
-      res.status(500).json({ error: 'External preview failed.' });
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'External preview failed.' });
+      }
     }
+
   });
 
   return router;
