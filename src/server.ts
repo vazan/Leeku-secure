@@ -1910,31 +1910,35 @@ app.get('/api/files/:id/preview', authenticateUser as express.RequestHandler, as
 
     const keyRow = keyRes.recordset[0];
     const fileKey = unwrapKey(keyRow.encrypted_key, keyRow.key_iv, keyRow.key_auth_tag);
-    const tempPath = buildUniqueTempFilePath(UPLOAD_TEMP, 'leeku-preview', fileId);
-    await decryptFileStream(vaultPath, tempPath, fileKey, keyRow.file_iv, keyRow.file_auth_tag);
-
-    const actualChecksum = await computeFileChecksum(tempPath);
-    if (actualChecksum !== file.checksum_sha256) {
-      try { fs.unlinkSync(tempPath); } catch {}
-      return res.status(500).json({ error: 'File integrity check failed.' });
-    }
-
     const originalName = decryptColumn(file.original_name_encrypted, file.original_name_iv, file.original_name_auth_tag);
     const safeName = originalName.replace(/"/g, '\\"');
-    const stat = fs.statSync(tempPath);
 
     res.setHeader('Content-Type', file.mime_type);
     res.setHeader('Content-Disposition', `inline; filename="${safeName}"`);
-    res.setHeader('Content-Length', stat.size.toString());
+    res.setHeader('Content-Length', String(file.size_bytes));
     res.setHeader('Cache-Control', 'private, max-age=300');
 
-    const cleanup = () => { try { fs.unlinkSync(tempPath); } catch {} };
-    const readStream = fs.createReadStream(tempPath);
-    readStream.pipe(res);
-    readStream.on('end', cleanup);
-    readStream.on('error', cleanup);
-    res.on('finish', cleanup);
-    res.on('close', cleanup);
+    const decipher = crypto.createDecipheriv('aes-256-gcm', fileKey, keyRow.file_iv, { authTagLength: 16 });
+    decipher.setAuthTag(keyRow.file_auth_tag);
+
+    const encryptedStream = fs.createReadStream(vaultPath, { highWaterMark: 64 * 1024 });
+    const abortStream = (error: unknown) => {
+      console.error('[GET /api/files/:id/preview] stream error', error);
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Preview failed.' });
+      } else {
+        res.destroy(error instanceof Error ? error : undefined);
+      }
+    };
+
+    encryptedStream.on('error', abortStream);
+    decipher.on('error', abortStream);
+    res.on('close', () => {
+      encryptedStream.destroy();
+      decipher.destroy();
+    });
+
+    encryptedStream.pipe(decipher).pipe(res);
   } catch (err) { console.error('[GET /api/files/:id/preview]', err); res.status(500).json({ error: 'Preview failed.' }); }
 });
 

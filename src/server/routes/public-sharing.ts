@@ -200,11 +200,11 @@ export function createPublicSharingRouter(options: {
         file_status: string; stored_path: string;
         client_secret_hash: string | null;
         original_name_encrypted: Buffer; original_name_iv: Buffer; original_name_auth_tag: Buffer;
-        mime_type: string; checksum_sha256: string; file_id_join: string;
+        mime_type: string; size_bytes: number; file_id_join: string;
         encrypted_key: Buffer; key_iv: Buffer; key_auth_tag: Buffer; file_iv: Buffer; file_auth_tag: Buffer;
       }>(
         `SELECT sl.id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.allow_external_preview,
-                f.id AS file_id_join,f.status AS file_status,f.stored_path,f.mime_type,f.checksum_sha256,
+                f.id AS file_id_join,f.status AS file_status,f.stored_path,f.mime_type,f.size_bytes,
                 f.client_secret_hash,
                 f.original_name_encrypted,f.original_name_iv,f.original_name_auth_tag,
                 k.encrypted_key,k.key_iv,k.key_auth_tag,k.file_iv,k.file_auth_tag
@@ -243,55 +243,40 @@ export function createPublicSharingRouter(options: {
       );
       if (!reservation.rowsAffected[0]) return res.status(410).json({ error: 'Download limit reached or link expired.' });
 
-      const tempFile = buildUniqueTempFilePath('leeku-embed', token);
       const fileKey = unwrapKey(row.encrypted_key, row.key_iv, row.key_auth_tag);
-      await decryptFileStream(vaultFile, tempFile, fileKey, row.file_iv, row.file_auth_tag);
-      if ((await computeFileChecksum(tempFile)) !== row.checksum_sha256) {
-        try { fs.unlinkSync(tempFile); } catch {}
-        return res.status(500).json({ error: 'File integrity check failed.' });
-      }
-
       const originalName = decryptColumn(row.original_name_encrypted, row.original_name_iv, row.original_name_auth_tag);
       await options.logDownload(req, row.file_id_join, originalName, token);
 
-      const stat = fs.statSync(tempFile);
-      const rangeHeader = typeof req.headers.range === 'string' ? req.headers.range : '';
-      let cleanedUp = false;
-      const cleanup = () => {
-        if (cleanedUp) return;
-        cleanedUp = true;
-        try { fs.unlinkSync(tempFile); } catch {}
-      };
-
       res.setHeader('Content-Type', row.mime_type || 'application/octet-stream');
       res.setHeader('Content-Disposition', `inline; filename="${originalName.replace(/"/g, '\\"')}"`);
-      res.setHeader('Accept-Ranges', 'bytes');
+      res.setHeader('Content-Length', String(row.size_bytes));
+      res.setHeader('Accept-Ranges', 'none');
 
-      if (rangeHeader && rangeHeader.startsWith('bytes=')) {
-        const [startRaw, endRaw] = rangeHeader.replace('bytes=', '').split('-');
-        const start = Number(startRaw);
-        const end = endRaw ? Number(endRaw) : stat.size - 1;
-        if (Number.isFinite(start) && Number.isFinite(end) && start >= 0 && end >= start && end < stat.size) {
-          res.status(206);
-          res.setHeader('Content-Range', `bytes ${start}-${end}/${stat.size}`);
-          res.setHeader('Content-Length', String(end - start + 1));
-          const partial = fs.createReadStream(tempFile, { start, end });
-          partial.on('close', cleanup);
-          partial.on('error', cleanup);
-          res.on('finish', cleanup);
-          res.on('close', cleanup);
-          partial.pipe(res);
-          return;
-        }
+      if (typeof req.headers.range === 'string' && req.headers.range.startsWith('bytes=')) {
+        return res.status(416).json({ error: 'Range requests are not supported for encrypted embed streams.' });
       }
 
-      res.setHeader('Content-Length', stat.size.toString());
-      const stream = fs.createReadStream(tempFile);
-      stream.on('close', cleanup);
-      stream.on('error', cleanup);
-      res.on('finish', cleanup);
-      res.on('close', cleanup);
-      stream.pipe(res);
+      const decipher = crypto.createDecipheriv('aes-256-gcm', fileKey, row.file_iv, { authTagLength: 16 });
+      decipher.setAuthTag(row.file_auth_tag);
+
+      const encryptedStream = fs.createReadStream(vaultFile, { highWaterMark: 64 * 1024 });
+      const abortStream = (error: unknown) => {
+        console.error('[GET /api/public/share/:token/embed] stream error', error);
+        if (!res.headersSent) {
+          res.status(500).json({ error: 'External preview failed.' });
+        } else {
+          res.destroy(error instanceof Error ? error : undefined);
+        }
+      };
+
+      encryptedStream.on('error', abortStream);
+      decipher.on('error', abortStream);
+      res.on('close', () => {
+        encryptedStream.destroy();
+        decipher.destroy();
+      });
+
+      encryptedStream.pipe(decipher).pipe(res);
     } catch (error) {
       console.error('[GET /api/public/share/:token/embed]', error);
       res.status(500).json({ error: 'External preview failed.' });
