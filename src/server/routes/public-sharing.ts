@@ -33,7 +33,15 @@ export function createPublicSharingRouter(options: {
 }): express.Router {
   const router = express.Router();
   const EMBED_CACHE_PREFIX = 'leeku-embed-cache';
-  const EMBED_CACHE_TTL_MS = 30 * 60_000;
+  const EMBED_CACHE_TTL_MS = (() => {
+    const fallback = 30 * 60_000;
+    const raw = process.env.PUBLIC_SHARE_EMBED_CACHE_TTL_MS;
+    if (!raw) return fallback;
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed) && parsed >= 60_000) return Math.floor(parsed);
+    console.warn(`[public-sharing] Invalid PUBLIC_SHARE_EMBED_CACHE_TTL_MS="${raw}". Using ${fallback}.`);
+    return fallback;
+  })();
   const EMBED_CACHE_SWEEP_INTERVAL_MS = 60_000;
   const embedCacheInflight = new Map<string, Promise<string>>();
   let lastEmbedCacheSweep = 0;
