@@ -1026,7 +1026,7 @@ export default function UserDashboard({
                     className="h-10 w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-muted)] px-3 text-sm outline-none focus:border-[var(--accent-linear)]"
                   />
                   <div className="mt-3 rounded-lg border border-[var(--accent-linear)]/30 bg-[color-mix(in_srgb,var(--accent-linear)_10%,transparent)] px-3 py-2 text-xs font-medium text-[var(--text-secondary)] shadow-sm">
-                    {filesLeft} file{filesLeft === 1 ? "" : "s"} left in your quota. Maximum file size: {formatBytes(activeQuota?.max_file_size_bytes || 0)}.
+                    {filesLeft} file{filesLeft === 1 ? "" : "s"} left in your quota. <br/> Maximum file size: {formatBytes(activeQuota?.max_file_size_bytes || 0)}.
                   </div>
                 </div>
               </div>
