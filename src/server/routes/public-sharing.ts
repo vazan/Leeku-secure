@@ -108,6 +108,8 @@ export function createPublicSharingRouter(options: {
     const inflight = embedCacheInflight.get(cacheKey);
     if (inflight) return inflight;
 
+    const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
     const buildPromise = (async () => {
       const partPath = `${cachePath}.part-${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
       try {
@@ -117,10 +119,17 @@ export function createPublicSharingRouter(options: {
           throw new Error('File integrity check failed.');
         }
 
+        await sleep(100);
+
         let finalized = false;
         let lastFinalizeError: unknown = null;
 
-        for (let attempt = 0; attempt < 5 && !finalized; attempt += 1) {
+        for (let attempt = 0; attempt < 8 && !finalized; attempt += 1) {
+          if (attempt > 0) {
+            const backoffMs = Math.min(1000, 50 * Math.pow(2, attempt - 1));
+            await sleep(backoffMs);
+          }
+
           try {
             fs.renameSync(partPath, cachePath);
             finalized = true;
