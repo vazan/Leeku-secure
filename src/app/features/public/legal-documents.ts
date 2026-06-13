@@ -158,6 +158,7 @@ export const legalDocuments: LegalDocument[] = [
           "Illegal content",
           "Copyright infringement",
           "Harmful or abusive content",
+          "Pornography",
         ],
       },
       {
