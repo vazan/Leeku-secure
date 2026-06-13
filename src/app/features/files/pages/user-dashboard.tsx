@@ -995,18 +995,18 @@ export default function UserDashboard({
                     </button>
                   </p>
                 )}
-                <p className="mt-2 text-xs text-[var(--text-faint)]">
-                  Optional: set an upload secret key for an extra encryption layer.
-                </p>
                 <div className="mx-auto mt-3 w-full max-w-md text-left" onFocusCapture={() => setIsReadOnly(false)} onBlurCapture={() => setIsReadOnly(true)}>
                   <label className="mb-1 block text-xs font-medium text-[var(--text-muted)]">
                     Upload secret key
                   </label>
+                  <p className="mb-2 text-xs text-[var(--text-faint)]">
+                    Optional: add a secret key for an extra encryption layer.
+                  </p>
                   <input
                     type={isReadOnly ? "text" : "password"}
                     value={uploadSecretKey}
                     onChange={(event) => setUploadSecretKey(event.target.value)}
-                    placeholder="(OPTIONAL) Enter a secret key for this upload"
+                    placeholder="Enter a secret key for this upload"
                     className="h-10 w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-muted)] px-3 text-sm outline-none focus:border-[var(--accent-linear)]"
                   />
                 </div>
