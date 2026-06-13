@@ -3,6 +3,7 @@ import {
   Folder,
   Link2,
   ShieldCheck,
+  X,
 } from "lucide-react";
 
 import { motion } from 'motion/react';
@@ -11,6 +12,11 @@ import { Shield, Upload, Sparkles, HardDrive, Key, Flame } from 'lucide-react';
 import leekuMascot from '@/app/shared/assets/leeku_mascot.png';
 import { MascotAvatar } from '@/app/shared/components/legacy/mascots';
 import type { Quota } from "@/app/shared/types";
+import {
+  legalDocuments,
+  type LegalDocument,
+  type LegalDocumentId,
+} from "@/app/features/public/legal-documents";
 
 interface LandingPageProps {
   onGoToAuth: (mode: "login" | "register") => void;
@@ -30,6 +36,8 @@ const LEEKU_QUOTES = [
 export default function LandingPage({ onGoToAuth, quotas }: LandingPageProps) {
   const [mascotQuote, setMascotQuote] = useState(LEEKU_QUOTES[0]);
   const [isMobile, setIsMobile] = useState<boolean>(false);
+  const [activeLegalDocumentId, setActiveLegalDocumentId] =
+    useState<LegalDocumentId | null>(null);
 
   // Rotate mascot quotes periodically for micro-interaction amusement
   useEffect(() => {
@@ -53,6 +61,10 @@ export default function LandingPage({ onGoToAuth, quotas }: LandingPageProps) {
     if (bytes >= 1073741824) return `${(bytes / 1073741824).toFixed(0)} GB`;
     return `${(bytes / 1048576).toFixed(0)} MB`;
   };
+
+  const activeLegalDocument = activeLegalDocumentId
+    ? legalDocuments.find((document) => document.id === activeLegalDocumentId) || null
+    : null;
 
   return (
     <div className="min-h-screen bg-[var(--bg-primary)] text-[var(--text-primary)]">
@@ -262,6 +274,108 @@ export default function LandingPage({ onGoToAuth, quotas }: LandingPageProps) {
         </div>
 
       </main>
+
+      <footer className="border-t border-[var(--border-subtle)] bg-[var(--bg-panel)]/80">
+        <div className="mx-auto flex max-w-7xl flex-col gap-4 px-5 py-6 text-sm text-[var(--text-muted)] lg:flex-row lg:items-center lg:justify-between lg:px-8">
+          <p>Leeku's Secure Vault policy center</p>
+          <div className="flex flex-wrap gap-x-4 gap-y-2">
+            {legalDocuments.map((document) => (
+              <button
+                key={document.id}
+                type="button"
+                onClick={() => setActiveLegalDocumentId(document.id)}
+                className="text-left font-medium text-[var(--text-secondary)] underline-offset-4 hover:text-[var(--text-primary)] hover:underline"
+              >
+                {document.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      </footer>
+
+      {activeLegalDocument && (
+        <LegalDocumentModal
+          document={activeLegalDocument}
+          onClose={() => setActiveLegalDocumentId(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+function LegalDocumentModal(props: {
+  document: LegalDocument;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") props.onClose();
+    };
+
+    document.addEventListener("keydown", closeOnEscape);
+    return () => document.removeEventListener("keydown", closeOnEscape);
+  }, [props]);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 grid place-items-center bg-black/70 p-4 backdrop-blur-sm"
+      onPointerDown={(event) => {
+        if (event.target === event.currentTarget) props.onClose();
+      }}
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="legal-document-title"
+        className="flex max-h-[85vh] w-full max-w-3xl flex-col overflow-hidden rounded-2xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] shadow-[var(--shadow-panel)]"
+        onPointerDown={(event) => event.stopPropagation()}
+      >
+        <div className="flex items-start justify-between border-b border-[var(--border-subtle)] px-6 py-5">
+          <div>
+            <p className="text-xs font-medium uppercase tracking-[0.24em] text-[var(--accent-linear)]">
+              Legal
+            </p>
+            <h2 id="legal-document-title" className="mt-2 text-xl font-semibold">
+              {props.document.title}
+            </h2>
+            <p className="mt-1 text-sm text-[var(--text-muted)]">
+              Last updated: {props.document.lastUpdated}
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={props.onClose}
+            className="rounded-md p-2 text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+            aria-label="Close legal document"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        <div className="space-y-6 overflow-y-auto px-6 py-5">
+          {props.document.sections.map((section) => (
+            <section key={section.heading} className="space-y-2">
+              <h3 className="text-sm font-semibold uppercase tracking-[0.18em] text-[var(--text-secondary)]">
+                {section.heading}
+              </h3>
+              {section.paragraphs?.map((paragraph) => (
+                <p key={paragraph} className="text-sm leading-7 text-[var(--text-muted)]">
+                  {paragraph}
+                </p>
+              ))}
+              {section.bullets && (
+                <ul className="space-y-2 pl-5 text-sm leading-7 text-[var(--text-muted)]">
+                  {section.bullets.map((bullet) => (
+                    <li key={bullet} className="list-disc">
+                      {bullet}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </section>
+          ))}
+        </div>
+      </div>
     </div>
   );
 }
