@@ -266,6 +266,7 @@ export default function UserDashboard({
   const [avatarUploading, setAvatarUploading] = useState(false);
   const uploadRequestRef = React.useRef<XMLHttpRequest | null>(null);
   const uploadStoppedRef = React.useRef(false);
+  const dropzoneFileInputRef = React.useRef<HTMLInputElement | null>(null);
   const downloadRequestRef = React.useRef<AbortController | null>(null);
 
   const activeQuota =
@@ -274,6 +275,11 @@ export default function UserDashboard({
 
   const notify = (message: string) => toast(message);
   const notifyError = (message: string) => toast.error(message);
+
+  const openUploadFilePicker = () => {
+    if (uploading) return;
+    dropzoneFileInputRef.current?.click();
+  };
 
   const loadFilesAndLinks = async () => {
     const [filesResponse, linksResponse] = await Promise.all([
@@ -937,8 +943,33 @@ export default function UserDashboard({
                   event.dataTransfer.files[0] &&
                     uploadFile(event.dataTransfer.files[0]);
                 }}
+                onClick={(event) => {
+                  if (event.target === event.currentTarget) {
+                    openUploadFilePicker();
+                  }
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    openUploadFilePicker();
+                  }
+                }}
+                role="button"
+                tabIndex={0}
                 className={`rounded-2xl border border-dashed p-8 text-center ${dragging ? "border-[var(--accent-linear)] bg-[color-mix(in_srgb,var(--accent-linear)_14%,transparent)]" : "border-[var(--border-subtle)] bg-[var(--bg-panel)]"}`}
               >
+                <input
+                  ref={dropzoneFileInputRef}
+                  type="file"
+                  className="hidden"
+                  disabled={uploading}
+                  onChange={(event) => {
+                    if (event.target.files?.[0]) {
+                      uploadFile(event.target.files[0]);
+                    }
+                    event.currentTarget.value = "";
+                  }}
+                />
                 <div className="mx-auto grid h-11 w-11 place-items-center rounded-xl bg-[var(--bg-hover)]">
                   <Upload className="h-5 w-5" />
                 </div>
@@ -952,6 +983,18 @@ export default function UserDashboard({
                     ? "We will let you know when it is ready."
                     : `One file at a time, up to ${formatBytes(activeQuota?.max_file_size_bytes || 0)}.`}
                 </p>
+                {!uploading && (
+                  <p className="mt-2 text-sm text-[var(--text-muted)]">
+                    or{" "}
+                    <button
+                      type="button"
+                      onClick={openUploadFilePicker}
+                      className="font-semibold text-[var(--accent-linear)] underline-offset-4 hover:underline"
+                    >
+                      Browse files
+                    </button>
+                  </p>
+                )}
                 <p className="mt-2 text-xs text-[var(--text-faint)]">
                   Optional: set an upload secret key for an extra encryption layer.
                 </p>
