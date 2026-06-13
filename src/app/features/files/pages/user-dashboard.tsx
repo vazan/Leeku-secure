@@ -4,8 +4,6 @@ import {
   Camera,
   CalendarDays,
   Copy,
-  File,
-  FileText,
   Folder,
   LayoutGrid,
   Link2,
@@ -47,6 +45,7 @@ import DashboardSidebar, {
 import TransferProgress, {
   type TransferState,
 } from "@/app/shared/components/common/transfer-progress";
+import FileTypeIcon from "@/app/shared/components/common/file-type-icon";
 import { downloadWithProgress } from "@/app/shared/utils/download-with-progress";
 import { encryptFileForUploadWithSecret } from "@/app/shared/utils/client-file-secret";
 
@@ -1590,12 +1589,6 @@ function FileThumbnail({
     setPlaying(false);
   };
 
-  const fallbackIcon = fileKind(file) === "Image" ? (
-    <File className={iconClassName} />
-  ) : (
-    <FileText className={iconClassName} />
-  );
-
   return (
     <div
       role={isMp4 && interactiveVideo && onOpenVideo ? "button" : undefined}
@@ -1665,7 +1658,11 @@ function FileThumbnail({
           )}
         </>
       ) : (
-        fallbackIcon
+        <FileTypeIcon
+          fileName={file.original_name}
+          mimeType={file.mime_type}
+          className={iconClassName}
+        />
       )}
     </div>
   );

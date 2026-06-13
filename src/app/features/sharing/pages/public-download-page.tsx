@@ -3,11 +3,11 @@ import {
   ArrowLeft,
   Check,
   Download,
-  FileText,
   Loader2,
   Lock,
 } from "lucide-react";
 import ErrorScreen from "@/app/shared/components/common/error-screen";
+import FileTypeIcon from "@/app/shared/components/common/file-type-icon";
 import TransferProgress, {
   type TransferState,
 } from "@/app/shared/components/common/transfer-progress";
@@ -302,7 +302,11 @@ export default function PublicDownloadPage({
           </div>
           <div className="mt-10 flex items-start gap-4">
             <div className="grid h-12 w-12 flex-none place-items-center rounded-xl bg-[var(--bg-hover)]">
-              <FileText className="h-5 w-5" />
+              <FileTypeIcon
+                fileName={meta.file_name}
+                mimeType={meta.mime_type}
+                className="h-5 w-5"
+              />
             </div>
             <div className="min-w-0 flex-1">
               <h1 className="break-all text-xl font-semibold leading-snug">
