@@ -32,6 +32,11 @@ export function createPublicSharingRouter(options: {
   logDownload: (req: express.Request, fileId: string, originalName: string, token: string) => Promise<void>;
 }): express.Router {
   const router = express.Router();
+  const EMBED_CACHE_PREFIX = 'leeku-embed-cache';
+  const EMBED_CACHE_TTL_MS = 30 * 60_000;
+  const EMBED_CACHE_SWEEP_INTERVAL_MS = 60_000;
+  const embedCacheInflight = new Map<string, Promise<string>>();
+  let lastEmbedCacheSweep = 0;
 
   if (!fs.existsSync(options.tempPath)) {
     fs.mkdirSync(options.tempPath, { recursive: true });
@@ -40,6 +45,92 @@ export function createPublicSharingRouter(options: {
   const buildUniqueTempFilePath = (prefix: string, id: string): string => {
     const unique = crypto.randomBytes(8).toString('hex');
     return path.join(options.tempPath, `${prefix}-${id}-${Date.now()}-${unique}.tmp`);
+  };
+
+  const getEmbedCachePath = (token: string, fileId: string): string => {
+    const key = crypto.createHash('sha256').update(`${token}:${fileId}`).digest('hex').slice(0, 24);
+    return path.join(options.tempPath, `${EMBED_CACHE_PREFIX}-${key}.tmp`);
+  };
+
+  const sweepEmbedCache = () => {
+    const now = Date.now();
+    if (now - lastEmbedCacheSweep < EMBED_CACHE_SWEEP_INTERVAL_MS) return;
+    lastEmbedCacheSweep = now;
+
+    try {
+      const entries = fs.readdirSync(options.tempPath, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isFile()) continue;
+        if (!entry.name.startsWith(EMBED_CACHE_PREFIX)) continue;
+
+        const fullPath = path.join(options.tempPath, entry.name);
+        try {
+          const stat = fs.statSync(fullPath);
+          if (now - stat.mtimeMs > EMBED_CACHE_TTL_MS) {
+            fs.unlinkSync(fullPath);
+          }
+        } catch {
+          // best-effort cleanup only
+        }
+      }
+    } catch {
+      // best-effort cleanup only
+    }
+  };
+
+  const ensureEmbedCacheFile = async (
+    cachePath: string,
+    cacheKey: string,
+    vaultFile: string,
+    fileKey: Buffer,
+    fileIv: Buffer,
+    fileAuthTag: Buffer,
+    expectedSize: number,
+    expectedChecksum: string,
+  ): Promise<string> => {
+    if (fs.existsSync(cachePath)) {
+      try {
+        const stat = fs.statSync(cachePath);
+        if (stat.size === expectedSize) return cachePath;
+      } catch {
+        // continue and regenerate
+      }
+    }
+
+    const inflight = embedCacheInflight.get(cacheKey);
+    if (inflight) return inflight;
+
+    const buildPromise = (async () => {
+      const partPath = `${cachePath}.part-${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+      try {
+        await decryptFileStream(vaultFile, partPath, fileKey, fileIv, fileAuthTag);
+        const checksum = await computeFileChecksum(partPath);
+        if (checksum !== expectedChecksum) {
+          throw new Error('File integrity check failed.');
+        }
+
+        try {
+          fs.renameSync(partPath, cachePath);
+        } catch {
+          if (fs.existsSync(cachePath)) {
+            try { fs.unlinkSync(partPath); } catch {}
+          } else {
+            throw new Error('Failed to finalize embed cache file.');
+          }
+        }
+
+        return cachePath;
+      } finally {
+        try { if (fs.existsSync(partPath)) fs.unlinkSync(partPath); } catch {}
+      }
+    })();
+
+    embedCacheInflight.set(cacheKey, buildPromise);
+    try {
+      return await buildPromise;
+    } finally {
+      embedCacheInflight.delete(cacheKey);
+    }
   };
 
   router.get('/:token', async (req, res) => {
@@ -200,11 +291,11 @@ export function createPublicSharingRouter(options: {
         file_status: string; stored_path: string;
         client_secret_hash: string | null;
         original_name_encrypted: Buffer; original_name_iv: Buffer; original_name_auth_tag: Buffer;
-        mime_type: string; size_bytes: number; file_id_join: string;
+        mime_type: string; size_bytes: number; checksum_sha256: string; file_id_join: string;
         encrypted_key: Buffer; key_iv: Buffer; key_auth_tag: Buffer; file_iv: Buffer; file_auth_tag: Buffer;
       }>(
         `SELECT sl.id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.allow_external_preview,
-                f.id AS file_id_join,f.status AS file_status,f.stored_path,f.mime_type,f.size_bytes,
+                f.id AS file_id_join,f.status AS file_status,f.stored_path,f.mime_type,f.size_bytes,f.checksum_sha256,
                 f.client_secret_hash,
                 f.original_name_encrypted,f.original_name_iv,f.original_name_auth_tag,
                 k.encrypted_key,k.key_iv,k.key_auth_tag,k.file_iv,k.file_auth_tag
@@ -247,36 +338,46 @@ export function createPublicSharingRouter(options: {
       const originalName = decryptColumn(row.original_name_encrypted, row.original_name_iv, row.original_name_auth_tag);
       await options.logDownload(req, row.file_id_join, originalName, token);
 
+      sweepEmbedCache();
+      const cachePath = getEmbedCachePath(token, row.file_id_join);
+      const cacheKey = `${token}:${row.file_id_join}`;
+      await ensureEmbedCacheFile(
+        cachePath,
+        cacheKey,
+        vaultFile,
+        fileKey,
+        row.file_iv,
+        row.file_auth_tag,
+        row.size_bytes,
+        row.checksum_sha256,
+      );
+
+      const stat = fs.statSync(cachePath);
+      const rangeHeader = typeof req.headers.range === 'string' ? req.headers.range.trim() : '';
+
       res.setHeader('Content-Type', row.mime_type || 'application/octet-stream');
       res.setHeader('Content-Disposition', `inline; filename="${originalName.replace(/"/g, '\\"')}"`);
-      res.setHeader('Content-Length', String(row.size_bytes));
-      res.setHeader('Accept-Ranges', 'none');
+      res.setHeader('Accept-Ranges', 'bytes');
 
-      if (typeof req.headers.range === 'string' && req.headers.range.startsWith('bytes=')) {
-        return res.status(416).json({ error: 'Range requests are not supported for encrypted embed streams.' });
+      if (rangeHeader.startsWith('bytes=')) {
+        const [startRaw, endRaw] = rangeHeader.slice(6).split('-');
+        const start = Number(startRaw);
+        const end = endRaw ? Number(endRaw) : stat.size - 1;
+
+        if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end < start || end >= stat.size) {
+          res.status(416);
+          res.setHeader('Content-Range', `bytes */${stat.size}`);
+          return res.json({ error: 'Requested range is not satisfiable.' });
+        }
+
+        res.status(206);
+        res.setHeader('Content-Range', `bytes ${start}-${end}/${stat.size}`);
+        res.setHeader('Content-Length', String(end - start + 1));
+        return fs.createReadStream(cachePath, { start, end }).pipe(res);
       }
 
-      const decipher = crypto.createDecipheriv('aes-256-gcm', fileKey, row.file_iv, { authTagLength: 16 });
-      decipher.setAuthTag(row.file_auth_tag);
-
-      const encryptedStream = fs.createReadStream(vaultFile, { highWaterMark: 64 * 1024 });
-      const abortStream = (error: unknown) => {
-        console.error('[GET /api/public/share/:token/embed] stream error', error);
-        if (!res.headersSent) {
-          res.status(500).json({ error: 'External preview failed.' });
-        } else {
-          res.destroy(error instanceof Error ? error : undefined);
-        }
-      };
-
-      encryptedStream.on('error', abortStream);
-      decipher.on('error', abortStream);
-      res.on('close', () => {
-        encryptedStream.destroy();
-        decipher.destroy();
-      });
-
-      encryptedStream.pipe(decipher).pipe(res);
+      res.setHeader('Content-Length', String(stat.size));
+      return fs.createReadStream(cachePath).pipe(res);
     } catch (error) {
       console.error('[GET /api/public/share/:token/embed]', error);
       res.status(500).json({ error: 'External preview failed.' });
