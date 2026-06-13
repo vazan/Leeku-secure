@@ -991,7 +991,7 @@ export default function UserDashboard({
                 <p className="mt-1 text-xs text-[var(--text-muted)]">
                   {uploading
                     ? "We will let you know when it is ready."
-                    : `One file at a time, up to ${formatBytes(activeQuota?.max_file_size_bytes || 0)}.`}
+                    : `One file at a time.`}
                 </p>
                 {!uploading && (
                   <p className="mt-2 text-sm text-[var(--text-muted)]">
