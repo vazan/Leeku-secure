@@ -1662,6 +1662,9 @@ function ShareDialog(props: {
     ? `${pad2(selectedExpiresDate.getHours())}:${pad2(selectedExpiresDate.getMinutes())}`
     : "23:59";
 
+  const [isReadOnly, setIsReadOnly] = useState(true);
+  const [password, setPassword] = useState('');
+
   useEffect(() => {
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key === "Escape") props.onClose();
@@ -1699,10 +1702,10 @@ function ShareDialog(props: {
             <X className="h-4 w-4" />
           </button>
         </div>
-        <div className="mt-6 grid gap-4 sm:grid-cols-2">
+        <div className="mt-6 grid gap-4 sm:grid-cols-2" onFocusCapture={() => setIsReadOnly(false)} onBlurCapture={() => setIsReadOnly(true)}>
           <Field
             label="Password"
-            type="password"
+            type={isReadOnly ? "text" : "password"}
             value={props.password}
             onChange={props.onPassword}
             placeholder="Optional"
