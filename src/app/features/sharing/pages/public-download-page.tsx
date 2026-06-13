@@ -1,14 +1,17 @@
-import React, { useEffect, useId, useRef, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import {
   ArrowLeft,
   Check,
   Download,
   FileText,
-  Folder,
   Loader2,
   Lock,
 } from "lucide-react";
 import ErrorScreen from "@/app/shared/components/common/error-screen";
+import TransferProgress, {
+  type TransferState,
+} from "@/app/shared/components/common/transfer-progress";
+import { downloadWithProgress } from "@/app/shared/utils/download-with-progress";
 
 interface PublicDownloadPageProps {
   token: string;
@@ -27,6 +30,30 @@ interface PublicFileMeta {
   downloads_max: number | null;
 }
 
+interface PreparedDownloadStartResponse {
+  download_id: string;
+  status_url: string;
+  file_url: string;
+}
+
+interface PreparedDownloadStatus {
+  status: "preparing" | "ready" | "error";
+  phase: "decrypting" | "verifying" | "finalizing" | "ready" | "error";
+  loaded: number;
+  total: number;
+  size: number;
+  error: string | null;
+  file_url: string | null;
+}
+
+const preparationPhaseLabel: Record<PreparedDownloadStatus["phase"], string> = {
+  decrypting: "Decrypting file",
+  verifying: "Verifying integrity",
+  finalizing: "Unlocking secure content",
+  ready: "Starting download",
+  error: "Download failed",
+};
+
 const formatBytes = (bytes: number) => {
   const units = ["B", "KB", "MB", "GB", "TB"];
   const index = Math.min(
@@ -35,6 +62,61 @@ const formatBytes = (bytes: number) => {
   );
   return `${(bytes / 1024 ** index).toFixed(index > 1 ? 1 : 0)} ${units[index]}`;
 };
+
+const pause = (ms: number, signal: AbortSignal) =>
+  new Promise<void>((resolve, reject) => {
+    const timeoutId = window.setTimeout(() => {
+      signal.removeEventListener("abort", handleAbort);
+      resolve();
+    }, ms);
+
+    const handleAbort = () => {
+      window.clearTimeout(timeoutId);
+      reject(new DOMException("Aborted", "AbortError"));
+    };
+
+    if (signal.aborted) {
+      handleAbort();
+      return;
+    }
+
+    signal.addEventListener("abort", handleAbort, { once: true });
+  });
+
+async function readJsonError(response: Response, fallback: string) {
+  try {
+    const data = await response.json();
+    return data.error || fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+async function waitForPreparedDownload(
+  statusUrl: string,
+  signal: AbortSignal,
+  onStatus: (status: PreparedDownloadStatus) => void,
+) {
+  while (true) {
+    const response = await fetch(statusUrl, { signal });
+    if (!response.ok) {
+      throw new Error(await readJsonError(response, "Download unavailable."));
+    }
+
+    const status = (await response.json()) as PreparedDownloadStatus;
+    onStatus(status);
+
+    if (status.status === "error") {
+      throw new Error(status.error || "Download unavailable.");
+    }
+
+    if (status.status === "ready" && status.file_url) {
+      return status.file_url;
+    }
+
+    await pause(500, signal);
+  }
+}
 
 export default function PublicDownloadPage({
   token,
@@ -47,8 +129,9 @@ export default function PublicDownloadPage({
   const [secretKey, setSecretKey] = useState("");
   const [downloading, setDownloading] = useState(false);
   const [done, setDone] = useState(false);
-  const downloadTarget = useId().replace(/:/g, "");
+  const [transfer, setTransfer] = useState<TransferState | null>(null);
   const doneTimerRef = useRef<number | null>(null);
+  const downloadControllerRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     fetch(`/api/public/share/${token}`)
@@ -65,43 +148,124 @@ export default function PublicDownloadPage({
   useEffect(
     () => () => {
       if (doneTimerRef.current) window.clearTimeout(doneTimerRef.current);
+      downloadControllerRef.current?.abort();
     },
     [],
   );
 
-  const handleDownloadFrameLoad = (
-    event: React.SyntheticEvent<HTMLIFrameElement>,
-  ) => {
-    const text =
-      event.currentTarget.contentDocument?.body?.textContent?.trim() || "";
-    if (!text) return;
-
-    try {
-      const data = JSON.parse(text);
-      if (data.error) {
-        if (doneTimerRef.current) window.clearTimeout(doneTimerRef.current);
-        setError(data.error);
-        setDone(false);
-        setDownloading(false);
-      }
-    } catch {
-      // Successful attachment downloads do not render JSON into the iframe.
-    }
-  };
-
-  const download = (event: React.FormEvent<HTMLFormElement>) => {
+  const download = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    setDownloading(true);
+    if (!meta) return;
+
+    downloadControllerRef.current?.abort();
+    const controller = new AbortController();
+    downloadControllerRef.current = controller;
+    const startedAt = Date.now();
+
     setError("");
     setDone(false);
-
-    const form = event.currentTarget;
+    setDownloading(true);
     if (doneTimerRef.current) window.clearTimeout(doneTimerRef.current);
-    doneTimerRef.current = window.setTimeout(() => {
+    setTransfer({
+      direction: "download",
+      name: meta.file_name,
+      loaded: 0,
+      total: meta.size,
+      startedAt,
+      processing: true,
+      processingLoaded: 0,
+      processingTotal: meta.size,
+      processingStartedAt: startedAt,
+      phaseLabel: preparationPhaseLabel.decrypting,
+    });
+
+    try {
+      const startResponse = await fetch(`/api/public/share/${token}/download`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          password: password || undefined,
+          secret_key: secretKey || undefined,
+        }),
+        signal: controller.signal,
+      });
+      if (!startResponse.ok) {
+        throw new Error(
+          await readJsonError(startResponse, "Download unavailable."),
+        );
+      }
+
+      const startData =
+        (await startResponse.json()) as PreparedDownloadStartResponse;
+      const fileUrl = await waitForPreparedDownload(
+        startData.status_url,
+        controller.signal,
+        (status) => {
+          setTransfer({
+            direction: "download",
+            name: meta.file_name,
+            loaded: 0,
+            total: meta.size,
+            startedAt,
+            processing: true,
+            processingLoaded: status.loaded,
+            processingTotal: status.total || status.size || meta.size,
+            processingStartedAt: startedAt,
+            phaseLabel: preparationPhaseLabel[status.phase],
+          });
+        },
+      );
+
+      setTransfer({
+        direction: "download",
+        name: meta.file_name,
+        loaded: 0,
+        total: meta.size,
+        startedAt,
+      });
+
+      await downloadWithProgress(fileUrl, meta.file_name, {
+        signal: controller.signal,
+        onProgress: ({ loaded, total }) => {
+          setTransfer({
+            direction: "download",
+            name: meta.file_name,
+            loaded,
+            total: total || meta.size,
+            startedAt,
+          });
+        },
+      });
+
+      setTransfer({
+        direction: "download",
+        name: meta.file_name,
+        loaded: meta.size,
+        total: meta.size,
+        startedAt,
+        complete: true,
+      });
       setDone(true);
       setDownloading(false);
-    }, 1200);
-    form.submit();
+      doneTimerRef.current = window.setTimeout(() => {
+        setTransfer((current: TransferState | null) =>
+          current?.startedAt === startedAt ? null : current,
+        );
+      }, 1800);
+    } catch (reason) {
+      setTransfer(null);
+      setDone(false);
+      setDownloading(false);
+      setError(
+        reason instanceof Error ? reason.message : "Download unavailable.",
+      );
+    } finally {
+      if (downloadControllerRef.current === controller) {
+        downloadControllerRef.current = null;
+      }
+    }
   };
 
   if (loading)
@@ -164,16 +328,19 @@ export default function PublicDownloadPage({
               </p>
             </div>
           </div>
-          <iframe
-            name={downloadTarget}
-            title="Shared file download"
-            onLoad={handleDownloadFrameLoad}
-            className="hidden"
-          />
+          {transfer && (
+            <div className="mt-6">
+              <TransferProgress
+                transfer={transfer}
+                onCancel={
+                  transfer.complete
+                    ? undefined
+                    : () => downloadControllerRef.current?.abort()
+                }
+              />
+            </div>
+          )}
           <form
-            method="POST"
-            action={`/api/public/share/${token}/download`}
-            target={downloadTarget}
             onSubmit={download}
             className="mt-6 space-y-4"
           >
@@ -207,8 +374,6 @@ export default function PublicDownloadPage({
                 />
               </label>
             )}
-            <input type="hidden" name="password" value={password} />
-            <input type="hidden" name="secret_key" value={secretKey} />
             {error && (
               <p className="rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-muted)] p-3 text-sm text-[var(--text-muted)]">
                 {error}

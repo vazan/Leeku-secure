@@ -76,6 +76,86 @@ type UploadStreamEvent = {
   error?: string;
 };
 
+interface PreparedDownloadStartResponse {
+  download_id: string;
+  status_url: string;
+  file_url: string;
+}
+
+interface PreparedDownloadStatus {
+  status: "preparing" | "ready" | "error";
+  phase: "decrypting" | "verifying" | "finalizing" | "ready" | "error";
+  loaded: number;
+  total: number;
+  size: number;
+  error: string | null;
+  file_url: string | null;
+}
+
+const preparationPhaseLabel: Record<PreparedDownloadStatus["phase"], string> = {
+  decrypting: "Decrypting file",
+  verifying: "Verifying integrity",
+  finalizing: "Unlocking secure content",
+  ready: "Starting download",
+  error: "Download failed",
+};
+
+const pause = (ms: number, signal: AbortSignal) =>
+  new Promise<void>((resolve, reject) => {
+    const timeoutId = window.setTimeout(() => {
+      signal.removeEventListener("abort", handleAbort);
+      resolve();
+    }, ms);
+
+    const handleAbort = () => {
+      window.clearTimeout(timeoutId);
+      reject(new DOMException("Aborted", "AbortError"));
+    };
+
+    if (signal.aborted) {
+      handleAbort();
+      return;
+    }
+
+    signal.addEventListener("abort", handleAbort, { once: true });
+  });
+
+async function readJsonError(response: Response, fallback: string) {
+  try {
+    const data = await response.json();
+    return data.error || fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+async function waitForPreparedDownload(
+  statusUrl: string,
+  headers: Record<string, string>,
+  signal: AbortSignal,
+  onStatus: (status: PreparedDownloadStatus) => void,
+) {
+  while (true) {
+    const response = await fetch(statusUrl, { headers, signal });
+    if (!response.ok) {
+      throw new Error(await readJsonError(response, "Download unavailable."));
+    }
+
+    const status = (await response.json()) as PreparedDownloadStatus;
+    onStatus(status);
+
+    if (status.status === "error") {
+      throw new Error(status.error || "Download unavailable.");
+    }
+
+    if (status.status === "ready" && status.file_url) {
+      return status.file_url;
+    }
+
+    await pause(500, signal);
+  }
+}
+
 const dashboardViews: DashboardView[] = [
   "home",
   "files",
@@ -186,6 +266,7 @@ export default function UserDashboard({
   const [avatarUploading, setAvatarUploading] = useState(false);
   const uploadRequestRef = React.useRef<XMLHttpRequest | null>(null);
   const uploadStoppedRef = React.useRef(false);
+  const downloadRequestRef = React.useRef<AbortController | null>(null);
 
   const activeQuota =
     quotas.find((quota) => quota.id === user.quota_id) || quotas[0];
@@ -497,6 +578,9 @@ export default function UserDashboard({
       notifyError("Download cancelled. This file requires its secret key.");
       return;
     }
+    downloadRequestRef.current?.abort();
+    const controller = new AbortController();
+    downloadRequestRef.current = controller;
     const startedAt = Date.now();
     setTransfer({
       direction: "download",
@@ -504,13 +588,62 @@ export default function UserDashboard({
       loaded: 0,
       total: file.size,
       startedAt,
+      processing: true,
+      processingLoaded: 0,
+      processingTotal: file.size,
+      processingStartedAt: startedAt,
+      phaseLabel: preparationPhaseLabel.decrypting,
     });
     try {
-      await downloadWithProgress(`/api/files/${file.id}/download`, file.original_name, {
+      const requestHeaders = {
+        ...authHeaders(token),
+        ...(secretKey ? { "X-File-Secret": secretKey } : {}),
+      };
+      const startResponse = await fetch(`/api/files/${file.id}/download/prepare`, {
+        method: "POST",
         headers: {
-          ...authHeaders(token),
-          ...(secretKey ? { "X-File-Secret": secretKey } : {}),
+          ...requestHeaders,
         },
+        signal: controller.signal,
+      });
+      if (!startResponse.ok) {
+        throw new Error(
+          await readJsonError(startResponse, "Download unavailable."),
+        );
+      }
+
+      const startData =
+        (await startResponse.json()) as PreparedDownloadStartResponse;
+      const fileUrl = await waitForPreparedDownload(
+        startData.status_url,
+        authHeaders(token),
+        controller.signal,
+        (status) => {
+          setTransfer({
+            direction: "download",
+            name: file.original_name,
+            loaded: 0,
+            total: file.size,
+            startedAt,
+            processing: true,
+            processingLoaded: status.loaded,
+            processingTotal: status.total || status.size || file.size,
+            processingStartedAt: startedAt,
+            phaseLabel: preparationPhaseLabel[status.phase],
+          });
+        },
+      );
+
+      setTransfer({
+        direction: "download",
+        name: file.original_name,
+        loaded: 0,
+        total: file.size,
+        startedAt,
+      });
+      await downloadWithProgress(fileUrl, file.original_name, {
+        headers: authHeaders(token),
+        signal: controller.signal,
         onProgress: ({ loaded, total }) =>
           setTransfer({
             direction: "download",
@@ -538,6 +671,10 @@ export default function UserDashboard({
     } catch (reason) {
       setTransfer(null);
       notifyError(reason instanceof Error ? reason.message : "Download unavailable.");
+    } finally {
+      if (downloadRequestRef.current === controller) {
+        downloadRequestRef.current = null;
+      }
     }
   };
 
@@ -765,7 +902,11 @@ export default function UserDashboard({
               <TransferProgress
                 transfer={transfer}
                 onCancel={
-                  transfer.direction === "upload" ? stopUpload : undefined
+                  transfer.direction === "upload"
+                    ? stopUpload
+                    : transfer.direction === "download"
+                      ? () => downloadRequestRef.current?.abort()
+                      : undefined
                 }
               />
             </div>

@@ -322,15 +322,29 @@ export function computeChecksum(data: Buffer): string {
   return crypto.createHash('sha256').update(data).digest('hex');
 }
 
+export interface StreamProgress {
+  processedBytes: number;
+  totalBytes: number;
+}
+
 /**
  * Computes a SHA-256 checksum of a file on disk via streaming.
  * Uses constant memory regardless of file size.
  */
-export function computeFileChecksum(filePath: string): Promise<string> {
+export function computeFileChecksum(
+  filePath: string,
+  onProgress?: (progress: StreamProgress) => void,
+): Promise<string> {
   return new Promise((resolve, reject) => {
     const hash = crypto.createHash('sha256');
+    const totalBytes = fs.statSync(filePath).size;
+    let processedBytes = 0;
     const stream = fs.createReadStream(filePath);
-    stream.on('data', (chunk) => hash.update(chunk));
+    stream.on('data', (chunk) => {
+      hash.update(chunk);
+      processedBytes += Buffer.byteLength(chunk);
+      onProgress?.({ processedBytes, totalBytes });
+    });
     stream.on('end', () => resolve(hash.digest('hex')));
     stream.on('error', reject);
   });
@@ -368,13 +382,14 @@ export interface EncryptFileStreamResult {
 export function encryptFileStream(
   srcPath:  string,
   destPath: string,
-  onProgress?: (progress: { processedBytes: number }) => void,
+  onProgress?: (progress: StreamProgress) => void,
 ): Promise<EncryptFileStreamResult> {
   return new Promise((resolve, reject) => {
     const key = crypto.randomBytes(KEY_LENGTH);
     const iv  = crypto.randomBytes(IV_LENGTH);
     const checksum = crypto.createHash('sha256');
     const cipher = crypto.createCipheriv(ALGORITHM, key, iv, { authTagLength: TAG_LENGTH });
+    const totalBytes = fs.statSync(srcPath).size;
 
     const readStream  = fs.createReadStream(srcPath,  { highWaterMark: 64 * 1024 });
     const writeStream = fs.createWriteStream(destPath);
@@ -385,7 +400,7 @@ export function encryptFileStream(
     readStream.on('data', (chunk) => {
       checksum.update(chunk);
       processedBytes += Buffer.byteLength(chunk);
-      onProgress?.({ processedBytes });
+      onProgress?.({ processedBytes, totalBytes });
     });
 
     cipher.on('data', (chunk) => {
@@ -427,13 +442,21 @@ export function decryptFileStream(
   key:      Buffer,
   iv:       Buffer,
   authTag:  Buffer,
+  onProgress?: (progress: StreamProgress) => void,
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const decipher = crypto.createDecipheriv(ALGORITHM, key, iv, { authTagLength: TAG_LENGTH });
     decipher.setAuthTag(authTag);
+    const totalBytes = fs.statSync(srcPath).size;
 
     const readStream  = fs.createReadStream(srcPath,  { highWaterMark: 64 * 1024 });
     const writeStream = fs.createWriteStream(destPath);
+    let processedBytes = 0;
+
+    readStream.on('data', (chunk) => {
+      processedBytes += Buffer.byteLength(chunk);
+      onProgress?.({ processedBytes, totalBytes });
+    });
 
     readStream
       .pipe(decipher)

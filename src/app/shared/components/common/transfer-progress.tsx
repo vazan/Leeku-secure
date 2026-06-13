@@ -92,8 +92,7 @@ export default function TransferProgress({
         </div>
         <div className="min-w-0 flex-1">
           <div className="flex items-center justify-between gap-4">
-            <p className="truncate text-sm font-medium">{transfer.name}</p>
-            <span className="shrink-0 font-mono text-xs text-[var(--text-muted)]">
+            <span className="shrink-0 font-mono text-xs text-[var(--text-muted)] ml-auto">
               {transfer.complete ? "100%" : activeTotal ? `${percent}%` : "Starting"}
             </span>
           </div>
@@ -113,7 +112,7 @@ export default function TransferProgress({
             onClick={onCancel}
             className="shrink-0 rounded-lg border border-[color-mix(in_srgb,var(--error-linear)_42%,transparent)] px-3 py-2 text-xs font-medium text-[var(--error-linear)] hover:bg-[color-mix(in_srgb,var(--error-linear)_12%,transparent)]"
           >
-            Stop upload
+            {transfer.direction === "upload" ? "Stop upload" : "Stop download"}
           </button>
         )}
       </div>

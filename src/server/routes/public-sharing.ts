@@ -26,6 +26,26 @@ interface ShareRow {
   allow_external_preview: boolean;
 }
 
+type DownloadPreparationPhase = 'decrypting' | 'verifying' | 'finalizing' | 'ready' | 'error';
+
+interface PublicDownloadSession {
+  id: string;
+  token: string;
+  shareId: string;
+  fileId: string;
+  originalName: string;
+  mimeType: string;
+  tempFile: string;
+  sizeBytes: number;
+  status: 'preparing' | 'ready' | 'error';
+  phase: DownloadPreparationPhase;
+  loaded: number;
+  total: number;
+  expiresAt: number;
+  claimed: boolean;
+  error?: string;
+}
+
 export function createPublicSharingRouter(options: {
   vaultPath: string;
   tempPath: string;
@@ -43,7 +63,9 @@ export function createPublicSharingRouter(options: {
     return fallback;
   })();
   const EMBED_CACHE_SWEEP_INTERVAL_MS = 60_000;
+  const DOWNLOAD_SESSION_TTL_MS = 10 * 60_000;
   const embedCacheInflight = new Map<string, Promise<string>>();
+  const downloadSessions = new Map<string, PublicDownloadSession>();
   let lastEmbedCacheSweep = 0;
 
   if (!fs.existsSync(options.tempPath)) {
@@ -83,6 +105,26 @@ export function createPublicSharingRouter(options: {
       }
     } catch {
       // best-effort cleanup only
+    }
+  };
+
+  const removeDownloadSession = (downloadId: string) => {
+    const session = downloadSessions.get(downloadId);
+    if (!session) return;
+    downloadSessions.delete(downloadId);
+    try {
+      if (fs.existsSync(session.tempFile)) fs.unlinkSync(session.tempFile);
+    } catch {
+      // best-effort cleanup only
+    }
+  };
+
+  const sweepDownloadSessions = () => {
+    const now = Date.now();
+    for (const [downloadId, session] of downloadSessions.entries()) {
+      if (session.expiresAt <= now) {
+        removeDownloadSession(downloadId);
+      }
     }
   };
 
@@ -273,19 +315,21 @@ const buildPromise = (async () => {
     standardHeaders: true, legacyHeaders: false,
     message: { error: 'Too many download or password attempts. Please wait before trying again.' },
   }), async (req, res) => {
+    sweepDownloadSessions();
     const token = req.params.token;
     const { password, secret_key } = req.body;
     try {
       const request = await getRequest(); request.input('tok', sql.Char(32), token);
       const result = await request.query<ShareRow & {
         file_status: string; stored_path: string;
+        size_bytes: number; encrypted_size_bytes: number | null;
         client_secret_hash: string | null; client_crypto_salt: Buffer | null; client_crypto_iv: Buffer | null; client_crypto_iterations: number | null;
         original_name_encrypted: Buffer; original_name_iv: Buffer; original_name_auth_tag: Buffer;
         mime_type: string; checksum_sha256: string; file_id_join: string;
         encrypted_key: Buffer; key_iv: Buffer; key_auth_tag: Buffer; file_iv: Buffer; file_auth_tag: Buffer;
       }>(
         `SELECT sl.id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.allow_external_preview,
-                f.id AS file_id_join,f.status AS file_status,f.stored_path,f.mime_type,f.checksum_sha256,
+          f.id AS file_id_join,f.status AS file_status,f.stored_path,f.mime_type,f.size_bytes,f.encrypted_size_bytes,f.checksum_sha256,
                 f.client_secret_hash,f.client_crypto_salt,f.client_crypto_iv,f.client_crypto_iterations,
                 f.original_name_encrypted,f.original_name_iv,f.original_name_auth_tag,
                 k.encrypted_key,k.key_iv,k.key_auth_tag,k.file_iv,k.file_auth_tag
@@ -312,91 +356,201 @@ const buildPromise = (async () => {
       }
       const vaultFile = path.join(options.vaultPath, row.stored_path);
       if (!fs.existsSync(vaultFile)) return res.status(410).json({ error: 'Vault file not found.' });
-      const tempFile = buildUniqueTempFilePath('leeku-share', token);
       const fileKey = unwrapKey(row.encrypted_key, row.key_iv, row.key_auth_tag);
-      await decryptFileStream(vaultFile, tempFile, fileKey, row.file_iv, row.file_auth_tag);
-      if ((await computeFileChecksum(tempFile)) !== row.checksum_sha256) {
-        try { fs.unlinkSync(tempFile); } catch {}
-        return res.status(500).json({ error: 'File integrity check failed.' });
-      }
+      const originalName = decryptColumn(row.original_name_encrypted, row.original_name_iv, row.original_name_auth_tag);
+      const tempFile = buildUniqueTempFilePath('leeku-share', token);
+      const encryptedSize = Number(row.encrypted_size_bytes || 0) || fs.statSync(vaultFile).size;
+      const sessionId = crypto.randomUUID();
+      const session: PublicDownloadSession = {
+        id: sessionId,
+        token,
+        shareId: row.id,
+        fileId: row.file_id_join,
+        originalName,
+        mimeType: row.mime_type || 'application/octet-stream',
+        tempFile,
+        sizeBytes: Number(row.size_bytes || 0),
+        status: 'preparing',
+        phase: 'decrypting',
+        loaded: 0,
+        total: encryptedSize,
+        expiresAt: Date.now() + DOWNLOAD_SESSION_TTL_MS,
+        claimed: false,
+      };
+      downloadSessions.set(sessionId, session);
 
-      if (row.client_secret_hash) {
-        if (!row.client_crypto_salt || !row.client_crypto_iv || !row.client_crypto_iterations) {
-          try { fs.unlinkSync(tempFile); } catch {}
-          return res.status(500).json({ error: 'Secret-key metadata is missing for this file.' });
-        }
-        const protectedPayload = fs.readFileSync(tempFile);
-        const providedSecret = typeof secret_key === 'string' ? secret_key.trim() : '';
+      void (async () => {
         try {
-          const plaintext = decryptClientProtectedPayload(
-            protectedPayload,
-            providedSecret,
-            row.client_crypto_salt,
-            row.client_crypto_iv,
-            row.client_crypto_iterations,
-          );
-          fs.writeFileSync(tempFile, plaintext);
-        } catch {
-          try { fs.unlinkSync(tempFile); } catch {}
-          return res.status(403).json({ error: 'Incorrect secret key.' });
-        }
-      }
+          await decryptFileStream(vaultFile, tempFile, fileKey, row.file_iv, row.file_auth_tag, ({ processedBytes, totalBytes }) => {
+            const current = downloadSessions.get(sessionId);
+            if (!current) return;
+            current.phase = 'decrypting';
+            current.loaded = processedBytes;
+            current.total = totalBytes;
+            current.expiresAt = Date.now() + DOWNLOAD_SESSION_TTL_MS;
+          });
 
-      const reserve = await getRequest(); reserve.input('id', sql.UniqueIdentifier, row.id);
+          const current = downloadSessions.get(sessionId);
+          if (!current) return;
+          current.phase = 'verifying';
+          current.loaded = 0;
+          current.total = current.sizeBytes || 1;
+
+          const checksum = await computeFileChecksum(tempFile, ({ processedBytes, totalBytes }) => {
+            const active = downloadSessions.get(sessionId);
+            if (!active) return;
+            active.phase = 'verifying';
+            active.loaded = processedBytes;
+            active.total = totalBytes;
+            active.expiresAt = Date.now() + DOWNLOAD_SESSION_TTL_MS;
+          });
+          if (checksum !== row.checksum_sha256) {
+            throw new Error('File integrity check failed.');
+          }
+
+          if (row.client_secret_hash) {
+            if (!row.client_crypto_salt || !row.client_crypto_iv || !row.client_crypto_iterations) {
+              throw new Error('Secret-key metadata is missing for this file.');
+            }
+
+            const active = downloadSessions.get(sessionId);
+            if (!active) return;
+            active.phase = 'finalizing';
+            active.loaded = 0;
+            active.total = 1;
+
+            const protectedPayload = fs.readFileSync(tempFile);
+            const providedSecret = typeof secret_key === 'string' ? secret_key.trim() : '';
+            const plaintext = decryptClientProtectedPayload(
+              protectedPayload,
+              providedSecret,
+              row.client_crypto_salt,
+              row.client_crypto_iv,
+              row.client_crypto_iterations,
+            );
+            fs.writeFileSync(tempFile, plaintext);
+
+            active.loaded = 1;
+            active.total = 1;
+          }
+
+          const ready = downloadSessions.get(sessionId);
+          if (!ready) return;
+          ready.status = 'ready';
+          ready.phase = 'ready';
+          ready.loaded = ready.sizeBytes;
+          ready.total = ready.sizeBytes;
+          ready.expiresAt = Date.now() + DOWNLOAD_SESSION_TTL_MS;
+        } catch (error) {
+          const failed = downloadSessions.get(sessionId);
+          if (failed) {
+            failed.status = 'error';
+            failed.phase = 'error';
+            failed.error = error instanceof Error ? error.message : 'Download failed.';
+            failed.expiresAt = Date.now() + 30_000;
+          }
+          try { if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile); } catch {}
+        }
+      })();
+
+      res.status(202).json({
+        download_id: sessionId,
+        status_url: `/api/public/share/${token}/download/${sessionId}/status`,
+        file_url: `/api/public/share/${token}/download/${sessionId}/file`,
+      });
+    } catch (error) {
+      console.error('[POST /api/public/share/:token/download]', error);
+      res.status(500).json({ error: 'Download failed.' });
+    }
+  });
+
+  router.get('/:token/download/:downloadId/status', async (req, res) => {
+    sweepDownloadSessions();
+    const { token, downloadId } = req.params;
+    const session = downloadSessions.get(downloadId);
+    if (!session || session.token !== token) {
+      return res.status(404).json({ error: 'Download session not found.' });
+    }
+
+    res.json({
+      status: session.status,
+      phase: session.phase,
+      loaded: session.loaded,
+      total: session.total,
+      size: session.sizeBytes,
+      error: session.error || null,
+      file_url: session.status === 'ready'
+        ? `/api/public/share/${token}/download/${downloadId}/file`
+        : null,
+    });
+  });
+
+  router.get('/:token/download/:downloadId/file', async (req, res) => {
+    sweepDownloadSessions();
+    const { token, downloadId } = req.params;
+    const session = downloadSessions.get(downloadId);
+    if (!session || session.token !== token) {
+      return res.status(404).json({ error: 'Download session not found.' });
+    }
+    if (session.status === 'error') {
+      const errorMessage = session.error || 'Download failed.';
+      removeDownloadSession(downloadId);
+      return res.status(500).json({ error: errorMessage });
+    }
+    if (session.status !== 'ready') {
+      return res.status(409).json({ error: 'Download is still being prepared.' });
+    }
+    if (session.claimed) {
+      return res.status(409).json({ error: 'This download session has already been used.' });
+    }
+
+    session.claimed = true;
+
+    try {
+      const reserve = await getRequest(); reserve.input('id', sql.UniqueIdentifier, session.shareId);
       const reservation = await reserve.query(
         `UPDATE share_links SET download_count=download_count+1
          WHERE id=@id AND is_active=1 AND (expires_at IS NULL OR expires_at>SYSDATETIMEOFFSET())
            AND (max_downloads IS NULL OR download_count<max_downloads)`
       );
       if (!reservation.rowsAffected[0]) {
-        try { fs.unlinkSync(tempFile); } catch {}
+        removeDownloadSession(downloadId);
         return res.status(410).json({ error: 'Download limit reached or link expired.' });
       }
 
-      const originalName = decryptColumn(row.original_name_encrypted, row.original_name_iv, row.original_name_auth_tag);
-      await options.logDownload(req, row.file_id_join, originalName, token);
+      await options.logDownload(req, session.fileId, session.originalName, token);
 
-      // 1. Fetch file stats safely
       let fileSize = '0';
       try {
-        fileSize = fs.statSync(tempFile).size.toString();
+        fileSize = fs.statSync(session.tempFile).size.toString();
       } catch (statErr) {
-        console.error('[Download] Failed to stat cache file:', statErr.message);
+        console.error('[Download] Failed to stat prepared file:', statErr instanceof Error ? statErr.message : statErr);
+        removeDownloadSession(downloadId);
         return res.status(500).send('File access error.');
       }
 
-      res.setHeader('Content-Type', row.mime_type || 'application/octet-stream');
-      res.setHeader('Content-Disposition', `attachment; filename="${originalName.replace(/"/g, '\\"')}"`);
+      res.setHeader('Content-Type', session.mimeType);
+      res.setHeader('Content-Disposition', `attachment; filename="${session.originalName.replace(/"/g, '\\"')}"`);
       res.setHeader('Content-Length', fileSize);
 
-      // 2. Instantiate the stream
-      const stream = fs.createReadStream(tempFile);
-
-      // 3. CRITICAL WINDOWS FIX: Register the error handler BEFORE piping
+      const stream = fs.createReadStream(session.tempFile);
       stream.on('error', (streamErr) => {
-        console.error('[Stream Error] Prevented crash on locked cache file:', streamErr.message);
-        
-        // Clean up stream resources safely
+        console.error('[Stream Error] Prevented crash on prepared public file:', streamErr instanceof Error ? streamErr.message : streamErr);
         stream.destroy();
-        
+        removeDownloadSession(downloadId);
         if (!res.headersSent) {
           res.status(503).send('Media stream temporary lock. Please try again.');
         }
       });
 
-      // 4. Now it is completely safe to pipe the data
       stream.pipe(res);
-
-      // 5. CACHE CLEANUP SAFETY NOTE:
-      // If "tempFile" is a global shared cache file (e.g. leeku-embed-cache-XYZ.tmp), 
-      // DO NOT delete it when a single user closes or finishes their download.
-      // If it is an isolated file intended for one-time use only, leave these listeners active:
-      stream.on('end',   () => { try { fs.unlinkSync(tempFile); } catch {} });
-      res.on('finish',   () => { try { fs.unlinkSync(tempFile); } catch {} });
-      res.on('close',    () => { try { fs.unlinkSync(tempFile); } catch {} });
+      stream.on('end', () => removeDownloadSession(downloadId));
+      res.on('finish', () => removeDownloadSession(downloadId));
+      res.on('close', () => removeDownloadSession(downloadId));
     } catch (error) {
-      console.error('[POST /api/public/share/:token/download]', error);
-      res.status(500).json({ error: 'Download failed.' });
+      session.claimed = false;
+      console.error('[GET /api/public/share/:token/download/:downloadId/file]', error);
+      return res.status(500).json({ error: 'Download failed.' });
     }
   });
 

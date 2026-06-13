@@ -117,6 +117,48 @@ function buildUniqueTempFilePath(baseDir: string, prefix: string, id: string): s
   return path.join(baseDir, `${prefix}-${id}-${Date.now()}-${unique}.tmp`);
 }
 
+type PrivateDownloadPreparationPhase = 'decrypting' | 'verifying' | 'finalizing' | 'ready' | 'error';
+
+interface PrivateDownloadSession {
+  id: string;
+  userId: string;
+  fileId: string;
+  originalName: string;
+  mimeType: string;
+  tempFile: string;
+  sizeBytes: number;
+  status: 'preparing' | 'ready' | 'error';
+  phase: PrivateDownloadPreparationPhase;
+  loaded: number;
+  total: number;
+  expiresAt: number;
+  claimed: boolean;
+  error?: string;
+}
+
+const PRIVATE_DOWNLOAD_SESSION_TTL_MS = 10 * 60_000;
+const privateDownloadSessions = new Map<string, PrivateDownloadSession>();
+
+function removePrivateDownloadSession(downloadId: string): void {
+  const session = privateDownloadSessions.get(downloadId);
+  if (!session) return;
+  privateDownloadSessions.delete(downloadId);
+  try {
+    if (fs.existsSync(session.tempFile)) fs.unlinkSync(session.tempFile);
+  } catch {
+    // best-effort cleanup only
+  }
+}
+
+function sweepPrivateDownloadSessions(): void {
+  const now = Date.now();
+  for (const [downloadId, session] of privateDownloadSessions.entries()) {
+    if (session.expiresAt <= now) {
+      removePrivateDownloadSession(downloadId);
+    }
+  }
+}
+
 function configureHttpServer(server: http.Server): http.Server {
   server.requestTimeout = HTTP_REQUEST_TIMEOUT_MS;
   server.headersTimeout = HTTP_HEADERS_TIMEOUT_MS;
@@ -2029,6 +2071,222 @@ app.get('/api/files/:id/download', authenticateUser as express.RequestHandler, a
     res.on('finish',        () => { try { fs.unlinkSync(tempPath); } catch {} });
     res.on('close',         () => { try { fs.unlinkSync(tempPath); } catch {} });
   } catch (err) { console.error('[GET /api/files/:id/download]', err); res.status(500).json({ error: 'Download failed.' }); }
+});
+
+app.post('/api/files/:id/download/prepare', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  sweepPrivateDownloadSessions();
+  const fileId = req.params.id;
+  try {
+    const fileReq = await getRequest();
+    fileReq.input('id', sql.UniqueIdentifier, fileId);
+    const fileResult = await fileReq.query<FileRow>(
+      `SELECT id,owner_user_id,original_name_encrypted,original_name_iv,original_name_auth_tag,
+              stored_path,size_bytes,status,mime_type,encrypted_size_bytes,checksum_sha256,
+              scan_result,scan_message,is_encrypted,leeku_vibe,ttl_hours,
+              client_secret_hash,client_crypto_salt,client_crypto_iv,client_crypto_iterations,
+              expires_at,created_at
+       FROM files WHERE id=@id`
+    );
+    if (!fileResult.recordset.length) return res.status(404).json({ error: 'File not found.' });
+
+    const file = fileResult.recordset[0];
+    if (file.owner_user_id !== req.userId && req.user!.role !== 'Admin') {
+      return res.status(403).json({ error: 'You do not have permission to download this file.' });
+    }
+    if (file.status === 'Blocked') {
+      return res.status(410).json({ error: 'Blocked files cannot be downloaded.' });
+    }
+
+    const vaultPath = path.join(FILE_VAULT, file.stored_path);
+    if (!fs.existsSync(vaultPath)) return res.status(410).json({ error: 'Vault file not found.' });
+
+    const keyReq = await getRequest();
+    keyReq.input('fid', sql.UniqueIdentifier, fileId);
+    const keyRes = await keyReq.query<{ encrypted_key: Buffer; key_iv: Buffer; key_auth_tag: Buffer; file_iv: Buffer; file_auth_tag: Buffer }>(
+      'SELECT encrypted_key,key_iv,key_auth_tag,file_iv,file_auth_tag FROM file_encryption_keys WHERE file_id=@fid'
+    );
+    if (!keyRes.recordset.length) return res.status(500).json({ error: 'Encryption key not found.' });
+
+    const secretHeaderRaw = req.headers['x-file-secret'];
+    const providedSecret = Array.isArray(secretHeaderRaw)
+      ? String(secretHeaderRaw[0] || '').trim()
+      : String(secretHeaderRaw || '').trim();
+    if (file.client_secret_hash) {
+      if (!providedSecret) return res.status(403).json({ error: 'This file requires a secret key to download.' });
+      if (!(await verifyFileSecret(providedSecret, file.client_secret_hash))) {
+        return res.status(403).json({ error: 'Incorrect secret key.' });
+      }
+    }
+
+    const originalName = decryptColumn(file.original_name_encrypted, file.original_name_iv, file.original_name_auth_tag);
+    const tempFile = buildUniqueTempFilePath(UPLOAD_TEMP, 'leeku-dl', fileId);
+    const encryptedSize = Number(file.encrypted_size_bytes || 0) || fs.statSync(vaultPath).size;
+    const sessionId = crypto.randomUUID();
+    const session: PrivateDownloadSession = {
+      id: sessionId,
+      userId: req.userId!,
+      fileId,
+      originalName,
+      mimeType: file.mime_type || 'application/octet-stream',
+      tempFile,
+      sizeBytes: Number(file.size_bytes || 0),
+      status: 'preparing',
+      phase: 'decrypting',
+      loaded: 0,
+      total: encryptedSize,
+      expiresAt: Date.now() + PRIVATE_DOWNLOAD_SESSION_TTL_MS,
+      claimed: false,
+    };
+    privateDownloadSessions.set(sessionId, session);
+
+    const keyRow = keyRes.recordset[0];
+    const fileKey = unwrapKey(keyRow.encrypted_key, keyRow.key_iv, keyRow.key_auth_tag);
+
+    void (async () => {
+      try {
+        await decryptFileStream(vaultPath, tempFile, fileKey, keyRow.file_iv, keyRow.file_auth_tag, ({ processedBytes, totalBytes }) => {
+          const current = privateDownloadSessions.get(sessionId);
+          if (!current) return;
+          current.phase = 'decrypting';
+          current.loaded = processedBytes;
+          current.total = totalBytes;
+          current.expiresAt = Date.now() + PRIVATE_DOWNLOAD_SESSION_TTL_MS;
+        });
+
+        const current = privateDownloadSessions.get(sessionId);
+        if (!current) return;
+        current.phase = 'verifying';
+        current.loaded = 0;
+        current.total = current.sizeBytes || 1;
+
+        const checksum = await computeFileChecksum(tempFile, ({ processedBytes, totalBytes }) => {
+          const active = privateDownloadSessions.get(sessionId);
+          if (!active) return;
+          active.phase = 'verifying';
+          active.loaded = processedBytes;
+          active.total = totalBytes;
+          active.expiresAt = Date.now() + PRIVATE_DOWNLOAD_SESSION_TTL_MS;
+        });
+        if (checksum !== file.checksum_sha256) {
+          throw new Error('File integrity check failed.');
+        }
+
+        if (file.client_secret_hash) {
+          if (!file.client_crypto_salt || !file.client_crypto_iv || !file.client_crypto_iterations) {
+            throw new Error('Secret-key metadata is missing for this file.');
+          }
+
+          const active = privateDownloadSessions.get(sessionId);
+          if (!active) return;
+          active.phase = 'finalizing';
+          active.loaded = 0;
+          active.total = 1;
+
+          const protectedPayload = fs.readFileSync(tempFile);
+          const plaintext = decryptClientProtectedPayload(
+            protectedPayload,
+            providedSecret,
+            file.client_crypto_salt,
+            file.client_crypto_iv,
+            file.client_crypto_iterations,
+          );
+          fs.writeFileSync(tempFile, plaintext);
+          active.loaded = 1;
+          active.total = 1;
+        }
+
+        const ready = privateDownloadSessions.get(sessionId);
+        if (!ready) return;
+        ready.status = 'ready';
+        ready.phase = 'ready';
+        ready.loaded = ready.sizeBytes;
+        ready.total = ready.sizeBytes;
+        ready.expiresAt = Date.now() + PRIVATE_DOWNLOAD_SESSION_TTL_MS;
+      } catch (error) {
+        const failed = privateDownloadSessions.get(sessionId);
+        if (failed) {
+          failed.status = 'error';
+          failed.phase = 'error';
+          failed.error = error instanceof Error ? error.message : 'Download failed.';
+          failed.expiresAt = Date.now() + 30_000;
+        }
+        try { if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile); } catch {}
+      }
+    })();
+
+    res.status(202).json({
+      download_id: sessionId,
+      status_url: `/api/files/${fileId}/download/${sessionId}/status`,
+      file_url: `/api/files/${fileId}/download/${sessionId}/file`,
+    });
+  } catch (err) {
+    console.error('[POST /api/files/:id/download/prepare]', err);
+    res.status(500).json({ error: 'Download failed.' });
+  }
+});
+
+app.get('/api/files/:id/download/:downloadId/status', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  sweepPrivateDownloadSessions();
+  const { id: fileId, downloadId } = req.params;
+  const session = privateDownloadSessions.get(downloadId);
+  if (!session || session.fileId !== fileId || session.userId !== req.userId) {
+    return res.status(404).json({ error: 'Download session not found.' });
+  }
+
+  res.json({
+    status: session.status,
+    phase: session.phase,
+    loaded: session.loaded,
+    total: session.total,
+    size: session.sizeBytes,
+    error: session.error || null,
+    file_url: session.status === 'ready'
+      ? `/api/files/${fileId}/download/${downloadId}/file`
+      : null,
+  });
+});
+
+app.get('/api/files/:id/download/:downloadId/file', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  sweepPrivateDownloadSessions();
+  const { id: fileId, downloadId } = req.params;
+  const session = privateDownloadSessions.get(downloadId);
+  if (!session || session.fileId !== fileId || session.userId !== req.userId) {
+    return res.status(404).json({ error: 'Download session not found.' });
+  }
+  if (session.status === 'error') {
+    const errorMessage = session.error || 'Download failed.';
+    removePrivateDownloadSession(downloadId);
+    return res.status(500).json({ error: errorMessage });
+  }
+  if (session.status !== 'ready') {
+    return res.status(409).json({ error: 'Download is still being prepared.' });
+  }
+  if (session.claimed) {
+    return res.status(409).json({ error: 'This download session has already been used.' });
+  }
+
+  session.claimed = true;
+
+  try {
+    const safeName = session.originalName.replace(/"/g, '\\"');
+    const stat = fs.statSync(session.tempFile);
+
+    res.setHeader('Content-Type', session.mimeType);
+    res.setHeader('Content-Disposition', `attachment; filename="${safeName}"`);
+    res.setHeader('Content-Length', stat.size.toString());
+    await logSystemEvent(req.userId!, req.user!.username, 'Download', 'File', fileId, req, `Direct download of "${session.originalName}".`);
+
+    const readStream = fs.createReadStream(session.tempFile);
+    readStream.pipe(res);
+    readStream.on('end', () => removePrivateDownloadSession(downloadId));
+    readStream.on('error', () => removePrivateDownloadSession(downloadId));
+    res.on('finish', () => removePrivateDownloadSession(downloadId));
+    res.on('close', () => removePrivateDownloadSession(downloadId));
+  } catch (err) {
+    session.claimed = false;
+    console.error('[GET /api/files/:id/download/:downloadId/file]', err);
+    res.status(500).json({ error: 'Download failed.' });
+  }
 });
 
 // ──────────────────────────────────────────────────────────────

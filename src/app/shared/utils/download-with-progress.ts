@@ -6,53 +6,83 @@ export interface DownloadProgress {
 interface DownloadOptions {
   method?: "GET" | "POST";
   headers?: Record<string, string>;
-  body?: string;
+  body?: BodyInit | null;
+  signal?: AbortSignal;
   onProgress: (progress: DownloadProgress) => void;
 }
 
-async function responseError(xhr: XMLHttpRequest) {
+async function responseError(response: Response) {
   try {
-    const text =
-      xhr.response instanceof Blob ? await xhr.response.text() : xhr.responseText;
+    const text = await response.text();
     return JSON.parse(text || "{}").error || "Download unavailable.";
   } catch {
     return "Download unavailable.";
   }
 }
 
-export function downloadWithProgress(
+function triggerBrowserDownload(blob: Blob, fileName: string) {
+  const objectUrl = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = objectUrl;
+  anchor.download = fileName;
+  anchor.style.display = "none";
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+}
+
+export async function downloadWithProgress(
   url: string,
   fileName: string,
   options: DownloadOptions,
 ) {
-  return new Promise<void>((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    xhr.open(options.method || "GET", url);
-    Object.entries(options.headers || {}).forEach(([name, value]) =>
-      xhr.setRequestHeader(name, value),
-    );
-    xhr.responseType = "blob";
-    xhr.onprogress = (event) => {
-      options.onProgress({
-        loaded: event.loaded,
-        total: event.lengthComputable ? event.total : 0,
-      });
-    };
-    xhr.onload = async () => {
-      if (xhr.status < 200 || xhr.status >= 300) {
-        reject(new Error(await responseError(xhr)));
-        return;
-      }
-      const objectUrl = URL.createObjectURL(xhr.response);
-      const anchor = document.createElement("a");
-      anchor.href = objectUrl;
-      anchor.download = fileName;
-      anchor.click();
-      URL.revokeObjectURL(objectUrl);
-      resolve();
-    };
-    xhr.onerror = () => reject(new Error("Download interrupted."));
-    xhr.onabort = () => reject(new Error("Download cancelled."));
-    xhr.send(options.body);
-  });
+  try {
+    const response = await fetch(url, {
+      method: options.method || "GET",
+      headers: options.headers,
+      body: options.body,
+      signal: options.signal,
+    });
+
+    if (!response.ok) {
+      throw new Error(await responseError(response));
+    }
+
+    const headerTotal = Number(response.headers.get("Content-Length") || "0");
+    const total = Number.isFinite(headerTotal) ? headerTotal : 0;
+    const reader = response.body?.getReader();
+
+    if (!reader) {
+      const blob = await response.blob();
+      options.onProgress({ loaded: blob.size, total: total || blob.size });
+      triggerBrowserDownload(blob, fileName);
+      return;
+    }
+
+    const chunks: Uint8Array[] = [];
+    let loaded = 0;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+
+      chunks.push(value);
+      loaded += value.byteLength;
+      options.onProgress({ loaded, total });
+    }
+
+    const blob = new Blob(chunks, {
+      type: response.headers.get("Content-Type") || "application/octet-stream",
+    });
+    options.onProgress({ loaded, total: total || loaded });
+    triggerBrowserDownload(blob, fileName);
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") {
+      throw new Error("Download cancelled.");
+    }
+    if (error instanceof Error) throw error;
+    throw new Error("Download interrupted.");
+  }
 }
