@@ -18,6 +18,19 @@ import {
   Terminal,
 } from "lucide-react";
 
+const fileIconModules = import.meta.glob("../../assets/file_icons/*.png", {
+  eager: true,
+  import: "default",
+}) as Record<string, string>;
+
+const fileIconByExtension = Object.fromEntries(
+  Object.entries(fileIconModules).map(([path, url]) => {
+    const match = path.match(/\/([A-Z0-9]+)\.png$/i);
+    const extension = (match?.[1] || "").toUpperCase();
+    return [extension, url];
+  }),
+) as Record<string, string>;
+
 type FileIconKind =
   | "audio"
   | "archive"
@@ -132,6 +145,11 @@ function extensionFromName(fileName: string) {
   return trimmed.slice(dot + 1).toLowerCase();
 }
 
+function customIconFor(fileName: string) {
+  const ext = extensionFromName(fileName).toUpperCase();
+  return ext ? fileIconByExtension[ext] || null : null;
+}
+
 function kindFromFile(fileName: string, mimeType: string): FileIconKind {
   const ext = extensionFromName(fileName);
   const fromExtension = extensionToKind[ext];
@@ -211,8 +229,17 @@ export default function FileTypeIcon({
   mimeType: string;
   className: string;
 }) {
+  const customIconUrl = customIconFor(fileName);
   const kind = kindFromFile(fileName, mimeType);
   const badge = badgeFor(fileName);
+
+  if (customIconUrl) {
+    return (
+      <span className="grid h-full w-full place-items-center">
+        <img src={customIconUrl} alt="" className="h-full w-full object-contain" loading="lazy" />
+      </span>
+    );
+  }
 
   return (
     <span className="relative grid h-full w-full place-items-center">
