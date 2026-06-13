@@ -995,7 +995,13 @@ export default function UserDashboard({
                     </button>
                   </p>
                 )}
-                <div className="mx-auto mt-3 w-full max-w-md text-left" onFocusCapture={() => setIsReadOnly(false)} onBlurCapture={() => setIsReadOnly(true)}>
+                {!uploading && (
+                  <div
+                    aria-hidden="true"
+                    className="mx-auto mt-3 h-px w-full max-w-md bg-[var(--border-subtle)]/70"
+                  />
+                )}
+                <div className="mx-auto mt-4 w-full max-w-md text-left" onFocusCapture={() => setIsReadOnly(false)} onBlurCapture={() => setIsReadOnly(true)}>
                   <label className="mb-1 block text-xs font-medium text-[var(--text-muted)]">
                     Upload secret key
                   </label>
