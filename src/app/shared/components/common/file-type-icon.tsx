@@ -19,28 +19,72 @@ import {
 } from "lucide-react";
 
 type FileIconKind =
+  | "audio"
   | "archive"
   | "binary"
+  | "cad"
   | "code"
   | "config"
   | "data"
+  | "design"
   | "document"
   | "executable"
+  | "font"
   | "image"
   | "media"
   | "pdf"
+  | "presentation"
   | "script"
   | "spreadsheet"
   | "text"
   | "web";
 
 const extensionToKind: Record<string, FileIconKind> = {
+  mpeg: "media",
+  mpg: "media",
+  avi: "media",
+  mkv: "media",
+  wav: "audio",
+  flac: "audio",
+  m4a: "audio",
+  ogg: "audio",
+  mid: "audio",
+  midi: "audio",
+  swf: "media",
+  flv: "media",
+  psd: "design",
+  eps: "design",
+  svg: "image",
+  tiff: "image",
+  tif: "image",
+  indd: "design",
+  ttf: "font",
+  otf: "font",
+  eot: "font",
+  woff: "font",
+  woff2: "font",
+  dwg: "cad",
+  skp: "cad",
+  blend: "cad",
+  ma: "cad",
+  obj: "cad",
+  nbt: "binary",
+  sch: "design",
+  pcb: "design",
+  dbf: "data",
+  mdb: "data",
+  mht: "web",
+  mhtml: "web",
+  chm: "document",
+  msi: "executable",
+  pkg: "executable",
+  sub: "text",
   txt: "text",
   doc: "document",
   docx: "document",
   pdf: "pdf",
-  ppt: "document",
-  pptx: "document",
+  ppt: "presentation",
+  pptx: "presentation",
   xls: "spreadsheet",
   xlsx: "spreadsheet",
   csv: "spreadsheet",
@@ -93,9 +137,19 @@ function kindFromFile(fileName: string, mimeType: string): FileIconKind {
   const fromExtension = extensionToKind[ext];
   if (fromExtension) return fromExtension;
 
+  if (mimeType.startsWith("font/")) return "font";
   if (mimeType.startsWith("image/")) return "image";
   if (mimeType.startsWith("video/")) return "media";
-  if (mimeType.startsWith("audio/")) return "media";
+  if (mimeType.startsWith("audio/")) return "audio";
+  if (mimeType.includes("presentation") || mimeType.includes("powerpoint"))
+    return "presentation";
+  if (
+    mimeType.includes("photoshop") ||
+    mimeType.includes("postscript") ||
+    mimeType.includes("illustrator")
+  )
+    return "design";
+  if (mimeType.includes("cad") || mimeType.includes("dwg")) return "cad";
   if (mimeType.includes("pdf")) return "pdf";
   if (mimeType.includes("spreadsheet") || mimeType.includes("csv"))
     return "spreadsheet";
@@ -122,15 +176,20 @@ function kindFromFile(fileName: string, mimeType: string): FileIconKind {
 }
 
 function iconForKind(kind: FileIconKind, className: string) {
+  if (kind === "audio") return <FileVolume2 className={className} />;
   if (kind === "archive") return <Archive className={className} />;
   if (kind === "binary") return <Binary className={className} />;
+  if (kind === "cad") return <Braces className={className} />;
   if (kind === "code") return <Code className={className} />;
   if (kind === "config") return <Braces className={className} />;
   if (kind === "data") return <Database className={className} />;
+  if (kind === "design") return <FileType2 className={className} />;
   if (kind === "executable") return <Terminal className={className} />;
+  if (kind === "font") return <FileText className={className} />;
   if (kind === "image") return <FileType2 className={className} />;
   if (kind === "media") return <FileVideo className={className} />;
   if (kind === "pdf") return <ScanText className={className} />;
+  if (kind === "presentation") return <Presentation className={className} />;
   if (kind === "script") return <FileCode2 className={className} />;
   if (kind === "spreadsheet") return <FileSpreadsheet className={className} />;
   if (kind === "text") return <FileText className={className} />;
