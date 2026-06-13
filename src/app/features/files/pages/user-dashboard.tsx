@@ -817,6 +817,9 @@ export default function UserDashboard({
     }
   };
 
+  const [isReadOnly, setIsReadOnly] = useState(true);
+  const [password, setPassword] = useState('');
+
   const navItems: DashboardNavItem[] = [
     ["home", <LayoutGrid className="h-4 w-4" />, "Home"],
     ["files", <Folder className="h-4 w-4" />, "All files"],
@@ -952,15 +955,15 @@ export default function UserDashboard({
                 <p className="mt-2 text-xs text-[var(--text-faint)]">
                   Optional: set an upload secret key for an extra encryption layer.
                 </p>
-                <div className="mx-auto mt-3 w-full max-w-md text-left">
+                <div className="mx-auto mt-3 w-full max-w-md text-left" onFocusCapture={() => setIsReadOnly(false)} onBlurCapture={() => setIsReadOnly(true)}>
                   <label className="mb-1 block text-xs font-medium text-[var(--text-muted)]">
-                    Optional upload secret key
+                    Upload secret key
                   </label>
                   <input
-                    type="password"
+                    type={isReadOnly ? "text" : "password"}
                     value={uploadSecretKey}
                     onChange={(event) => setUploadSecretKey(event.target.value)}
-                    placeholder="Enter a secret key for this upload"
+                    placeholder="(OPTIONAL) Enter a secret key for this upload"
                     className="h-10 w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-muted)] px-3 text-sm outline-none focus:border-[var(--accent-linear)]"
                   />
                 </div>
