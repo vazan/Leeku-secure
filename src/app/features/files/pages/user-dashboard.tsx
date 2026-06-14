@@ -952,19 +952,6 @@ export default function UserDashboard({
                   event.dataTransfer.files[0] &&
                     uploadFile(event.dataTransfer.files[0]);
                 }}
-                onClick={(event) => {
-                  if (event.target === event.currentTarget) {
-                    openUploadFilePicker();
-                  }
-                }}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter" || event.key === " ") {
-                    event.preventDefault();
-                    openUploadFilePicker();
-                  }
-                }}
-                role="button"
-                tabIndex={0}
                 className={`rounded-2xl border border-dashed p-8 text-center ${dragging ? "border-[var(--accent-linear)] bg-[color-mix(in_srgb,var(--accent-linear)_14%,transparent)]" : "border-[var(--border-subtle)] bg-[var(--bg-panel)]"}`}
               >
                 <input
