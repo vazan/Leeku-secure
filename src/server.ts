@@ -463,8 +463,27 @@ const apiLimiter = rateLimit({
   message: { error: 'Rate limit exceeded.' },
 });
 
+// Upload endpoint gets a much higher limit (300 RPM) so chunked uploads
+// don't hit the general API limit. The GET check and POST per chunk
+// each count — for a 10 GB file that's ~200 requests.
+const uploadLimiter = rateLimit({
+  windowMs: 60_000,
+  max: 300,
+  standardHeaders: true, legacyHeaders: false,
+  message: { error: 'Rate limit exceeded.' },
+});
+
 app.use('/api/auth', authLimiter);
-app.use('/api', apiLimiter);
+// Apply general limiter to all /api routes EXCEPT /api/files/upload
+app.use('/api', (req, res, next) => {
+  if (req.path === '/files/upload' || req.path === '/files/upload/') {
+    next();
+  } else {
+    apiLimiter(req, res, next);
+  }
+});
+// Apply the higher limit just to the upload endpoint
+app.use('/api/files/upload', uploadLimiter);
 app.use('/api/public/share', rateLimit({
   windowMs: 60_000,
   max: parseInt(process.env.PUBLIC_SHARE_RATE_LIMIT_RPM || '60', 10),
@@ -1514,11 +1533,24 @@ app.get('/api/files', authenticateUser as express.RequestHandler, async (req: Au
 // Multer — multipart upload middleware (streaming, no memory limits)
 // ──────────────────────────────────────────────────────────────
 
+// Ensure ALL temp directories exist before any upload middleware runs
 if (!fs.existsSync(UPLOAD_TEMP)) {
   fs.mkdirSync(UPLOAD_TEMP, { recursive: true });
   console.log(`[server] Created upload temp directory: ${UPLOAD_TEMP}`);
 }
 
+const CHUNK_UPLOAD_TEMP = path.join(UPLOAD_TEMP, 'chunk-uploads');
+const RESUMABLE_CHUNK_DIR = path.join(UPLOAD_TEMP, 'chunks');
+
+for (const dir of [CHUNK_UPLOAD_TEMP, RESUMABLE_CHUNK_DIR]) {
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+    console.log(`[server] Created directory: ${dir}`);
+  }
+}
+
+// Multer instance for full (non-resumable) file uploads — no size limit;
+// quota checks enforce size server-side.
 const upload = multer({
   dest: UPLOAD_TEMP,
   limits: {
@@ -1528,19 +1560,121 @@ const upload = multer({
   },
 });
 
-const receiveUpload: express.RequestHandler = (req, res, next) => {
-  upload.single('file')(req, res, (error: unknown) => {
-    if (!error) {
-      next();
-      return;
+// Multer instance for individual Resumable.js chunks — each chunk ≤ 55 MB.
+// We allow a small overhead so that boundary / headers don't cause rejection.
+const CHUNK_MAX_BYTES = 55 * 1024 * 1024;
+const chunkUpload = multer({
+  dest: CHUNK_UPLOAD_TEMP,
+  limits: {
+    files: 1,
+    fileSize: CHUNK_MAX_BYTES,
+  },
+});
+
+// ── Resumable.js protocol helpers ──────────────────────────────
+
+/**
+ * Returns the on-disk path where a single resumable chunk is stored.
+ */
+function chunkPath(identifier: string, chunkNumber: number): string {
+  return path.join(RESUMABLE_CHUNK_DIR, identifier, String(chunkNumber));
+}
+
+/**
+ * Returns the directory that holds all chunks for a given identifier.
+ */
+function chunkDir(identifier: string): string {
+  return path.join(RESUMABLE_CHUNK_DIR, identifier);
+}
+
+/**
+ * Count how many chunks have already been persisted for `identifier`.
+ */
+function countReceivedChunks(identifier: string): number {
+  const dir = chunkDir(identifier);
+  if (!fs.existsSync(dir)) return 0;
+  let count = 0;
+  for (const entry of fs.readdirSync(dir)) {
+    if (/^\d+$/.test(entry)) count++;
+  }
+  return count;
+}
+
+/**
+ * Merge all chunks (1 … totalChunks) into a single temporary file.
+ * Cleans up the chunk directory afterwards.
+ * Returns the path to the merged file.
+ */
+function mergeChunks(identifier: string, totalChunks: number): string {
+  const dir = chunkDir(identifier);
+  const mergedPath = path.join(UPLOAD_TEMP, `merged_${identifier}`);
+
+  const fdOut = fs.openSync(mergedPath, 'w');
+  try {
+    for (let i = 1; i <= totalChunks; i++) {
+      const cp = path.join(dir, String(i));
+      if (!fs.existsSync(cp)) {
+        throw new Error(`Missing chunk ${i} of ${totalChunks} for identifier "${identifier}".`);
+      }
+      const data = fs.readFileSync(cp);
+      fs.writeSync(fdOut, data);
+      fs.unlinkSync(cp); // clean up chunk after appending
     }
+  } finally {
+    fs.closeSync(fdOut);
+  }
+
+  // Remove empty chunk directory
+  try { fs.rmdirSync(dir); } catch { /* best effort */ }
+
+  return mergedPath;
+}
+
+/**
+ * Middleware: forwards to chunk multer for Resumable.js uploads,
+ * or to regular multer for direct (non-resumable) uploads.
+ */
+const receiveUploadOrChunk: express.RequestHandler = (req, res, next) => {
+  const isResumable = !!req.query.resumableIdentifier;
+
+  if (isResumable) {
+    chunkUpload.single('file')(req, res, (error: unknown) => {
+      if (!error) { next(); return; }
+
+      const message = error instanceof Error ? error.message : String(error);
+
+      if (message === 'Request aborted' || req.destroyed || req.aborted) {
+        console.warn('[upload] Chunk upload aborted before completion.', {
+          ip: getRequestIp(req),
+          contentLength: req.headers['content-length'] ?? null,
+          userAgent: req.headers['user-agent'] ?? null,
+        });
+        if (!res.headersSent && !res.writableEnded && !req.destroyed) {
+          res.status(499).json({ error: 'Upload connection closed before the chunk finished sending.' });
+        }
+        return;
+      }
+
+      // Return JSON instead of next(error) so the client gets a parseable error
+      console.error('[upload] Chunk upload error:', message);
+      if (!res.headersSent && !res.writableEnded) {
+        res.status(400).json({ error: `Chunk upload failed: ${message}` });
+      }
+    });
+    return;
+  }
+
+  // Non-resumable (legacy) upload
+  upload.single('file')(req, res, (error: unknown) => {
+    if (!error) { next(); return; }
 
     const message = error instanceof Error ? error.message : String(error);
+
     if (message === 'Request aborted' || req.destroyed || req.aborted) {
       console.warn('[upload] Multipart request aborted before the file finished streaming.', {
         ip: getRequestIp(req),
-        contentLength: req.headers['content-length'] || null,
-        userAgent: req.headers['user-agent'] || null,
+        contentLength: req.headers['content-length'] ?? null,
+        userAgent: req.headers['user-agent'] ?? null,
       });
       if (!res.headersSent && !res.writableEnded && !req.destroyed) {
         res.status(499).json({ error: 'Upload connection closed before the file finished sending.' });
@@ -1553,319 +1687,450 @@ const receiveUpload: express.RequestHandler = (req, res, next) => {
 };
 
 // ──────────────────────────────────────────────────────────────
-// API: Files — Upload (multipart/form-data, streaming)
+// GET /api/files/upload — Resumable.js chunk existence check
+// ──────────────────────────────────────────────────────────────
+// If the chunk file exists and is non-empty we return 200 (skip),
+// otherwise 204 (upload needed).
+app.get('/api/files/upload', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  const identifier  = req.query.resumableIdentifier as string | undefined;
+  const chunkNumber = req.query.resumableChunkNumber as string | undefined;
+
+  if (!identifier || !chunkNumber) {
+    return res.status(400).json({ error: 'Missing "resumableIdentifier" or "resumableChunkNumber" query parameter.' });
+  }
+
+  const cp = chunkPath(identifier, parseInt(chunkNumber, 10));
+  if (fs.existsSync(cp) && fs.statSync(cp).size > 0) {
+    return res.status(200).end(); // chunk already present — skip
+  }
+  return res.status(204).end();   // chunk missing — please upload
+});
+
+// ──────────────────────────────────────────────────────────────
+// POST /api/files/upload — File upload (resumable or direct)
 // ──────────────────────────────────────────────────────────────
 
-app.post('/api/files/upload', authenticateUser as express.RequestHandler, receiveUpload, async (req: AuthenticatedRequest, res) => {
-  const multerFile = req.file;
-  if (!multerFile) return res.status(400).json({ error: 'No file attached. Use multipart/form-data with field name "file".' });
+app.post(
+  '/api/files/upload',
+  authenticateUser as express.RequestHandler,
+  receiveUploadOrChunk,
+  async (req: AuthenticatedRequest, res) => {
 
-  const original_name = req.body.original_name || multerFile.originalname;
-  const mime_type     = req.body.mime_type     || multerFile.mimetype || 'application/octet-stream';
-  const ttl_hours     = req.body.ttl_hours     || null;
-  const size          = multerFile.size;
-  const tempFilePath  = multerFile.path; // on-disk temp file from multer
+    const isResumable = !!req.query.resumableIdentifier;
 
-  const user = req.user!;
-  let currentStage = 'quota_lookup';
-  let vaultFilePath: string | null = null;
-  const streamsProgress = String(req.headers.accept || '').includes('application/x-ndjson');
-  const processingTotal = 1000;
-  let progressStreamStarted = false;
+    // ═══════════════════════════════════════════════════════════
+    // RESUMABLE.JS — chunk upload
+    // ═══════════════════════════════════════════════════════════
+    if (isResumable) {
+      const identifier   = req.query.resumableIdentifier as string;
+      const chunkNumber  = parseInt(req.query.resumableChunkNumber  as string, 10);
+      const totalChunks  = parseInt(req.query.resumableTotalChunks  as string, 10);
+      const totalSize    = parseInt(req.query.resumableTotalSize    as string, 10);
+      const originalName = (req.query.resumableFilename as string) || 'upload';
+      const mimeType     = (req.query.resumableType     as string) || 'application/octet-stream';
 
-  const sendUploadProgress = (payload: Record<string, unknown>) => {
-    if (!streamsProgress || res.writableEnded) return;
-    if (!progressStreamStarted) {
-      progressStreamStarted = true;
-      res.status(200);
-      res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
-      res.setHeader('Cache-Control', 'no-cache, no-transform');
-      res.setHeader('X-Accel-Buffering', 'no');
-      res.flushHeaders?.();
-    }
-    res.write(`${JSON.stringify(payload)}\n`);
-  };
+      if (!identifier || isNaN(chunkNumber) || isNaN(totalChunks)) {
+        return res.status(400).json({ error: 'Invalid or missing resumable upload parameters.' });
+      }
 
-  let uploadSecretHash: string | null = null;
-  let uploadSecretSalt: Buffer | null = null;
-  let uploadSecretIv: Buffer | null = null;
-  let uploadSecretIterations: number | null = null;
+      const multerFile = req.file;
+      if (!multerFile) {
+        return res.status(400).json({ error: 'No chunk file attached. Use multipart/form-data with field name "file".' });
+      }
 
-  const finishUploadError = (statusCode: number, message: string) => {
-    try { if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath); } catch {}
-    if (vaultFilePath) try { if (fs.existsSync(vaultFilePath)) fs.unlinkSync(vaultFilePath); } catch {}
-    if (progressStreamStarted) {
-      sendUploadProgress({ type: 'error', error: message });
-      res.end();
-      return;
-    }
-    cleanupAndRespond(res, tempFilePath, statusCode, message);
-  };
+      // ── Persist the chunk ──────────────────────────────────
+      const dir = chunkDir(identifier);
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
 
-  try {
-    console.info('[upload] Multipart upload received.', {
-      userId: user.id,
-      username: user.username,
-      originalName: original_name,
-      mimeType: mime_type,
-      declaredSize: size,
-      ttlHours: ttl_hours ?? null,
-      hasUploadSecret: (req.body.upload_secret_key || '').length > 0,
-      tempPath: tempFilePath,
-    });
+      const destPath = chunkPath(identifier, chunkNumber);
+      try {
+        fs.renameSync(multerFile.path, destPath);
+      } catch (renameErr) {
+        // Fallback: copy + delete if rename crosses device boundaries
+        fs.copyFileSync(multerFile.path, destPath);
+        try { fs.unlinkSync(multerFile.path); } catch { /* best effort */ }
+      }
 
-    // ── Optional client-side file secret metadata ─────────────
-    currentStage = 'validate_upload_secret';
-    const uploadSecretRaw = typeof req.body.upload_secret_key === 'string' ? req.body.upload_secret_key.trim() : '';
-    const uploadSecretSaltB64 = typeof req.body.upload_secret_salt_b64 === 'string' ? req.body.upload_secret_salt_b64 : '';
-    const uploadSecretIvB64 = typeof req.body.upload_secret_iv_b64 === 'string' ? req.body.upload_secret_iv_b64 : '';
-    const uploadSecretIterationsRaw = typeof req.body.upload_secret_iterations === 'string' ? req.body.upload_secret_iterations : '';
-    if (uploadSecretRaw.length > 0) {
-      if (uploadSecretRaw.length < 8) return finishUploadError(400, 'Secret key must contain at least 8 characters.');
-      if (!uploadSecretSaltB64 || !uploadSecretIvB64 || !uploadSecretIterationsRaw) return finishUploadError(400, 'Missing client encryption metadata for secret-protected upload.');
-      const parsedIterations = Number(uploadSecretIterationsRaw);
-      if (!Number.isInteger(parsedIterations) || parsedIterations < 100000 || parsedIterations > 1000000) return finishUploadError(400, 'Invalid client encryption iteration count.');
-      const parsedSalt = Buffer.from(uploadSecretSaltB64, 'base64');
-      const parsedIv   = Buffer.from(uploadSecretIvB64,   'base64');
-      if (parsedSalt.length !== 16 || parsedIv.length !== 12) return finishUploadError(400, 'Invalid client encryption salt or IV.');
-      uploadSecretIterations = parsedIterations;
-      uploadSecretSalt = parsedSalt;
-      uploadSecretIv   = parsedIv;
-      uploadSecretHash = await hashFileSecret(uploadSecretRaw);
-    } else if (uploadSecretSaltB64 || uploadSecretIvB64 || uploadSecretIterationsRaw) {
-      return finishUploadError(400, 'Secret metadata provided without a secret key.');
-    }
+      // ── Check whether all chunks have arrived ──────────────
+      const received = countReceivedChunks(identifier);
 
-    // ── Quota checks ──────────────────────────────────────────
-    currentStage = 'quota_lookup';
-    const qReq = await getRequest();
-    qReq.input('qid', sql.NVarChar(50), user.quota_id);
-    const qRes = await qReq.query<Quota>('SELECT id,name,storage_limit_bytes,max_file_size_bytes,max_files,daily_upload_limit_bytes FROM quotas WHERE id=@qid');
-    const quota = qRes.recordset[0];
-    if (!quota) return cleanupAndRespond(res, tempFilePath, 400, 'Quota tier not found.');
+      if (received < totalChunks) {
+        // Still waiting for more chunks — acknowledge this one
+        console.info('[upload] Chunk received (waiting for more).', {
+          userId: req.user!.id,
+          identifier,
+          chunkNumber,
+          received,
+          totalChunks,
+        });
+        return res.json({
+          success: true,
+          done: false,
+          chunk: chunkNumber,
+          received,
+          total: totalChunks,
+        });
+      }
 
-    if (size > quota.max_file_size_bytes) {
-      console.warn('[upload] Rejected by max file size quota.', { userId: user.id, originalName: original_name, declaredSize: size, maxFileSizeBytes: quota.max_file_size_bytes });
-      return cleanupAndRespond(res, tempFilePath, 400, `File too large. Tier "${quota.name}" allows ${Math.round(quota.max_file_size_bytes/1024/1024)}MB per file.`);
-    }
-
-    const cntReq = await getRequest();
-    cntReq.input('ownerId', sql.UniqueIdentifier, req.userId!);
-    const cntRes = await cntReq.query<{cnt:number;used:number}>(
-      "SELECT COUNT(*) AS cnt, ISNULL(SUM(size_bytes),0) AS used FROM files WHERE owner_user_id=@ownerId AND status='Available'"
-    );
-    const { cnt, used } = cntRes.recordset[0];
-    if (cnt >= quota.max_files) {
-      console.warn('[upload] Rejected by file count quota.', { userId: user.id, fileCount: cnt, maxFiles: quota.max_files });
-      return cleanupAndRespond(res, tempFilePath, 400, `File count limit reached (${quota.max_files} files).`);
-    }
-    if (Number(used) + size > Number(quota.storage_limit_bytes)) {
-      console.warn('[upload] Rejected by storage quota.', { userId: user.id, usedBytes: used, incomingSize: size, storageLimitBytes: quota.storage_limit_bytes });
-      return cleanupAndRespond(res, tempFilePath, 400, `Storage full. ${Math.round(used/1024/1024)}MB / ${Math.round(quota.storage_limit_bytes/1024/1024)}MB used.`);
-    }
-
-    // ── Heuristic pre-scan (extension-based, no file I/O) ─────
-    currentStage = 'heuristic_scan';
-    const heuristic = heuristicPreScan(original_name, mime_type);
-    if (heuristic !== null && !heuristic.clean) {
-      console.warn('[upload] Rejected by heuristic pre-scan.', { userId: user.id, originalName: original_name, threats: heuristic.threats });
-      const vibe = await generateLeekuVibe(original_name, false);
-      const threatDetail = heuristic.threats.length > 0 ? heuristic.threats.join('; ') : 'unknown';
-      const logMsg = `Heuristic block: "${original_name}" — ${heuristic.message} [Flags: ${threatDetail}]`;
-      await logSystemEvent(user.id, user.username, 'Scan', 'File', original_name, req, logMsg);
-      return cleanupAndRespond(res, tempFilePath, 422, heuristic.message || vibe);
-    }
-
-    // ── Bitdefender scan (reads the temp file directly from disk) ──
-    currentStage = 'bitdefender_scan';
-    sendUploadProgress({
-      type: 'processing',
-      phase: 'Scanning file',
-      loaded: 50,
-      total: processingTotal,
-    });
-    const scanResult = await scanFilePath(tempFilePath, size);
-    sendUploadProgress({
-      type: 'processing',
-      phase: 'Scan complete',
-      loaded: 250,
-      total: processingTotal,
-    });
-    console.info('[upload] Scan completed.', { userId: user.id, originalName: original_name, scanStatus: scanResult.status, scanDurationMs: scanResult.scanDurationMs });
-    const acceptedWithoutScanner =
-      scanResult.status === 'Unavailable' && ALLOW_UNSCANNED_UPLOADS_IN_DEVELOPMENT;
-
-    if (!scanResult.clean && !acceptedWithoutScanner) {
-      console.warn('[upload] Rejected by Bitdefender scan.', { userId: user.id, originalName: original_name, scanStatus: scanResult.status });
-      const vibe = await generateLeekuVibe(original_name, false);
-      await logSystemEvent(user.id, user.username, 'Scan', 'File', 'rejected', req, `AV block: "${original_name}" — ${scanResult.message}`);
-      return finishUploadError(422, vibe || scanResult.message);
-    }
-    if (acceptedWithoutScanner) {
-      console.warn('[upload] Bitdefender unavailable; accepting upload because NODE_ENV=development.', {
-        userId: user.id,
-        originalName: original_name,
+      // ── All chunks received — merge them into one temp file ─
+      console.info('[upload] All chunks received — merging.', {
+        userId: req.user!.id,
+        identifier,
+        totalChunks,
+        totalSize,
       });
+
+      let mergedPath: string;
+      try {
+        mergedPath = mergeChunks(identifier, totalChunks);
+      } catch (mergeErr) {
+        console.error('[upload] Failed to merge chunks.', {
+          userId: req.user!.id,
+          identifier,
+          error: mergeErr instanceof Error ? mergeErr.message : String(mergeErr),
+        });
+        return res.status(500).json({ error: 'Failed to assemble file chunks. Please try again.' });
+      }
+
+      // ── Synthesise a multer-compatible file object ─────────
+      const mergedStat = fs.statSync(mergedPath);
+      req.file = {
+        fieldname: 'file',
+        originalname: originalName,
+        encoding: '7bit',
+        mimetype: mimeType,
+        destination: UPLOAD_TEMP,
+        filename: `merged_${identifier}`,
+        path: mergedPath,
+        size: mergedStat.size,
+      } as Express.Multer.File;
+
+      // Inject body parameters so the downstream code treats it like a regular upload
+      req.body = req.body || {};
+      req.body.original_name = originalName;
+      req.body.mime_type     = mimeType;
+      req.body.ttl_hours     = (req.query.ttl_hours as string) || null;
+
+      // Fall through to the shared processing pipeline below
     }
-    const persistedScanResult = acceptedWithoutScanner ? 'Clean' : scanResult.status;
-    const persistedScanMessage = acceptedWithoutScanner
-      ? `Development bypass: Bitdefender scanner unavailable; file was not scanned. ${scanResult.message}`
-      : scanResult.message;
 
-    // ── Stream-encrypt directly to vault (constant memory) ─────
-    currentStage = 'encrypt_file';
-    const vaultFileName = generateSecureToken(16) + '.vault';
-    vaultFilePath = path.join(FILE_VAULT, vaultFileName);
+    // ═══════════════════════════════════════════════════════════
+    // SHARED FILE PROCESSING PIPELINE (resumable & direct)
+    // ═══════════════════════════════════════════════════════════
 
-    sendUploadProgress({
-      type: 'processing',
-      phase: 'Encrypting file',
-      loaded: 260,
-      total: processingTotal,
-    });
-    const encryptResult = await encryptFileStream(tempFilePath, vaultFilePath, ({ processedBytes }) => {
-      const encryptedProgress = size > 0 ? Math.min(1, processedBytes / size) : 1;
+    const multerFile = req.file;
+    if (!multerFile) return res.status(400).json({ error: 'No file attached. Use multipart/form-data with field name "file".' });
+
+    const original_name = req.body.original_name || multerFile.originalname;
+    const mime_type     = req.body.mime_type     || multerFile.mimetype || 'application/octet-stream';
+    const ttl_hours     = req.body.ttl_hours     || null;
+    const size          = multerFile.size;
+    const tempFilePath  = multerFile.path;
+
+    const user = req.user!;
+    let currentStage = 'quota_lookup';
+    let vaultFilePath: string | null = null;
+    const streamsProgress = String(req.headers.accept || '').includes('application/x-ndjson');
+    const processingTotal = 1000;
+    let progressStreamStarted = false;
+
+    const sendUploadProgress = (payload: Record<string, unknown>) => {
+      if (!streamsProgress || res.writableEnded) return;
+      if (!progressStreamStarted) {
+        progressStreamStarted = true;
+        res.status(200);
+        res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-cache, no-transform');
+        res.setHeader('X-Accel-Buffering', 'no');
+        res.flushHeaders?.();
+      }
+      res.write(`${JSON.stringify(payload)}\n`);
+    };
+
+    let uploadSecretHash: string | null = null;
+    let uploadSecretSalt: Buffer | null = null;
+    let uploadSecretIv: Buffer | null = null;
+    let uploadSecretIterations: number | null = null;
+
+    const finishUploadError = (statusCode: number, message: string) => {
+      try { if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath); } catch {}
+      if (vaultFilePath) try { if (fs.existsSync(vaultFilePath)) fs.unlinkSync(vaultFilePath); } catch {}
+      if (progressStreamStarted) {
+        sendUploadProgress({ type: 'error', error: message });
+        res.end();
+        return;
+      }
+      cleanupAndRespond(res, tempFilePath, statusCode, message);
+    };
+
+    try {
+      console.info('[upload] Upload received.', {
+        userId: user.id,
+        username: user.username,
+        originalName: original_name,
+        mimeType: mime_type,
+        declaredSize: size,
+        ttlHours: ttl_hours ?? null,
+        hasUploadSecret: (req.body.upload_secret_key || '').length > 0,
+        tempPath: tempFilePath,
+        isResumable,
+      });
+
+      // ── Optional client-side file secret metadata ─────────────
+      currentStage = 'validate_upload_secret';
+      const uploadSecretRaw = typeof req.body.upload_secret_key === 'string' ? req.body.upload_secret_key.trim() : '';
+      const uploadSecretSaltB64 = typeof req.body.upload_secret_salt_b64 === 'string' ? req.body.upload_secret_salt_b64 : '';
+      const uploadSecretIvB64 = typeof req.body.upload_secret_iv_b64 === 'string' ? req.body.upload_secret_iv_b64 : '';
+      const uploadSecretIterationsRaw = typeof req.body.upload_secret_iterations === 'string' ? req.body.upload_secret_iterations : '';
+      if (uploadSecretRaw.length > 0) {
+        if (uploadSecretRaw.length < 8) return finishUploadError(400, 'Secret key must contain at least 8 characters.');
+        if (!uploadSecretSaltB64 || !uploadSecretIvB64 || !uploadSecretIterationsRaw) return finishUploadError(400, 'Missing client encryption metadata for secret-protected upload.');
+        const parsedIterations = Number(uploadSecretIterationsRaw);
+        if (!Number.isInteger(parsedIterations) || parsedIterations < 100000 || parsedIterations > 1000000) return finishUploadError(400, 'Invalid client encryption iteration count.');
+        const parsedSalt = Buffer.from(uploadSecretSaltB64, 'base64');
+        const parsedIv   = Buffer.from(uploadSecretIvB64,   'base64');
+        if (parsedSalt.length !== 16 || parsedIv.length !== 12) return finishUploadError(400, 'Invalid client encryption salt or IV.');
+        uploadSecretIterations = parsedIterations;
+        uploadSecretSalt = parsedSalt;
+        uploadSecretIv   = parsedIv;
+        uploadSecretHash = await hashFileSecret(uploadSecretRaw);
+      } else if (uploadSecretSaltB64 || uploadSecretIvB64 || uploadSecretIterationsRaw) {
+        return finishUploadError(400, 'Secret metadata provided without a secret key.');
+      }
+
+      // ── Quota checks ──────────────────────────────────────────
+      currentStage = 'quota_lookup';
+      const qReq = await getRequest();
+      qReq.input('qid', sql.NVarChar(50), user.quota_id);
+      const qRes = await qReq.query<Quota>('SELECT id,name,storage_limit_bytes,max_file_size_bytes,max_files,daily_upload_limit_bytes FROM quotas WHERE id=@qid');
+      const quota = qRes.recordset[0];
+      if (!quota) return cleanupAndRespond(res, tempFilePath, 400, 'Quota tier not found.');
+
+      if (size > quota.max_file_size_bytes) {
+        console.warn('[upload] Rejected by max file size quota.', { userId: user.id, originalName: original_name, declaredSize: size, maxFileSizeBytes: quota.max_file_size_bytes });
+        return cleanupAndRespond(res, tempFilePath, 400, `File too large. Tier "${quota.name}" allows ${Math.round(quota.max_file_size_bytes/1024/1024)}MB per file.`);
+      }
+
+      const cntReq = await getRequest();
+      cntReq.input('ownerId', sql.UniqueIdentifier, req.userId!);
+      const cntRes = await cntReq.query<{cnt:number;used:number}>(
+        "SELECT COUNT(*) AS cnt, ISNULL(SUM(size_bytes),0) AS used FROM files WHERE owner_user_id=@ownerId AND status='Available'"
+      );
+      const { cnt, used } = cntRes.recordset[0];
+      if (cnt >= quota.max_files) {
+        console.warn('[upload] Rejected by file count quota.', { userId: user.id, fileCount: cnt, maxFiles: quota.max_files });
+        return cleanupAndRespond(res, tempFilePath, 400, `File count limit reached (${quota.max_files} files).`);
+      }
+      if (Number(used) + size > Number(quota.storage_limit_bytes)) {
+        console.warn('[upload] Rejected by storage quota.', { userId: user.id, usedBytes: used, incomingSize: size, storageLimitBytes: quota.storage_limit_bytes });
+        return cleanupAndRespond(res, tempFilePath, 400, `Storage full. ${Math.round(used/1024/1024)}MB / ${Math.round(quota.storage_limit_bytes/1024/1024)}MB used.`);
+      }
+
+      // ── Heuristic pre-scan (extension-based, no file I/O) ─────
+      currentStage = 'heuristic_scan';
+      const heuristic = heuristicPreScan(original_name, mime_type);
+      if (heuristic !== null && !heuristic.clean) {
+        console.warn('[upload] Rejected by heuristic pre-scan.', { userId: user.id, originalName: original_name, threats: heuristic.threats });
+        const vibe = await generateLeekuVibe(original_name, false);
+        const threatDetail = heuristic.threats.length > 0 ? heuristic.threats.join('; ') : 'unknown';
+        const logMsg = `Heuristic block: "${original_name}" — ${heuristic.message} [Flags: ${threatDetail}]`;
+        await logSystemEvent(user.id, user.username, 'Scan', 'File', original_name, req, logMsg);
+        return cleanupAndRespond(res, tempFilePath, 422, heuristic.message || vibe);
+      }
+
+      // ── Bitdefender scan (reads the temp file directly from disk) ──
+      currentStage = 'bitdefender_scan';
+      sendUploadProgress({
+        type: 'processing',
+        phase: 'Scanning file',
+        loaded: 50,
+        total: processingTotal,
+      });
+      const scanResult = await scanFilePath(tempFilePath, size);
+      sendUploadProgress({
+        type: 'processing',
+        phase: 'Scan complete',
+        loaded: 250,
+        total: processingTotal,
+      });
+      console.info('[upload] Scan completed.', { userId: user.id, originalName: original_name, scanStatus: scanResult.status, scanDurationMs: scanResult.scanDurationMs });
+      const acceptedWithoutScanner =
+        scanResult.status === 'Unavailable' && ALLOW_UNSCANNED_UPLOADS_IN_DEVELOPMENT;
+
+      if (!scanResult.clean && !acceptedWithoutScanner) {
+        console.warn('[upload] Rejected by Bitdefender scan.', { userId: user.id, originalName: original_name, scanStatus: scanResult.status });
+        const vibe = await generateLeekuVibe(original_name, false);
+        await logSystemEvent(user.id, user.username, 'Scan', 'File', 'rejected', req, `AV block: "${original_name}" — ${scanResult.message}`);
+        return finishUploadError(422, vibe || scanResult.message);
+      }
+      if (acceptedWithoutScanner) {
+        console.warn('[upload] Bitdefender unavailable; accepting upload because NODE_ENV=development.', {
+          userId: user.id,
+          originalName: original_name,
+        });
+      }
+      const persistedScanResult = acceptedWithoutScanner ? 'Clean' : scanResult.status;
+      const persistedScanMessage = acceptedWithoutScanner
+        ? `Development bypass: Bitdefender scanner unavailable; file was not scanned. ${scanResult.message}`
+        : scanResult.message;
+
+      // ── Stream-encrypt directly to vault (constant memory) ─────
+      currentStage = 'encrypt_file';
+      const vaultFileName = generateSecureToken(16) + '.vault';
+      vaultFilePath = path.join(FILE_VAULT, vaultFileName);
+
       sendUploadProgress({
         type: 'processing',
         phase: 'Encrypting file',
-        loaded: 260 + Math.round(encryptedProgress * 620),
+        loaded: 260,
         total: processingTotal,
       });
-    });
-    const wrapped = wrapKey(encryptResult.key);
-    sendUploadProgress({
-      type: 'processing',
-      phase: 'Encryption complete',
-      loaded: 900,
-      total: processingTotal,
-    });
-    console.info('[upload] Stream-encrypted to vault.', { userId: user.id, originalName: original_name, vaultFileName, encryptedSizeBytes: encryptResult.encryptedSize });
-
-    // ── Clean up the multer temp file ─────────────────────────
-    try { fs.unlinkSync(tempFilePath); } catch (e) { /* best effort */ }
-
-    // ── Prepare metadata & insert DB records ──────────────────
-    currentStage = 'prepare_metadata';
-    const ttlH      = isValidTtl(Number(ttl_hours)) ? Number(ttl_hours) as any : null;
-    const expiresAt = ttlH ? computeExpiresAt(ttlH) : null;
-    const encName   = encryptColumn(original_name);
-    const leekuVibe = await generateLeekuVibe(original_name, true);
-
-    currentStage = 'insert_file_record';
-    sendUploadProgress({
-      type: 'processing',
-      phase: 'Saving file record',
-      loaded: 940,
-      total: processingTotal,
-    });
-    const fileReq = await getRequest();
-    fileReq.input('ownerId', sql.UniqueIdentifier, req.userId!);
-    fileReq.input('nEnc',   sql.VarBinary(2048), encName.ciphertext);
-    fileReq.input('nIv',    sql.VarBinary(16),   encName.iv);
-    fileReq.input('nTag',   sql.VarBinary(16),   encName.authTag);
-    fileReq.input('spath',  sql.NVarChar(1000),  vaultFileName);
-    fileReq.input('mime',   sql.NVarChar(255),   mime_type);
-    fileReq.input('sz',     sql.BigInt,          size);
-    fileReq.input('esz',    sql.BigInt,          encryptResult.encryptedSize);
-    fileReq.input('chk',    sql.Char(64),        encryptResult.checksum);
-    fileReq.input('scan',   sql.NVarChar(20),    persistedScanResult);
-    fileReq.input('smsg',   sql.NVarChar(sql.MAX), persistedScanMessage);
-    fileReq.input('vibe',   sql.NVarChar(500),   leekuVibe);
-    fileReq.input('ttl',    sql.Int,             ttlH);
-    fileReq.input('exp',    sql.DateTimeOffset,  expiresAt);
-    fileReq.input('clientSecretHash', sql.NVarChar(512), uploadSecretHash);
-    fileReq.input('clientCryptoSalt', sql.VarBinary(32), uploadSecretSalt);
-    fileReq.input('clientCryptoIv',   sql.VarBinary(16), uploadSecretIv);
-    fileReq.input('clientCryptoIterations', sql.Int, uploadSecretIterations);
-
-    const fileResult = await fileReq.query<FileRow>(
-      `INSERT INTO files (
-         owner_user_id, original_name_encrypted, original_name_iv, original_name_auth_tag,
-         stored_path, mime_type, size_bytes, encrypted_size_bytes,
-         checksum_sha256, scan_result, scan_message, scanned_at,
-         leeku_vibe, ttl_hours,
-         client_secret_hash, client_crypto_salt, client_crypto_iv, client_crypto_iterations,
-         expires_at, is_encrypted
-       )
-       OUTPUT INSERTED.id, INSERTED.owner_user_id,
-              INSERTED.original_name_encrypted, INSERTED.original_name_iv, INSERTED.original_name_auth_tag,
-              INSERTED.stored_path, INSERTED.mime_type, INSERTED.size_bytes, INSERTED.encrypted_size_bytes,
-              INSERTED.status, INSERTED.checksum_sha256, INSERTED.scan_result, INSERTED.scan_message,
-              INSERTED.is_encrypted, INSERTED.leeku_vibe, INSERTED.ttl_hours,
-              INSERTED.client_secret_hash, INSERTED.client_crypto_salt, INSERTED.client_crypto_iv, INSERTED.client_crypto_iterations,
-              INSERTED.expires_at, INSERTED.created_at
-       VALUES (@ownerId,@nEnc,@nIv,@nTag, @spath,@mime,@sz,@esz, @chk,@scan,@smsg,SYSDATETIMEOFFSET(), @vibe,@ttl,
-               @clientSecretHash,@clientCryptoSalt,@clientCryptoIv,@clientCryptoIterations,
-               @exp,1)`
-    );
-    const newFile = fileResult.recordset[0];
-    console.info('[upload] File record inserted.', { userId: user.id, originalName: original_name, fileId: newFile.id });
-
-    currentStage = 'insert_key_record';
-    sendUploadProgress({
-      type: 'processing',
-      phase: 'Saving encryption keys',
-      loaded: 970,
-      total: processingTotal,
-    });
-    const keyReq = await getRequest();
-    keyReq.input('fid',   sql.UniqueIdentifier, newFile.id);
-    keyReq.input('encK',  sql.VarBinary(64),    wrapped.encryptedKey);
-    keyReq.input('kIv',   sql.VarBinary(16),    wrapped.iv);
-    keyReq.input('kTag',  sql.VarBinary(16),    wrapped.authTag);
-    keyReq.input('fIv',   sql.VarBinary(16),    encryptResult.iv);
-    keyReq.input('fTag',  sql.VarBinary(16),    encryptResult.authTag);
-    await keyReq.query(
-      'INSERT INTO file_encryption_keys (file_id,encrypted_key,key_iv,key_auth_tag,file_iv,file_auth_tag) VALUES (@fid,@encK,@kIv,@kTag,@fIv,@fTag)'
-    );
-
-    currentStage = 'update_storage_usage';
-    const storageReq = await getRequest();
-    storageReq.input('sz', sql.BigInt, size); storageReq.input('id', sql.UniqueIdentifier, req.userId!);
-    await storageReq.query('UPDATE users SET storage_used_bytes=storage_used_bytes+@sz WHERE id=@id');
-
-    currentStage = 'log_upload_event';
-    await logSystemEvent(user.id, user.username, 'Upload', 'File', newFile.id, req,
-      `Uploaded "${original_name}" (${Math.round(size/1024)}KB). Scan: ${acceptedWithoutScanner ? 'development bypass (Bitdefender unavailable)' : scanResult.status}.`);
-
-    const mappedFile = mapFileRow(newFile, user.username);
-    console.info('[upload] Upload completed successfully.', {
-      userId: user.id, username: user.username, originalName: original_name,
-      fileId: newFile.id, scanStatus: scanResult.status, storedScanResult: persistedScanResult, storedPath: newFile.stored_path,
-    });
-
-    if (progressStreamStarted) {
+      const encryptResult = await encryptFileStream(tempFilePath, vaultFilePath, ({ processedBytes }) => {
+        const encryptedProgress = size > 0 ? Math.min(1, processedBytes / size) : 1;
+        sendUploadProgress({
+          type: 'processing',
+          phase: 'Encrypting file',
+          loaded: 260 + Math.round(encryptedProgress * 620),
+          total: processingTotal,
+        });
+      });
+      const wrapped = wrapKey(encryptResult.key);
       sendUploadProgress({
-        type: 'complete',
-        phase: 'Complete',
-        loaded: processingTotal,
+        type: 'processing',
+        phase: 'Encryption complete',
+        loaded: 900,
         total: processingTotal,
-        success: true,
-        message: 'File approved and encrypted!',
-        file: mappedFile,
       });
-      res.end();
-      return;
+      console.info('[upload] Stream-encrypted to vault.', { userId: user.id, originalName: original_name, vaultFileName, encryptedSizeBytes: encryptResult.encryptedSize });
+
+      // ── Clean up the temp file ────────────────────────────
+      try { fs.unlinkSync(tempFilePath); } catch (e) { /* best effort */ }
+
+      // ── Prepare metadata & insert DB records ──────────────────
+      currentStage = 'prepare_metadata';
+      const ttlH      = isValidTtl(Number(ttl_hours)) ? Number(ttl_hours) as any : null;
+      const expiresAt = ttlH ? computeExpiresAt(ttlH) : null;
+      const encName   = encryptColumn(original_name);
+      const leekuVibe = await generateLeekuVibe(original_name, true);
+
+      currentStage = 'insert_file_record';
+      sendUploadProgress({
+        type: 'processing',
+        phase: 'Saving file record',
+        loaded: 940,
+        total: processingTotal,
+      });
+      const fileReq = await getRequest();
+      fileReq.input('ownerId', sql.UniqueIdentifier, req.userId!);
+      fileReq.input('nEnc',   sql.VarBinary(2048), encName.ciphertext);
+      fileReq.input('nIv',    sql.VarBinary(16),   encName.iv);
+      fileReq.input('nTag',   sql.VarBinary(16),   encName.authTag);
+      fileReq.input('spath',  sql.NVarChar(1000),  vaultFileName);
+      fileReq.input('mime',   sql.NVarChar(255),   mime_type);
+      fileReq.input('sz',     sql.BigInt,          size);
+      fileReq.input('esz',    sql.BigInt,          encryptResult.encryptedSize);
+      fileReq.input('chk',    sql.Char(64),        encryptResult.checksum);
+      fileReq.input('scan',   sql.NVarChar(20),    persistedScanResult);
+      fileReq.input('smsg',   sql.NVarChar(sql.MAX), persistedScanMessage);
+      fileReq.input('vibe',   sql.NVarChar(500),   leekuVibe);
+      fileReq.input('ttl',    sql.Int,             ttlH);
+      fileReq.input('exp',    sql.DateTimeOffset,  expiresAt);
+      fileReq.input('clientSecretHash', sql.NVarChar(512), uploadSecretHash);
+      fileReq.input('clientCryptoSalt', sql.VarBinary(32), uploadSecretSalt);
+      fileReq.input('clientCryptoIv',   sql.VarBinary(16), uploadSecretIv);
+      fileReq.input('clientCryptoIterations', sql.Int, uploadSecretIterations);
+
+      const fileResult = await fileReq.query<FileRow>(
+        `INSERT INTO files (
+           owner_user_id, original_name_encrypted, original_name_iv, original_name_auth_tag,
+           stored_path, mime_type, size_bytes, encrypted_size_bytes,
+           checksum_sha256, scan_result, scan_message, scanned_at,
+           leeku_vibe, ttl_hours,
+           client_secret_hash, client_crypto_salt, client_crypto_iv, client_crypto_iterations,
+           expires_at, is_encrypted
+         )
+         OUTPUT INSERTED.id, INSERTED.owner_user_id,
+                INSERTED.original_name_encrypted, INSERTED.original_name_iv, INSERTED.original_name_auth_tag,
+                INSERTED.stored_path, INSERTED.mime_type, INSERTED.size_bytes, INSERTED.encrypted_size_bytes,
+                INSERTED.status, INSERTED.checksum_sha256, INSERTED.scan_result, INSERTED.scan_message,
+                INSERTED.is_encrypted, INSERTED.leeku_vibe, INSERTED.ttl_hours,
+                INSERTED.client_secret_hash, INSERTED.client_crypto_salt, INSERTED.client_crypto_iv, INSERTED.client_crypto_iterations,
+                INSERTED.expires_at, INSERTED.created_at
+         VALUES (@ownerId,@nEnc,@nIv,@nTag, @spath,@mime,@sz,@esz, @chk,@scan,@smsg,SYSDATETIMEOFFSET(), @vibe,@ttl,
+                 @clientSecretHash,@clientCryptoSalt,@clientCryptoIv,@clientCryptoIterations,
+                 @exp,1)`
+      );
+      const newFile = fileResult.recordset[0];
+      console.info('[upload] File record inserted.', { userId: user.id, originalName: original_name, fileId: newFile.id });
+
+      currentStage = 'insert_key_record';
+      sendUploadProgress({
+        type: 'processing',
+        phase: 'Saving encryption keys',
+        loaded: 970,
+        total: processingTotal,
+      });
+      const keyReq = await getRequest();
+      keyReq.input('fid',   sql.UniqueIdentifier, newFile.id);
+      keyReq.input('encK',  sql.VarBinary(64),    wrapped.encryptedKey);
+      keyReq.input('kIv',   sql.VarBinary(16),    wrapped.iv);
+      keyReq.input('kTag',  sql.VarBinary(16),    wrapped.authTag);
+      keyReq.input('fIv',   sql.VarBinary(16),    encryptResult.iv);
+      keyReq.input('fTag',  sql.VarBinary(16),    encryptResult.authTag);
+      await keyReq.query(
+        'INSERT INTO file_encryption_keys (file_id,encrypted_key,key_iv,key_auth_tag,file_iv,file_auth_tag) VALUES (@fid,@encK,@kIv,@kTag,@fIv,@fTag)'
+      );
+
+      currentStage = 'update_storage_usage';
+      const storageReq = await getRequest();
+      storageReq.input('sz', sql.BigInt, size); storageReq.input('id', sql.UniqueIdentifier, req.userId!);
+      await storageReq.query('UPDATE users SET storage_used_bytes=storage_used_bytes+@sz WHERE id=@id');
+
+      currentStage = 'log_upload_event';
+      await logSystemEvent(user.id, user.username, 'Upload', 'File', newFile.id, req,
+        `Uploaded "${original_name}" (${Math.round(size/1024)}KB). Scan: ${acceptedWithoutScanner ? 'development bypass (Bitdefender unavailable)' : scanResult.status}.`);
+
+      const mappedFile = mapFileRow(newFile, user.username);
+      console.info('[upload] Upload completed successfully.', {
+        userId: user.id, username: user.username, originalName: original_name,
+        fileId: newFile.id, scanStatus: scanResult.status, storedScanResult: persistedScanResult, storedPath: newFile.stored_path,
+      });
+
+      if (progressStreamStarted) {
+        sendUploadProgress({
+          type: 'complete',
+          phase: 'Complete',
+          loaded: processingTotal,
+          total: processingTotal,
+          success: true,
+          message: 'File approved and encrypted!',
+          file: mappedFile,
+        });
+        res.end();
+        return;
+      }
+      res.json({ success: true, message: 'File approved and encrypted!', file: mappedFile });
+    } catch (err) {
+      console.error('[POST /api/files/upload] Upload failed.', {
+        userId: user.id, username: user.username, originalName: original_name,
+        stage: currentStage, vaultFilePath,
+        error: err instanceof Error ? err.message : String(err),
+        stack: err instanceof Error ? err.stack : undefined,
+      });
+      // Clean up: delete vault file and temp upload file
+      if (vaultFilePath) try { if (fs.existsSync(vaultFilePath)) fs.unlinkSync(vaultFilePath); } catch {}
+      try { if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath); } catch {}
+      if (progressStreamStarted) {
+        sendUploadProgress({ type: 'error', error: 'Upload failed. Please try again.' });
+        res.end();
+        return;
+      }
+      res.status(500).json({ error: 'Upload failed. Please try again.' });
     }
-    res.json({ success: true, message: 'File approved and encrypted!', file: mappedFile });
-  } catch (err) {
-    console.error('[POST /api/files/upload] Upload failed.', {
-      userId: user.id, username: user.username, originalName: original_name,
-      stage: currentStage, vaultFilePath,
-      error: err instanceof Error ? err.message : String(err),
-      stack: err instanceof Error ? err.stack : undefined,
-    });
-    // Clean up: delete vault file if created AND temp upload file
-    if (vaultFilePath) try { if (fs.existsSync(vaultFilePath)) fs.unlinkSync(vaultFilePath); } catch {}
-    try { if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath); } catch {}
-    if (progressStreamStarted) {
-      sendUploadProgress({ type: 'error', error: 'Upload failed. Please try again.' });
-      res.end();
-      return;
-    }
-    res.status(500).json({ error: 'Upload failed. Please try again.' });
   }
-});
+);
 
 /**
  * Helper: clean up the temp upload file and send an error response.
