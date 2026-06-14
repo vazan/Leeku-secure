@@ -45,7 +45,9 @@ import DashboardSidebar, {
 import TransferProgress, {
   type TransferState,
 } from "@/app/shared/components/common/transfer-progress";
-import FileTypeIcon from "@/app/shared/components/common/file-type-icon";
+import FileTypeIcon, {
+  getFileTypeBadge,
+} from "@/app/shared/components/common/file-type-icon";
 import { downloadWithProgress } from "@/app/shared/utils/download-with-progress";
 import { encryptFileForUploadWithSecret } from "@/app/shared/utils/client-file-secret";
 
@@ -1497,6 +1499,7 @@ function FileThumbnail({
   iconClassName,
   onOpenVideo,
   interactiveVideo = false,
+  showTypeBadge = true,
 }: {
   file: FileMetadata;
   token: string;
@@ -1504,6 +1507,7 @@ function FileThumbnail({
   iconClassName: string;
   onOpenVideo?: () => void;
   interactiveVideo?: boolean;
+  showTypeBadge?: boolean;
 }) {
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
@@ -1649,6 +1653,7 @@ function FileThumbnail({
           fileName={file.original_name}
           mimeType={file.mime_type}
           className={iconClassName}
+          showBadge={showTypeBadge}
         />
       )}
     </div>
@@ -1706,7 +1711,11 @@ function FileCard({
           iconClassName="h-8 w-8"
           onOpenVideo={onOpenVideo}
           interactiveVideo
+          showTypeBadge={false}
         />
+        <span className="pointer-events-none absolute left-2 top-2 flex h-8 min-w-8 items-center justify-center rounded-md border border-[var(--border-subtle)] bg-[color-mix(in_srgb,var(--bg-elevated)_78%,transparent)] px-2 text-[10px] font-semibold leading-none text-[var(--text-secondary)] shadow-[var(--shadow-hairline)] backdrop-blur-sm">
+          {getFileTypeBadge(file.original_name)}
+        </span>
         <div ref={menuRef} className="absolute right-2 top-2">
           <button
             aria-label="File options"

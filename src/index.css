@@ -259,12 +259,12 @@ a {
   --admin-border-success: var(--admin-success);
   --admin-border-warning: var(--admin-warning);
   --admin-border-secondary: var(--admin-secondary);
-  --admin-panel-shadow: #ff008c 7px 7px 0 -2px, #00eaf0 0px 0px 0px 1px;
+  --admin-panel-shadow: #00eaf0 0px 0px 0px 1px;
   --gradient-header-glass: linear-gradient(rgba(16, 21, 27, 0.92) 0px, rgba(16, 21, 27, 0.84) 100%);
   --gradient-stripes-x: repeating-linear-gradient(to right, #00eaf0 0px, #00eaf0 3px, transparent 3px, transparent 7px);
   --gradient-soft-glow: radial-gradient(circle, rgba(0, 238, 244, 0.13) 0px, transparent 55%);
   --shadow-hairline: rgba(0, 238, 244, 0.2) 0px 1px 0px 0px;
-  --shadow-panel: #ff008c 7px 7px 0 -2px, #00eaf0 0px 0px 0px 1px;
+  --shadow-panel: #00eaf0 0px 0px 0px 1px;
   --shadow-popover: rgba(0, 0, 0, 0.55) 0px 5px 14px 0px;
 
   --background: #10151b;
@@ -308,6 +308,11 @@ a {
     radial-gradient(circle at 92% 82%, rgba(255, 0, 140, 0.18), transparent 38%),
     #10151b;
   background-attachment: fixed;
+}
+
+.leeku [class*="shadow-[var(--shadow-panel)]"],
+.leeku [class*="shadow-[var(--admin-panel-shadow)]"] {
+  filter: drop-shadow(7px 7px 0 var(--error-linear));
 }
 
 .leeku [class~="rounded-xl"],

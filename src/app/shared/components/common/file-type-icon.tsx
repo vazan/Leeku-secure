@@ -220,14 +220,20 @@ function badgeFor(fileName: string) {
   return ext ? ext.toUpperCase().slice(0, 4) : "FILE";
 }
 
+export function getFileTypeBadge(fileName: string) {
+  return badgeFor(fileName);
+}
+
 export default function FileTypeIcon({
   fileName,
   mimeType,
   className,
+  showBadge = true,
 }: {
   fileName: string;
   mimeType: string;
   className: string;
+  showBadge?: boolean;
 }) {
   const customIconUrl = customIconFor(fileName);
   const kind = kindFromFile(fileName, mimeType);
@@ -244,9 +250,11 @@ export default function FileTypeIcon({
   return (
     <span className="relative grid h-full w-full place-items-center">
       {iconForKind(kind, className)}
-      <span className="pointer-events-none absolute bottom-1 rounded bg-black/70 px-1 py-0.5 text-[8px] font-semibold leading-none text-white">
-        {badge}
-      </span>
+      {showBadge && (
+        <span className="pointer-events-none absolute bottom-1 rounded bg-black/70 px-1 py-0.5 text-[8px] font-semibold leading-none text-white">
+          {badge}
+        </span>
+      )}
     </span>
   );
 }
