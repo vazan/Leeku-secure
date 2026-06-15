@@ -934,18 +934,16 @@ export default function UserDashboard({
         total: file.size,
         startedAt,
       });
-      await downloadWithProgress(fileUrl, file.original_name, {
-        headers: authHeaders(token),
-        signal: controller.signal,
-        onProgress: ({ loaded, total }) =>
-          setTransfer({
-            direction: "download",
-            name: file.original_name,
-            loaded,
-            total: total || file.size,
-            startedAt,
-          }),
-      });
+
+      // ── Direct browser download (streams to disk, no RAM usage) ──
+      const anchor = document.createElement('a');
+      anchor.href = fileUrl;
+      anchor.download = file.original_name;
+      anchor.style.display = 'none';
+      document.body.appendChild(anchor);
+      anchor.click();
+      document.body.removeChild(anchor);
+
       setTransfer({
         direction: "download",
         name: file.original_name,
@@ -961,6 +959,7 @@ export default function UserDashboard({
           ),
         1800,
       );
+      
     } catch (reason) {
       setTransfer(null);
       notifyError(reason instanceof Error ? reason.message : "Download unavailable.");
