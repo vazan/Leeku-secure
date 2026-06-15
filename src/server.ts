@@ -139,10 +139,22 @@ interface PrivateDownloadSession {
 const PRIVATE_DOWNLOAD_SESSION_TTL_MS = 10 * 60_000;
 const privateDownloadSessions = new Map<string, PrivateDownloadSession>();
 
+// Track temp files from the direct download path so the sweep can clean them up
+const orphanedTempFiles = new Set<string>();
+
+function registerTempFile(tempPath: string): void {
+  orphanedTempFiles.add(tempPath);
+}
+
+function unregisterTempFile(tempPath: string): void {
+  orphanedTempFiles.delete(tempPath);
+}
+
 function removePrivateDownloadSession(downloadId: string): void {
   const session = privateDownloadSessions.get(downloadId);
   if (!session) return;
   privateDownloadSessions.delete(downloadId);
+  unregisterTempFile(session.tempFile);
   try {
     if (fs.existsSync(session.tempFile)) fs.unlinkSync(session.tempFile);
   } catch {
@@ -152,10 +164,65 @@ function removePrivateDownloadSession(downloadId: string): void {
 
 function sweepPrivateDownloadSessions(): void {
   const now = Date.now();
-  for (const [downloadId, session] of privateDownloadSessions.entries()) {
-    if (session.expiresAt <= now) {
-      removePrivateDownloadSession(downloadId);
+  // ... existing session cleanup ...
+
+  // Also scan the temp directory for any leeku-dl-*.tmp files older than 30 min
+  if (fs.existsSync(UPLOAD_TEMP)) {
+    const entries = fs.readdirSync(UPLOAD_TEMP);
+    for (const entry of entries) {
+      if (entry.startsWith('leeku-dl-') && entry.endsWith('.tmp')) {
+        const fullPath = path.join(UPLOAD_TEMP, entry);
+        try {
+          const stats = fs.statSync(fullPath);
+          if (now - stats.mtimeMs > 30 * 60_000) {  // older than 30 min
+            fs.unlinkSync(fullPath);
+            console.log(`[server] Sweep cleaned up stray temp file: ${entry}`);
+          }
+        } catch { /* best-effort */ }
+      }
     }
+  }
+}
+
+// ── Periodic sweep of expired download sessions ──
+let privateDownloadSweepTimer: ReturnType<typeof setInterval> | null = null;
+
+function startPrivateDownloadSweep(intervalMs: number = 30_000): void {
+  if (privateDownloadSweepTimer) return;
+  privateDownloadSweepTimer = setInterval(() => {
+    sweepPrivateDownloadSessions();
+  }, intervalMs);
+  // Allow the timer to keep the process alive if it's the only thing running
+  if (privateDownloadSweepTimer && typeof privateDownloadSweepTimer === 'object' && 'unref' in privateDownloadSweepTimer) {
+    privateDownloadSweepTimer.unref();
+  }
+}
+
+function stopPrivateDownloadSweep(): void {
+  if (privateDownloadSweepTimer) {
+    clearInterval(privateDownloadSweepTimer);
+    privateDownloadSweepTimer = null;
+  }
+}
+
+// ── Startup cleanup: remove any stale .tmp files left from a previous crash ──
+function cleanupStaleTempFiles(tempDir: string): void {
+  try {
+    if (!fs.existsSync(tempDir)) return;
+    const entries = fs.readdirSync(tempDir);
+    for (const entry of entries) {
+      if (entry.startsWith('leeku-dl-') && entry.endsWith('.tmp')) {
+        const fullPath = path.join(tempDir, entry);
+        try {
+          fs.unlinkSync(fullPath);
+          console.log(`[server] Cleaned up stale temp file: ${entry}`);
+        } catch (err) {
+          console.warn(`[server] Could not remove stale temp file ${entry}:`, err);
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('[server] Error during stale temp file cleanup:', err);
   }
 }
 
@@ -2251,60 +2318,83 @@ app.get('/api/files/:id/preview', authenticateUser as express.RequestHandler, as
 
 app.get('/api/files/:id/download', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
   const fileId = req.params.id;
+  let tempPath: string | null = null;
+  let tempFileCleaned = false;
+
+  const cleanupTemp = () => {
+    if (tempFileCleaned) return;
+    tempFileCleaned = true;
+    if (tempPath) {
+      unregisterTempFile(tempPath);
+      try { if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath); } catch {}
+    }
+  };
+
   try {
     const fileReq = await getRequest();
     fileReq.input('id', sql.UniqueIdentifier, fileId);
     const fileResult = await fileReq.query<FileRow>(
       `SELECT id,owner_user_id,original_name_encrypted,original_name_iv,original_name_auth_tag,
-              stored_path,size_bytes,status,mime_type,encrypted_size_bytes,checksum_sha256,
-              scan_result,scan_message,is_encrypted,leeku_vibe,ttl_hours,
-              client_secret_hash,client_crypto_salt,client_crypto_iv,client_crypto_iterations,
-              expires_at,created_at
-       FROM files WHERE id=@id`
+      stored_path,size_bytes,status,mime_type,encrypted_size_bytes,checksum_sha256,
+      scan_result,scan_message,is_encrypted,leeku_vibe,ttl_hours,
+      client_secret_hash,client_crypto_salt,client_crypto_iv,client_crypto_iterations,
+      expires_at,created_at
+      FROM files WHERE id=@id`
     );
-    if (!fileResult.recordset.length) return res.status(404).json({ error: 'File not found.' });
+    if (!fileResult.recordset.length) { cleanupTemp(); return res.status(404).json({ error: 'File not found.' }); }
     const file = fileResult.recordset[0];
     if (file.owner_user_id !== req.userId && req.user!.role !== 'Admin')
-      return res.status(403).json({ error: 'You do not have permission to download this file.' });
+      { cleanupTemp(); return res.status(403).json({ error: 'You do not have permission to download this file.' }); }
     if (file.status === 'Blocked')
-      return res.status(410).json({ error: 'Blocked files cannot be downloaded.' });
+      { cleanupTemp(); return res.status(410).json({ error: 'Blocked files cannot be downloaded.' }); }
 
     const vaultPath = path.join(FILE_VAULT, file.stored_path);
-    if (!fs.existsSync(vaultPath)) return res.status(410).json({ error: 'Vault file not found.' });
+    if (!fs.existsSync(vaultPath)) { cleanupTemp(); return res.status(410).json({ error: 'Vault file not found.' }); }
 
     const keyReq = await getRequest();
     keyReq.input('fid', sql.UniqueIdentifier, fileId);
     const keyRes = await keyReq.query<{ encrypted_key: Buffer; key_iv: Buffer; key_auth_tag: Buffer; file_iv: Buffer; file_auth_tag: Buffer }>(
       'SELECT encrypted_key,key_iv,key_auth_tag,file_iv,file_auth_tag FROM file_encryption_keys WHERE file_id=@fid'
     );
-    if (!keyRes.recordset.length) return res.status(500).json({ error: 'Encryption key not found.' });
+    if (!keyRes.recordset.length) { cleanupTemp(); return res.status(500).json({ error: 'Encryption key not found.' }); }
 
     const keyRow = keyRes.recordset[0];
     const fileKey = unwrapKey(keyRow.encrypted_key, keyRow.key_iv, keyRow.key_auth_tag);
     const secretHeaderRaw = req.headers['x-file-secret'];
     const providedSecret = Array.isArray(secretHeaderRaw)
-      ? String(secretHeaderRaw[0] || '').trim()
-      : String(secretHeaderRaw || '').trim();
+    ? String(secretHeaderRaw[0] || '').trim()
+    : String(secretHeaderRaw || '').trim();
     if (file.client_secret_hash) {
-      if (!providedSecret) return res.status(403).json({ error: 'This file requires a secret key to download.' });
+      if (!providedSecret) { cleanupTemp(); return res.status(403).json({ error: 'This file requires a secret key to download.' }); }
       if (!(await verifyFileSecret(providedSecret, file.client_secret_hash)))
-        return res.status(403).json({ error: 'Incorrect secret key.' });
+        { cleanupTemp(); return res.status(403).json({ error: 'Incorrect secret key.' }); }
     }
 
     // ── Streaming decrypt to temp file (avoids 2 GiB Buffer limit) ──
-    const tempPath = buildUniqueTempFilePath(UPLOAD_TEMP, 'leeku-dl', fileId);
+    tempPath = buildUniqueTempFilePath(UPLOAD_TEMP, 'leeku-dl', fileId);
+    // Register the temp file so the periodic sweep can find it if cleanup is missed
+    registerTempFile(tempPath);
+
     await decryptFileStream(vaultPath, tempPath, fileKey, keyRow.file_iv, keyRow.file_auth_tag);
+
+    if (clientDisconnected) {
+      cleanupTemp();
+      return;
+    }
+
+    // If the client disconnected during decryption, stop here (cleanupTemp already called via req.close)
+    if (tempFileCleaned) return;
 
     // Verify checksum via streaming (constant memory)
     const actualChecksum = await computeFileChecksum(tempPath);
     if (actualChecksum !== file.checksum_sha256) {
-      try { fs.unlinkSync(tempPath); } catch {}
+      cleanupTemp();
       return res.status(500).json({ error: 'File integrity check failed.' });
     }
 
     if (file.client_secret_hash) {
       if (!file.client_crypto_salt || !file.client_crypto_iv || !file.client_crypto_iterations) {
-        try { fs.unlinkSync(tempPath); } catch {}
+        cleanupTemp();
         return res.status(500).json({ error: 'Secret-key metadata is missing for this file.' });
       }
       const protectedPayload = fs.readFileSync(tempPath);
@@ -2315,13 +2405,13 @@ app.get('/api/files/:id/download', authenticateUser as express.RequestHandler, a
         );
         fs.writeFileSync(tempPath, plaintext);
       } catch {
-        try { fs.unlinkSync(tempPath); } catch {}
+        cleanupTemp();
         return res.status(403).json({ error: 'Incorrect secret key.' });
       }
     }
 
     const originalName = decryptColumn(file.original_name_encrypted, file.original_name_iv, file.original_name_auth_tag);
-    const safeName = originalName.replace(/"/g, '\\"');
+    const safeName = originalName.replace(/\"/g, '\\"');
     const stat = fs.statSync(tempPath);
 
     res.setHeader('Content-Type', file.mime_type || 'application/octet-stream');
@@ -2331,11 +2421,15 @@ app.get('/api/files/:id/download', authenticateUser as express.RequestHandler, a
 
     const readStream = fs.createReadStream(tempPath);
     readStream.pipe(res);
-    readStream.on('end',    () => { try { fs.unlinkSync(tempPath); } catch {} });
-    readStream.on('error',  () => { try { fs.unlinkSync(tempPath); } catch {} });
-    res.on('finish',        () => { try { fs.unlinkSync(tempPath); } catch {} });
-    res.on('close',         () => { try { fs.unlinkSync(tempPath); } catch {} });
-  } catch (err) { console.error('[GET /api/files/:id/download]', err); res.status(500).json({ error: 'Download failed.' }); }
+    readStream.on('end',   cleanupTemp);
+    readStream.on('error', cleanupTemp);
+    res.on('finish',       cleanupTemp);
+    res.on('close',        cleanupTemp);
+  } catch (err) {
+    cleanupTemp();
+    console.error('[GET /api/files/:id/download]', err);
+    if (!res.headersSent) res.status(500).json({ error: 'Download failed.' });
+  }
 });
 
 app.post('/api/files/:id/download/prepare', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
@@ -2385,6 +2479,7 @@ app.post('/api/files/:id/download/prepare', authenticateUser as express.RequestH
 
     const originalName = decryptColumn(file.original_name_encrypted, file.original_name_iv, file.original_name_auth_tag);
     const tempFile = buildUniqueTempFilePath(UPLOAD_TEMP, 'leeku-dl', fileId);
+    registerTempFile(tempFile);
     const encryptedSize = Number(file.encrypted_size_bytes || 0) || fs.statSync(vaultPath).size;
     const sessionId = crypto.randomUUID();
     const session: PrivateDownloadSession = {
@@ -2403,6 +2498,17 @@ app.post('/api/files/:id/download/prepare', authenticateUser as express.RequestH
       claimed: false,
     };
     privateDownloadSessions.set(sessionId, session);
+    let clientDisconnected = false;
+    req.on('close', () => {
+      clientDisconnected = true;
+    });
+
+    if (clientDisconnected) {
+      removePrivateDownloadSession(sessionId);
+      return;
+    }
+
+    const current = privateDownloadSessions.get(sessionId);
 
     const keyRow = keyRes.recordset[0];
     const fileKey = unwrapKey(keyRow.encrypted_key, keyRow.key_iv, keyRow.key_auth_tag);
@@ -2432,6 +2538,7 @@ app.post('/api/files/:id/download/prepare', authenticateUser as express.RequestH
           active.total = totalBytes;
           active.expiresAt = Date.now() + PRIVATE_DOWNLOAD_SESSION_TTL_MS;
         });
+
         if (checksum !== file.checksum_sha256) {
           throw new Error('File integrity check failed.');
         }
@@ -2532,8 +2639,14 @@ app.get('/api/files/:id/download/:downloadId/file', authenticateUser as express.
 
   session.claimed = true;
 
+  // Listen for early client disconnect before the stream is set up
+  let streamPiped = false;
+  req.on('close', () => {
+    removePrivateDownloadSession(downloadId);
+  });
+
   try {
-    const safeName = session.originalName.replace(/"/g, '\\"');
+    const safeName = session.originalName.replace(/\"/g, '\\"');
     const stat = fs.statSync(session.tempFile);
 
     res.setHeader('Content-Type', session.mimeType);
@@ -2542,6 +2655,7 @@ app.get('/api/files/:id/download/:downloadId/file', authenticateUser as express.
     await logSystemEvent(req.userId!, req.user!.username, 'Download', 'File', fileId, req, `Direct download of "${session.originalName}".`);
 
     const readStream = fs.createReadStream(session.tempFile);
+    streamPiped = true;
     readStream.pipe(res);
     readStream.on('end', () => removePrivateDownloadSession(downloadId));
     readStream.on('error', () => removePrivateDownloadSession(downloadId));
@@ -2550,7 +2664,7 @@ app.get('/api/files/:id/download/:downloadId/file', authenticateUser as express.
   } catch (err) {
     session.claimed = false;
     console.error('[GET /api/files/:id/download/:downloadId/file]', err);
-    res.status(500).json({ error: 'Download failed.' });
+    if (!res.headersSent) res.status(500).json({ error: 'Download failed.' });
   }
 });
 
@@ -3010,6 +3124,12 @@ async function bootstrap() {
   // 6. Start expiry cleanup
   startExpiryCleanup(getExpiredFiles, markFilesExpired, logExpiredFile);
 
+  // 6b. Clean up stale download temp files from previous crashes
+  cleanupStaleTempFiles(UPLOAD_TEMP);
+
+  // 6c. Start periodic sweep of expired download sessions
+  startPrivateDownloadSweep();
+
   // 7. Static files & SPA fallback
   const distPath = path.join(process.cwd(), 'dist');
   app.use(express.static(distPath));
@@ -3045,15 +3165,19 @@ async function bootstrap() {
     }));
   }
 
-  // 7. Graceful shutdown
+  // 9. Graceful shutdown
   const shutdown = async (sig: string) => {
     console.log(`[server] ${sig} — shutting down.`);
+    stopPrivateDownloadSweep();
+    // Sweep once more to clean up any remaining temp files
+    sweepPrivateDownloadSessions();
     stopExpiryCleanup();
     await closePool();
     process.exit(0);
   };
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT',  () => shutdown('SIGINT'));
+
 }
 
 bootstrap().catch(err => {
