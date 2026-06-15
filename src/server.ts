@@ -165,7 +165,11 @@ function removePrivateDownloadSession(downloadId: string): void {
 
 function sweepPrivateDownloadSessions(): void {
   const now = Date.now();
-  // ... existing session cleanup ...
+  for (const [id, session] of privateDownloadSessions.entries()) {
+    if (now > session.expiresAt) {
+      removePrivateDownloadSession(id);
+    }
+  }
 
   // Also scan the temp directory for any leeku-dl-*.tmp files older than 30 min
   if (fs.existsSync(UPLOAD_TEMP)) {
@@ -2630,7 +2634,7 @@ app.get('/api/files/:id/download/:downloadId/status', authenticateUser as expres
   const { id: fileId, downloadId } = req.params;
   const session = privateDownloadSessions.get(downloadId);
   if (!session || session.fileId !== fileId || session.userId !== req.userId) {
-    return res.status(404).json({ error: 'Download session not found.' });
+    return res.status(404).json({ error: 'Download session not found. Wait a few seconds.' });
   }
 
   res.json({
@@ -2651,7 +2655,7 @@ app.get('/api/files/:id/download/:downloadId/file', authenticateUser as express.
   const { id: fileId, downloadId } = req.params;
   const session = privateDownloadSessions.get(downloadId);
   if (!session || session.fileId !== fileId || session.userId !== req.userId) {
-    return res.status(404).json({ error: 'Download session not found.' });
+    return res.status(404).json({ error: 'Download session not found. Wait a few seconds.' });
   }
   if (session.status === 'error') {
     const errorMessage = session.error || 'Download failed.';
