@@ -535,7 +535,7 @@ const apiLimiter = rateLimit({
 // each count — for a 10 GB file that's ~200 requests.
 const uploadLimiter = rateLimit({
   windowMs: 60_000,
-  max: 300,
+  max: 800,
   standardHeaders: true, legacyHeaders: false,
   message: { error: 'Rate limit exceeded.' },
 });
@@ -543,7 +543,11 @@ const uploadLimiter = rateLimit({
 app.use('/api/auth', authLimiter);
 // Apply general limiter to all /api routes EXCEPT /api/files/upload
 app.use('/api', (req, res, next) => {
-  if (req.path === '/files/upload' || req.path === '/files/upload/') {
+  if (
+    req.path === '/files/upload' || 
+    req.path === '/files/upload/' ||
+    req.path.startsWith('/public/share')
+  ) {
     next();
   } else {
     apiLimiter(req, res, next);
@@ -551,12 +555,6 @@ app.use('/api', (req, res, next) => {
 });
 // Apply the higher limit just to the upload endpoint
 app.use('/api/files/upload', uploadLimiter);
-app.use('/api/public/share', rateLimit({
-  windowMs: 60_000,
-  max: parseInt(process.env.PUBLIC_SHARE_RATE_LIMIT_RPM || '60', 10),
-  standardHeaders: true, legacyHeaders: false,
-  message: { error: 'Too many shared-link requests. Please wait before trying again.' },
-}));
 
 // ──────────────────────────────────────────────────────────────
 // JWT helpers
