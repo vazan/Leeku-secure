@@ -381,32 +381,32 @@ const buildPromise = (async () => {
 
       void (async () => {
         try {
-          await decryptFileStream(vaultFile, tempFile, fileKey, row.file_iv, row.file_auth_tag, ({ processedBytes, totalBytes }) => {
+            const hash = crypto.createHash('sha256');
+
+            await decryptFileStream(vaultFile, tempFile, fileKey, row.file_iv, row.file_auth_tag, ({ processedBytes, totalBytes }) => {
+                const current = downloadSessions.get(sessionId);
+                if (!current) return;
+                current.phase = 'decrypting';
+                current.loaded = processedBytes;
+                current.total = totalBytes;
+                current.expiresAt = Date.now() + DOWNLOAD_SESSION_TTL_MS;
+            }, hash);   // ← pass hash into decryptFileStream
+
             const current = downloadSessions.get(sessionId);
             if (!current) return;
-            current.phase = 'decrypting';
-            current.loaded = processedBytes;
-            current.total = totalBytes;
-            current.expiresAt = Date.now() + DOWNLOAD_SESSION_TTL_MS;
-          });
+            current.phase = 'verifying';
+            current.loaded = 0;
+            current.total = current.sizeBytes || 1;
 
-          const current = downloadSessions.get(sessionId);
-          if (!current) return;
-          current.phase = 'verifying';
-          current.loaded = 0;
-          current.total = current.sizeBytes || 1;
+            // ── Checksum already computed during decryption — just compare ──
+            const checksum = hash.digest('hex');
+            if (checksum !== row.checksum_sha256) {
+                throw new Error('File integrity check failed.');
+            }
 
-          const checksum = await computeFileChecksum(tempFile, ({ processedBytes, totalBytes }) => {
-            const active = downloadSessions.get(sessionId);
-            if (!active) return;
-            active.phase = 'verifying';
-            active.loaded = processedBytes;
-            active.total = totalBytes;
-            active.expiresAt = Date.now() + DOWNLOAD_SESSION_TTL_MS;
-          });
-          if (checksum !== row.checksum_sha256) {
-            throw new Error('File integrity check failed.');
-          }
+            current.loaded = current.sizeBytes;
+            current.total = current.sizeBytes;
+
 
           if (row.client_secret_hash) {
             if (!row.client_crypto_salt || !row.client_crypto_iv || !row.client_crypto_iterations) {
