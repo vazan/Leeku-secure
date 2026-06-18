@@ -1,5 +1,5 @@
 -- ============================================================
--- LeekuSecure-Prod Database Creation & Configuration Script
+-- LeekuSecure Database Creation & Configuration Script
 -- SQL Server 2022 (Compatibility Level 160)
 -- ============================================================
 -- This is the production-ready schema from SSMS export.
@@ -24,12 +24,12 @@ GO
 --   L:\LOGS  = Transaction log location
 -- ============================================================
 
-CREATE DATABASE [LeekuSecure-Prod]
+CREATE DATABASE [LeekuSecure]
  CONTAINMENT = NONE
  ON  PRIMARY 
-( NAME = N'LeekuSecure_prod', FILENAME = N'P:\DATA\LeekuSecure_prod.mdf' , SIZE = 73728KB , MAXSIZE = UNLIMITED, FILEGROWTH = 65536KB )
+( NAME = N'LeekuSecure', FILENAME = N'P:\DATA\LeekuSecure.mdf' , SIZE = 73728KB , MAXSIZE = UNLIMITED, FILEGROWTH = 65536KB )
  LOG ON 
-( NAME = N'LeekuSecure_prod_log', FILENAME = N'L:\LOGS\LeekuSecure_prod_log.ldf' , SIZE = 73728KB , MAXSIZE = 2048GB , FILEGROWTH = 65536KB )
+( NAME = N'LeekuSecure_log', FILENAME = N'L:\LOGS\LeekuSecure_log.ldf' , SIZE = 73728KB , MAXSIZE = 2048GB , FILEGROWTH = 65536KB )
  WITH CATALOG_COLLATION = DATABASE_DEFAULT, LEDGER = OFF
 GO
 
@@ -37,94 +37,94 @@ GO
 -- Database Configuration
 -- ============================================================
 
-ALTER DATABASE [LeekuSecure-Prod] SET COMPATIBILITY_LEVEL = 160
+ALTER DATABASE [LeekuSecure] SET COMPATIBILITY_LEVEL = 160
 GO
 
 -- Enable full-text search capability
 IF (1 = FULLTEXTSERVICEPROPERTY('IsFullTextInstalled'))
 begin
-    EXEC [LeekuSecure-Prod].[dbo].[sp_fulltext_database] @action = 'enable'
+    EXEC [LeekuSecure].[dbo].[sp_fulltext_database] @action = 'enable'
 end
 GO
 
 -- ANSI Compliance
-ALTER DATABASE [LeekuSecure-Prod] SET ANSI_NULL_DEFAULT OFF 
+ALTER DATABASE [LeekuSecure] SET ANSI_NULL_DEFAULT OFF 
 GO
-ALTER DATABASE [LeekuSecure-Prod] SET ANSI_NULLS OFF 
+ALTER DATABASE [LeekuSecure] SET ANSI_NULLS OFF 
 GO
-ALTER DATABASE [LeekuSecure-Prod] SET ANSI_PADDING OFF 
+ALTER DATABASE [LeekuSecure] SET ANSI_PADDING OFF 
 GO
-ALTER DATABASE [LeekuSecure-Prod] SET ANSI_WARNINGS OFF 
+ALTER DATABASE [LeekuSecure] SET ANSI_WARNINGS OFF 
 GO
-ALTER DATABASE [LeekuSecure-Prod] SET ARITHABORT OFF 
+ALTER DATABASE [LeekuSecure] SET ARITHABORT OFF 
 GO
 
 -- Maintenance & Cleanup
-ALTER DATABASE [LeekuSecure-Prod] SET AUTO_CLOSE OFF 
+ALTER DATABASE [LeekuSecure] SET AUTO_CLOSE OFF 
 GO
-ALTER DATABASE [LeekuSecure-Prod] SET AUTO_SHRINK OFF 
+ALTER DATABASE [LeekuSecure] SET AUTO_SHRINK OFF 
 GO
-ALTER DATABASE [LeekuSecure-Prod] SET AUTO_UPDATE_STATISTICS ON 
+ALTER DATABASE [LeekuSecure] SET AUTO_UPDATE_STATISTICS ON 
 GO
-ALTER DATABASE [LeekuSecure-Prod] SET AUTO_UPDATE_STATISTICS_ASYNC OFF 
+ALTER DATABASE [LeekuSecure] SET AUTO_UPDATE_STATISTICS_ASYNC OFF 
 GO
 
 -- Concurrency & Transactions
-ALTER DATABASE [LeekuSecure-Prod] SET CURSOR_CLOSE_ON_COMMIT OFF 
+ALTER DATABASE [LeekuSecure] SET CURSOR_CLOSE_ON_COMMIT OFF 
 GO
-ALTER DATABASE [LeekuSecure-Prod] SET CURSOR_DEFAULT  GLOBAL 
+ALTER DATABASE [LeekuSecure] SET CURSOR_DEFAULT  GLOBAL 
 GO
-ALTER DATABASE [LeekuSecure-Prod] SET CONCAT_NULL_YIELDS_NULL OFF 
+ALTER DATABASE [LeekuSecure] SET CONCAT_NULL_YIELDS_NULL OFF 
 GO
-ALTER DATABASE [LeekuSecure-Prod] SET NUMERIC_ROUNDABORT OFF 
+ALTER DATABASE [LeekuSecure] SET NUMERIC_ROUNDABORT OFF 
 GO
-ALTER DATABASE [LeekuSecure-Prod] SET QUOTED_IDENTIFIER OFF 
+ALTER DATABASE [LeekuSecure] SET QUOTED_IDENTIFIER OFF 
 GO
-ALTER DATABASE [LeekuSecure-Prod] SET RECURSIVE_TRIGGERS OFF 
+ALTER DATABASE [LeekuSecure] SET RECURSIVE_TRIGGERS OFF 
 GO
 
 -- Service Broker (for async messaging)
-ALTER DATABASE [LeekuSecure-Prod] SET  ENABLE_BROKER 
+ALTER DATABASE [LeekuSecure] SET  ENABLE_BROKER 
 GO
 
 -- Isolation Level & Snapshots
-ALTER DATABASE [LeekuSecure-Prod] SET DATE_CORRELATION_OPTIMIZATION OFF 
+ALTER DATABASE [LeekuSecure] SET DATE_CORRELATION_OPTIMIZATION OFF 
 GO
-ALTER DATABASE [LeekuSecure-Prod] SET TRUSTWORTHY OFF 
+ALTER DATABASE [LeekuSecure] SET TRUSTWORTHY OFF 
 GO
-ALTER DATABASE [LeekuSecure-Prod] SET ALLOW_SNAPSHOT_ISOLATION OFF 
+ALTER DATABASE [LeekuSecure] SET ALLOW_SNAPSHOT_ISOLATION OFF 
 GO
-ALTER DATABASE [LeekuSecure-Prod] SET PARAMETERIZATION SIMPLE 
+ALTER DATABASE [LeekuSecure] SET PARAMETERIZATION SIMPLE 
 GO
-ALTER DATABASE [LeekuSecure-Prod] SET READ_COMMITTED_SNAPSHOT ON 
+ALTER DATABASE [LeekuSecure] SET READ_COMMITTED_SNAPSHOT ON 
 GO
-ALTER DATABASE [LeekuSecure-Prod] SET HONOR_BROKER_PRIORITY OFF 
+ALTER DATABASE [LeekuSecure] SET HONOR_BROKER_PRIORITY OFF 
 GO
 
 -- Recovery & Backup Strategy
-ALTER DATABASE [LeekuSecure-Prod] SET RECOVERY FULL 
+ALTER DATABASE [LeekuSecure] SET RECOVERY FULL 
 GO
-ALTER DATABASE [LeekuSecure-Prod] SET  MULTI_USER 
+ALTER DATABASE [LeekuSecure] SET  MULTI_USER 
 GO
-ALTER DATABASE [LeekuSecure-Prod] SET PAGE_VERIFY CHECKSUM  
+ALTER DATABASE [LeekuSecure] SET PAGE_VERIFY CHECKSUM  
 GO
-ALTER DATABASE [LeekuSecure-Prod] SET DB_CHAINING OFF 
+ALTER DATABASE [LeekuSecure] SET DB_CHAINING OFF 
 GO
 
 -- Advanced Options
-ALTER DATABASE [LeekuSecure-Prod] SET FILESTREAM( NON_TRANSACTED_ACCESS = OFF ) 
+ALTER DATABASE [LeekuSecure] SET FILESTREAM( NON_TRANSACTED_ACCESS = OFF ) 
 GO
-ALTER DATABASE [LeekuSecure-Prod] SET TARGET_RECOVERY_TIME = 60 SECONDS 
+ALTER DATABASE [LeekuSecure] SET TARGET_RECOVERY_TIME = 60 SECONDS 
 GO
-ALTER DATABASE [LeekuSecure-Prod] SET DELAYED_DURABILITY = DISABLED 
+ALTER DATABASE [LeekuSecure] SET DELAYED_DURABILITY = DISABLED 
 GO
-ALTER DATABASE [LeekuSecure-Prod] SET ACCELERATED_DATABASE_RECOVERY = OFF  
+ALTER DATABASE [LeekuSecure] SET ACCELERATED_DATABASE_RECOVERY = OFF  
 GO
 
 -- Query Store (for query performance insights)
-ALTER DATABASE [LeekuSecure-Prod] SET QUERY_STORE = ON
+ALTER DATABASE [LeekuSecure] SET QUERY_STORE = ON
 GO
-ALTER DATABASE [LeekuSecure-Prod] SET QUERY_STORE (
+ALTER DATABASE [LeekuSecure] SET QUERY_STORE (
     OPERATION_MODE = READ_WRITE, 
     CLEANUP_POLICY = (STALE_QUERY_THRESHOLD_DAYS = 30), 
     DATA_FLUSH_INTERVAL_SECONDS = 900, 
@@ -141,7 +141,7 @@ GO
 -- Switch to Database & Create Security Context
 -- ============================================================
 
-USE [LeekuSecure-Prod]
+USE [LeekuSecure]
 GO
 
 -- Create application user (assumes login already exists)
@@ -782,11 +782,11 @@ GO
 
 USE [master]
 GO
-ALTER DATABASE [LeekuSecure-Prod] SET  READ_WRITE 
+ALTER DATABASE [LeekuSecure] SET  READ_WRITE 
 GO
 
 PRINT '====================================================='
-PRINT 'LeekuSecure-Prod Database Creation Complete'
+PRINT 'LeekuSecure Database Creation Complete'
 PRINT '====================================================='
 PRINT 'Tables created: users, files, file_encryption_keys,'
 PRINT '                share_links, refresh_tokens, system_logs, quotas'

@@ -1,49 +1,58 @@
 -- ============================================================
--- Leeku-Secure Common SQL Queries
--- Reference for application data access patterns
--- ============================================================
--- This document contains the most frequently used SQL queries
--- in the Leeku-Secure application, sourced from src/server.ts
--- and organized by feature area.
---
--- NOTE: Parameterized queries use @paramName syntax.
--- In TypeScript/mssql, parameters are added via request.input()
+-- Leeku-Secure SQL Query Reference
+-- Common SQL patterns for application development
 -- ============================================================
 
--- ============================================================
--- AUTHENTICATION & TOKEN MANAGEMENT
--- ============================================================
+# Common SQL Queries Reference
 
--- 1. Insert a new refresh token
+This document contains frequently used SQL queries extracted from the application, organized by feature area.
+
+**NOTE:** All queries use `@paramName` placeholders for parameterized queries. Parameters prevent SQL injection.
+
+---
+
+## Authentication & Token Management
+
+### 1. Insert a refresh token
+```sql
 INSERT INTO refresh_tokens (id, user_id, token_hash, expires_at, created_at, revoked_at, ip_address, user_agent)
 VALUES (NEWID(), @userId, @tokenHash, @expiresAt, SYSDATETIMEOFFSET(), NULL, @ipAddress, @userAgent);
+```
 
--- 2. Revoke a refresh token by hash (idempotent - use COALESCE to prevent re-update)
+### 2. Revoke a refresh token by hash (idempotent)
+```sql
 UPDATE refresh_tokens 
 SET revoked_at = COALESCE(revoked_at, SYSDATETIMEOFFSET()) 
 WHERE token_hash = @tokenHash;
+```
 
--- 3. Revoke all tokens for a user (logout all sessions)
+### 3. Revoke all tokens for a user (logout all sessions)
+```sql
 UPDATE refresh_tokens 
 SET revoked_at = COALESCE(revoked_at, SYSDATETIMEOFFSET())
 WHERE user_id = @userId;
+```
 
--- 4. Clean up expired and revoked tokens (periodic maintenance)
+### 4. Clean up expired and revoked tokens
+```sql
 DELETE FROM refresh_tokens
 WHERE expires_at < SYSDATETIMEOFFSET() OR revoked_at IS NOT NULL;
+```
 
--- 5. Find user by email hash (fast lookup using HMAC index)
-SELECT 
-    id, email_encrypted, email_iv, email_auth_tag,
-    username_encrypted, username_iv, username_auth_tag,
-    password_hash, role, quota_id, storage_used_bytes, status,
-    failed_login_count, locked_until, last_login_at,
-    email_verified, email_verification_token, email_verification_expires,
-    deletion_token, deletion_token_expires, created_at
+### 5. Find user by email hash
+```sql
+SELECT id, email_encrypted, email_iv, email_auth_tag,
+       username_encrypted, username_iv, username_auth_tag,
+       password_hash, role, quota_id, storage_used_bytes, status,
+       failed_login_count, locked_until, last_login_at,
+       email_verified, email_verification_token, email_verification_expires,
+       deletion_token, deletion_token_expires, created_at
 FROM users
 WHERE email_hash = @emailHash;
+```
 
--- 6. Find user by username hash (fast lookup)
+### 6. Find user by username hash
+```sql
 SELECT id, email_encrypted, email_iv, email_auth_tag,
        username_encrypted, username_iv, username_auth_tag,
        password_hash, role, quota_id, storage_used_bytes, status,
@@ -52,27 +61,21 @@ SELECT id, email_encrypted, email_iv, email_auth_tag,
        deletion_token, deletion_token_expires, created_at
 FROM users
 WHERE username_hash = @usernameHash;
+```
 
--- 7. Update failed login count and account lockout
-UPDATE users 
-SET failed_login_count = @count, locked_until = @lockedUntil 
-WHERE id = @userId;
+---
 
--- 8. Reset failed login count after successful authentication
-UPDATE users 
-SET failed_login_count = 0, locked_until = NULL, last_login_at = SYSDATETIMEOFFSET() 
-WHERE id = @userId;
+## User Registration & Account Management
 
--- ============================================================
--- USER REGISTRATION & ACCOUNT MANAGEMENT
--- ============================================================
-
--- 9. Check for duplicate email or username during registration
+### 7. Check for duplicate email or username
+```sql
 SELECT 
     (SELECT COUNT(*) FROM users WHERE email_hash = @emailHash) AS emailExists,
     (SELECT COUNT(*) FROM users WHERE username_hash = @usernameHash) AS usernameExists;
+```
 
--- 10. Insert new user during registration
+### 8. Insert new user during registration
+```sql
 INSERT INTO users (
     id, email_encrypted, email_iv, email_auth_tag, email_hash,
     username_encrypted, username_iv, username_auth_tag, username_hash,
@@ -81,9 +84,7 @@ INSERT INTO users (
     email_verified, email_verification_token, email_verification_expires,
     deletion_token, deletion_token_expires, created_at
 )
-OUTPUT INSERTED.id, INSERTED.email_encrypted, INSERTED.email_iv, INSERTED.email_auth_tag,
-       INSERTED.username_encrypted, INSERTED.username_iv, INSERTED.username_auth_tag,
-       INSERTED.role, INSERTED.quota_id, INSERTED.status, INSERTED.created_at
+OUTPUT INSERTED.*
 VALUES (
     NEWID(), @emailEncrypted, @emailIv, @emailAuthTag, @emailHash,
     @usernameEncrypted, @usernameIv, @usernameAuthTag, @usernameHash,
@@ -92,71 +93,56 @@ VALUES (
     0, @verificationToken, @verificationExpires,
     NULL, NULL, SYSDATETIMEOFFSET()
 );
+```
 
--- 11. Verify user email
-SELECT id, email_verified, email_verification_expires
-FROM users
-WHERE id = @userId;
-
+### 9. Verify user email
+```sql
 UPDATE users 
 SET email_verified = 1, email_verification_token = NULL, email_verification_expires = NULL 
 WHERE id = @userId;
+```
 
--- 12. Check for duplicate username when updating profile
-SELECT COUNT(*) AS count 
-FROM users 
-WHERE username_hash = @usernameHash AND id != @userId;
-
--- 13. Check for duplicate email when updating profile
-SELECT COUNT(*) AS c 
-FROM users 
-WHERE email_hash = @emailHash AND id != @userId;
-
--- 14. Update user profile (username, email, password)
+### 10. Update user profile (username/email/password)
+```sql
 UPDATE users 
 SET username_encrypted = @un, username_iv = @uni, username_auth_tag = @unat,
     username_hash = @unh, email_encrypted = @em, email_iv = @emi, 
     email_auth_tag = @emat, email_hash = @emh, password_hash = @ph
-WHERE id = @id
-OUTPUT INSERTED.*;
-
--- 15. Request account deletion (set deletion token)
-SELECT id, email_encrypted, email_iv, email_auth_tag,
-       username_encrypted, username_iv, username_auth_tag,
-       password_hash, role, quota_id, storage_used_bytes, status,
-       deletion_token, deletion_token_expires, created_at
-FROM users
 WHERE id = @userId;
+```
 
+### 11. Request account deletion (set deletion token)
+```sql
 UPDATE users 
 SET deletion_token = @token, deletion_token_expires = @expiresAt 
 WHERE id = @userId;
+```
 
--- 16. Cancel account deletion
-UPDATE users 
-SET deletion_token = NULL, deletion_token_expires = NULL 
-WHERE id = @userId;
-
--- 17. Delete user account (cascade deletes files, shares, tokens)
+### 12. Delete user account (cascades to files, shares, tokens)
+```sql
 DELETE FROM users 
 WHERE id = @userId;
+```
 
--- ============================================================
--- FILE MANAGEMENT
--- ============================================================
+---
 
--- 18. List files for a user (paginated example)
+## File Management
+
+### 13. List user's files (paginated)
+```sql
 SELECT id, owner_user_id,
        original_name_encrypted, original_name_iv, original_name_auth_tag,
        stored_path, mime_type, size_bytes, encrypted_size_bytes,
        status, checksum_sha256, is_encrypted, scan_result, scan_message, scanned_at,
        leeku_vibe, ttl_hours, expires_at, deleted_at, created_at
 FROM files
-WHERE owner_user_id = @userId AND deleted_at IS NULL AND expires_at > SYSDATETIMEOFFSET()
+WHERE owner_user_id = @userId AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > SYSDATETIMEOFFSET())
 ORDER BY created_at DESC
 OFFSET @offset ROWS FETCH NEXT @pageSize ROWS ONLY;
+```
 
--- 19. Get file metadata
+### 14. Get file metadata
+```sql
 SELECT id, owner_user_id,
        original_name_encrypted, original_name_iv, original_name_auth_tag,
        stored_path, mime_type, size_bytes, encrypted_size_bytes,
@@ -164,294 +150,340 @@ SELECT id, owner_user_id,
        leeku_vibe, ttl_hours, expires_at, deleted_at, created_at
 FROM files
 WHERE id = @fileId;
+```
 
--- 20. Check file ownership (security)
+### 15. Check file ownership (security)
+```sql
 SELECT COUNT(*) AS c
 FROM files
 WHERE id = @fileId AND owner_user_id = @userId;
+```
 
--- 21. Mark file as deleted (soft delete)
+### 16. Mark file as deleted (soft delete)
+```sql
 UPDATE files 
 SET deleted_at = SYSDATETIMEOFFSET() 
 WHERE id = @fileId AND owner_user_id = @userId;
+```
 
--- 22. Hard delete file (permanent removal)
+### 17. Hard delete file (permanent removal)
+```sql
 DELETE FROM files 
 WHERE id = @fileId AND owner_user_id = @userId;
+```
 
--- 23. Get per-file encryption key
-SELECT file_id, encrypted_key, key_iv, key_auth_tag, file_iv, file_auth_tag
+### 18. Get per-file encryption key
+```sql
+SELECT file_id, encrypted_key, key_iv, key_auth_tag, file_iv, file_auth_tag, algorithm, created_at
 FROM file_encryption_keys
 WHERE file_id = @fileId;
+```
 
--- 24. Insert file encryption key
-INSERT INTO file_encryption_keys (file_id, encrypted_key, key_iv, key_auth_tag, file_iv, file_auth_tag)
-VALUES (@fileId, @encryptedKey, @keyIv, @keyAuthTag, @fileIv, @fileAuthTag);
+### 19. Insert file encryption key
+```sql
+INSERT INTO file_encryption_keys (file_id, encrypted_key, key_iv, key_auth_tag, file_iv, file_auth_tag, algorithm, created_at)
+VALUES (@fileId, @encryptedKey, @keyIv, @keyAuthTag, @fileIv, @fileAuthTag, 'AES-256-GCM', SYSDATETIMEOFFSET());
+```
 
--- 25. Update file scan result
+### 20. Update file scan result
+```sql
 UPDATE files 
 SET scan_result = @scanResult, scan_message = @scanMessage, scanned_at = SYSDATETIMEOFFSET(),
     leeku_vibe = @leekuVibe, status = CASE WHEN @scanResult = 'Infected' THEN 'Blocked' ELSE status END
 WHERE id = @fileId;
+```
 
--- 26. Get user storage quota info
-SELECT id, name, storage_limit_bytes, max_file_size_bytes, max_files, daily_upload_limit_bytes 
-FROM quotas 
-WHERE id = @quotaId;
-
--- 27. Update user storage used
+### 21. Update user storage used
+```sql
 UPDATE users 
 SET storage_used_bytes = storage_used_bytes + @sizeBytes 
 WHERE id = @userId;
+```
 
--- 28. Check daily upload limit
+### 22. Check daily upload limit
+```sql
 SELECT ISNULL(SUM(size_bytes), 0) AS totalUploaded
 FROM files
 WHERE owner_user_id = @userId AND CAST(created_at AS DATE) = CAST(GETDATE() AS DATE);
+```
 
--- ============================================================
--- SHARE LINKS
--- ============================================================
+---
 
--- 29. Create a share link
-INSERT INTO share_links (id, file_id, public_token, password_hash, expires_at, max_downloads, download_count, is_active, created_at)
-VALUES (NEWID(), @fileId, @publicToken, @passwordHash, @expiresAt, @maxDownloads, 0, 1, SYSDATETIMEOFFSET());
+## Share Links
 
--- 30. Get share link by public token
-SELECT id, file_id, public_token, password_hash, expires_at, max_downloads, download_count, is_active, created_at
+### 23. Create a share link
+```sql
+INSERT INTO share_links (id, file_id, public_token, password_hash, expires_at, max_downloads, download_count, is_active, allow_external_preview, created_at)
+VALUES (NEWID(), @fileId, @publicToken, @passwordHash, @expiresAt, @maxDownloads, 0, 1, 0, SYSDATETIMEOFFSET());
+```
+
+### 24. Get share link by public token
+```sql
+SELECT id, file_id, public_token, password_hash, expires_at, max_downloads, download_count, is_active, allow_external_preview, created_at
 FROM share_links
 WHERE public_token = @publicToken;
+```
 
--- 31. Increment share link download count (atomic)
-UPDATE share_links 
-SET download_count = download_count + 1 
-WHERE id = @shareLinkId;
+### 25. Increment share link download count (atomic)
+```sql
+EXEC sp_IncrementDownloadCount @PublicToken = @token;
+```
 
--- 32. Check if share link is active and not expired
+### 26. Check if share link is valid
+```sql
 SELECT is_active, expires_at, max_downloads, download_count
 FROM share_links
-WHERE id = @shareLinkId;
+WHERE id = @shareLinkId
+  AND is_active = 1
+  AND (expires_at IS NULL OR expires_at > SYSDATETIMEOFFSET())
+  AND (max_downloads IS NULL OR download_count < max_downloads);
+```
 
--- 33. Disable a share link
+### 27. Disable a share link
+```sql
 UPDATE share_links 
 SET is_active = 0 
 WHERE id = @shareLinkId;
+```
 
--- 34. Delete a share link
-DELETE FROM share_links 
-WHERE id = @shareLinkId AND file_id IN (
-    SELECT id FROM files WHERE owner_user_id = @userId
-);
+---
 
--- ============================================================
--- SYSTEM LOGGING & AUDIT
--- ============================================================
+## System Logging & Audit
 
--- 35. Insert system log entry (audit trail)
-INSERT INTO system_logs (user_id, username_snapshot, event_type, target_type, target_id, ip_address, message)
-VALUES (@userId, @usernameSnapshot, @eventType, @targetType, @targetId, @ipAddress, @message);
+### 28. Insert system log entry
+```sql
+INSERT INTO system_logs (user_id, username_snapshot, event_type, target_type, target_id, ip_address, message, created_at)
+VALUES (@userId, @usernameSnapshot, @eventType, @targetType, @targetId, @ipAddress, @message, SYSDATETIMEOFFSET());
+```
 
--- 36. Get recent logs for a user
+### 29. Get recent logs for a user
+```sql
 SELECT id, user_id, username_snapshot, event_type, target_type, target_id, ip_address, message, created_at
 FROM system_logs
 WHERE user_id = @userId
 ORDER BY created_at DESC
 OFFSET @offset ROWS FETCH NEXT @pageSize ROWS ONLY;
+```
 
--- 37. Get logs for a specific event type
+### 30. Get logs for specific event type
+```sql
 SELECT id, user_id, username_snapshot, event_type, target_type, target_id, ip_address, message, created_at
 FROM system_logs
 WHERE event_type = @eventType
 ORDER BY created_at DESC
 OFFSET @offset ROWS FETCH NEXT @pageSize ROWS ONLY;
+```
 
--- 38. Find failed scan events (security monitoring)
+### 31. Find failed scan events (security monitoring)
+```sql
 SELECT id, user_id, username_snapshot, event_type, target_type, target_id, ip_address, message, created_at
 FROM system_logs
-WHERE event_type = 'Scan' AND message LIKE '%Blocked%'
+WHERE event_type = 'Scan' AND message LIKE '%Infected%'
 ORDER BY created_at DESC;
+```
 
--- ============================================================
--- ADMIN / MONITORING QUERIES
--- ============================================================
+---
 
--- 39. Get platform statistics
+## Admin & Monitoring
+
+### 32. Get platform statistics
+```sql
 SELECT
     (SELECT COUNT(*) FROM users WHERE status = 'Active') AS totalUsers,
     (SELECT COUNT(*) FROM files WHERE status = 'Available') AS totalFiles,
     (SELECT ISNULL(SUM(storage_used_bytes), 0) FROM users WHERE status = 'Active') AS storageUsedBytes,
     (SELECT COUNT(*) FROM files WHERE CAST(created_at AS DATE) = CAST(GETDATE() AS DATE)) AS uploadsToday,
     (SELECT COUNT(*) FROM files WHERE status = 'Blocked') AS blockedFiles;
+```
 
--- 40. Count failed scans (malware)
-SELECT COUNT(*) AS failedScans 
-FROM system_logs 
-WHERE event_type = 'Scan' AND message LIKE '%Blocked%';
-
--- 41. Get all quotas
-SELECT id, name, storage_limit_bytes, max_file_size_bytes, max_files, daily_upload_limit_bytes 
-FROM quotas 
-ORDER BY storage_limit_bytes;
-
--- 42. Get user list (admin dashboard)
+### 33. Get user list (admin dashboard)
+```sql
 SELECT id, email_hash, username_hash, role, quota_id, storage_used_bytes, status,
        failed_login_count, locked_until, last_login_at, email_verified, created_at
 FROM users
 WHERE status = 'Active'
 ORDER BY created_at DESC
 OFFSET @offset ROWS FETCH NEXT @pageSize ROWS ONLY;
+```
 
--- 43. Suspend a user account (admin action)
+### 34. Suspend a user account
+```sql
 UPDATE users 
 SET status = 'Suspended' 
 WHERE id = @userId;
+```
 
--- 44. Unsuspend a user account (admin action)
-UPDATE users 
-SET status = 'Active' 
-WHERE id = @userId;
+### 35. Get expired files for cleanup
+```sql
+EXEC sp_GetExpiredFiles;
+```
 
--- ============================================================
--- MAINTENANCE & CLEANUP QUERIES
--- ============================================================
+---
 
--- 45. Delete expired share links
+## Maintenance & Cleanup
+
+### 36. Delete expired share links
+```sql
 DELETE FROM share_links
 WHERE expires_at < SYSDATETIMEOFFSET() AND is_active = 1;
+```
 
--- 46. Delete expired files (soft-deleted only, archived)
-DELETE FROM files
-WHERE deleted_at IS NOT NULL AND deleted_at < DATEADD(day, -90, SYSDATETIMEOFFSET());
-
--- 47. Delete expired email verification tokens
+### 37. Delete expired email verification tokens
+```sql
 UPDATE users
 SET email_verification_token = NULL, email_verification_expires = NULL
 WHERE email_verification_expires < SYSDATETIMEOFFSET() AND email_verified = 0;
+```
 
--- 48. List files approaching expiration (for reminders)
+### 38. List files approaching expiration (for reminders)
+```sql
 SELECT id, owner_user_id, stored_path, mime_type, size_bytes, ttl_hours, expires_at, created_at
 FROM files
 WHERE status = 'Available' AND expires_at IS NOT NULL
   AND expires_at < DATEADD(hour, 24, SYSDATETIMEOFFSET())
   AND expires_at > SYSDATETIMEOFFSET()
 ORDER BY expires_at ASC;
+```
 
--- 49. Hard delete expired files (PERMANENT - use with caution!)
-DELETE FROM files
-WHERE status = 'Available' AND expires_at < SYSDATETIMEOFFSET();
+### 39. Mark expired files as deleted (after physical deletion)
+```sql
+DECLARE @ids dbo.GuidList;
+INSERT INTO @ids VALUES (id1), (id2), (id3), ...;
+EXEC sp_MarkFilesExpired @ids;
+```
 
--- 50. Reset failed login count for locked accounts (admin batch operation)
+### 40. Reset failed login count for locked accounts
+```sql
 UPDATE users
 SET failed_login_count = 0, locked_until = NULL
 WHERE locked_until < SYSDATETIMEOFFSET();
+```
 
--- ============================================================
--- SECURITY & COMPLIANCE QUERIES
--- ============================================================
+---
 
--- 51. GDPR Subject Access Request: Get all data for a user
+## Security & Compliance (GDPR)
+
+### 41. GDPR Subject Access Request - All User Data
+```sql
 -- Personal info
-SELECT 'users' AS table_name, id, email_hash, username_hash, role, quota_id, 
-       storage_used_bytes, status, created_at
-FROM users
-WHERE id = @userId;
+SELECT 'users' AS table_name, * FROM users WHERE id = @userId;
 
 -- User's files
-SELECT 'files' AS table_name, id, original_name_encrypted, mime_type, size_bytes, 
-       status, checksum_sha256, scan_result, created_at
-FROM files
-WHERE owner_user_id = @userId;
+SELECT 'files' AS table_name, * FROM files WHERE owner_user_id = @userId;
 
 -- User's share links
-SELECT 'share_links' AS table_name, id, public_token, is_active, download_count, created_at
-FROM share_links
-WHERE file_id IN (SELECT id FROM files WHERE owner_user_id = @userId);
+SELECT 'share_links' AS table_name, sl.* FROM share_links sl
+INNER JOIN files f ON sl.file_id = f.id
+WHERE f.owner_user_id = @userId;
 
 -- User's activity logs
-SELECT 'system_logs' AS table_name, id, event_type, target_type, target_id, 
-       ip_address, message, created_at
-FROM system_logs
+SELECT 'system_logs' AS table_name, * FROM system_logs 
 WHERE user_id = @userId
 ORDER BY created_at DESC;
+```
 
--- 52. Audit: Files modified in last 30 days
+### 42. Audit trail - Files created in last 30 days
+```sql
 SELECT id, owner_user_id, original_name_encrypted, mime_type, size_bytes, status,
        scan_result, scanned_at, created_at
 FROM files
 WHERE created_at >= DATEADD(day, -30, SYSDATETIMEOFFSET())
 ORDER BY created_at DESC;
+```
 
--- 53. Security: Find suspicious activity (multiple failed logins)
+### 43. Find suspicious activity (multiple failed logins)
+```sql
 SELECT id, email_hash, username_hash, failed_login_count, locked_until, last_login_at, created_at
 FROM users
-WHERE failed_login_count > 3 OR locked_until > SYSDATETIMEOFFSET();
+WHERE failed_login_count > 3 OR locked_until > SYSDATETIMEOFFSET()
+ORDER BY failed_login_count DESC;
+```
 
--- ============================================================
--- INDEX OPTIMIZATION QUERIES
--- ============================================================
+---
 
--- 54. Find missing indexes (SQL Server DMV query)
-SELECT 
-    d.equality_columns,
-    d.inequality_columns,
-    s.avg_total_user_cost,
-    s.avg_user_impact,
-    s.user_seeks,
-    s.user_scans,
-    s.user_lookups
-FROM sys.dm_db_missing_index_details d
-INNER JOIN sys.dm_db_missing_index_groups g ON d.index_handle = g.index_handle
-INNER JOIN sys.dm_db_missing_index_groups_stats s ON g.index_group_id = s.group_id
-WHERE database_id = DB_ID()
-ORDER BY s.avg_user_impact DESC;
+## Application Integration Notes
 
--- 55. Check index usage statistics
-SELECT 
-    OBJECT_NAME(ius.object_id) AS table_name,
-    i.name AS index_name,
-    ius.user_seeks,
-    ius.user_scans,
-    ius.user_lookups,
-    ius.user_updates
-FROM sys.dm_db_index_usage_stats ius
-INNER JOIN sys.indexes i ON ius.object_id = i.object_id AND ius.index_id = i.index_id
-WHERE database_id = DB_ID()
-ORDER BY ius.user_seeks + ius.user_scans + ius.user_lookups DESC;
+### Using Stored Procedures (Recommended)
 
--- ============================================================
--- PERFORMANCE HINTS & NOTES
--- ============================================================
-/*
-PARAMETERIZED QUERIES:
-- All queries above use @paramName placeholders.
-- In TypeScript with mssql package:
-  const req = new sql.Request();
-  req.input('userId', sql.UniqueIdentifier, userIdGuid);
-  req.input('tokenHash', sql.Char(64), hashedToken);
-  const result = await req.query(sqlString);
+Instead of inline SQL, use these stored procedures:
 
-INDEXES:
-- email_hash and username_hash are UNIQUE for fast lookups during auth.
-- owner_user_id on files enables quick retrieval of user's files.
-- created_at indexes on files and system_logs optimize date-range queries.
-- Composite indexes (user_id, event_type, created_at) optimize audit queries.
+```javascript
+// Example in Node.js
+const sql = require('mssql');
 
-SOFT DELETES:
-- Files use deleted_at for logical deletion (data preservation).
-- Share links use is_active flag for deactivation without deletion.
-- Physical deletion is deferred 90+ days for compliance.
+// Increment download counter (atomic, prevents race conditions)
+const req = new sql.Request(pool);
+req.input('PublicToken', sql.Char(32), publicToken);
+await req.execute('sp_IncrementDownloadCount');
 
-ENCRYPTION:
-- email_encrypted, username_encrypted, original_name_encrypted are ciphertext (VARBINARY).
-- _iv and _auth_tag columns store GCM cryptographic artifacts.
-- email_hash, username_hash, checksum_sha256 are unencrypted hashes for lookups/integrity.
+// Get expired files for cleanup
+const result = await req.execute('sp_GetExpiredFiles');
+const expiredFiles = result.recordset;
 
-IDENTITY & AUTO-INCREMENT:
-- system_logs.id is BIGINT IDENTITY (auto-incrementing) for sequential log IDs.
-- Prevents race conditions in audit logging.
+// Mark files as expired (safe batch operation)
+const ids = new sql.Table('GuidList');
+ids.columns.add('id', sql.UniqueIdentifier);
+fileIds.forEach(id => ids.rows.add(id));
+req.input('FileIds', ids);
+await req.execute('sp_MarkFilesExpired');
 
-PERFORMANCE GOTCHAS:
-- Avoid SELECT * on encrypted columns without filtering by indexed _hash columns first.
-- LIKE queries on NVARCHAR(MAX) columns (message, scan_message) may be slow; consider full-text search for large datasets.
-- Deletion cascades (users → files → share_links) can be slow on large datasets; batch deletes if needed.
-*/
+// Record failed login attempt
+req.input('EmailHash', sql.Char(64), emailHash);
+req.input('MaxAttempts', sql.Int, 5);
+req.input('LockoutMinutes', sql.Int, 15);
+await req.execute('sp_RecordFailedLogin');
+
+// Reset login counter on success
+req.input('UserId', sql.UniqueIdentifier, userId);
+await req.execute('sp_ResetLoginAttempts');
+```
+
+### Parameterized Query Example
+
+```javascript
+// Always use parameters to prevent SQL injection
+const req = new sql.Request(pool);
+req.input('userId', sql.UniqueIdentifier, userId);
+req.input('offset', sql.Int, 0);
+req.input('pageSize', sql.Int, 20);
+
+const result = await req.query(`
+  SELECT * FROM files 
+  WHERE owner_user_id = @userId
+  ORDER BY created_at DESC
+  OFFSET @offset ROWS FETCH NEXT @pageSize ROWS ONLY
+`);
+```
+
+### Performance Tips
+
+```sql
+-- ✅ FAST: Uses indexed columns
+SELECT * FROM files WHERE owner_user_id = @userId AND status = 'Available'
+
+-- ✅ FAST: Uses filtered index
+SELECT * FROM files WHERE expires_at <= GETDATE() AND status = 'Available'
+
+-- ⚠️ SLOW: Full table scan (LIKE on unindexed column)
+SELECT * FROM system_logs WHERE message LIKE '%searchterm%'
+
+-- ⚠️ SLOW: Implicit conversion (prevents index use)
+SELECT * FROM files WHERE created_at > '2024-01-01'  -- STRING, not DATETIMEOFFSET
+```
+
+---
+
+## References
+
+- **All queries:** From [src/server.ts](../../src/server.ts)
+- **TypeScript interfaces:** See server.ts lines 578-620
+- **Stored procedures:** See production_schema.sql
+- **Data types:** Consult VALIDATION.md or production_schema.sql
+
+---
+
+## Questions?
+
+- See README.md for quick start
+- See VALIDATION.md for validation queries
+- See production_schema.sql for schema documentation
