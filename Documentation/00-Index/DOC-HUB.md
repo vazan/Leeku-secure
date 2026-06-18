@@ -23,7 +23,16 @@ Leeku Secure is a self-hosted encrypted file vault platform deployed on Windows 
 | Deployment Guide | `Documentation/01-Technical/DEPLOYMENT.md` | Production deployment instructions for Windows Server 2022 with IIS ARR reverse proxy ✅ CONFIRMED |
 | Security Controls | `Documentation/04-Risk-And-Corrections/SECURITY.md` | Security controls catalogue and threat model covering encryption, authentication, AV scanning, and network hardening ✅ CONFIRMED |
 | QA Report | `Documentation/04-Risk-And-Corrections/DOC-QA-REPORT.md` | Documentation quality-assurance gate report with coverage scores and remediation log ✅ CONFIRMED |
+| Debt Remediation Playbook | `Documentation/04-Risk-And-Corrections/DEBT-REMEDIATION-PLAYBOOK.md` | Step-by-step fix guide for all 9 debt items with exact file/line references, code snippets, and acceptance criteria ✅ CONFIRMED |
 | Contributing | `CONTRIBUTING.md` | Contribution guidelines covering branching strategy, code standards, and pull-request process ✅ CONFIRMED |
+| User Guide | `Documentation/02-Non-Technical/USER-GUIDE.md` | End-user guide covering upload, download, sharing, account management, and security features ✅ CONFIRMED |
+| Platform Overview | `Documentation/02-Non-Technical/PLATFORM-OVERVIEW.md` | Non-technical overview of the platform, its security guarantees, and legal notices ✅ CONFIRMED |
+| Roles & Permissions | `Documentation/03-Roles/ROLES-AND-PERMISSIONS.md` | Complete reference for User/Admin roles, permission matrix per endpoint, and role assignment workflow ✅ CONFIRMED |
+| Admin Guide | `Documentation/03-Roles/ADMIN-GUIDE.md` | Step-by-step guide for system administrators covering all admin operations ✅ CONFIRMED |
+| Maintenance Mode | `Documentation/03-Roles/MAINTENANCE-MODE.md` | Procedures for enabling/disabling maintenance mode and managing planned downtime ✅ CONFIRMED |
+| Operator Runbook | `Documentation/03-Roles/OPERATOR-RUNBOOK.md` | P0/P1/P2 incident runbooks with escalation trees for on-call operators ✅ CONFIRMED |
+| Roadmap | `Documentation/05-Roadmap/ROADMAP.md` | RICE-scored feature roadmap with 7 items, dependency graph, and sprint execution plan ✅ CONFIRMED |
+| Debt Register | `Documentation/05-Roadmap/DEBT-REGISTER.md` | 9 tech debt items with severity, RICE scores, and recommended remediation steps ✅ CONFIRMED |
 
 ---
 
@@ -38,10 +47,11 @@ Leeku Secure is a self-hosted encrypted file vault platform deployed on Windows 
 | Production deployment and IIS configuration | Covered | `DEPLOYMENT.md` |
 | Security controls and threat model | Covered | `SECURITY.md` |
 | Documentation quality assurance | Covered | `DOC-QA-REPORT.md` |
+| Debt remediation — actionable fix guide | Covered | `DEBT-REMEDIATION-PLAYBOOK.md` |
 | Contribution process | Covered | `CONTRIBUTING.md` |
-| Non-technical / user-facing guides | Not yet written | `Documentation/02-Non-Technical/` (empty) |
-| Role-based access and permissions reference | Not yet written | `Documentation/03-Roles/` (empty) |
-| Product roadmap | Not yet written | `Documentation/05-Roadmap/` (empty) |
+| Non-technical / user-facing guides | Covered | `Documentation/02-Non-Technical/` |
+| Role-based access and permissions reference | Covered | `Documentation/03-Roles/` |
+| Product roadmap and tech debt | Covered | `Documentation/05-Roadmap/` |
 
 ---
 
