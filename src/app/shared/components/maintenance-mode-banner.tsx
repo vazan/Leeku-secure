@@ -49,7 +49,7 @@ export function MaintenanceModeBanner(): JSX.Element | null {
   }
 
   return (
-    <div className="fixed top-0 left-0 right-0 z-50 bg-gradient-to-r from-red-900 via-red-800 to-red-900 text-white shadow-2xl border-b-4 border-red-600">
+    <div className="w-full bg-gradient-to-r from-red-900 via-red-800 to-red-900 text-white shadow-2xl border-b-4 border-red-600">
       <div className="max-w-full px-4 py-4 sm:px-6 lg:px-8">
         <div className="flex items-center justify-center gap-3 text-center">
           <div className="flex-shrink-0">
