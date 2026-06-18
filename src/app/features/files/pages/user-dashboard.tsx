@@ -27,6 +27,7 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/app/shared/components/ui/popover";
+import { MaintenanceModeBanner } from "@/app/shared/components/maintenance-mode-banner";
 import type {
   FileMetadata,
   Quota,
@@ -1123,6 +1124,7 @@ export default function UserDashboard({
 
   return (
     <div className="min-h-screen bg-[var(--bg-primary)] text-[var(--text-primary)]">
+      <MaintenanceModeBanner />
       <DashboardSidebar
         user={user}
         view={view}

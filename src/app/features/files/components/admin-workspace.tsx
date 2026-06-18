@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
-import { Activity, Database, Plus, Server, ShieldAlert, Terminal, Users } from "lucide-react";
+import { Activity, Database, Plus, Server, ShieldAlert, Terminal, Users, AlertTriangle } from "lucide-react";
 import { toast } from "sonner";
+import { MaintenanceModeControl } from "@/app/shared/components/maintenance-mode-control";
 import type { FileMetadata, Quota, SystemLog, SystemStats, User } from "@/app/shared/types";
 
-type AdminTab = "overview" | "users" | "files" | "quotas" | "logs" | "security" | "health";
+type AdminTab = "overview" | "users" | "files" | "quotas" | "logs" | "security" | "health" | "maintenance";
 
 const tabs: Array<[AdminTab, string]> = [
   ["overview", "Overview"],
@@ -13,6 +14,7 @@ const tabs: Array<[AdminTab, string]> = [
   ["logs", "Logs"],
   ["security", "Security Events"],
   ["health", "System Health"],
+  ["maintenance", "Maintenance"],
 ];
 
 const getCsrfToken = () =>
@@ -66,6 +68,22 @@ export default function AdminWorkspace({
     max_files: 25,
     daily_upload_limit_mb: 100,
   });
+  const [maintenanceStatus, setMaintenanceStatus] = useState(false);
+  const [loadingMaintenance, setLoadingMaintenance] = useState(false);
+
+  useEffect(() => {
+    // Load maintenance status on mount
+    const fetchMaintenanceStatus = async () => {
+      try {
+        const response = await fetch('/api/admin/maintenance-status');
+        const data = await response.json();
+        setMaintenanceStatus(data.maintenance_mode);
+      } catch (error) {
+        console.error('Failed to fetch maintenance status:', error);
+      }
+    };
+    fetchMaintenanceStatus();
+  }, []);
 
   useEffect(() => setLocalQuotas(quotas), [quotas]);
 
@@ -344,6 +362,17 @@ export default function AdminWorkspace({
               <br />Blocked files: {stats?.blockedFiles || 0}
             </p>
           </AdminPanel>
+        </div>
+      )}
+      {tab === "maintenance" && (
+        <div className="grid gap-6">
+          <MaintenanceModeControl 
+            currentStatus={maintenanceStatus}
+            onStatusChange={(newStatus) => {
+              setMaintenanceStatus(newStatus);
+              onReload();
+            }}
+          />
         </div>
       )}
     </section>

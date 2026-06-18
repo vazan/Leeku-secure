@@ -11,6 +11,7 @@ import { useState, useEffect } from 'react';
 import { Shield, Upload, Sparkles, HardDrive, Key, Flame } from 'lucide-react';
 import leekuMascot from '@/app/shared/assets/leeku_mascot.png';
 import { MascotAvatar } from '@/app/shared/components/legacy/mascots';
+import { MaintenanceModeBanner } from '@/app/shared/components/maintenance-mode-banner';
 import type { Quota } from "@/app/shared/types";
 import {
   legalDocuments,
@@ -68,6 +69,7 @@ export default function LandingPage({ onGoToAuth, quotas }: LandingPageProps) {
 
   return (
     <div className="min-h-screen bg-[var(--bg-primary)] text-[var(--text-primary)]">
+      <MaintenanceModeBanner />
       <nav className="mx-auto flex max-w-7xl items-center justify-between px-5 py-5 lg:px-8">
         <div 
           className="flex items-center gap-3 cursor-pointer group"

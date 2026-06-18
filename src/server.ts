@@ -44,9 +44,11 @@ import { sendVerificationEmail, sendAccountDeletionEmail, validateMxRecord, veri
 import multer from 'multer';
 import os from 'os';
 import { iisLoggingMiddleware, validateIISLoggingConfig } from './server/middleware/iis-logger.js';
+import { maintenanceModeMiddleware, getMaintenanceStatus } from './server/middleware/maintenance-mode.js';
 import { createSessionRouter } from './server/routes/sessions.js';
 import { createHealthRouter } from './server/routes/health.js';
 import { createPublicSharingRouter } from './server/routes/public-sharing.js';
+import { createMaintenanceModeRouter } from './server/routes/maintenance-mode.js';
 import { validateProductionConfig } from './server/utils/production.js';
 import type { Quota, User, FileMetadata, ShareLink, SystemLog, SystemStats } from './app/shared/types/index.js';
 
@@ -1623,6 +1625,25 @@ app.get('/api/files', authenticateUser as express.RequestHandler, async (req: Au
 // ──────────────────────────────────────────────────────────────
 
 // ──────────────────────────────────────────────────────────────
+// Maintenance mode check function
+// ──────────────────────────────────────────────────────────────
+
+async function checkMaintenanceMode(
+  operationType: 'upload' | 'download' | 'delete',
+  req: express.Request, res: express.Response
+): Promise<boolean> {
+  const isMaintenanceEnabled = await getMaintenanceStatus();
+  if (isMaintenanceEnabled) {
+    res.status(503).json({
+      error: 'System is under maintenance. Please try again later.',
+      maintenance_mode: true,
+    });
+    return true; // Operation blocked
+  }
+  return false; // Operation allowed
+}
+
+// ──────────────────────────────────────────────────────────────
 // Multer — multipart upload middleware (streaming, no memory limits)
 // ──────────────────────────────────────────────────────────────
 
@@ -1915,6 +1936,9 @@ app.post(
 
     const multerFile = req.file;
     if (!multerFile) return res.status(400).json({ error: 'No file attached. Use multipart/form-data with field name "file".' });
+
+    // Check maintenance mode before proceeding with upload
+    if (await checkMaintenanceMode('upload', req as AuthenticatedRequest, res)) return;
 
     const original_name = req.body.original_name || multerFile.originalname;
     const mime_type     = req.body.mime_type     || multerFile.mimetype || 'application/octet-stream';
@@ -2242,6 +2266,10 @@ function cleanupAndRespond(
 
 app.post('/api/files/:id/delete', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
   const fileId = req.params.id;
+  
+  // Check maintenance mode before proceeding
+  if (await checkMaintenanceMode('delete', req, res)) return;
+  
   try {
     const fileReq = await getRequest();
     fileReq.input('id', sql.UniqueIdentifier, fileId);
@@ -2462,6 +2490,10 @@ app.get('/api/files/:id/download', authenticateUser as express.RequestHandler, a
 
 app.post('/api/files/:id/download/prepare', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
   sweepPrivateDownloadSessions();
+  
+  // Check maintenance mode before proceeding
+  if (await checkMaintenanceMode('download', req, res)) return;
+  
   const fileId = req.params.id;
   try {
     const fileReq = await getRequest();
@@ -3137,6 +3169,11 @@ async function bootstrap() {
   await ensureOptionalShareLinkColumns();
 
   app.use('/api/health', createHealthRouter(FILE_VAULT, NODE_ENV === 'production'));
+
+  app.use('/api/admin/maintenance', createMaintenanceModeRouter({
+    verifyAdmin: verifyAdmin as express.RequestHandler,
+    logSystemEvent,
+  }));
 
   // 3. Validate IIS logging config
   validateIISLoggingConfig();
