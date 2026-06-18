@@ -58,7 +58,35 @@ sqlcmd -S your-sql-server -U sa -P <password> -i production_schema.sql
 
 ---
 
-### 2. `migrations/001_initial_schema.sql` - Initial Migration (Dev-Friendly)
+### 3. `003_maintenance_mode.sql` - Maintenance Mode Configuration (Optional)
+**Purpose:** Adds system-wide maintenance mode control without downtime.
+
+**Features:**
+- Creates `system_config` table for storing system settings
+- Implements `sp_GetMaintenanceStatus` to check maintenance state
+- Implements `sp_ToggleMaintenanceMode` to enable/disable maintenance
+- Initial value: maintenance mode disabled (normal operations)
+- Lightweight, non-intrusive addition to existing schema
+
+**When to apply:**
+- ✅ After `production_schema.sql` is deployed (optional enhancement)
+- ✅ When you need admin-controlled downtime for updates
+- ✅ For graceful system maintenance without data loss
+
+**How to run:**
+```powershell
+sqlcmd -S your-sql-server -U sa -P <password> -d LeekuSecure -i 003_maintenance_mode.sql
+```
+
+**Verify installation:**
+```sql
+SELECT * FROM system_config WHERE key = 'maintenance_mode'
+-- Should return: | maintenance_mode | false | (current timestamp) |
+```
+
+---
+
+### 4. `migrations/001_initial_schema.sql` - Initial Migration (Dev-Friendly)
 **Purpose:** Simple, idempotent migration for development and quick setup.
 
 **Features:**
@@ -152,6 +180,7 @@ sqlcmd -S localhost -U sa -P <password> -d LeekuSecure -i migrations/001_initial
 | **Production deployment** | `production_schema.sql` | ⭐ Optimized, secure, enterprise-ready |
 | **Staging environment** | `production_schema.sql` | Match prod for testing |
 | **Dev/local testing** | `migrations/001_initial_schema.sql` | Simple, fast, minimal overhead |
+| **Maintenance mode (optional)** | `003_maintenance_mode.sql` | Enable/disable file operations without downtime |
 | **Migration (001→002)** | See VALIDATION.md | Step-by-step guide (if file exists) |
 
 ---
