@@ -371,7 +371,7 @@ function StatusBadge({ tone, children }: { tone: "green" | "pink" | "muted"; chi
 }
 
 function AdminInput({ label, value, onChange, type = "text" }: { label: string; value: string; onChange: (value: string) => void; type?: string }) {
-  return <label><span className="mb-2 block text-xs text-[var(--text-muted)]">{label}</span><input required type={type} value={value} onChange={(event) => onChange(event.target.value)} className="w-full border border-[var(--border-subtle)] bg-[var(--bg-elevated)] px-3 py-2.5 text-[var(--text-primary)] outline-none focus:border-[var(--border-strong)]" /></label>;
+  return <label><span className="mb-2 block text-xs text-[var(--text-muted)]">{label}</span><input type={type} value={value} onChange={(event) => onChange(event.target.value)} className="w-full border border-[var(--border-subtle)] bg-[var(--bg-elevated)] px-3 py-2.5 text-[var(--text-primary)] outline-none focus:border-[var(--border-strong)]" /></label>;
 }
 
 function AdminNumber({ label, value, onChange }: { label: string; value: number; onChange: (value: number) => void }) {

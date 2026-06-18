@@ -443,6 +443,7 @@ export function decryptFileStream(
   iv:       Buffer,
   authTag:  Buffer,
   onProgress?: (progress: StreamProgress) => void,
+  hash?: crypto.Hash
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const decipher = crypto.createDecipheriv(ALGORITHM, key, iv, { authTagLength: TAG_LENGTH });
@@ -458,6 +459,13 @@ export function decryptFileStream(
       onProgress?.({ processedBytes, totalBytes });
     });
 
+    // ── Feed decrypted chunks into the hash (if provided) for zero-cost checksum ──
+    if (hash) {
+      decipher.on('data', (chunk: Buffer) => {
+        hash.update(chunk);
+      });
+    }
+
     readStream
       .pipe(decipher)
       .pipe(writeStream)
@@ -465,6 +473,7 @@ export function decryptFileStream(
       .on('error', reject);
   });
 }
+
 
 /**
  * Validates that the MASTER_KEY_BASE64 env var is present and long enough.

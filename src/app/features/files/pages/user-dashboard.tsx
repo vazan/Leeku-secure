@@ -45,7 +45,9 @@ import DashboardSidebar, {
 import TransferProgress, {
   type TransferState,
 } from "@/app/shared/components/common/transfer-progress";
-import FileTypeIcon from "@/app/shared/components/common/file-type-icon";
+import FileTypeIcon, {
+  getFileTypeBadge,
+} from "@/app/shared/components/common/file-type-icon";
 import { downloadWithProgress } from "@/app/shared/utils/download-with-progress";
 import { encryptFileForUploadWithSecret } from "@/app/shared/utils/client-file-secret";
 
@@ -266,6 +268,16 @@ export default function UserDashboard({
   const uploadRequestRef = React.useRef<XMLHttpRequest | null>(null);
   const uploadStoppedRef = React.useRef(false);
   const dropzoneFileInputRef = React.useRef<HTMLInputElement | null>(null);
+  const resumableUploadRef = React.useRef<{
+    file: globalThis.File;
+    targetFile: globalThis.File;
+    identifier: string;
+    totalChunks: number;
+    chunkSize: number;
+    currentChunk: number;
+    aborted: boolean;
+    activeXhr: XMLHttpRequest | null;
+  } | null>(null);
   const downloadRequestRef = React.useRef<AbortController | null>(null);
 
   const activeQuota =
@@ -390,14 +402,35 @@ export default function UserDashboard({
 
   const stopUpload = () => {
     uploadStoppedRef.current = true;
+    // Abort active chunk XHR if resumable upload is in progress
+    if (resumableUploadRef.current?.activeXhr) {
+      resumableUploadRef.current.activeXhr.abort();
+      resumableUploadRef.current.aborted = true;
+    }
     uploadRequestRef.current?.abort();
   };
 
+  const RESUMABLE_CHUNK_SIZE = 50 * 1024 * 1024; // 50 MB
+
+  const generateResumableIdentifier = (file: globalThis.File): string => {
+    // Deterministic hash from file properties
+    const parts = [file.name, file.size, file.lastModified, file.type].join("-");
+    let hash = 0;
+    for (let i = 0; i < parts.length; i++) {
+      hash = ((hash << 5) - hash) + parts.charCodeAt(i);
+      hash |= 0;
+    }
+    return (hash >>> 0).toString(36) + "-" + Date.now().toString(36);
+  };
+
   const uploadFile = async (file: globalThis.File) => {
-    if (uploadRequestRef.current) {
+    console.log("[uploadFile] called with", file.name, file.size, "RESUMABLE_CHUNK_SIZE:", RESUMABLE_CHUNK_SIZE);
+    console.log("[uploadFile] FILE_IS_LARGE?", file.size > RESUMABLE_CHUNK_SIZE);
+    if (uploadRequestRef.current || resumableUploadRef.current) {
       notifyError("An upload is already running.");
       return;
     }
+
     const startedAt = Date.now();
     uploadStoppedRef.current = false;
     setUploading(true);
@@ -410,22 +443,254 @@ export default function UserDashboard({
       startedAt,
     });
 
-    const formData = new FormData();
+    // ── Encrypt with secret key if provided ──────────────────
+    const secretMeta: Record<string, string> = {};
     let uploadTargetFile: globalThis.File = file;
     try {
       if (uploadSecretKey.trim()) {
         const encrypted = await encryptFileForUploadWithSecret(file, uploadSecretKey);
         uploadTargetFile = encrypted.encryptedFile;
-        formData.append("upload_secret_key", uploadSecretKey.trim());
-        formData.append("upload_secret_salt_b64", encrypted.saltBase64);
-        formData.append("upload_secret_iv_b64", encrypted.ivBase64);
-        formData.append("upload_secret_iterations", String(encrypted.iterations));
+        secretMeta.upload_secret_key = uploadSecretKey.trim();
+        secretMeta.upload_secret_salt_b64 = encrypted.saltBase64;
+        secretMeta.upload_secret_iv_b64 = encrypted.ivBase64;
+        secretMeta.upload_secret_iterations = String(encrypted.iterations);
       }
     } catch (reason) {
       setUploading(false);
       setTransfer(null);
       notifyError(reason instanceof Error ? reason.message : "Could not encrypt the file with your secret key.");
       return;
+    }
+
+    const FILE_IS_LARGE = uploadTargetFile.size > RESUMABLE_CHUNK_SIZE;
+
+    // ═════════════════════════════════════════════════════════
+    // LARGE FILES → Resumable.js chunked upload (50 MB each)
+    // ═════════════════════════════════════════════════════════
+    if (FILE_IS_LARGE) {
+      const identifier = generateResumableIdentifier(file);
+      const totalChunks = Math.max(1, Math.ceil(uploadTargetFile.size / RESUMABLE_CHUNK_SIZE));
+      const totalSize = uploadTargetFile.size;
+
+      // Build a query string for secret metadata (appended to every chunk request)
+      const secretParams = new URLSearchParams();
+      if (secretMeta.upload_secret_key) {
+        secretParams.set("upload_secret_key", secretMeta.upload_secret_key);
+        secretParams.set("upload_secret_salt_b64", secretMeta.upload_secret_salt_b64);
+        secretParams.set("upload_secret_iv_b64", secretMeta.upload_secret_iv_b64);
+        secretParams.set("upload_secret_iterations", secretMeta.upload_secret_iterations);
+      }
+
+      resumableUploadRef.current = {
+        file,
+        targetFile: uploadTargetFile,
+        identifier,
+        totalChunks,
+        chunkSize: RESUMABLE_CHUNK_SIZE,
+        currentChunk: 1,
+        aborted: false,
+        activeXhr: null,
+      };
+
+      let totalBytesUploaded = 0;
+
+      try {
+        for (let chunkNumber = 1; chunkNumber <= totalChunks; chunkNumber++) {
+          if (resumableUploadRef.current.aborted) {
+            throw new Error("Upload aborted.");
+          }
+
+          const start = (chunkNumber - 1) * RESUMABLE_CHUNK_SIZE;
+          const end = Math.min(chunkNumber * RESUMABLE_CHUNK_SIZE, uploadTargetFile.size);
+          const chunkBlob = uploadTargetFile.slice(start, end);
+
+          // ── Check if chunk already exists (GET) ──────────
+          const checkUrl =
+            `/api/files/upload` +
+            `?resumableIdentifier=${encodeURIComponent(identifier)}` +
+            `&resumableChunkNumber=${chunkNumber}`;
+
+          const checkResp = await fetch(checkUrl, {
+            headers: { "X-CSRF-Token": getCsrfToken() },
+          });
+
+          if (checkResp.status === 200) {
+            // Chunk already exists — skip
+            totalBytesUploaded += chunkBlob.size;
+            resumableUploadRef.current.currentChunk = chunkNumber + 1;
+            updateProgress(file, totalBytesUploaded, uploadTargetFile.size, startedAt, chunkNumber, totalChunks);
+            continue;
+          }
+
+          // ── Upload chunk (POST) ───────────────────────────
+          const uploadUrl =
+            `/api/files/upload` +
+            `?resumableIdentifier=${encodeURIComponent(identifier)}` +
+            `&resumableChunkNumber=${chunkNumber}` +
+            `&resumableTotalChunks=${totalChunks}` +
+            `&resumableTotalSize=${totalSize}` +
+            `&resumableFilename=${encodeURIComponent(file.name)}` +
+            `&resumableType=${encodeURIComponent(file.type || 'application/octet-stream')}` +
+            (secretParams.toString() ? `&${secretParams.toString()}` : '');
+
+            const chunkResult = await new Promise<{
+              success?: boolean;
+              done?: boolean;
+              error?: string;
+              responseText?: string;
+              status?: number;
+            }>((resolve, reject) => {
+              const xhr = new XMLHttpRequest();
+              resumableUploadRef.current!.activeXhr = xhr;
+
+              const chunkFormData = new FormData();
+              chunkFormData.append("file", chunkBlob, file.name);
+
+              let ndjsonCursor = 0;
+              let ndjsonBuffer = "";
+
+              // ── NDJSON streaming: read encryption progress live ──
+              const readNdjsonStream = () => {
+                const chunk = xhr.responseText.slice(ndjsonCursor);
+                ndjsonCursor = xhr.responseText.length;
+                if (!chunk) return;
+                ndjsonBuffer += chunk;
+                const lines = ndjsonBuffer.split("\n");
+                ndjsonBuffer = lines.pop() || "";
+                for (const line of lines) {
+                  if (!line.trim()) continue;
+                  try {
+                    const event = JSON.parse(line) as UploadStreamEvent;
+                    if (event.type === "processing" && chunkNumber === totalChunks) {
+                      setTransfer({
+                        direction: "upload",
+                        name: file.name,
+                        loaded: uploadTargetFile.size,
+                        total: uploadTargetFile.size,
+                        startedAt,
+                        processing: true,
+                        processingStartedAt: Date.now(),
+                        processingLoaded: event.loaded ?? 0,
+                        processingTotal: event.total ?? 0,
+                        phaseLabel: event.phase || "Processing...",
+                      });
+                    }
+                  } catch {
+                    // ignore
+                  }
+                }
+              };
+
+              xhr.upload.onprogress = (event) => {
+                if (event.lengthComputable) {
+                  const chunkLoaded = totalBytesUploaded + event.loaded;
+                  const pct = Math.round((chunkLoaded / uploadTargetFile.size) * 100);
+                  setUploadProgress(pct);
+                  setTransfer({
+                    direction: "upload",
+                    name: file.name,
+                    loaded: chunkLoaded,
+                    total: uploadTargetFile.size,
+                    startedAt,
+                    phaseLabel: `Uploading chunk ${chunkNumber}/${totalChunks} (${Math.round(event.loaded / 1024 / 1024)} MB)`,
+                  });
+                }
+              };
+
+              // ← NEW: read NDJSON progressively as data arrives
+              xhr.onreadystatechange = () => {
+                if (xhr.readyState === XMLHttpRequest.LOADING || xhr.readyState === XMLHttpRequest.DONE) {
+                  readNdjsonStream();
+                }
+              };
+
+              xhr.onload = () => {
+                resumableUploadRef.current!.activeXhr = null;
+                resolve({
+                  status: xhr.status,
+                  responseText: xhr.responseText,
+                  ...(xhr.status >= 200 && xhr.status < 300
+                  ? (() => {
+                    try {
+                      return JSON.parse(xhr.responseText);
+                    } catch {
+                      return { done: true, responseText: xhr.responseText };
+                    }
+                  })()
+                  : (() => {
+                    try {
+                      return { error: JSON.parse(xhr.responseText).error || "Chunk upload failed." };
+                    } catch {
+                      return { error: "Chunk upload failed." };
+                    }
+                  })()),
+                });
+              };
+
+              xhr.onerror = () => reject(new Error("Network error during chunk upload."));
+              xhr.onabort = () => reject(new Error("Upload aborted."));
+
+              xhr.open("POST", uploadUrl);
+              xhr.setRequestHeader("X-CSRF-Token", getCsrfToken());
+              xhr.setRequestHeader("Accept", "application/x-ndjson");
+              xhr.send(chunkFormData);
+            });
+
+            if (chunkResult.error) {
+              throw new Error(chunkResult.error);
+            }
+
+            totalBytesUploaded += chunkBlob.size;
+            resumableUploadRef.current.currentChunk = chunkNumber + 1;
+
+            // The NDJSON was already streamed live via onreadystatechange above.
+            // No need to parse responseText again here.
+        }
+
+        // ── All chunks uploaded successfully ──────────────────
+        setUploading(false);
+        setUploadProgress(100);
+        setTransfer({
+          direction: "upload",
+          name: file.name,
+          loaded: uploadTargetFile.size,
+          total: uploadTargetFile.size,
+          startedAt,
+          complete: true,
+        });
+        window.setTimeout(
+          () => setTransfer((current) => (current?.startedAt === startedAt ? null : current)),
+          1800,
+        );
+        notify("Upload complete.");
+        await loadFilesAndLinks();
+        onTriggerRefreshUser();
+      } catch (err) {
+        setUploading(false);
+        setUploadProgress(0);
+        setTransfer(null);
+        const msg = err instanceof Error ? err.message : "Upload failed.";
+        if (msg !== "Upload aborted.") {
+          notifyError(msg);
+        }
+      } finally {
+        resumableUploadRef.current = null;
+        uploadRequestRef.current = null;
+      }
+      return;
+    }
+
+    // ═════════════════════════════════════════════════════════
+    // SMALL FILES (≤ 50 MB) → Direct upload (existing XHR flow)
+    // ═════════════════════════════════════════════════════════
+    const formData = new FormData();
+
+    // Append secret metadata if present
+    if (secretMeta.upload_secret_key) {
+      formData.append("upload_secret_key", secretMeta.upload_secret_key);
+      formData.append("upload_secret_salt_b64", secretMeta.upload_secret_salt_b64);
+      formData.append("upload_secret_iv_b64", secretMeta.upload_secret_iv_b64);
+      formData.append("upload_secret_iterations", secretMeta.upload_secret_iterations);
     }
 
     formData.append("file", uploadTargetFile);
@@ -439,7 +704,7 @@ export default function UserDashboard({
     let uploadStreamError = "";
     let uploadStreamComplete = false;
 
-    const handleUploadStreamEvent = (event: UploadStreamEvent) => {
+    const handleStreamEvent = (event: UploadStreamEvent) => {
       if (event.type === "processing") {
         processingStartedAt ||= Date.now();
         setTransfer({
@@ -483,7 +748,7 @@ export default function UserDashboard({
       for (const line of lines) {
         if (!line.trim()) continue;
         try {
-          handleUploadStreamEvent(JSON.parse(line) as UploadStreamEvent);
+          handleStreamEvent(JSON.parse(line) as UploadStreamEvent);
         } catch {
           // Non-streaming JSON responses are handled when the request finishes.
         }
@@ -577,6 +842,27 @@ export default function UserDashboard({
     xhr.send(formData);
   };
 
+  // ── Helper: update progress bar during resumable upload ──────
+  const updateProgress = (
+    file: globalThis.File,
+    loadedBytes: number,
+    totalBytes: number,
+    startedAt: number,
+    chunkNumber: number,
+    totalChunks: number,
+  ) => {
+    const pct = totalBytes > 0 ? Math.round((loadedBytes / totalBytes) * 100) : 0;
+    setUploadProgress(pct);
+    setTransfer({
+      direction: "upload",
+      name: file.name,
+      loaded: loadedBytes,
+      total: totalBytes,
+      startedAt,
+      phaseLabel: `Uploading chunk ${chunkNumber}/${totalChunks}`,
+    });
+  };
+
   const downloadFile = async (file: FileMetadata) => {
     const secretKey = file.has_user_secret
       ? window.prompt(`Enter the secret key for "${file.original_name}"`)?.trim() || ""
@@ -648,18 +934,16 @@ export default function UserDashboard({
         total: file.size,
         startedAt,
       });
-      await downloadWithProgress(fileUrl, file.original_name, {
-        headers: authHeaders(token),
-        signal: controller.signal,
-        onProgress: ({ loaded, total }) =>
-          setTransfer({
-            direction: "download",
-            name: file.original_name,
-            loaded,
-            total: total || file.size,
-            startedAt,
-          }),
-      });
+
+      // ── Direct browser download (streams to disk, no RAM usage) ──
+      const anchor = document.createElement('a');
+      anchor.href = fileUrl;
+      anchor.download = file.original_name;
+      anchor.style.display = 'none';
+      document.body.appendChild(anchor);
+      anchor.click();
+      document.body.removeChild(anchor);
+
       setTransfer({
         direction: "download",
         name: file.original_name,
@@ -675,6 +959,7 @@ export default function UserDashboard({
           ),
         1800,
       );
+      
     } catch (reason) {
       setTransfer(null);
       notifyError(reason instanceof Error ? reason.message : "Download unavailable.");
@@ -952,19 +1237,6 @@ export default function UserDashboard({
                   event.dataTransfer.files[0] &&
                     uploadFile(event.dataTransfer.files[0]);
                 }}
-                onClick={(event) => {
-                  if (event.target === event.currentTarget) {
-                    openUploadFilePicker();
-                  }
-                }}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter" || event.key === " ") {
-                    event.preventDefault();
-                    openUploadFilePicker();
-                  }
-                }}
-                role="button"
-                tabIndex={0}
                 className={`rounded-2xl border border-dashed p-8 text-center ${dragging ? "border-[var(--accent-linear)] bg-[color-mix(in_srgb,var(--accent-linear)_14%,transparent)]" : "border-[var(--border-subtle)] bg-[var(--bg-panel)]"}`}
               >
                 <input
@@ -1510,6 +1782,7 @@ function FileThumbnail({
   iconClassName,
   onOpenVideo,
   interactiveVideo = false,
+  showTypeBadge = true,
 }: {
   file: FileMetadata;
   token: string;
@@ -1517,6 +1790,7 @@ function FileThumbnail({
   iconClassName: string;
   onOpenVideo?: () => void;
   interactiveVideo?: boolean;
+  showTypeBadge?: boolean;
 }) {
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
@@ -1662,6 +1936,7 @@ function FileThumbnail({
           fileName={file.original_name}
           mimeType={file.mime_type}
           className={iconClassName}
+          showBadge={showTypeBadge}
         />
       )}
     </div>
@@ -1719,7 +1994,11 @@ function FileCard({
           iconClassName="h-8 w-8"
           onOpenVideo={onOpenVideo}
           interactiveVideo
+          showTypeBadge={false}
         />
+        <span className="pointer-events-none absolute left-2 top-2 flex h-8 min-w-8 items-center justify-center rounded-md border border-[var(--border-subtle)] bg-[color-mix(in_srgb,var(--bg-elevated)_78%,transparent)] px-2 text-[10px] font-semibold leading-none text-[var(--text-secondary)] shadow-[var(--shadow-hairline)] backdrop-blur-sm">
+          {getFileTypeBadge(file.original_name)}
+        </span>
         <div ref={menuRef} className="absolute right-2 top-2">
           <button
             aria-label="File options"

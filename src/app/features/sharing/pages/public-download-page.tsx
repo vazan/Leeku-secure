@@ -11,7 +11,6 @@ import FileTypeIcon from "@/app/shared/components/common/file-type-icon";
 import TransferProgress, {
   type TransferState,
 } from "@/app/shared/components/common/transfer-progress";
-import { downloadWithProgress } from "@/app/shared/utils/download-with-progress";
 
 interface PublicDownloadPageProps {
   token: string;
@@ -226,18 +225,14 @@ export default function PublicDownloadPage({
         startedAt,
       });
 
-      await downloadWithProgress(fileUrl, meta.file_name, {
-        signal: controller.signal,
-        onProgress: ({ loaded, total }) => {
-          setTransfer({
-            direction: "download",
-            name: meta.file_name,
-            loaded,
-            total: total || meta.size,
-            startedAt,
-          });
-        },
-      });
+      // ── Direct browser download (streams to disk, no RAM usage) ──
+      const anchor = document.createElement('a');
+      anchor.href = fileUrl;
+      anchor.download = meta.file_name;
+      document.body.appendChild(anchor);
+      anchor.click();
+      document.body.removeChild(anchor);
+      
 
       setTransfer({
         direction: "download",

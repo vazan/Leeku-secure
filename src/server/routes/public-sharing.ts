@@ -381,36 +381,36 @@ const buildPromise = (async () => {
 
       void (async () => {
         try {
-          await decryptFileStream(vaultFile, tempFile, fileKey, row.file_iv, row.file_auth_tag, ({ processedBytes, totalBytes }) => {
+            const hash = crypto.createHash('sha256');
+
+            await decryptFileStream(vaultFile, tempFile, fileKey, row.file_iv, row.file_auth_tag, ({ processedBytes, totalBytes }) => {
+                const current = downloadSessions.get(sessionId);
+                if (!current) return;
+                current.phase = 'decrypting';
+                current.loaded = processedBytes;
+                current.total = totalBytes;
+                current.expiresAt = Date.now() + DOWNLOAD_SESSION_TTL_MS;
+            }, hash);   // ← pass hash into decryptFileStream
+
             const current = downloadSessions.get(sessionId);
             if (!current) return;
-            current.phase = 'decrypting';
-            current.loaded = processedBytes;
-            current.total = totalBytes;
-            current.expiresAt = Date.now() + DOWNLOAD_SESSION_TTL_MS;
-          });
+            current.phase = 'verifying';
+            current.loaded = 0;
+            current.total = current.sizeBytes || 1;
 
-          const current = downloadSessions.get(sessionId);
-          if (!current) return;
-          current.phase = 'verifying';
-          current.loaded = 0;
-          current.total = current.sizeBytes || 1;
+            // ── Checksum already computed during decryption — just compare ──
+            const checksum = hash.digest('hex');
+            if (checksum !== row.checksum_sha256) {
+                throw new Error('File integrity check failed.');
+            }
 
-          const checksum = await computeFileChecksum(tempFile, ({ processedBytes, totalBytes }) => {
-            const active = downloadSessions.get(sessionId);
-            if (!active) return;
-            active.phase = 'verifying';
-            active.loaded = processedBytes;
-            active.total = totalBytes;
-            active.expiresAt = Date.now() + DOWNLOAD_SESSION_TTL_MS;
-          });
-          if (checksum !== row.checksum_sha256) {
-            throw new Error('File integrity check failed.');
-          }
+            current.loaded = current.sizeBytes;
+            current.total = current.sizeBytes;
+
 
           if (row.client_secret_hash) {
             if (!row.client_crypto_salt || !row.client_crypto_iv || !row.client_crypto_iterations) {
-              throw new Error('Secret-key metadata is missing for this file.');
+                throw new Error('Secret-key metadata is missing for this file.');
             }
 
             const active = downloadSessions.get(sessionId);
@@ -419,20 +419,25 @@ const buildPromise = (async () => {
             active.loaded = 0;
             active.total = 1;
 
+            // ── Guard: client-secret protected files over 512 MB cannot be decrypted in memory ──
+            const secretCheckStat = fs.statSync(tempFile);
+            if (secretCheckStat.size > 512 * 1024 * 1024) {
+                throw new Error('Client-secret protected files over 512 MB are not supported for public sharing. Please re-upload without client-side encryption.');
+            }
             const protectedPayload = fs.readFileSync(tempFile);
             const providedSecret = typeof secret_key === 'string' ? secret_key.trim() : '';
             const plaintext = decryptClientProtectedPayload(
-              protectedPayload,
-              providedSecret,
-              row.client_crypto_salt,
-              row.client_crypto_iv,
-              row.client_crypto_iterations,
+                protectedPayload,
+                providedSecret,
+                row.client_crypto_salt,
+                row.client_crypto_iv,
+                row.client_crypto_iterations,
             );
             fs.writeFileSync(tempFile, plaintext);
 
             active.loaded = 1;
             active.total = 1;
-          }
+        }
 
           const ready = downloadSessions.get(sessionId);
           if (!ready) return;
