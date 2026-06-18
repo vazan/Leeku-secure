@@ -10,13 +10,14 @@ import express from 'express';
 import { getMaintenanceStatus, setMaintenanceStatus } from '../middleware/maintenance-mode.js';
 
 export function createMaintenanceModeRouter(options: {
+  authenticateUser: express.RequestHandler;
   verifyAdmin: express.RequestHandler;
   logSystemEvent: (userId: string, username: string, event: string, target: string, targetId: string, req: express.Request, msg: string) => Promise<void>;
 }): express.Router {
   const router = express.Router();
 
   /**
-   * GET /api/admin/maintenance-status
+   * GET /api/admin/maintenance/status
    * Public endpoint - returns current maintenance mode status
    * Accessible by anyone (used to display banners)
    */
@@ -35,7 +36,7 @@ export function createMaintenanceModeRouter(options: {
    * Admin-only endpoint - toggle maintenance mode
    * Request body: { enabled: boolean }
    */
-  router.post('/toggle', options.verifyAdmin as express.RequestHandler, async (req: any, res) => {
+  router.post('/toggle', options.authenticateUser, options.verifyAdmin, async (req: any, res) => {
     try {
       const { enabled } = req.body;
       

@@ -3171,6 +3171,7 @@ async function bootstrap() {
   app.use('/api/health', createHealthRouter(FILE_VAULT, NODE_ENV === 'production'));
 
   app.use('/api/admin/maintenance', createMaintenanceModeRouter({
+    authenticateUser: authenticateUser as express.RequestHandler,
     verifyAdmin: verifyAdmin as express.RequestHandler,
     logSystemEvent,
   }));
