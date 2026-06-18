@@ -31,6 +31,7 @@ Deployed on Windows Server 2022 at **leeks.miku.rip** ✅
 
 ### 🎛️ Administration & Operations
 - **Admin panel:** user management, quota tiers, file blocking, system logs, server health stats
+- **Maintenance mode:** Block all file operations during system updates (admin-only control)
 - **IIS W3C Extended Log Format** output for compliance and analytics
 - **Native Windows Server 2022 deployment** with IIS ARR reverse-proxy compatibility
 - **Production startup validation** of Bitdefender, secrets, database, and vault access
@@ -115,6 +116,7 @@ See [Documentation/SQL/README.md](Documentation/SQL/README.md) for schema select
 |---|---|
 | [DEPLOYMENT.md](Documentation/01-Technical/DEPLOYMENT.md) | Production deployment on Windows Server 2022 with IIS ARR |
 | [SECURITY.md](Documentation/04-Risk-And-Corrections/SECURITY.md) | Security controls catalogue, threat model, encryption details |
+| [MAINTENANCE-MODE.md](Documentation/03-Roles/MAINTENANCE-MODE.md) | System maintenance mode: enable/disable file operations, admin control, user notifications |
 | [OPERATOR-RUNBOOK.md](Documentation/03-Roles/OPERATOR-RUNBOOK.md) | Day-to-day operations, troubleshooting, maintenance tasks |
 | [ADMIN-GUIDE.md](Documentation/03-Roles/ADMIN-GUIDE.md) | Admin panel usage, user management, quota tiers, file blocking |
 
@@ -225,7 +227,8 @@ Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for:
 | **Database (SQL Server 2022)** | ✅ Production | 7 tables, 12 optimized indexes, 5 stored procedures |
 | **Encryption** | ✅ Verified | AES-256-GCM files, column encryption, master key wrapping |
 | **Scanning (Bitdefender)** | ✅ Integrated | Fail-closed in production, optional AI summaries |
-| **Documentation** | ✅ Comprehensive | 15+ technical guides, API reference, runbooks |
+| **Maintenance Mode** | ✅ Complete | System-wide file operation blocking, admin-only control, user banners |
+| **Documentation** | ✅ Comprehensive | 16+ technical guides, API reference, runbooks |
 | **Test Framework** | ⚠️ Planned | Gap identified in CONTRIBUTING.md; discussion needed |
 
 Apache-2.0 — see source file headers (`SPDX-License-Identifier: Apache-2.0`).
