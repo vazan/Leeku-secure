@@ -34,7 +34,7 @@ export function MaintenanceModeControl({
     setSuccess(null);
 
     try {
-      const response = await fetch('/api/admin/maintenance-toggle', {
+      const response = await fetch('/api/admin/maintenance/toggle', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

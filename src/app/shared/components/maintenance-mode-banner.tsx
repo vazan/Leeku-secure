@@ -24,7 +24,7 @@ export function MaintenanceModeBanner(): JSX.Element | null {
   useEffect(() => {
     const fetchMaintenanceStatus = async () => {
       try {
-        const response = await fetch('/api/admin/maintenance-status');
+        const response = await fetch('/api/admin/maintenance/status');
         if (response.ok) {
           const data: MaintenanceStatusResponse = await response.json();
           setIsMaintenanceMode(data.maintenance_mode);

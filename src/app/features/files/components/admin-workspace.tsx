@@ -75,7 +75,7 @@ export default function AdminWorkspace({
     // Load maintenance status on mount
     const fetchMaintenanceStatus = async () => {
       try {
-        const response = await fetch('/api/admin/maintenance-status');
+        const response = await fetch('/api/admin/maintenance/status');
         const data = await response.json();
         setMaintenanceStatus(data.maintenance_mode);
       } catch (error) {
