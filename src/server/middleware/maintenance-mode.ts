@@ -16,6 +16,24 @@ const CACHE_DURATION_MS = 5000; // Cache for 5 seconds
 /**
  * Get current maintenance mode status
  */
+const BOOTSTRAP_SQL = `
+IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = 'system_config' AND schema_id = SCHEMA_ID('dbo'))
+BEGIN
+  CREATE TABLE [dbo].[system_config](
+    [key]        [nvarchar](100)  NOT NULL,
+    [value]      [nvarchar](max)  NOT NULL,
+    [updated_at] [datetimeoffset](7) NOT NULL DEFAULT SYSDATETIMEOFFSET(),
+    CONSTRAINT [PK_system_config] PRIMARY KEY CLUSTERED ([key] ASC)
+  );
+  INSERT INTO [dbo].[system_config] ([key],[value]) VALUES (N'maintenance_mode', N'0');
+END
+`;
+
+async function ensureTable(): Promise<void> {
+  const request = await getRequest();
+  await request.query(BOOTSTRAP_SQL);
+}
+
 export async function getMaintenanceStatus(): Promise<boolean> {
   const now = Date.now();
   
@@ -25,13 +43,14 @@ export async function getMaintenanceStatus(): Promise<boolean> {
   }
 
   try {
+    await ensureTable();
     const request = await getRequest();
-    const result = await request.query<{ is_maintenance_enabled: boolean }>(
-      `SELECT CAST(ISNULL((SELECT [value] FROM [dbo].[system_config] 
-       WHERE [key] = N'maintenance_mode'), N'false') AS BIT) AS is_maintenance_enabled`
+    const result = await request.query<{ v: string }>(
+      `SELECT [value] AS v FROM [dbo].[system_config] WHERE [key] = N'maintenance_mode'`
     );
 
-    const status = result.recordset[0]?.is_maintenance_enabled ?? false;
+    const raw = result.recordset[0]?.v ?? '0';
+    const status = raw === '1' || raw.toLowerCase() === 'true';
     maintenanceCachedStatus = status;
     maintenanceCacheTTL = now + CACHE_DURATION_MS;
     
@@ -48,19 +67,23 @@ export async function getMaintenanceStatus(): Promise<boolean> {
  */
 export async function setMaintenanceStatus(enabled: boolean): Promise<boolean> {
   try {
+    await ensureTable();
     const request = await getRequest();
-    request.input('enabled', sql.Bit, enabled ? 1 : 0);
-    const result = await request.query<{ is_maintenance_enabled: boolean }>(
-      `EXEC [dbo].[sp_ToggleMaintenanceMode] @enabled`
-    );
+    request.input('val', sql.NVarChar, enabled ? '1' : '0');
+    await request.query(`
+      MERGE [dbo].[system_config] AS target
+      USING (SELECT N'maintenance_mode' AS [key]) AS src ON target.[key] = src.[key]
+      WHEN MATCHED THEN
+        UPDATE SET [value] = @val, [updated_at] = SYSDATETIMEOFFSET()
+      WHEN NOT MATCHED THEN
+        INSERT ([key],[value]) VALUES (N'maintenance_mode', @val);
+    `);
 
-    const status = result.recordset[0]?.is_maintenance_enabled ?? false;
-    
     // Invalidate cache
-    maintenanceCachedStatus = status;
+    maintenanceCachedStatus = enabled;
     maintenanceCacheTTL = Date.now() + CACHE_DURATION_MS;
     
-    return status;
+    return enabled;
   } catch (error) {
     console.error('[setMaintenanceStatus] Error updating maintenance status:', error);
     throw error;
