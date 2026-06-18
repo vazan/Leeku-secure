@@ -14,6 +14,12 @@ interface MaintenanceModeControlProps {
   onStatusChange?: (newStatus: boolean) => void;
 }
 
+const getCsrfToken = () =>
+  document.cookie
+    .split("; ")
+    .find((row) => row.startsWith("leeku_csrf="))
+    ?.split("=")[1] || "";
+
 export function MaintenanceModeControl({
   currentStatus,
   onStatusChange,
@@ -32,7 +38,7 @@ export function MaintenanceModeControl({
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'X-CSRF-Token': (document.querySelector('meta[name="csrf-token"]') as HTMLMetaElement)?.content || '',
+          'X-CSRF-Token': getCsrfToken(),
         },
         body: JSON.stringify({ enabled: !currentStatus }),
       });
