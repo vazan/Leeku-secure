@@ -3200,11 +3200,17 @@ async function bootstrap() {
   // 6c. Start periodic sweep of expired download sessions
   startPrivateDownloadSweep();
 
-  // 7. Static files & SPA fallback
+  // 7. Share link vanity path (Discord embeds) & SPA fallback
   const distPath = path.join(process.cwd(), 'dist');
   app.use(express.static(distPath));
-  app.get('*', (req, res) => res.sendFile(path.join(distPath, 'index.html')));
 
+  // Vanity path for share links — redirects to server-rendered OG HTML page
+  app.get('/s/:token', (req, res) => {
+    res.redirect(301, `/api/public/share/${req.params.token}/og`);
+  });  
+
+  app.get('*', (req, res) => res.sendFile(path.join(distPath, 'index.html')));
+  
   // 8. HTTP or HTTPS
   const sslEnabled = process.env.SSL_ENABLED === 'true';
   if (sslEnabled) {

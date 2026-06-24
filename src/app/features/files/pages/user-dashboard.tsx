@@ -990,7 +990,7 @@ export default function UserDashboard({
   const toShareUrl = (publicToken: string, allowExternalPreview: boolean) =>
     allowExternalPreview
       ? `${window.location.origin}/api/public/share/${publicToken}/embed`
-      : `${window.location.origin}/#f/${publicToken}`;
+      : `${window.location.origin}/s/${publicToken}`;
 
   const openShare = (file: FileMetadata) => {
     const existing = links.find((link) => link.file_id === file.id);

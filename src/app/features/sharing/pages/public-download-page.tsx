@@ -134,15 +134,64 @@ export default function PublicDownloadPage({
 
   useEffect(() => {
     fetch(`/api/public/share/${token}`)
-      .then(async (response) => {
-        const data = await response.json();
-        if (!response.ok)
-          throw new Error(data.error || "This link is no longer available.");
-        setMeta(data);
-      })
-      .catch((reason) => setError(reason.message))
-      .finally(() => setLoading(false));
-  }, [token]);
+    .then(async (response) => {
+      const data = await response.json();
+      if (!response.ok)
+        throw new Error(data.error || "This link is no longer available.");
+      setMeta(data);
+
+      // Update OG meta tags for JS-capable crawlers (e.g. newer Discord bots)
+      const title = `${data.file_name} - Shared by ${data.uploader}`;
+      document.title = title;
+
+      const setMetaTag = (attr: string, attrValue: string, content: string) => {
+        let el = document.querySelector(`meta[${attr}="${attrValue}"]`) as HTMLMetaElement | null;
+        if (!el) {
+          el = document.createElement('meta');
+          el.setAttribute(attr, attrValue);
+          document.head.appendChild(el);
+        }
+        el.setAttribute('content', content);
+      };
+
+      setMetaTag('property', 'og:title', title);
+      setMetaTag('property', 'og:description', `${data.file_name} · ${formatBytes(data.size)} · Shared by ${data.uploader}`);
+      setMetaTag('property', 'og:type', 'website');
+      setMetaTag('property', 'og:url', `${window.location.origin}/s/${token}`);
+      setMetaTag('name', 'twitter:card', 'summary');
+      setMetaTag('name', 'twitter:title', title);
+      setMetaTag('name', 'twitter:description', `${data.file_name} · Shared by ${data.uploader}`);
+    })
+    .catch((reason) => setError(reason.message))
+    .finally(() => setLoading(false));
+}, [token]);
+
+  // ── Update document head with OG meta tags for Discord embeds ──
+  useEffect(() => {
+    if (!meta) return;
+
+    const title = `${meta.file_name} - Shared by ${meta.uploader}`;
+    document.title = title;
+
+    const setMetaTag = (property: string, content: string) => {
+      const attr = property.startsWith('twitter:') ? 'name' : 'property';
+      let el = document.querySelector(`meta[${attr}="${property}"]`) as HTMLMetaElement | null;
+      if (!el) {
+        el = document.createElement('meta');
+        el.setAttribute(attr, property);
+        document.head.appendChild(el);
+      }
+      el.setAttribute('content', content);
+    };
+
+    setMetaTag('og:title', title);
+    setMetaTag('og:description', `${meta.file_name} · ${formatBytes(meta.size)} · Shared by ${meta.uploader}`);
+    setMetaTag('og:type', 'website');
+    setMetaTag('og:url', window.location.href.split('#')[0] + '#f/' + token);
+    setMetaTag('twitter:card', 'summary');
+    setMetaTag('twitter:title', title);
+    setMetaTag('twitter:description', `${meta.file_name} · Shared by ${meta.uploader}`);
+  }, [meta, token]);
 
   useEffect(
     () => () => {

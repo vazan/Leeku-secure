@@ -309,6 +309,117 @@ const buildPromise = (async () => {
     }
   });
 
+  // ── Helpers for OG metadata pages (Discord embeds) ──
+  const ogFormatBytes = (bytes: number): string => {
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    const index = Math.min(
+      Math.floor(Math.log(Math.max(bytes, 1)) / Math.log(1024)),
+      units.length - 1,
+    );
+    return `${(bytes / 1024 ** index).toFixed(index > 1 ? 1 : 0)} ${units[index]}`;
+  };
+
+  const ogErrorHtml = (label: string): string => `<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><title>${label}</title></head><body><p>${label}</p></body></html>`;
+
+  const buildShareOgHtml = async (
+    req: express.Request,
+    res: express.Response,
+    token: string,
+    baseUrl: string,
+  ): Promise<void> => {
+    const request = await getRequest();
+    request.input('tok', sql.Char(32), token);
+    const result = await request.query<ShareRow & {
+      file_status: string; mime_type: string;
+      size_bytes: number; file_created_at: Date; stored_path: string;
+      original_name_encrypted: Buffer; original_name_iv: Buffer; original_name_auth_tag: Buffer;
+      owner_username_encrypted: Buffer; owner_username_iv: Buffer; owner_username_auth_tag: Buffer;
+    }>(
+      `SELECT sl.id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.allow_external_preview,
+              f.status AS file_status,f.mime_type,f.size_bytes,f.created_at AS file_created_at,f.stored_path,
+              f.original_name_encrypted,f.original_name_iv,f.original_name_auth_tag,
+              u.username_encrypted AS owner_username_encrypted,u.username_iv AS owner_username_iv,u.username_auth_tag AS owner_username_auth_tag
+       FROM share_links sl
+       INNER JOIN files f ON sl.file_id=f.id
+       INNER JOIN users u ON f.owner_user_id=u.id
+       WHERE sl.public_token=@tok`
+    );
+    const row = result.recordset[0];
+    if (!row) { res.status(404).type('html').send(ogErrorHtml('Not Found')); return; }
+    if (!row.is_active) { res.status(404).type('html').send(ogErrorHtml('Not Found')); return; }
+    if (row.file_status === 'Blocked') { res.status(410).type('html').send(ogErrorHtml('Unavailable')); return; }
+    if (row.expires_at && new Date(row.expires_at) < new Date()) { res.status(410).type('html').send(ogErrorHtml('Expired')); return; }
+    if (row.max_downloads && row.download_count >= row.max_downloads) { res.status(410).type('html').send(ogErrorHtml('Expired')); return; }
+
+    const fileName = decryptColumn(row.original_name_encrypted, row.original_name_iv, row.original_name_auth_tag);
+    const uploader = decryptColumn(row.owner_username_encrypted, row.owner_username_iv, row.owner_username_auth_tag);
+    const sizeLabel = ogFormatBytes(row.size_bytes);
+    const appUrl = `${baseUrl}/#f/${token}`;
+
+    const esc = (s: string) => s.replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const safeFileName = esc(fileName);
+    const safeUploader = esc(uploader);
+    const safeAppUrl = esc(appUrl);
+    const ogTitle = `${safeFileName} - Shared by ${safeUploader}`;
+    const ogDescription = `${safeFileName} · ${sizeLabel} · Shared by ${safeUploader}`;
+
+    const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>${ogTitle}</title>
+<meta property="og:title" content="${ogTitle}" />
+<meta property="og:description" content="${ogDescription}" />
+<meta property="og:type" content="website" />
+<meta property="og:url" content="${safeAppUrl}" />
+<meta name="twitter:card" content="summary" />
+<meta name="twitter:title" content="${ogTitle}" />
+<meta name="twitter:description" content="${ogDescription}" />
+<meta http-equiv="refresh" content="0;url=${safeAppUrl}" />
+<link rel="canonical" href="${safeAppUrl}" />
+</head>
+<body>
+<p><a href="${safeAppUrl}">${safeFileName}</a></p>
+<p>Shared by ${safeUploader} · ${sizeLabel}</p>
+</body>
+</html>`;
+
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.send(html);
+  };
+
+  // ── /:token/og route (works at /api/public/share/TOKEN/og) ──
+  router.get('/:token/og', async (req, res) => {
+    const protocol = req.protocol || 'https';
+    const host = req.get('host') || 'leeks.miku.rip';
+    const baseUrl = `${protocol}://${host}`;
+    try {
+      await buildShareOgHtml(req, res, req.params.token, baseUrl);
+    } catch (error) {
+      console.error('[GET /:token/og]', error);
+      if (!res.headersSent) {
+        res.status(500).type('html').send(ogErrorHtml('Internal Error'));
+      }
+    }
+  });
+
+  // ── /s/:token vanity route (for Discord embed URLs like domain.com/s/TOKEN) ──
+  router.get('/s/:token', async (req, res) => {
+    const protocol = req.protocol || 'https';
+    const host = req.get('host') || 'leeks.miku.rip';
+    const baseUrl = `${protocol}://${host}`;
+    try {
+      await buildShareOgHtml(req, res, req.params.token, baseUrl);
+    } catch (error) {
+      console.error('[GET /s/:token]', error);
+      if (!res.headersSent) {
+        res.status(500).type('html').send(ogErrorHtml('Internal Error'));
+      }
+    }
+  });
+
   router.post('/:token/download', rateLimit({
     windowMs: 15 * 60_000,
     max: parseInt(process.env.PUBLIC_SHARE_DOWNLOAD_ATTEMPTS_PER_15_MIN || '12', 10),
