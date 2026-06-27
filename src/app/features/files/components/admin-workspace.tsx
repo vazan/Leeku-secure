@@ -70,6 +70,12 @@ export default function AdminWorkspace({
   });
   const [maintenanceStatus, setMaintenanceStatus] = useState(false);
   const [loadingMaintenance, setLoadingMaintenance] = useState(false);
+  const [securityLogs, setSecurityLogs] = useState<SystemLog[]>([]);
+  const [createDummyDraft, setCreateDummyDraft] = useState({
+    username: "",
+    password: "",
+    quota_id: "guest",
+  });
 
   useEffect(() => {
     // Load maintenance status on mount
@@ -87,16 +93,20 @@ export default function AdminWorkspace({
 
   useEffect(() => setLocalQuotas(quotas), [quotas]);
 
-  const securityLogs = useMemo(
-    () =>
-      logs.filter(
-        (log) =>
-          log.event_type === "Security" ||
-          log.event_type === "Scan" ||
-          /reject|blocked|malware|threat/i.test(log.message),
-      ),
-    [logs],
-  );
+  const loadSecurityLogs = async () => {
+    try {
+      const response = await fetch('/api/admin/logs/security', { headers: adminHeaders() });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Failed to load security logs.');
+      setSecurityLogs(data.logs || []);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Failed to load security logs.');
+    }
+  };
+
+  useEffect(() => {
+    loadSecurityLogs().catch(() => undefined);
+  }, []);
 
   const post = async (url: string, body?: unknown) => {
     const response = await fetch(url, {
@@ -114,6 +124,7 @@ export default function AdminWorkspace({
       await action();
       toast.success(success);
       await onReload();
+      await loadSecurityLogs();
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "Administrative action failed.");
     }
@@ -142,6 +153,48 @@ export default function AdminWorkspace({
       "Account properties updated.",
     );
     setEditingUser(null);
+  };
+
+  const createDummyUser = async (event: React.FormEvent) => {
+    event.preventDefault();
+    const username = createDummyDraft.username.trim();
+    const password = createDummyDraft.password.trim();
+    if (!username || !password) {
+      toast.error("Username and password are required.");
+      return;
+    }
+
+    await runAction(
+      () =>
+        post('/api/admin/users/create-dummy', {
+          username,
+          password,
+          quota_id: createDummyDraft.quota_id || 'guest',
+        }),
+      'Dummy user account created.',
+    );
+    setCreateDummyDraft({
+      username: "",
+      password: "",
+      quota_id: createDummyDraft.quota_id || "guest",
+    });
+  };
+
+  const promptResetPassword = async (target: User) => {
+    const nextPassword = window.prompt(`Set a new password for "${target.username}" (minimum 8 characters):`);
+    if (!nextPassword) return;
+    if (nextPassword.trim().length < 8) {
+      toast.error("Password must contain at least 8 characters.");
+      return;
+    }
+
+    await runAction(
+      () =>
+        post(`/api/admin/users/${target.id}/reset-password`, {
+          password: nextPassword,
+        }),
+      "Password reset successfully.",
+    );
   };
 
   const saveQuota = async (event: React.FormEvent) => {
@@ -227,6 +280,32 @@ export default function AdminWorkspace({
 
       {tab === "users" && (
         <AdminPanel title="User accounts" meta={`${users.length} accounts`}>
+          <form onSubmit={createDummyUser} className="mb-5 grid gap-4 border border-[var(--border-strong)] bg-[var(--bg-elevated)] p-5 md:grid-cols-2">
+            <AdminInput
+              label="Dummy username"
+              value={createDummyDraft.username}
+              onChange={(value) => setCreateDummyDraft({ ...createDummyDraft, username: value })}
+            />
+            <AdminInput
+              label="Initial password"
+              type="password"
+              value={createDummyDraft.password}
+              onChange={(value) => setCreateDummyDraft({ ...createDummyDraft, password: value })}
+            />
+            <AdminSelect
+              label="Initial quota"
+              value={createDummyDraft.quota_id}
+              options={localQuotas.map((quota) => quota.id)}
+              onChange={(value) => setCreateDummyDraft({ ...createDummyDraft, quota_id: value })}
+            />
+            <div className="flex items-end justify-end">
+              <AdminButton type="submit" tone="green">Create dummy account</AdminButton>
+            </div>
+            <p className="md:col-span-2 text-xs text-[var(--text-muted)]">
+              New account email is auto-assigned as username@dummy.local.
+            </p>
+          </form>
+
           {editingUser && (
             <form onSubmit={saveUser} className="mb-5 grid gap-4 border border-[var(--border-strong)] bg-[var(--bg-elevated)] p-5 md:grid-cols-2">
               <AdminInput label="Username" value={editUser.username} onChange={(value) => setEditUser({ ...editUser, username: value })} />
@@ -257,6 +336,7 @@ export default function AdminWorkspace({
                     <td className="px-4 py-3"><StatusBadge tone={target.status === "Active" ? "green" : "pink"}>{target.status}</StatusBadge></td>
                     <td className="space-x-2 px-4 py-3 text-right">
                       <AdminButton tone="cyan" onClick={() => startEditUser(target)}>Edit info</AdminButton>
+                      <AdminButton tone="green" onClick={() => promptResetPassword(target)}>Reset password</AdminButton>
                       <AdminButton
                         tone="pink"
                         onClick={() =>
@@ -412,7 +492,12 @@ function AdminSelect({ label, value, options, onChange }: { label: string; value
 }
 
 function LogPanel({ title, logs, security = false }: { title: string; logs: SystemLog[]; security?: boolean }) {
-  return <AdminPanel title={title} accent={security ? "pink" : "cyan"}><div className="max-h-[520px] space-y-3 overflow-y-auto border border-[var(--border-subtle)] bg-[var(--admin-surface)] p-4">{logs.length ? logs.map((log) => <div key={log.id} className="border-b border-[var(--border-subtle)] pb-3 text-xs"><div className={`mb-1 flex justify-between ${security ? "text-[var(--admin-critical)]" : "text-[var(--text-muted)]"}`}><span>{new Date(log.created_at).toLocaleString()} | IP: {log.ip_address}</span><span>[{security ? "Threat detected" : log.event_type}]</span></div><p className={security ? "text-[var(--admin-critical)]" : "text-[var(--text-secondary)]"}><strong>@{log.username || "System"}:</strong> {log.message}</p></div>) : <p className="py-8 text-center text-xs text-[var(--text-muted)]">No matching events.</p>}</div></AdminPanel>;
+  const [selectedLog, setSelectedLog] = useState<SystemLog | null>(null);
+
+  const emptyMessage = security
+    ? "No security events found yet. Trigger a scan block, lockout, or other security action to populate this view."
+    : "No matching events.";
+  return <AdminPanel title={title} accent={security ? "pink" : "cyan"}><div className="space-y-3"><div className="max-h-[520px] space-y-3 overflow-y-auto border border-[var(--border-subtle)] bg-[var(--admin-surface)] p-4">{logs.length ? logs.map((log) => <button key={log.id} type="button" onClick={() => setSelectedLog(log)} className="w-full border-b border-[var(--border-subtle)] pb-3 text-left text-xs hover:bg-[var(--bg-hover)]"><div className={`mb-1 flex justify-between ${security ? "text-[var(--admin-critical)]" : "text-[var(--text-muted)]"}`}><span>{new Date(log.created_at).toLocaleString()} | IP: {log.ip_address}</span>{!security && <span>[{log.event_type}]</span>}</div><p className={security ? "text-[var(--admin-critical)]" : "text-[var(--text-secondary)]"}><strong>@{log.username || "System"}:</strong> {log.message}</p></button>) : <p className="py-8 text-center text-xs text-[var(--text-muted)]">{emptyMessage}</p>}</div></div>{selectedLog && <div className="fixed inset-0 z-50 grid place-items-center bg-black/70 p-4" onPointerDown={(event) => { if (event.target === event.currentTarget) setSelectedLog(null); }}><div className="w-full max-w-2xl border border-[var(--border-strong)] bg-[var(--bg-panel)] p-5" onPointerDown={(event) => event.stopPropagation()}><div className="mb-4 flex items-center justify-between border-b border-[var(--border-subtle)] pb-3"><h3 className="text-sm font-semibold">Log details</h3><button type="button" onClick={() => setSelectedLog(null)} className="border border-[var(--border-subtle)] px-2 py-1 text-xs text-[var(--text-muted)] hover:bg-[var(--bg-hover)]">Close</button></div><div className="grid gap-2 text-xs text-[var(--text-secondary)]"><p><strong>ID:</strong> {selectedLog.id}</p><p><strong>Event type:</strong> {selectedLog.event_type}</p><p><strong>Target type:</strong> {selectedLog.target_type}</p><p><strong>Target ID:</strong> {selectedLog.target_id}</p><p><strong>User:</strong> @{selectedLog.username || "System"}</p><p><strong>User ID:</strong> {selectedLog.user_id || "N/A"}</p><p><strong>IP:</strong> {selectedLog.ip_address}</p><p><strong>Created:</strong> {new Date(selectedLog.created_at).toLocaleString()}</p><p className="mt-2 whitespace-pre-wrap border border-[var(--border-subtle)] bg-[var(--admin-surface)] p-3"><strong>Message:</strong><br />{selectedLog.message}</p></div></div></div>}</AdminPanel>;
 }
 
 function HealthMetric({ icon, label, value }: { icon: React.ReactNode; label: string; value: string }) {

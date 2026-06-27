@@ -34,17 +34,51 @@ function getSmtpConfig() {
   };
 }
 
+function getSmtpFromAddress(): string {
+  const from = String(process.env.SMTP_USER || '').trim();
+  if (!from) {
+    throw new Error('[email] SMTP_USER must be set in .env');
+  }
+  return from;
+}
+
 // ──────────────────────────────────────────────────────────────
 // Singleton transporter (lazy)
 // ──────────────────────────────────────────────────────────────
 
 let transporter: Transporter | null = null;
+let transporterConfigSignature = '';
+
+function maskEmail(value: string): string {
+  const trimmed = String(value || '').trim();
+  const at = trimmed.indexOf('@');
+  if (at <= 1) return '***';
+  return `${trimmed.slice(0, 2)}***${trimmed.slice(at)}`;
+}
+
+function buildTransporterSignature(config: ReturnType<typeof getSmtpConfig>): string {
+  return [
+    config.host,
+    String(config.port),
+    String(config.secure),
+    String(config.tls?.rejectUnauthorized),
+    String(config.auth?.user || ''),
+    String(config.auth?.pass || ''),
+  ].join('|');
+}
 
 function getTransporter(): Transporter {
-  if (!transporter) {
-    const config = getSmtpConfig();
+  const config = getSmtpConfig();
+  const signature = buildTransporterSignature(config);
+  const smtpFrom = getSmtpFromAddress();
+
+  if (!transporter || transporterConfigSignature !== signature) {
     transporter = nodemailer.createTransport(config);
-    console.log(`[email] SMTP transporter created: ${config.host}:${config.port} (secure=${config.secure})`);
+    transporterConfigSignature = signature;
+    console.log(
+      `[email] SMTP transporter created: ${config.host}:${config.port} ` +
+      `(secure=${config.secure}, auth=${maskEmail(String(config.auth.user))}, from=${maskEmail(smtpFrom)})`
+    );
   }
   return transporter;
 }
@@ -141,25 +175,75 @@ export async function sendVerificationEmail(to: string, username: string, token:
   </p>
 </div>`;
 
-  const smtp = getSmtpConfig();
-  const authUser = smtp.auth.user;
-  const displayFrom = process.env.SMTP_FROM || authUser;
+  const displayFrom = getSmtpFromAddress();
 
-  // Exchange enforces that the SMTP envelope MAIL FROM matches the authenticated
-  // user. We always set envelope.from to the auth user, but can have a different
-  // From header in the message body if SMTP_FROM is configured to something else.
   await getTransporter().sendMail({
     from: `"Leeku Secure" <${displayFrom}>`,
     to,
     subject: 'Verify your email — Leeku Secure',
     html,
     envelope: {
-      from: authUser,
+      from: displayFrom,
       to,
     },
   });
 
-  console.log(`[email] Verification email sent to ${to} (envelope from: ${authUser})`);
+  console.log(`[email] Verification email sent to ${to} (envelope from: ${displayFrom})`);
+}
+
+interface QuotaChangeRequestEmailPayload {
+  requesterUsername: string;
+  requesterEmail: string;
+  currentPlanName: string;
+  requestedPlanName: string;
+  note: string;
+}
+
+export async function sendQuotaChangeRequestEmail(
+  recipients: string[],
+  payload: QuotaChangeRequestEmailPayload,
+): Promise<void> {
+  if (!recipients.length) {
+    throw new Error('[email] At least one admin recipient is required for quota change request emails');
+  }
+
+  const html = `
+<div style="max-width:680px;margin:0 auto;font-family:monospace;background:#0A0E14;border:3px solid #00F2FF;padding:32px;">
+  <div style="text-align:center;margin-bottom:24px;">
+    <span style="background:#00F2FF;color:#0A0E14;padding:4px 12px;font-size:10px;font-weight:900;letter-spacing:2px;">LEEKU_QUOTA_REQUEST</span>
+  </div>
+  <h1 style="color:#00F2FF;text-align:center;font-size:22px;text-transform:uppercase;letter-spacing:1px;margin:0 0 8px;">
+    Quota Upgrade Request
+  </h1>
+  <p style="color:#ccc;text-align:center;font-size:12px;margin:0 0 24px;">
+    A user submitted a request to change their quota plan.
+  </p>
+  <table style="width:100%;border-collapse:collapse;background:#0F1419;border:1px solid #1f2a3a;">
+    <tr><td style="padding:10px;border-bottom:1px solid #1f2a3a;color:#8aa1bf;">User</td><td style="padding:10px;border-bottom:1px solid #1f2a3a;color:#fff;">${payload.requesterUsername}</td></tr>
+    <tr><td style="padding:10px;border-bottom:1px solid #1f2a3a;color:#8aa1bf;">Email</td><td style="padding:10px;border-bottom:1px solid #1f2a3a;color:#fff;">${payload.requesterEmail}</td></tr>
+    <tr><td style="padding:10px;border-bottom:1px solid #1f2a3a;color:#8aa1bf;">Current plan</td><td style="padding:10px;border-bottom:1px solid #1f2a3a;color:#fff;">${payload.currentPlanName}</td></tr>
+    <tr><td style="padding:10px;color:#8aa1bf;">Requested plan</td><td style="padding:10px;color:#fff;">${payload.requestedPlanName}</td></tr>
+  </table>
+  <div style="margin-top:16px;border:1px solid #1f2a3a;background:#0F1419;padding:12px;">
+    <p style="margin:0 0 6px;color:#8aa1bf;font-size:11px;text-transform:uppercase;letter-spacing:1px;">User note</p>
+    <p style="margin:0;color:#ddd;font-size:12px;white-space:pre-wrap;">${payload.note}</p>
+  </div>
+</div>`;
+
+  const displayFrom = getSmtpFromAddress();
+
+  await getTransporter().sendMail({
+    from: `"Leeku Secure" <${displayFrom}>`,
+    to: recipients.join(','),
+    subject: `Quota request: ${payload.requesterUsername} -> ${payload.requestedPlanName}`,
+    html,
+    envelope: {
+      from: displayFrom,
+      to: recipients,
+    },
+  });
+
+  console.log(`[email] Quota change request email sent to ${recipients.length} admin recipient(s).`);
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -203,9 +287,7 @@ export async function sendAccountDeletionEmail(to: string, username: string, tok
   </p>
 </div>`;
 
-  const smtp = getSmtpConfig();
-  const authUser = smtp.auth.user;
-  const displayFrom = process.env.SMTP_FROM || authUser;
+  const displayFrom = getSmtpFromAddress();
 
   await getTransporter().sendMail({
     from: `"Leeku Secure" <${displayFrom}>`,
@@ -213,10 +295,10 @@ export async function sendAccountDeletionEmail(to: string, username: string, tok
     subject: 'Confirm account deletion — Leeku Secure',
     html,
     envelope: {
-      from: authUser,
+      from: displayFrom,
       to,
     },
   });
 
-  console.log(`[email] Account deletion email sent to ${to} (envelope from: ${authUser})`);
+  console.log(`[email] Account deletion email sent to ${to} (envelope from: ${displayFrom})`);
 }

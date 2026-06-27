@@ -91,6 +91,46 @@ export async function setMaintenanceStatus(enabled: boolean): Promise<boolean> {
 }
 
 /**
+ * Get whether maintenance mode was auto-enabled by the UNC share monitor.
+ */
+export async function getUncShareAutoMaintenanceStatus(): Promise<boolean> {
+  try {
+    await ensureTable();
+    const request = await getRequest();
+    const result = await request.query<{ v: string }>(
+      `SELECT [value] AS v FROM [dbo].[system_config] WHERE [key] = N'maintenance_auto_unc_share'`
+    );
+    const raw = result.recordset[0]?.v ?? '0';
+    return raw === '1' || raw.toLowerCase() === 'true';
+  } catch (error) {
+    console.error('[getUncShareAutoMaintenanceStatus] Error fetching UNC auto-maintenance status:', error);
+    return false;
+  }
+}
+
+/**
+ * Set whether maintenance mode is currently auto-managed by UNC share monitor.
+ */
+export async function setUncShareAutoMaintenanceStatus(enabled: boolean): Promise<void> {
+  try {
+    await ensureTable();
+    const request = await getRequest();
+    request.input('val', sql.NVarChar, enabled ? '1' : '0');
+    await request.query(`
+      MERGE [dbo].[system_config] AS target
+      USING (SELECT N'maintenance_auto_unc_share' AS [key]) AS src ON target.[key] = src.[key]
+      WHEN MATCHED THEN
+        UPDATE SET [value] = @val, [updated_at] = SYSDATETIMEOFFSET()
+      WHEN NOT MATCHED THEN
+        INSERT ([key],[value]) VALUES (N'maintenance_auto_unc_share', @val);
+    `);
+  } catch (error) {
+    console.error('[setUncShareAutoMaintenanceStatus] Error updating UNC auto-maintenance status:', error);
+    throw error;
+  }
+}
+
+/**
  * Invalidate maintenance status cache
  */
 export function invalidateMaintenanceCache(): void {

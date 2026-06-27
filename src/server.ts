@@ -40,11 +40,17 @@ import {
   computeExpiresAt, isValidTtl,
   type ExpiredFileRecord,
 } from './server/utils/expiry-cleanup.js';
-import { sendVerificationEmail, sendAccountDeletionEmail, validateMxRecord, verifySmtpConnection } from './server/utils/email.js';
+import { sendVerificationEmail, sendAccountDeletionEmail, sendQuotaChangeRequestEmail, validateMxRecord, verifySmtpConnection } from './server/utils/email.js';
 import multer from 'multer';
 import os from 'os';
 import { iisLoggingMiddleware, validateIISLoggingConfig } from './server/middleware/iis-logger.js';
-import { maintenanceModeMiddleware, getMaintenanceStatus } from './server/middleware/maintenance-mode.js';
+import {
+  maintenanceModeMiddleware,
+  getMaintenanceStatus,
+  setMaintenanceStatus,
+  getUncShareAutoMaintenanceStatus,
+  setUncShareAutoMaintenanceStatus,
+} from './server/middleware/maintenance-mode.js';
 import { createSessionRouter } from './server/routes/sessions.js';
 import { createHealthRouter } from './server/routes/health.js';
 import { createPublicSharingRouter } from './server/routes/public-sharing.js';
@@ -99,6 +105,7 @@ const HTTP_REQUEST_TIMEOUT_MS = parseNonNegativeIntEnv('HTTP_REQUEST_TIMEOUT_MS'
 const HTTP_HEADERS_TIMEOUT_MS = parseNonNegativeIntEnv('HTTP_HEADERS_TIMEOUT_MS', 60_000);
 const HTTP_KEEP_ALIVE_TIMEOUT_MS = parseNonNegativeIntEnv('HTTP_KEEP_ALIVE_TIMEOUT_MS', 5_000);
 const HTTP_SOCKET_TIMEOUT_MS = parseNonNegativeIntEnv('HTTP_SOCKET_TIMEOUT_MS', 0);
+const UNC_SHARE_HEALTHCHECK_INTERVAL_MS = parseNonNegativeIntEnv('UNC_SHARE_HEALTHCHECK_INTERVAL_MS', 5 * 60_000);
 const ALLOW_UNSCANNED_UPLOADS_IN_DEVELOPMENT =
   NODE_ENV === 'development' && process.env.ALLOW_UNSCANNED_UPLOADS_IN_DEVELOPMENT !== 'false';
 
@@ -231,6 +238,73 @@ function cleanupStaleTempFiles(tempDir: string): void {
   } catch (err) {
     console.warn('[server] Error during stale temp file cleanup:', err);
   }
+}
+
+let uncShareMonitorTimer: ReturnType<typeof setInterval> | null = null;
+let uncShareMonitorRunning = false;
+
+async function isUncShareAvailable(sharePath: string): Promise<boolean> {
+  try {
+    await fs.promises.access(sharePath, fs.constants.R_OK);
+    await fs.promises.readdir(sharePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function evaluateUncShareHealth(): Promise<void> {
+  if (!FILE_VAULT.startsWith('\\\\')) return;
+  if (uncShareMonitorRunning) return;
+  uncShareMonitorRunning = true;
+
+  try {
+    const shareAvailable = await isUncShareAvailable(FILE_VAULT);
+    const maintenanceEnabled = await getMaintenanceStatus();
+    const autoEnabled = await getUncShareAutoMaintenanceStatus();
+
+    if (!shareAvailable) {
+      if (!maintenanceEnabled) {
+        await setMaintenanceStatus(true);
+        await setUncShareAutoMaintenanceStatus(true);
+        console.error(`[maintenance][unc-monitor] UNC share unavailable: ${FILE_VAULT}. Maintenance mode enabled.`);
+      }
+      return;
+    }
+
+    if (autoEnabled) {
+      await setMaintenanceStatus(false);
+      await setUncShareAutoMaintenanceStatus(false);
+      console.log(`[maintenance][unc-monitor] UNC share restored: ${FILE_VAULT}. Maintenance mode disabled.`);
+    }
+  } catch (error) {
+    console.error('[maintenance][unc-monitor] Health check failed:', error);
+  } finally {
+    uncShareMonitorRunning = false;
+  }
+}
+
+function startUncShareMonitor(intervalMs: number = UNC_SHARE_HEALTHCHECK_INTERVAL_MS): void {
+  if (!FILE_VAULT.startsWith('\\\\')) {
+    console.log('[maintenance][unc-monitor] FILE_STORAGE_UNC_PATH is not a UNC path. Monitor disabled.');
+    return;
+  }
+  if (uncShareMonitorTimer) return;
+
+  void evaluateUncShareHealth();
+  uncShareMonitorTimer = setInterval(() => {
+    void evaluateUncShareHealth();
+  }, intervalMs);
+  if (uncShareMonitorTimer && typeof uncShareMonitorTimer === 'object' && 'unref' in uncShareMonitorTimer) {
+    uncShareMonitorTimer.unref();
+  }
+  console.log(`[maintenance][unc-monitor] Started. Interval=${intervalMs}ms Path=${FILE_VAULT}`);
+}
+
+function stopUncShareMonitor(): void {
+  if (!uncShareMonitorTimer) return;
+  clearInterval(uncShareMonitorTimer);
+  uncShareMonitorTimer = null;
 }
 
 function configureHttpServer(server: http.Server): http.Server {
@@ -1294,6 +1368,101 @@ app.post('/api/users/me/update', authenticateUser as express.RequestHandler, asy
     await logSystemEvent(userId, user.username, 'Auth', 'User', userId, req, 'Updated account details.');
     res.json({ success: true, user });
   } catch (err) { console.error('[POST /api/users/me/update]', err); res.status(500).json({ error: 'Failed to update account.' }); }
+});
+
+app.post('/api/users/me/quota-change-request', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  const requestedQuotaId = String(req.body?.requested_quota_id || '').trim();
+  const note = String(req.body?.note || '').trim();
+  const requester = req.user!;
+
+  if (!requestedQuotaId) {
+    return res.status(400).json({ error: 'Requested plan is required.' });
+  }
+  if (requestedQuotaId === requester.quota_id) {
+    return res.status(400).json({ error: 'You are already on this plan.' });
+  }
+  if (!note || note.length < 10 || note.length > 2000) {
+    return res.status(400).json({ error: 'Please provide a note between 10 and 2000 characters.' });
+  }
+  if (!SMTP_ENABLED) {
+    return res.status(503).json({ error: 'Quota requests are unavailable because SMTP is not configured.' });
+  }
+
+  try {
+    const requestedQuotaRequest = await getRequest();
+    requestedQuotaRequest.input('id', sql.NVarChar(50), requestedQuotaId);
+    const requestedQuotaResult = await requestedQuotaRequest.query<Quota>(
+      'SELECT id, name, storage_limit_bytes, max_file_size_bytes, max_files, daily_upload_limit_bytes FROM quotas WHERE id=@id'
+    );
+    if (!requestedQuotaResult.recordset.length) {
+      return res.status(404).json({ error: 'Requested plan not found.' });
+    }
+    const requestedQuota = requestedQuotaResult.recordset[0];
+
+    const currentQuotaRequest = await getRequest();
+    currentQuotaRequest.input('id', sql.NVarChar(50), requester.quota_id);
+    const currentQuotaResult = await currentQuotaRequest.query<Quota>(
+      'SELECT id, name, storage_limit_bytes, max_file_size_bytes, max_files, daily_upload_limit_bytes FROM quotas WHERE id=@id'
+    );
+    const currentQuotaName = currentQuotaResult.recordset[0]?.name || requester.quota_id;
+
+    const adminRequest = await getRequest();
+    const adminUsers = await adminRequest.query<UserRow>(
+      `SELECT id, email_encrypted, email_iv, email_auth_tag,
+              username_encrypted, username_iv, username_auth_tag,
+              role, quota_id, storage_used_bytes, status, created_at,
+              failed_login_count, locked_until
+       FROM users
+       WHERE role='Admin' AND status='Active'`
+    );
+
+    const adminRecipients = Array.from(new Set(
+      adminUsers.recordset
+        .map((row) => {
+          try {
+            return decryptColumn(row.email_encrypted, row.email_iv, row.email_auth_tag).trim();
+          } catch (decryptError) {
+            console.warn('[POST /api/users/me/quota-change-request] Skipping admin recipient due to invalid encrypted email.', {
+              adminId: row.id,
+              error: decryptError instanceof Error ? decryptError.message : String(decryptError),
+            });
+            return '';
+          }
+        })
+        .filter((email) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
+    ));
+
+    if (!adminRecipients.length) {
+      return res.status(500).json({ error: 'No valid admin recipients are configured.' });
+    }
+
+    // Match account registration behavior: send email asynchronously so the
+    // user request is accepted even if SMTP has intermittent issues.
+    sendQuotaChangeRequestEmail(adminRecipients, {
+      requesterUsername: requester.username,
+      requesterEmail: requester.email,
+      currentPlanName: currentQuotaName,
+      requestedPlanName: requestedQuota.name,
+      note,
+    }).catch((emailError) => {
+      console.error('[POST /api/users/me/quota-change-request] SMTP send failed:', emailError);
+    });
+
+    await logSystemEvent(
+      requester.id,
+      requester.username,
+      'Admin',
+      'QuotaRequest',
+      requestedQuota.id,
+      req,
+      `Requested quota change from "${currentQuotaName}" to "${requestedQuota.name}".`
+    );
+
+    res.json({ success: true, message: 'Your quota change request was submitted.' });
+  } catch (err) {
+    console.error('[POST /api/users/me/quota-change-request]', err);
+    res.status(500).json({ error: 'Failed to submit quota change request. Contact support if this continues.' });
+  }
 });
 
 const profilePictureUpload = multer({
@@ -2900,6 +3069,149 @@ app.get('/api/admin/users', authenticateUser as express.RequestHandler, verifyAd
   } catch (err) { console.error('[GET /api/admin/users]', err); res.status(500).json({ error: 'Failed to load users.' }); }
 });
 
+app.post('/api/admin/users/create-dummy', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  const usernameRaw = String(req.body?.username || '').trim();
+  const passwordRaw = String(req.body?.password || '').trim();
+  const requestedQuotaId = String(req.body?.quota_id || 'guest').trim() || 'guest';
+
+  if (!usernameRaw || usernameRaw.length < 3 || usernameRaw.length > 64) {
+    return res.status(400).json({ error: 'Username must be between 3 and 64 characters.' });
+  }
+  if (!/^[a-zA-Z0-9._-]+$/.test(usernameRaw)) {
+    return res.status(400).json({ error: 'Username may only contain letters, numbers, dot, underscore, and hyphen.' });
+  }
+  if (!passwordRaw || passwordRaw.length < 8 || passwordRaw.length > 128) {
+    return res.status(400).json({ error: 'Password must be between 8 and 128 characters.' });
+  }
+
+  const username = usernameRaw;
+  const email = `${username.toLowerCase()}@dummy.local`;
+  const usernameHash = hashColumnForLookup(username.toLowerCase());
+  const emailHash = hashColumnForLookup(email);
+
+  try {
+    const quotaCheckReq = await getRequest();
+    quotaCheckReq.input('qid', sql.NVarChar(50), requestedQuotaId);
+    const quotaCheck = await quotaCheckReq.query<{ c: number }>('SELECT COUNT(*) AS c FROM quotas WHERE id=@qid');
+    if (!quotaCheck.recordset[0].c) {
+      return res.status(400).json({ error: 'Quota tier not found.' });
+    }
+
+    const dupReq = await getRequest();
+    dupReq.input('uH', sql.Char(64), usernameHash);
+    dupReq.input('eH', sql.Char(64), emailHash);
+    const dup = await dupReq.query<{ usernameExists: number; emailExists: number }>(
+      `SELECT
+         (SELECT COUNT(*) FROM users WHERE username_hash=@uH) AS usernameExists,
+         (SELECT COUNT(*) FROM users WHERE email_hash=@eH) AS emailExists`
+    );
+    if (dup.recordset[0].usernameExists > 0) {
+      return res.status(400).json({ error: 'Username already exists.' });
+    }
+    if (dup.recordset[0].emailExists > 0) {
+      return res.status(400).json({ error: 'Dummy email already exists for this username.' });
+    }
+
+    const encEmail = encryptColumn(email);
+    const encUsername = encryptColumn(username);
+    const passwordHash = await hashPassword(passwordRaw);
+
+    const insertReq = await getRequest();
+    insertReq.input('eEnc', sql.VarBinary(512), encEmail.ciphertext);
+    insertReq.input('eIv', sql.VarBinary(16), encEmail.iv);
+    insertReq.input('eTag', sql.VarBinary(16), encEmail.authTag);
+    insertReq.input('eHash', sql.Char(64), emailHash);
+    insertReq.input('uEnc', sql.VarBinary(512), encUsername.ciphertext);
+    insertReq.input('uIv', sql.VarBinary(16), encUsername.iv);
+    insertReq.input('uTag', sql.VarBinary(16), encUsername.authTag);
+    insertReq.input('uHash', sql.Char(64), usernameHash);
+    insertReq.input('pw', sql.NVarChar(512), passwordHash);
+    insertReq.input('quota', sql.NVarChar(50), requestedQuotaId);
+
+    const created = await insertReq.query<UserRow>(
+      `INSERT INTO users (
+         email_encrypted, email_iv, email_auth_tag, email_hash,
+         username_encrypted, username_iv, username_auth_tag, username_hash,
+         password_hash, quota_id, role, status,
+         email_verified, email_verification_token, email_verification_expires
+       )
+       OUTPUT INSERTED.id, INSERTED.email_encrypted, INSERTED.email_iv, INSERTED.email_auth_tag,
+              INSERTED.username_encrypted, INSERTED.username_iv, INSERTED.username_auth_tag,
+              INSERTED.role, INSERTED.quota_id, INSERTED.storage_used_bytes,
+              INSERTED.status, INSERTED.created_at, INSERTED.failed_login_count, INSERTED.locked_until
+       VALUES (@eEnc,@eIv,@eTag,@eHash, @uEnc,@uIv,@uTag,@uHash, @pw,@quota, N'User', N'Active', 1, NULL, NULL)`
+    );
+
+    const user = mapUserRow(created.recordset[0]);
+    await logSystemEvent(
+      req.userId!,
+      req.user!.username,
+      'Admin',
+      'User',
+      user.id,
+      req,
+      `Created dummy account "${username}" (${email}).`
+    );
+
+    res.json({ success: true, user });
+  } catch (err) {
+    console.error('[POST /api/admin/users/create-dummy]', err);
+    res.status(500).json({ error: 'Failed to create dummy user account.' });
+  }
+});
+
+app.post('/api/admin/users/:id/reset-password', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  const userId = req.params.id;
+  const newPassword = String(req.body?.password || '').trim();
+  if (!newPassword || newPassword.length < 8 || newPassword.length > 128) {
+    return res.status(400).json({ error: 'Password must be between 8 and 128 characters.' });
+  }
+
+  try {
+    const findReq = await getRequest();
+    findReq.input('id', sql.UniqueIdentifier, userId);
+    const found = await findReq.query<UserRow>(
+      `SELECT id,email_encrypted,email_iv,email_auth_tag,username_encrypted,username_iv,username_auth_tag,
+              role,quota_id,storage_used_bytes,status,created_at,failed_login_count,locked_until
+       FROM users WHERE id=@id`
+    );
+    if (!found.recordset.length) {
+      return res.status(404).json({ error: 'User not found.' });
+    }
+
+    const passwordHash = await hashPassword(newPassword);
+    const updateReq = await getRequest();
+    updateReq.input('id', sql.UniqueIdentifier, userId);
+    updateReq.input('pw', sql.NVarChar(512), passwordHash);
+    const updated = await updateReq.query<UserRow>(
+      `UPDATE users
+       SET password_hash=@pw, failed_login_count=0, locked_until=NULL
+       OUTPUT INSERTED.id,INSERTED.email_encrypted,INSERTED.email_iv,INSERTED.email_auth_tag,
+              INSERTED.username_encrypted,INSERTED.username_iv,INSERTED.username_auth_tag,
+              INSERTED.role,INSERTED.quota_id,INSERTED.storage_used_bytes,INSERTED.status,INSERTED.created_at,INSERTED.failed_login_count,INSERTED.locked_until
+       WHERE id=@id`
+    );
+    const user = mapUserRow(updated.recordset[0]);
+
+    await revokeAllRefreshSessions(userId);
+
+    await logSystemEvent(
+      req.userId!,
+      req.user!.username,
+      'Security',
+      'User',
+      userId,
+      req,
+      `Admin reset password for "${user.username}".`
+    );
+
+    res.json({ success: true, user });
+  } catch (err) {
+    console.error('[POST /api/admin/users/:id/reset-password]', err);
+    res.status(500).json({ error: 'Failed to reset user password.' });
+  }
+});
+
 app.post('/api/admin/users/:id/suspend', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
   const userId = req.params.id;
   try {
@@ -3036,6 +3348,30 @@ app.get('/api/admin/logs', authenticateUser as express.RequestHandler, verifyAdm
     );
     res.json({ logs: result.recordset.map(mapLogRow) });
   } catch (err) { console.error('[GET /api/admin/logs]', err); res.status(500).json({ error: 'Failed to load logs.' }); }
+});
+
+app.get('/api/admin/logs/security', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, async (req, res) => {
+  try {
+    const request = await getRequest();
+    request.input('top', sql.Int, MAX_LOG_ENTRIES);
+    const result = await request.query<LogRow>(
+      `SELECT TOP (@top)
+         id,user_id,username_snapshot,event_type,target_type,target_id,ip_address,message,created_at
+       FROM system_logs
+       WHERE LOWER(LTRIM(RTRIM(event_type))) IN ('security', 'scan')
+          OR message LIKE '%reject%'
+          OR message LIKE '%blocked%'
+          OR message LIKE '%malware%'
+          OR message LIKE '%threat%'
+          OR message LIKE '%lock%'
+          OR message LIKE '%failed login%'
+       ORDER BY created_at DESC`
+    );
+    res.json({ logs: result.recordset.map(mapLogRow) });
+  } catch (err) {
+    console.error('[GET /api/admin/logs/security]', err);
+    res.status(500).json({ error: 'Failed to load security logs.' });
+  }
 });
 
 app.post('/api/admin/quotas', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
@@ -3200,6 +3536,9 @@ async function bootstrap() {
   // 6c. Start periodic sweep of expired download sessions
   startPrivateDownloadSweep();
 
+  // 6d. Start UNC share health monitor (auto-maintenance toggle)
+  startUncShareMonitor();
+
   // 7. Share link vanity path (Discord embeds) & SPA fallback
   const distPath = path.join(process.cwd(), 'dist');
   app.use(express.static(distPath));
@@ -3247,6 +3586,7 @@ async function bootstrap() {
   const shutdown = async (sig: string) => {
     console.log(`[server] ${sig} — shutting down worker ${process.pid}.`);
     stopPrivateDownloadSweep();
+    stopUncShareMonitor();
     sweepPrivateDownloadSessions();
     stopExpiryCleanup();
     await closePool();
