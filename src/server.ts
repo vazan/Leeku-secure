@@ -3010,6 +3010,10 @@ app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, asy
         allow_external_preview !== undefined
           ? !!allow_external_preview
           : !!shareRow.allow_external_preview;
+      const nextMaxDownloads =
+        max_downloads !== undefined
+          ? (max_downloads ? Number(max_downloads) : null)
+          : shareRow.max_downloads;
       if (nextAllowExternalPreview) {
         if (!file.mime_type.startsWith('image/') && !file.mime_type.startsWith('video/'))
           return res.status(400).json({ error: 'External preview is only supported for image and video files.' });
@@ -3018,13 +3022,16 @@ app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, asy
         if (file.client_secret_hash)
           return res.status(400).json({ error: 'Files protected with a secret key cannot use external preview.' });
       }
-      if (is_active === true && !shareRow.is_active) {
+      if (
+        (is_active === true && !shareRow.is_active) ||
+        (max_downloads !== undefined && nextMaxDownloads !== shareRow.max_downloads)
+      ) {
         upReq.input('newToken', sql.Char(32), generateSecureToken(16));
         sets.push('public_token=@newToken', 'download_count=0');
       }
       if (password !== undefined) { upReq.input('pw', sql.NVarChar(256), password ? await hashSharePassword(password) : null); sets.push('password_hash=@pw'); }
       if (expires_at !== undefined) { upReq.input('exp', sql.DateTimeOffset, expires_at||null); sets.push('expires_at=@exp'); }
-      if (max_downloads !== undefined) { upReq.input('md', sql.Int, max_downloads ? Number(max_downloads) : null); sets.push('max_downloads=@md'); }
+      if (max_downloads !== undefined) { upReq.input('md', sql.Int, nextMaxDownloads); sets.push('max_downloads=@md'); }
       if (is_active !== undefined) { upReq.input('act', sql.Bit, is_active ? 1 : 0); sets.push('is_active=@act'); }
       if (allow_external_preview !== undefined) {
         upReq.input('allowExternalPreview', sql.Bit, allow_external_preview ? 1 : 0);

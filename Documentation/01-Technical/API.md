@@ -642,7 +642,7 @@ Constraints:
 - `allow_external_preview` and `password` are mutually exclusive
 - `allow_external_preview` and `client_secret_hash` are mutually exclusive
 
-Re-activating an inactive link (`is_active: true`) generates a new `public_token` and resets `download_count`.
+Re-activating an inactive link (`is_active: true`) or changing `max_downloads` generates a new `public_token` and resets `download_count`.
 
 **Response 200:**
 ```json
