@@ -4,7 +4,7 @@
 
 Leeku Secure is a self-hosted, full-stack file hosting platform that encrypts every uploaded file with AES-256-GCM before writing it to a UNC storage share. All PII columns in the database are individually encrypted; no plaintext filename, email, or username is stored at rest.
 
-The `main` branch targets SQL Server. The `postgresql` branch swaps the persistence layer to PostgreSQL so operators can choose the database stack that fits their environment.
+This branch targets PostgreSQL for all database setup and operations.
 
 Deployed on Windows Server 2022 at **leeks.miku.rip** ✅
 
@@ -84,7 +84,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for complete step-by-step setup with prer
 See [DEPLOYMENT.md](Documentation/01-Technical/DEPLOYMENT.md) for Windows Server 2022 + IIS ARR setup.
 
 **Database:**
-Use [Documentation/SQL/postgresql_schema.sql](Documentation/SQL/postgresql_schema.sql) on the `postgresql` branch. The SQL Server scripts remain on `main`.
+Use [Documentation/SQL/postgresql_schema.sql](Documentation/SQL/postgresql_schema.sql) on this branch.
 
 ## Development Scripts
 
@@ -125,11 +125,8 @@ Use [Documentation/SQL/postgresql_schema.sql](Documentation/SQL/postgresql_schem
 ### 📊 Database
 | Document | Purpose |
 |---|---|
-| [SQL/README.md](Documentation/SQL/README.md) | SQL documentation quick-start and file overview |
-| [SQL/production_schema.sql](Documentation/SQL/production_schema.sql) | Complete database creation script (7 tables, 12 indexes, 5 stored procs) |
-| [SQL/VALIDATION.md](Documentation/SQL/VALIDATION.md) | Schema validation queries, index strategy, performance benchmarks |
-| [SQL/queries.sql](Documentation/SQL/queries.sql) | 40+ reference SQL patterns for common operations |
-| [SQL/schema.sql](Documentation/SQL/schema.sql) | Detailed schema reference with encryption architecture |
+| [SQL/postgresql_schema.sql](Documentation/SQL/postgresql_schema.sql) | Canonical PostgreSQL schema for this branch |
+| [SQL/README.md](Documentation/SQL/README.md) | PostgreSQL SQL docs quick reference |
 
 ## Project Structure
 

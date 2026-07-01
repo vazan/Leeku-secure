@@ -22,16 +22,15 @@ When enabled, maintenance mode:
 
 ### Prerequisites
 
-Before using maintenance mode, you must apply the migration script to your database:
+Before using maintenance mode, apply the PostgreSQL schema once:
 
-```sql
-sqlcmd -S <server> -U sa -P <password> -d LeekuSecure -i Documentation/SQL/003_maintenance_mode.sql
+```sh
+psql -U leeku_app -d LeekuSecure -f Documentation/SQL/postgresql_schema.sql
 ```
 
-This creates:
+This ensures:
 - **`system_config` table** — Stores system configuration keys/values
-- **`sp_GetMaintenanceStatus` stored procedure** — Retrieves current status
-- **`sp_ToggleMaintenanceMode` stored procedure** — Updates status
+- **`maintenance_mode` key** — Tracks current maintenance state
 
 ---
 
@@ -179,15 +178,14 @@ You can view these in the **Security Events** or **Audit Logs** tab in the admin
 
 **Possible causes:**
 - Missing or corrupt `system_config` table
-- Missing stored procedures
 - Database connection issues
 
 **Solution:**
-- Re-run the migration script: `003_maintenance_mode.sql`
-- Verify stored procedures exist:
+- Re-run schema bootstrap: `Documentation/SQL/postgresql_schema.sql`
+- Verify config row exists:
   ```sql
-  SELECT * FROM INFORMATION_SCHEMA.ROUTINES 
-  WHERE ROUTINE_NAME LIKE 'sp_%Maintenance%'
+  SELECT * FROM system_config
+  WHERE "key" = 'maintenance_mode';
   ```
 
 ### Banner doesn't appear for users
@@ -223,14 +221,15 @@ You can view these in the **Security Events** or **Audit Logs** tab in the admin
 ```sql
 -- System configuration table
 CREATE TABLE system_config (
-    [key] NVARCHAR(100) PRIMARY KEY,
-    [value] NVARCHAR(MAX) NOT NULL,
-    [updated_at] DATETIMEOFFSET(7) NOT NULL DEFAULT SYSDATETIMEOFFSET()
-)
+  "key" TEXT PRIMARY KEY,
+  "value" TEXT NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 
 -- Initial value
-INSERT INTO system_config ([key], [value], [updated_at])
-VALUES ('maintenance_mode', 'false', SYSDATETIMEOFFSET())
+INSERT INTO system_config ("key", "value", updated_at)
+VALUES ('maintenance_mode', '0', CURRENT_TIMESTAMP)
+ON CONFLICT ("key") DO NOTHING;
 ```
 
 ### Middleware Flow
