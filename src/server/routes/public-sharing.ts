@@ -3,8 +3,7 @@ import rateLimit from 'express-rate-limit';
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import sql from 'mssql';
-import { getRequest } from '../db.js';
+import { getRequest, sql } from '../db.js';
 import {
   computeFileChecksum,
   decryptClientProtectedPayload,
@@ -626,7 +625,7 @@ const buildPromise = (async () => {
       const reserve = await getRequest(); reserve.input('id', sql.UniqueIdentifier, session.shareId);
       const reservation = await reserve.query(
         `UPDATE share_links SET download_count=download_count+1
-         WHERE id=@id AND is_active=1 AND (expires_at IS NULL OR expires_at>SYSDATETIMEOFFSET())
+         WHERE id=@id AND is_active=TRUE AND (expires_at IS NULL OR expires_at>CURRENT_TIMESTAMP)
            AND (max_downloads IS NULL OR download_count<max_downloads)`
       );
       if (!reservation.rowsAffected[0]) {
@@ -717,7 +716,7 @@ const buildPromise = (async () => {
       const reserve = await getRequest(); reserve.input('id', sql.UniqueIdentifier, row.id);
       const reservation = await reserve.query(
         `UPDATE share_links SET download_count=download_count+1
-         WHERE id=@id AND is_active=1 AND (expires_at IS NULL OR expires_at>SYSDATETIMEOFFSET())
+         WHERE id=@id AND is_active=TRUE AND (expires_at IS NULL OR expires_at>CURRENT_TIMESTAMP)
            AND (max_downloads IS NULL OR download_count<max_downloads)`
       );
       if (!reservation.rowsAffected[0]) return res.status(410).json({ error: 'Download limit reached or link expired.' });

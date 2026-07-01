@@ -22,10 +22,9 @@ import cluster from 'cluster';
 import { fileURLToPath } from 'url';
 import { execFileSync } from 'child_process';
 import { GoogleGenAI } from '@google/genai';
-import sql from 'mssql';
 import si from 'systeminformation';
 
-import { getPool, closePool, getRequest } from './server/db.js';
+import { getPool, closePool, getRequest, sql } from './server/db.js';
 import {
   encryptFile, wrapKey, unwrapKey,
   encryptFileStream, decryptFileStream, computeFileChecksum,
@@ -706,9 +705,12 @@ async function issueRefreshSession(
   request.input('ua', sql.NVarChar(500), String(req.headers['user-agent'] || '').substring(0, 500) || null);
   await request.query(
     `DELETE FROM refresh_tokens
-     WHERE user_id=@uid AND (expires_at<=SYSDATETIMEOFFSET() OR revoked_at<DATEADD(day,-1,SYSDATETIMEOFFSET()));
-     INSERT INTO refresh_tokens (id,user_id,token_hash,expires_at,created_at,revoked_at,ip_address,user_agent)
-     VALUES (NEWID(),@uid,@hash,@exp,SYSDATETIMEOFFSET(),NULL,@ip,@ua)`
+     WHERE user_id=@uid AND (expires_at<=CURRENT_TIMESTAMP OR revoked_at<CURRENT_TIMESTAMP - INTERVAL '1 day')`
+  );
+  request.input('id', sql.UniqueIdentifier, crypto.randomUUID());
+  await request.query(
+    `INSERT INTO refresh_tokens (id,user_id,token_hash,expires_at,created_at,revoked_at,ip_address,user_agent)
+     VALUES (@id,@uid,@hash,@exp,CURRENT_TIMESTAMP,NULL,@ip,@ua)`
   );
   setRefreshCookie(res, token);
 }
@@ -1094,12 +1096,12 @@ app.post('/api/auth/register', async (req, res) => {
          username_encrypted, username_iv, username_auth_tag, username_hash,
          password_hash, quota_id, email_verified, email_verification_token, email_verification_expires
        )
-       OUTPUT INSERTED.id, INSERTED.email_encrypted, INSERTED.email_iv, INSERTED.email_auth_tag,
-              INSERTED.username_encrypted, INSERTED.username_iv, INSERTED.username_auth_tag,
-              INSERTED.role, INSERTED.quota_id, INSERTED.storage_used_bytes,
-              INSERTED.status, INSERTED.created_at, INSERTED.failed_login_count, INSERTED.locked_until,
-              INSERTED.email_verified, INSERTED.email_verification_token, INSERTED.email_verification_expires
-       VALUES (@eEnc,@eIv,@eTag,@eHash, @uEnc,@uIv,@uTag,@uHash, @pw, @quota, @vOk, @vTok, @vExp)`
+      VALUES (@eEnc,@eIv,@eTag,@eHash, @uEnc,@uIv,@uTag,@uHash, @pw, @quota, @vOk, @vTok, @vExp)
+      RETURNING id, email_encrypted, email_iv, email_auth_tag,
+           username_encrypted, username_iv, username_auth_tag,
+           role, quota_id, storage_used_bytes,
+           status, created_at, failed_login_count, locked_until,
+           email_verified, email_verification_token, email_verification_expires`
     );
 
     const row = newUser.recordset[0];
@@ -1163,7 +1165,7 @@ app.get('/api/auth/verify-email', async (req, res) => {
     const upReq = await getRequest();
     upReq.input('id', sql.UniqueIdentifier, row.id);
     await upReq.query(
-      `UPDATE users SET email_verified=1, email_verification_token=NULL, email_verification_expires=NULL WHERE id=@id`
+      `UPDATE users SET email_verified=TRUE, email_verification_token=NULL, email_verification_expires=NULL WHERE id=@id`
     );
 
     await logSystemEvent(row.id, null, 'Auth', 'User', row.id, req, 'Email verified successfully.');
@@ -1353,11 +1355,11 @@ app.post('/api/users/me/update', authenticateUser as express.RequestHandler, asy
 
     const updated = await upReq.query<UserRow>(
       `UPDATE users SET ${sets.join(',')}
-       OUTPUT INSERTED.id, INSERTED.email_encrypted, INSERTED.email_iv, INSERTED.email_auth_tag,
-              INSERTED.username_encrypted, INSERTED.username_iv, INSERTED.username_auth_tag,
-              INSERTED.role, INSERTED.quota_id, INSERTED.storage_used_bytes,
-              INSERTED.status, INSERTED.created_at, INSERTED.failed_login_count, INSERTED.locked_until
-       WHERE id=@id`
+      WHERE id=@id
+      RETURNING id, email_encrypted, email_iv, email_auth_tag,
+           username_encrypted, username_iv, username_auth_tag,
+           role, quota_id, storage_used_bytes,
+           status, created_at, failed_login_count, locked_until`
     );
     const user = mapUserRow(updated.recordset[0]);
     if (password?.trim()) {
@@ -2337,16 +2339,16 @@ app.post(
            client_secret_hash, client_crypto_salt, client_crypto_iv, client_crypto_iterations,
            expires_at, is_encrypted
          )
-         OUTPUT INSERTED.id, INSERTED.owner_user_id,
-                INSERTED.original_name_encrypted, INSERTED.original_name_iv, INSERTED.original_name_auth_tag,
-                INSERTED.stored_path, INSERTED.mime_type, INSERTED.size_bytes, INSERTED.encrypted_size_bytes,
-                INSERTED.status, INSERTED.checksum_sha256, INSERTED.scan_result, INSERTED.scan_message,
-                INSERTED.is_encrypted, INSERTED.leeku_vibe, INSERTED.ttl_hours,
-                INSERTED.client_secret_hash, INSERTED.client_crypto_salt, INSERTED.client_crypto_iv, INSERTED.client_crypto_iterations,
-                INSERTED.expires_at, INSERTED.created_at
          VALUES (@ownerId,@nEnc,@nIv,@nTag, @spath,@mime,@sz,@esz, @chk,@scan,@smsg,SYSDATETIMEOFFSET(), @vibe,@ttl,
                  @clientSecretHash,@clientCryptoSalt,@clientCryptoIv,@clientCryptoIterations,
-                 @exp,1)`
+                 @exp,TRUE)
+               RETURNING id, owner_user_id,
+             original_name_encrypted, original_name_iv, original_name_auth_tag,
+             stored_path, mime_type, size_bytes, encrypted_size_bytes,
+             status, checksum_sha256, scan_result, scan_message,
+             is_encrypted, leeku_vibe, ttl_hours,
+             client_secret_hash, client_crypto_salt, client_crypto_iv, client_crypto_iterations,
+             expires_at, created_at`
       );
       const newFile = fileResult.recordset[0];
       console.info('[upload] File record inserted.', { userId: user.id, originalName: original_name, fileId: newFile.id });
@@ -2995,9 +2997,9 @@ app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, asy
       insReq.input('allowExternalPreview', sql.Bit, allowExternalPreview ? 1 : 0);
       const insRes = await insReq.query<ShareRow>(
         `INSERT INTO share_links (file_id,public_token,password_hash,expires_at,max_downloads,is_active,allow_external_preview)
-         OUTPUT INSERTED.id,INSERTED.file_id,INSERTED.public_token,INSERTED.password_hash,
-                INSERTED.expires_at,INSERTED.max_downloads,INSERTED.download_count,INSERTED.is_active,INSERTED.allow_external_preview,INSERTED.created_at
-         VALUES (@fid,@tok,@pwH,@exp,@md,@act,@allowExternalPreview)`
+          VALUES (@fid,@tok,@pwH,@exp,@md,@act,@allowExternalPreview)
+          RETURNING id,file_id,public_token,password_hash,
+               expires_at,max_downloads,download_count,is_active,allow_external_preview,created_at`
       );
       shareRow = insRes.recordset[0];
     } else {
@@ -3040,9 +3042,9 @@ app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, asy
       if (sets.length) {
         const upRes = await upReq.query<ShareRow>(
           `UPDATE share_links SET ${sets.join(',')}
-           OUTPUT INSERTED.id,INSERTED.file_id,INSERTED.public_token,INSERTED.password_hash,
-                  INSERTED.expires_at,INSERTED.max_downloads,INSERTED.download_count,INSERTED.is_active,INSERTED.allow_external_preview,INSERTED.created_at
-           WHERE id=@id`
+           WHERE id=@id
+           RETURNING id,file_id,public_token,password_hash,
+                     expires_at,max_downloads,download_count,is_active,allow_external_preview,created_at`
         );
         shareRow = upRes.recordset[0];
       }
@@ -3142,11 +3144,11 @@ app.post('/api/admin/users/create-dummy', authenticateUser as express.RequestHan
          password_hash, quota_id, role, status,
          email_verified, email_verification_token, email_verification_expires
        )
-       OUTPUT INSERTED.id, INSERTED.email_encrypted, INSERTED.email_iv, INSERTED.email_auth_tag,
-              INSERTED.username_encrypted, INSERTED.username_iv, INSERTED.username_auth_tag,
-              INSERTED.role, INSERTED.quota_id, INSERTED.storage_used_bytes,
-              INSERTED.status, INSERTED.created_at, INSERTED.failed_login_count, INSERTED.locked_until
-       VALUES (@eEnc,@eIv,@eTag,@eHash, @uEnc,@uIv,@uTag,@uHash, @pw,@quota, N'User', N'Active', 1, NULL, NULL)`
+            VALUES (@eEnc,@eIv,@eTag,@eHash, @uEnc,@uIv,@uTag,@uHash, @pw,@quota, N'User', N'Active', TRUE, NULL, NULL)
+           RETURNING id, email_encrypted, email_iv, email_auth_tag,
+           username_encrypted, username_iv, username_auth_tag,
+           role, quota_id, storage_used_bytes,
+           status, created_at, failed_login_count, locked_until`
     );
 
     const user = mapUserRow(created.recordset[0]);
@@ -3193,10 +3195,10 @@ app.post('/api/admin/users/:id/reset-password', authenticateUser as express.Requ
     const updated = await updateReq.query<UserRow>(
       `UPDATE users
        SET password_hash=@pw, failed_login_count=0, locked_until=NULL
-       OUTPUT INSERTED.id,INSERTED.email_encrypted,INSERTED.email_iv,INSERTED.email_auth_tag,
-              INSERTED.username_encrypted,INSERTED.username_iv,INSERTED.username_auth_tag,
-              INSERTED.role,INSERTED.quota_id,INSERTED.storage_used_bytes,INSERTED.status,INSERTED.created_at,INSERTED.failed_login_count,INSERTED.locked_until
-       WHERE id=@id`
+      WHERE id=@id
+      RETURNING id,email_encrypted,email_iv,email_auth_tag,
+           username_encrypted,username_iv,username_auth_tag,
+           role,quota_id,storage_used_bytes,status,created_at,failed_login_count,locked_until`
     );
     const user = mapUserRow(updated.recordset[0]);
 
@@ -3235,10 +3237,10 @@ app.post('/api/admin/users/:id/suspend', authenticateUser as express.RequestHand
     const upReq = await getRequest(); upReq.input('s', sql.NVarChar(20), newStatus); upReq.input('id', sql.UniqueIdentifier, userId);
     const updated = await upReq.query<UserRow>(
       `UPDATE users SET status=@s
-       OUTPUT INSERTED.id,INSERTED.email_encrypted,INSERTED.email_iv,INSERTED.email_auth_tag,
-              INSERTED.username_encrypted,INSERTED.username_iv,INSERTED.username_auth_tag,
-              INSERTED.role,INSERTED.quota_id,INSERTED.storage_used_bytes,INSERTED.status,INSERTED.created_at,INSERTED.failed_login_count,INSERTED.locked_until
-       WHERE id=@id`
+      WHERE id=@id
+      RETURNING id,email_encrypted,email_iv,email_auth_tag,
+           username_encrypted,username_iv,username_auth_tag,
+           role,quota_id,storage_used_bytes,status,created_at,failed_login_count,locked_until`
     );
     const user = mapUserRow(updated.recordset[0]);
     await logSystemEvent(req.userId!, req.user!.username, 'Admin', 'User', userId, req, `Toggled status of "${user.username}" to ${newStatus}.`);
@@ -3256,10 +3258,10 @@ app.post('/api/admin/users/:id/quota', authenticateUser as express.RequestHandle
     const upReq = await getRequest(); upReq.input('q', sql.NVarChar(50), quota_id); upReq.input('id', sql.UniqueIdentifier, userId);
     const updated = await upReq.query<UserRow>(
       `UPDATE users SET quota_id=@q
-       OUTPUT INSERTED.id,INSERTED.email_encrypted,INSERTED.email_iv,INSERTED.email_auth_tag,
-              INSERTED.username_encrypted,INSERTED.username_iv,INSERTED.username_auth_tag,
-              INSERTED.role,INSERTED.quota_id,INSERTED.storage_used_bytes,INSERTED.status,INSERTED.created_at,INSERTED.failed_login_count,INSERTED.locked_until
-       WHERE id=@id`
+      WHERE id=@id
+      RETURNING id,email_encrypted,email_iv,email_auth_tag,
+           username_encrypted,username_iv,username_auth_tag,
+           role,quota_id,storage_used_bytes,status,created_at,failed_login_count,locked_until`
     );
     if (!updated.recordset.length) return res.status(404).json({ error: 'User not found.' });
     const user = mapUserRow(updated.recordset[0]);
@@ -3299,10 +3301,10 @@ app.post('/api/admin/users/:id/edit', authenticateUser as express.RequestHandler
 
     const updated = await upReq.query<UserRow>(
       `UPDATE users SET ${sets.join(',')}
-       OUTPUT INSERTED.id,INSERTED.email_encrypted,INSERTED.email_iv,INSERTED.email_auth_tag,
-              INSERTED.username_encrypted,INSERTED.username_iv,INSERTED.username_auth_tag,
-              INSERTED.role,INSERTED.quota_id,INSERTED.storage_used_bytes,INSERTED.status,INSERTED.created_at,INSERTED.failed_login_count,INSERTED.locked_until
-       WHERE id=@id`
+      WHERE id=@id
+      RETURNING id,email_encrypted,email_iv,email_auth_tag,
+           username_encrypted,username_iv,username_auth_tag,
+           role,quota_id,storage_used_bytes,status,created_at,failed_login_count,locked_until`
     );
     if (!updated.recordset.length) return res.status(404).json({ error: 'User not found.' });
     const user = mapUserRow(updated.recordset[0]);
@@ -3391,9 +3393,14 @@ app.post('/api/admin/quotas', authenticateUser as express.RequestHandler, verify
     request.input('sl', sql.BigInt, Number(storage_limit_bytes)); request.input('mf', sql.BigInt, Number(max_file_size_bytes));
     request.input('mfi', sql.Int, Number(max_files)); request.input('dl', sql.BigInt, Number(daily_upload_limit_bytes));
     await request.query(
-      `MERGE quotas AS target USING (SELECT @id AS id) AS src ON target.id=src.id
-       WHEN MATCHED THEN UPDATE SET name=@name,storage_limit_bytes=@sl,max_file_size_bytes=@mf,max_files=@mfi,daily_upload_limit_bytes=@dl
-       WHEN NOT MATCHED THEN INSERT (id,name,storage_limit_bytes,max_file_size_bytes,max_files,daily_upload_limit_bytes) VALUES (@id,@name,@sl,@mf,@mfi,@dl);`
+      `INSERT INTO quotas (id,name,storage_limit_bytes,max_file_size_bytes,max_files,daily_upload_limit_bytes)
+       VALUES (@id,@name,@sl,@mf,@mfi,@dl)
+       ON CONFLICT (id) DO UPDATE SET
+         name=EXCLUDED.name,
+         storage_limit_bytes=EXCLUDED.storage_limit_bytes,
+         max_file_size_bytes=EXCLUDED.max_file_size_bytes,
+         max_files=EXCLUDED.max_files,
+         daily_upload_limit_bytes=EXCLUDED.daily_upload_limit_bytes`
     );
     const allReq = await getRequest();
     const allQuotas = await allReq.query<Quota>('SELECT id,name,storage_limit_bytes,max_file_size_bytes,max_files,daily_upload_limit_bytes FROM quotas ORDER BY storage_limit_bytes');
@@ -3477,25 +3484,21 @@ async function logExpiredFile(file: ExpiredFileRecord): Promise<void> {
 // ──────────────────────────────────────────────────────────────
 
 async function ensureOptionalFileSecretColumns(): Promise<void> {
-  const request = await getRequest();
-  await request.query(`
-    IF COL_LENGTH('files', 'client_secret_hash') IS NULL
-      ALTER TABLE files ADD client_secret_hash NVARCHAR(512) NULL;
-    IF COL_LENGTH('files', 'client_crypto_salt') IS NULL
-      ALTER TABLE files ADD client_crypto_salt VARBINARY(32) NULL;
-    IF COL_LENGTH('files', 'client_crypto_iv') IS NULL
-      ALTER TABLE files ADD client_crypto_iv VARBINARY(16) NULL;
-    IF COL_LENGTH('files', 'client_crypto_iterations') IS NULL
-      ALTER TABLE files ADD client_crypto_iterations INT NULL;
-  `);
+  const addSecretHash = await getRequest();
+  await addSecretHash.query('ALTER TABLE files ADD COLUMN IF NOT EXISTS client_secret_hash TEXT');
+  const addSalt = await getRequest();
+  await addSalt.query('ALTER TABLE files ADD COLUMN IF NOT EXISTS client_crypto_salt BYTEA');
+  const addIv = await getRequest();
+  await addIv.query('ALTER TABLE files ADD COLUMN IF NOT EXISTS client_crypto_iv BYTEA');
+  const addIterations = await getRequest();
+  await addIterations.query('ALTER TABLE files ADD COLUMN IF NOT EXISTS client_crypto_iterations INTEGER');
 }
 
 async function ensureOptionalShareLinkColumns(): Promise<void> {
   const request = await getRequest();
-  await request.query(`
-    IF COL_LENGTH('share_links', 'allow_external_preview') IS NULL
-      ALTER TABLE share_links ADD allow_external_preview BIT NOT NULL CONSTRAINT DF_share_links_allow_external_preview DEFAULT(0);
-  `);
+  await request.query(
+    'ALTER TABLE share_links ADD COLUMN IF NOT EXISTS allow_external_preview BOOLEAN NOT NULL DEFAULT FALSE'
+  );
 }
 
 async function bootstrap() {
@@ -3503,9 +3506,9 @@ async function bootstrap() {
   validateProductionConfig();
   validateEncryptionConfig();
 
-  // 2. Connect SQL Server
+  // 2. Connect PostgreSQL
   await getPool();
-  console.log('[server] SQL Server connection pool ready.');
+  console.log('[server] PostgreSQL connection pool ready.');
 
   // 2b. Lightweight schema migration for optional user-provided file secrets.
   await ensureOptionalFileSecretColumns();

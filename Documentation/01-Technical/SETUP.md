@@ -3,12 +3,14 @@
 <!-- self_score: 88/100 -->
 <!-- self_score_breakdown: endpoints=n/a, env_vars=verified, schema=illustrative+verified, examples=verified, contract_drift=none_found -->
 
+> This `postgresql` branch targets PostgreSQL deployments. For actual database bootstrap on this branch, use [Documentation/SQL/postgresql_schema.sql](/home/midorica/Documents/vscode/projects/Leeku-secure/Documentation/SQL/postgresql_schema.sql). Historical SQL Server examples lower in this document are retained only as legacy reference from `main`.
+
 ## Prerequisites
 
 | Requirement | Version | Notes |
 |---|---|---|
 | Node.js LTS | 20+ | Required. `tsx` and `esbuild` depend on Node 18+ APIs |
-| SQL Server | 2022 | Express edition is sufficient for dev |
+| PostgreSQL | 15+ | `pgcrypto` extension must be available for UUID defaults |
 | Bitdefender Endpoint Security Tools | 7.x+ | Optional in dev; required in production |
 | SMTP server | Any | Optional; email verification is disabled when `SMTP_HOST` is blank |
 | OpenSSL | Any recent | For generating JWT key pair |
@@ -62,25 +64,33 @@ node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
 
 **Never reuse these values between environments.** Rotating `MASTER_KEY_BASE64` requires re-encrypting every file and every PII column in the database.
 
-### 4. Create the SQL Server database and run the schema
+### 4. Create the PostgreSQL database and run the schema
 
 ```sql
--- Run as sysadmin
-CREATE DATABASE LeekuSecure;
-GO
+-- Run this first while connected to the default `postgres` database.
+-- In pgAdmin, execute it by itself, not as part of a multi-statement batch.
+CREATE DATABASE "LeekuSecure";
 
-CREATE LOGIN leeku_app WITH PASSWORD = 'STRONG_PASSWORD_HERE';
-GO
+-- Then reconnect pgAdmin to the new `LeekuSecure` database as a PostgreSQL
+-- admin user and run these.
+CREATE USER leeku_app WITH ENCRYPTED PASSWORD 'STRONG_PASSWORD_HERE';
+GRANT ALL PRIVILEGES ON DATABASE "LeekuSecure" TO leeku_app;
+ALTER DATABASE "LeekuSecure" OWNER TO leeku_app;
 
-USE LeekuSecure;
-GO
-
-CREATE USER leeku_app FOR LOGIN leeku_app;
-GRANT SELECT, INSERT, UPDATE, DELETE ON SCHEMA::dbo TO leeku_app;
-GO
+-- Required so the application role can create tables and indexes in `public`.
+GRANT USAGE, CREATE ON SCHEMA public TO leeku_app;
+ALTER SCHEMA public OWNER TO leeku_app;
 ```
 
-Then execute the schema below (see [Database Schema](#database-schema)).
+`CREATE DATABASE` cannot run inside a transaction block. pgAdmin commonly wraps multi-statement executions in a transaction, so execute the `CREATE DATABASE` statement on its own, then run the remaining statements separately.
+
+If you see `permission denied for schema public` while running the schema, it means `leeku_app` can connect to the database but does not own the database/schema and does not have `CREATE` on `public`. Run the four statements above as an admin user, then rerun the schema import.
+
+Then apply [Documentation/SQL/postgresql_schema.sql](/home/midorica/Documents/vscode/projects/Leeku-secure/Documentation/SQL/postgresql_schema.sql):
+
+```sh
+psql -U leeku_app -d LeekuSecure -f Documentation/SQL/postgresql_schema.sql
+```
 
 ### 5. Configure .env from .env.example
 
@@ -100,12 +110,13 @@ MASTER_KEY_BASE64=<output from step 3>
 COOKIE_SECRET_BASE64=<output from step 3>
 
 DB_SERVER=localhost
-DB_PORT=1433
+DB_PORT=5432
 DB_NAME=LeekuSecure
 DB_USER=leeku_app
 DB_PASSWORD=<your password>
+DB_SSL=false
 DB_ENCRYPT=false
-DB_TRUST_SERVER_CERTIFICATE=true
+DB_TRUST_SERVER_CERTIFICATE=false
 
 FILE_STORAGE_UNC_PATH=C:\LeekuTemp\vault
 UPLOAD_TEMP_PATH=C:\LeekuTemp\uploads
@@ -132,144 +143,7 @@ Open `http://localhost:5173` in your browser.
 
 ## Database Schema
 
-> VERIFIED columns are confirmed by SQL queries and TypeScript interfaces in `src/server.ts` and `src/server/routes/`.
-> Columns marked (ILLUSTRATIVE) are inferred from INSERT/UPDATE parameter names and TypeScript row interfaces; exact SQL Server types may differ slightly from what your DBA chose.
-
-```sql
--- ============================================================
--- users
--- ============================================================
-CREATE TABLE users (
-    id                              UNIQUEIDENTIFIER    NOT NULL DEFAULT NEWID() PRIMARY KEY,
-    email_encrypted                 VARBINARY(512)      NOT NULL,        -- AES-256-GCM ciphertext
-    email_iv                        VARBINARY(16)       NOT NULL,        -- 12-byte IV (stored as 16)
-    email_auth_tag                  VARBINARY(16)       NOT NULL,        -- GCM auth tag
-    email_hash                      CHAR(64)            NOT NULL UNIQUE, -- HMAC-SHA256 for index lookup
-    username_encrypted              VARBINARY(512)      NOT NULL,
-    username_iv                     VARBINARY(16)       NOT NULL,
-    username_auth_tag               VARBINARY(16)       NOT NULL,
-    username_hash                   CHAR(64)            NOT NULL UNIQUE,
-    password_hash                   NVARCHAR(512)       NOT NULL,        -- Argon2id PHC string
-    role                            NVARCHAR(10)        NOT NULL DEFAULT 'User', -- 'User' | 'Admin'
-    quota_id                        NVARCHAR(50)        NOT NULL DEFAULT 'guest',
-    storage_used_bytes              BIGINT              NOT NULL DEFAULT 0,
-    status                          NVARCHAR(20)        NOT NULL DEFAULT 'Active', -- 'Active' | 'Suspended'
-    failed_login_count              INT                 NOT NULL DEFAULT 0,
-    locked_until                    DATETIMEOFFSET      NULL,
-    last_login_at                   DATETIMEOFFSET      NULL,
-    email_verified                  BIT                 NOT NULL DEFAULT 0,
-    email_verification_token        CHAR(64)            NULL,
-    email_verification_expires      DATETIMEOFFSET      NULL,
-    deletion_token                  CHAR(64)            NULL,
-    deletion_token_expires          DATETIMEOFFSET      NULL,
-    created_at                      DATETIMEOFFSET      NOT NULL DEFAULT SYSDATETIMEOFFSET()
-);
-
--- ============================================================
--- quotas
--- ============================================================
-CREATE TABLE quotas (
-    id                              NVARCHAR(50)        NOT NULL PRIMARY KEY,  -- e.g. 'guest', 'basic', 'pro'
-    name                            NVARCHAR(100)       NOT NULL,
-    storage_limit_bytes             BIGINT              NOT NULL,
-    max_file_size_bytes             BIGINT              NOT NULL,
-    max_files                       INT                 NOT NULL,
-    daily_upload_limit_bytes        BIGINT              NOT NULL
-);
-
--- Seed minimum quota tier required for registration
-INSERT INTO quotas (id, name, storage_limit_bytes, max_file_size_bytes, max_files, daily_upload_limit_bytes)
-VALUES ('guest', 'Guest', 1073741824, 104857600, 10, 524288000);
-
--- ============================================================
--- files
--- ============================================================
-CREATE TABLE files (
-    id                              UNIQUEIDENTIFIER    NOT NULL DEFAULT NEWID() PRIMARY KEY,
-    owner_user_id                   UNIQUEIDENTIFIER    NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    original_name_encrypted         VARBINARY(2048)     NOT NULL,
-    original_name_iv                VARBINARY(16)       NOT NULL,
-    original_name_auth_tag          VARBINARY(16)       NOT NULL,
-    stored_path                     NVARCHAR(1000)      NOT NULL,        -- vault-relative filename, e.g. 'abc123.vault'
-    mime_type                       NVARCHAR(255)       NOT NULL,
-    size_bytes                      BIGINT              NOT NULL,
-    encrypted_size_bytes            BIGINT              NOT NULL,
-    status                          NVARCHAR(20)        NOT NULL DEFAULT 'Available', -- 'Available' | 'Blocked' | 'Expired'
-    checksum_sha256                 CHAR(64)            NOT NULL,        -- SHA-256 of plaintext
-    scan_result                     NVARCHAR(20)        NULL,            -- 'Clean' | 'Infected' | 'Suspicious' | ...
-    scan_message                    NVARCHAR(MAX)       NULL,
-    scanned_at                      DATETIMEOFFSET      NULL,
-    is_encrypted                    BIT                 NOT NULL DEFAULT 1,
-    leeku_vibe                      NVARCHAR(500)       NULL,            -- AI-generated scan message
-    ttl_hours                       INT                 NULL,
-    expires_at                      DATETIMEOFFSET      NULL,
-    deleted_at                      DATETIMEOFFSET      NULL,
-    -- Optional client-side secret key columns (added by auto-migration on startup)
-    client_secret_hash              NVARCHAR(512)       NULL,            -- Argon2i hash
-    client_crypto_salt              VARBINARY(32)       NULL,
-    client_crypto_iv                VARBINARY(16)       NULL,
-    client_crypto_iterations        INT                 NULL,
-    created_at                      DATETIMEOFFSET      NOT NULL DEFAULT SYSDATETIMEOFFSET()
-);
-
--- ============================================================
--- file_encryption_keys
--- ============================================================
-CREATE TABLE file_encryption_keys (
-    file_id                         UNIQUEIDENTIFIER    NOT NULL REFERENCES files(id) ON DELETE CASCADE PRIMARY KEY,
-    encrypted_key                   VARBINARY(64)       NOT NULL,        -- AES-256-GCM wrapped per-file key
-    key_iv                          VARBINARY(16)       NOT NULL,
-    key_auth_tag                    VARBINARY(16)       NOT NULL,
-    file_iv                         VARBINARY(16)       NOT NULL,        -- IV used to encrypt the vault file
-    file_auth_tag                   VARBINARY(16)       NOT NULL
-);
-
--- ============================================================
--- share_links
--- ============================================================
-CREATE TABLE share_links (
-    id                              UNIQUEIDENTIFIER    NOT NULL DEFAULT NEWID() PRIMARY KEY,
-    file_id                         UNIQUEIDENTIFIER    NOT NULL REFERENCES files(id) ON DELETE CASCADE,
-    public_token                    CHAR(32)            NOT NULL UNIQUE, -- 16 random bytes as hex
-    password_hash                   NVARCHAR(256)       NULL,            -- bcrypt hash (cost 12)
-    expires_at                      DATETIMEOFFSET      NULL,
-    max_downloads                   INT                 NULL,
-    download_count                  INT                 NOT NULL DEFAULT 0,
-    is_active                       BIT                 NOT NULL DEFAULT 1,
-    -- Optional column (added by auto-migration on startup)
-    allow_external_preview          BIT                 NOT NULL DEFAULT 0,
-    created_at                      DATETIMEOFFSET      NOT NULL DEFAULT SYSDATETIMEOFFSET()
-);
-
--- ============================================================
--- refresh_tokens
--- ============================================================
-CREATE TABLE refresh_tokens (
-    id                              UNIQUEIDENTIFIER    NOT NULL DEFAULT NEWID() PRIMARY KEY,
-    user_id                         UNIQUEIDENTIFIER    NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    token_hash                      CHAR(64)            NOT NULL UNIQUE, -- SHA-256 of the opaque token
-    expires_at                      DATETIMEOFFSET      NOT NULL,
-    created_at                      DATETIMEOFFSET      NOT NULL DEFAULT SYSDATETIMEOFFSET(),
-    revoked_at                      DATETIMEOFFSET      NULL,
-    ip_address                      NVARCHAR(45)        NULL,
-    user_agent                      NVARCHAR(500)       NULL
-);
-
--- ============================================================
--- system_logs
--- ============================================================
-CREATE TABLE system_logs (
-    id                              BIGINT              NOT NULL IDENTITY(1,1) PRIMARY KEY,
-    user_id                         UNIQUEIDENTIFIER    NULL,            -- NULL for anonymous/system events
-    username_snapshot               NVARCHAR(200)       NULL,
-    event_type                      NVARCHAR(20)        NOT NULL,        -- 'Upload'|'Scan'|'Delete'|'Download'|'Link'|'Admin'|'Security'|'Auth'
-    target_type                     NVARCHAR(50)        NOT NULL,
-    target_id                       NVARCHAR(100)       NOT NULL,
-    ip_address                      NVARCHAR(45)        NOT NULL,
-    message                         NVARCHAR(MAX)       NOT NULL,
-    created_at                      DATETIMEOFFSET      NOT NULL DEFAULT SYSDATETIMEOFFSET()
-);
-```
+For this branch, the canonical database schema lives in [Documentation/SQL/postgresql_schema.sql](/home/midorica/Documents/vscode/projects/Leeku-secure/Documentation/SQL/postgresql_schema.sql). Use that file as the source of truth for table definitions, defaults, indexes, and seed data.
 
 > WARNING: The server runs two lightweight auto-migrations at startup (`ensureOptionalFileSecretColumns` and `ensureOptionalShareLinkColumns`) that add the `client_secret_hash`, `client_crypto_salt`, `client_crypto_iv`, `client_crypto_iterations`, and `allow_external_preview` columns if they are missing. These are safe to run on an existing database. VERIFIED — `src/server.ts` lines 2693-2713.
 
@@ -293,19 +167,18 @@ Get-ChildItem "C:\Program Files\Bitdefender" -Recurse -Filter "bdscan.exe" -Erro
 
 In development, set `ALLOW_UNSCANNED_UPLOADS_IN_DEVELOPMENT=true` to accept uploads without a scanner.
 
-### SQL Server connection refused
+### PostgreSQL connection refused
 
-Check that TCP/IP is enabled in SQL Server Configuration Manager and that port 1433 is open:
+Check that PostgreSQL is listening on port 5432 and accepting local connections:
 
 ```powershell
-Test-NetConnection -ComputerName localhost -Port 1433
+Test-NetConnection -ComputerName localhost -Port 5432
 ```
-
-If using a named instance (e.g. `.\SQLEXPRESS`), set `DB_SERVER=localhost\SQLEXPRESS` and ensure the SQL Server Browser service is running.
 
 For development with a self-signed certificate, set:
 
 ```env
+DB_SSL=false
 DB_ENCRYPT=false
 DB_TRUST_SERVER_CERTIFICATE=true
 ```

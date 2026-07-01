@@ -4,6 +4,8 @@
 
 Leeku Secure is a self-hosted, full-stack file hosting platform that encrypts every uploaded file with AES-256-GCM before writing it to a UNC storage share. All PII columns in the database are individually encrypted; no plaintext filename, email, or username is stored at rest.
 
+The `main` branch targets SQL Server. The `postgresql` branch swaps the persistence layer to PostgreSQL so operators can choose the database stack that fits their environment.
+
 Deployed on Windows Server 2022 at **leeks.miku.rip** ✅
 
 ---
@@ -42,7 +44,7 @@ Deployed on Windows Server 2022 at **leeks.miku.rip** ✅
 |---|---|---|
 | Frontend | React 19, Vite 6, Tailwind CSS 4, shadcn/ui, TypeScript | Latest |
 | Backend | Express 4, Node.js (ES modules), TypeScript | Node 22 LTS |
-| Database | SQL Server 2022 (`mssql` v12 driver) | 2022 |
+| Database | PostgreSQL 15+ (`pg` v8 driver) | 15+ |
 | Auth | JWT RS256, Argon2id, bcrypt, HMAC-SHA256 | Standard |
 | Scanning | Bitdefender Endpoint Security CLI (`product.console.exe` / `bdscan.exe`) | Latest |
 | Storage | Windows UNC path file vault (SMB share) | SMB 3.1.1+ |
@@ -70,7 +72,7 @@ openssl rsa -in keys/jwt_private.pem -pubout -out keys/jwt_public.pem
 node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
 
 # 4. Execute database schema
-# See Documentation/SQL/README.md for production and dev schema options
+psql -U leeku_app -d LeekuSecure -f Documentation/SQL/postgresql_schema.sql
 
 # 5. Start the dev server
 npm run dev
@@ -82,7 +84,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for complete step-by-step setup with prer
 See [DEPLOYMENT.md](Documentation/01-Technical/DEPLOYMENT.md) for Windows Server 2022 + IIS ARR setup.
 
 **Database:**
-See [Documentation/SQL/README.md](Documentation/SQL/README.md) for schema selection and deployment instructions.
+Use [Documentation/SQL/postgresql_schema.sql](Documentation/SQL/postgresql_schema.sql) on the `postgresql` branch. The SQL Server scripts remain on `main`.
 
 ## Development Scripts
 
@@ -142,7 +144,7 @@ leeku-secure/
 │   │   ├── routes/            # API endpoints (auth, files, share-links, etc.)
 │   │   ├── middleware/        # Express middleware (auth, logging, validation)
 │   │   ├── utils/             # Server utilities (encryption, scanning, database, email)
-│   │   ├── db.ts              # SQL Server connection pool
+│   │   ├── db.ts              # PostgreSQL connection adapter / pool
 │   │   └── server.ts          # Express app initialization
 │   ├── server.ts              # Backend entry point
 │   └── vite-env.d.ts          # Vite type definitions
@@ -224,7 +226,7 @@ Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for:
 | **Core Platform** | ✅ Production | Deployed and operational at leeks.miku.rip |
 | **Frontend (React 19)** | ✅ Stable | Latest Vite 6 + TypeScript, HMR in dev |
 | **Backend (Express)** | ✅ Stable | Node 22 LTS, all routes documented |
-| **Database (SQL Server 2022)** | ✅ Production | 7 tables, 12 optimized indexes, 5 stored procedures |
+| **Database (PostgreSQL 15+)** | ✅ Branch-ready | 8 tables, seed data, and branch bootstrap schema in `Documentation/SQL/postgresql_schema.sql` |
 | **Encryption** | ✅ Verified | AES-256-GCM files, column encryption, master key wrapping |
 | **Scanning (Bitdefender)** | ✅ Integrated | Fail-closed in production, optional AI summaries |
 | **Maintenance Mode** | ✅ Complete | System-wide file operation blocking, admin-only control, user banners |

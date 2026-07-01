@@ -10,7 +10,7 @@ self_score_breakdown:
 
 # Leeku Secure — Architecture
 
-> **Platform:** Windows Server 2022 / IIS ARR + Node.js 20 + React 19 + SQL Server 2022
+> **Platform:** Windows Server 2022 / IIS ARR + Node.js 20 + React 19 + PostgreSQL 15+
 > **License:** Apache-2.0
 
 ---
@@ -46,7 +46,7 @@ C4Context
         System(leekuApp, "Leeku Secure Application", "React 19 SPA + Express/Node.js API. Handles auth, upload, scan, encryption, and sharing.")
     }
 
-    System_Ext(sqlserver, "SQL Server 2022", "Primary relational store: users, files, keys, shares, logs, refresh tokens")
+    System_Ext(postgres, "PostgreSQL 15+", "Primary relational store: users, files, keys, shares, logs, refresh tokens")
     System_Ext(bitdefender, "Bitdefender Endpoint Security Tools", "On-premise CLI AV scanner (bdscan.exe / product.console.exe)")
     System_Ext(smtp, "SMTP Server", "Sends email verification and account-deletion confirmation emails")
     System_Ext(gemini, "Google Gemini API", "Generates 'leeku_vibe' status messages after scan results (optional)")
@@ -57,7 +57,7 @@ C4Context
     Rel(admin, leekuApp, "HTTPS — user management, system stats, audit logs")
     Rel(anon, leekuApp, "HTTPS — public share download / embed preview")
 
-    Rel(leekuApp, sqlserver, "mssql driver — TCP 1433 (TLS optional)")
+    Rel(leekuApp, postgres, "pg driver — TCP 5432 (TLS optional)")
     Rel(leekuApp, bitdefender, "child_process.spawn — local CLI invocation")
     Rel(leekuApp, smtp, "nodemailer — SMTP/587 or SMTP/465")
     Rel(leekuApp, gemini, "HTTPS — Gemini 2.0 Flash REST API (optional)")
@@ -67,7 +67,7 @@ C4Context
 
 **Evidence:**
 - Actors (User, Admin, Anonymous) ✅ CONFIRMED — `src/server.ts`: role-based middleware `verifyAdmin`, public routes under `/api/public/share/:token`
-- SQL Server 2022 ✅ CONFIRMED — `src/server/db.ts` header comment; `mssql` package; `DB_NAME=LeekuSecure` default
+- PostgreSQL 15+ ✅ CONFIRMED — `src/server/db.ts`; `pg` package; `DB_NAME=LeekuSecure` default
 - Bitdefender CLI ✅ CONFIRMED — `src/server/utils/scanner.ts`: `spawn(cliPath, ...)`, auto-detect paths under `C:\Program Files\Bitdefender\`
 - SMTP ✅ CONFIRMED — `src/server/utils/email.ts`: `nodemailer.createTransport`, `SMTP_HOST/SMTP_USER/SMTP_PASSWORD`
 - Google Gemini ✅ CONFIRMED — `src/server.ts` L23: `import { GoogleGenAI }`, `GEMINI_API_KEY`, model `gemini-2.0-flash`
@@ -92,7 +92,7 @@ C4Container
 
         Container(api, "Express API", "Node.js 20, Express, TypeScript", "All business logic: auth (JWT + refresh tokens), file upload pipeline (scan → encrypt → store), download prep, public share serving, health checks, admin endpoints.")
 
-        ContainerDb(db, "SQL Server 2022", "Microsoft SQL Server 2022", "Stores: users (PII AES-GCM encrypted), files (name encrypted), file_encryption_keys (wrapped keys), share_links, refresh_tokens, system_logs, quotas.")
+        ContainerDb(db, "PostgreSQL 15+", "PostgreSQL", "Stores: users (PII AES-GCM encrypted), files (name encrypted), file_encryption_keys (wrapped keys), share_links, refresh_tokens, system_logs, quotas.")
 
         ContainerDb(vault, "UNC File Vault", "Windows UNC Share / NTFS", "Stores AES-256-GCM encrypted file blobs. Filenames are random hex tokens (e.g. a3f9...vault). No plaintext files ever written here.")
     }
@@ -106,7 +106,7 @@ C4Container
     Rel(iis, spa, "HTTP", "Static file serving (dist/)")
     Rel(iis, api, "HTTP", "Reverse-proxy /api/* to :3000")
     Rel(spa, api, "HTTP/JSON + cookies", "REST API calls with JWT in HttpOnly cookie + CSRF header")
-    Rel(api, db, "TCP 1433 / mssql", "Parameterised queries — no plaintext PII in SQL")
+    Rel(api, db, "TCP 5432 / pg", "Parameterised queries — no plaintext PII in SQL")
     Rel(api, vault, "Windows file I/O", "Write encrypted blobs on upload; read on download/decrypt")
     Rel(api, bitdefender, "child_process.spawn", "Scan temp file before encryption")
     Rel(api, smtp, "SMTP/587", "Email verification and deletion confirmation")
@@ -116,7 +116,7 @@ C4Container
 **Evidence:**
 - React 19 SPA ✅ CONFIRMED — `src/client.tsx`, `vite.config.ts`, `src/app/app.tsx`; `build.outDir = 'dist'` (`vite.config.ts` L15)
 - Express API ✅ CONFIRMED — `src/server.ts` L14-16: `import express`, port 3000 (`src/server.ts` L76)
-- SQL Server 2022 ✅ CONFIRMED — `src/server/db.ts`
+- PostgreSQL 15+ ✅ CONFIRMED — `src/server/db.ts`
 - UNC File Vault ✅ CONFIRMED — `src/server.ts` L79, L345-348; random hex filenames: `generateSecureToken(16) + '.vault'` (`src/server.ts` L1718)
 - API-to-DB parameterised queries ✅ CONFIRMED — all queries use `request.input(...)` pattern in `src/server.ts`
 - Cookie transport (HttpOnly + CSRF) ✅ CONFIRMED — `src/server.ts` L192-245: `httpOnly: true`, `CSRF_COOKIE_NAME`
@@ -148,16 +148,16 @@ C4Component
 
         Component(emailSvc, "EmailService", "src/server/utils/email.ts", "MX record DNS validation. Sends email verification and account-deletion confirmation via nodemailer/SMTP. Lazy singleton transporter.")
 
-        Component(sessionSvc, "SessionService", "src/server/routes/sessions.ts", "Lists, revokes individual, revokes-others, and revokes-all refresh token sessions stored in SQL Server.")
+        Component(sessionSvc, "SessionService", "src/server/routes/sessions.ts", "Lists, revokes individual, revokes-others, and revokes-all refresh token sessions stored in PostgreSQL.")
 
         Component(expirySvc, "ExpiryCleanupService", "src/server/utils/expiry-cleanup.ts", "Background interval job (default 60s). Queries expired files, deletes vault blobs, marks DB records as Expired.")
 
         Component(iisLogger, "IISLogger", "src/server/middleware/iis-logger.ts", "Express middleware writing W3C Extended Log Format to C:\\inetpub\\logs\\LogFiles\\W3SVC{n}\\leeku_secure_YYYY-MM-DD.log with daily rollover.")
 
-        Component(dbPool, "DatabasePool", "src/server/db.ts", "Singleton mssql connection pool (min 2, max 10). Exposes getPool(), getRequest(), query(), execProc().")
+        Component(dbPool, "DatabasePool", "src/server/db.ts", "Singleton PostgreSQL pool plus compatibility adapter (min 2, max 10). Exposes getPool(), getRequest(), query(), execProc().")
     }
 
-    ContainerDb(db, "SQL Server 2022")
+    ContainerDb(db, "PostgreSQL 15+")
     ContainerDb(vault, "UNC File Vault")
     System_Ext(bitdefender, "Bitdefender CLI")
     System_Ext(smtp, "SMTP Server")
@@ -185,7 +185,7 @@ C4Component
     Rel(expirySvc, dbPool, "Query + update expired files")
     Rel(expirySvc, vault, "fs.unlinkSync expired blobs")
 
-    Rel(dbPool, db, "TCP 1433")
+    Rel(dbPool, db, "TCP 5432")
     Rel(scanSvc, bitdefender, "child_process.spawn")
     Rel(emailSvc, smtp, "SMTP/587")
 ```
@@ -218,7 +218,7 @@ sequenceDiagram
     participant BD as Bitdefender CLI
     participant Enc as EncryptionService
     participant Vault as UNC File Vault
-    participant DB as SQL Server 2022
+    participant DB as PostgreSQL 15+
     participant Gemini as Google Gemini API
 
     Browser->>API: POST /api/files/upload (multipart/form-data, file + metadata)
@@ -286,7 +286,7 @@ sequenceDiagram
     participant Browser as React SPA
     participant API as Express API
     participant Enc as EncryptionService
-    participant DB as SQL Server 2022
+    participant DB as PostgreSQL 15+
     participant SMTP as SMTP Server
 
     Browser->>API: POST /api/auth/register { username, email, password }
@@ -368,7 +368,7 @@ sequenceDiagram
     autonumber
     participant Browser as Anonymous Browser
     participant API as Express API
-    participant DB as SQL Server 2022
+    participant DB as PostgreSQL 15+
     participant Enc as EncryptionService
     participant Vault as UNC File Vault
     participant Temp as OS Temp Directory
@@ -446,7 +446,7 @@ sequenceDiagram
 
 **Status:** Accepted
 
-**Context:** ✅ CONFIRMED — `src/server/utils/encryption.ts` L1-26 (module docstring): The platform must encrypt uploaded file bytes at rest and protect PII columns (email, username) in SQL Server. Requirements include authenticated encryption (tamper detection), key hierarchy isolation between files and PII, and streaming support for large files on Windows Server 2022.
+**Context:** ✅ CONFIRMED — `src/server/utils/encryption.ts` L1-26 (module docstring): The platform must encrypt uploaded file bytes at rest and protect PII columns (email, username) in the relational database. Requirements include authenticated encryption (tamper detection), key hierarchy isolation between files and PII, and streaming support for large files on Windows Server 2022.
 
 **Decision:** ✅ CONFIRMED — AES-256-GCM (`aes-256-gcm`, 32-byte key, 12-byte IV, 16-byte auth tag) is used for:
 

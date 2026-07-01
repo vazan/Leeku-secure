@@ -6,6 +6,7 @@
  * Displays a prominent banner when the system is in maintenance mode
  */
 
+import type { ReactElement } from 'react';
 import { useEffect, useState } from 'react';
 
 interface MaintenanceStatusResponse {
@@ -17,7 +18,7 @@ interface MaintenanceStatusResponse {
  * Fetches and displays maintenance mode status
  * Auto-refreshes status every 10 seconds
  */
-export function MaintenanceModeBanner(): JSX.Element | null {
+export function MaintenanceModeBanner(): ReactElement | null {
   const [isMaintenanceMode, setIsMaintenanceMode] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
 

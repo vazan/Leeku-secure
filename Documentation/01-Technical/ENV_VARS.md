@@ -55,19 +55,20 @@ VERIFIED — `.env.example:93-110`, `src/server/db.ts:29-55`
 
 | Variable | Type | Default | Required | Description | Security Notes |
 |---|---|---|---|---|---|
-| `DB_SERVER` | string | `localhost` | Yes | SQL Server hostname or IP. | |
-| `DB_PORT` | integer | `1433` | No | SQL Server TCP port. | |
+| `DB_SERVER` | string | `localhost` | Yes | PostgreSQL hostname or IP. | |
+| `DB_PORT` | integer | `5432` | No | PostgreSQL TCP port. | |
 | `DB_NAME` | string | `LeekuSecure` | Yes | Database name. | |
-| `DB_USER` | string | — | Yes | SQL Server login name. | Use a least-privilege SQL login, not `sa`. |
-| `DB_PASSWORD` | string | `CHANGE_ME_STRONG_PASSWORD` | Yes | SQL Server login password. | Rotate via SQL Server login policy; update `.env` and restart. |
+| `DB_USER` | string | — | Yes | PostgreSQL role name. | Use a least-privilege application role, not `postgres`. |
+| `DB_PASSWORD` | string | `CHANGE_ME_STRONG_PASSWORD` | Yes | PostgreSQL role password. | Rotate via PostgreSQL role policy; update `.env` and restart. |
 | `DB_POOL_MIN` | integer | `2` | No | Minimum connection pool size. | |
 | `DB_POOL_MAX` | integer | `10` | No | Maximum connection pool size. | |
 | `DB_REQUEST_TIMEOUT_MS` | integer | `15000` | No | Per-query timeout in ms. | |
 | `DB_CONNECTION_TIMEOUT_MS` | integer | `30000` | No | Initial connection timeout in ms. | |
-| `DB_ENCRYPT` | boolean | `true` | Yes | Enforce TLS on the SQL Server connection. Set `true` in production. | |
-| `DB_TRUST_SERVER_CERTIFICATE` | boolean | `false` | No | Trust self-signed SQL Server cert. `false` in production; `true` only for dev with self-signed certs. | Never `true` in production. |
+| `DB_SSL` | boolean | `false` | No | Enable TLS for the PostgreSQL connection. Prefer `true` in production. | |
+| `DB_ENCRYPT` | boolean | `false` | No | Backward-compatible alias for `DB_SSL`. | Use `DB_SSL` going forward. |
+| `DB_TRUST_SERVER_CERTIFICATE` | boolean | `false` | No | When TLS is enabled, set `true` only for self-signed development certificates. | Never `true` in production. |
 
-**How to rotate DB_PASSWORD:** Update the SQL Server login password, then update `DB_PASSWORD` in `.env` and restart the Node process.
+**How to rotate DB_PASSWORD:** Update the PostgreSQL role password, then update `DB_PASSWORD` in `.env` and restart the Node process.
 
 ---
 
@@ -248,7 +249,7 @@ VERIFIED — `.env.example:338-374`
 |---|---|---|
 | `MASTER_KEY_BASE64` | Generate new value, re-encrypt all vault files and all encrypted DB columns, update `.env`, restart | All files and PII data must be re-encrypted — plan a maintenance window |
 | `COOKIE_SECRET_BASE64` | Generate new value, update `.env`, restart | All active JWT access tokens are immediately invalidated; users must refresh or re-login |
-| `DB_PASSWORD` | Update SQL Server login password, update `.env`, restart | Brief connection pool drain during restart |
+| `DB_PASSWORD` | Update PostgreSQL role password, update `.env`, restart | Brief connection pool drain during restart |
 | `SMTP_PASSWORD` | Generate new app password in email provider, update `.env`, restart | No data impact |
 | `GEMINI_API_KEY` | Revoke old key in Google Cloud Console, generate new one, update `.env`, restart | No data impact; falls back to static messages until restarted |
 | `STORAGE_NET_USE_PASS` | Change share password, update `.env`, restart | File vault inaccessible between share password change and restart |

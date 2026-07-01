@@ -6,6 +6,7 @@
  * Allows admins to enable/disable maintenance mode
  */
 
+import type { ReactElement } from 'react';
 import { useState } from 'react';
 import { AlertCircle, Check, AlertTriangle } from 'lucide-react';
 
@@ -23,7 +24,7 @@ const getCsrfToken = () =>
 export function MaintenanceModeControl({
   currentStatus,
   onStatusChange,
-}: MaintenanceModeControlProps): JSX.Element {
+}: MaintenanceModeControlProps): ReactElement {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);

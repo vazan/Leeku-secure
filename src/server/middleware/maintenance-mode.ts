@@ -6,8 +6,7 @@
  * Caches maintenance status to avoid DB hits on every request
  */
 
-import sql from 'mssql';
-import { getRequest } from '../db.js';
+import { getRequest, sql } from '../db.js';
 
 let maintenanceCachedStatus: boolean | null = null;
 let maintenanceCacheTTL: number = 0;
@@ -17,16 +16,19 @@ const CACHE_DURATION_MS = 5000; // Cache for 5 seconds
  * Get current maintenance mode status
  */
 const BOOTSTRAP_SQL = `
-IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = 'system_config' AND schema_id = SCHEMA_ID('dbo'))
-BEGIN
-  CREATE TABLE [dbo].[system_config](
-    [key]        [nvarchar](100)  NOT NULL,
-    [value]      [nvarchar](max)  NOT NULL,
-    [updated_at] [datetimeoffset](7) NOT NULL DEFAULT SYSDATETIMEOFFSET(),
-    CONSTRAINT [PK_system_config] PRIMARY KEY CLUSTERED ([key] ASC)
-  );
-  INSERT INTO [dbo].[system_config] ([key],[value]) VALUES (N'maintenance_mode', N'0');
-END
+CREATE TABLE IF NOT EXISTS system_config (
+  "key" TEXT PRIMARY KEY,
+  "value" TEXT NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO system_config ("key", "value")
+VALUES ('maintenance_mode', '0')
+ON CONFLICT ("key") DO NOTHING;
+
+INSERT INTO system_config ("key", "value")
+VALUES ('maintenance_auto_unc_share', '0')
+ON CONFLICT ("key") DO NOTHING;
 `;
 
 async function ensureTable(): Promise<void> {
@@ -71,12 +73,11 @@ export async function setMaintenanceStatus(enabled: boolean): Promise<boolean> {
     const request = await getRequest();
     request.input('val', sql.NVarChar, enabled ? '1' : '0');
     await request.query(`
-      MERGE [dbo].[system_config] AS target
-      USING (SELECT N'maintenance_mode' AS [key]) AS src ON target.[key] = src.[key]
-      WHEN MATCHED THEN
-        UPDATE SET [value] = @val, [updated_at] = SYSDATETIMEOFFSET()
-      WHEN NOT MATCHED THEN
-        INSERT ([key],[value]) VALUES (N'maintenance_mode', @val);
+      INSERT INTO system_config ("key", "value", updated_at)
+      VALUES ('maintenance_mode', @val, CURRENT_TIMESTAMP)
+      ON CONFLICT ("key") DO UPDATE
+      SET "value" = EXCLUDED."value",
+          updated_at = CURRENT_TIMESTAMP
     `);
 
     // Invalidate cache
@@ -117,12 +118,11 @@ export async function setUncShareAutoMaintenanceStatus(enabled: boolean): Promis
     const request = await getRequest();
     request.input('val', sql.NVarChar, enabled ? '1' : '0');
     await request.query(`
-      MERGE [dbo].[system_config] AS target
-      USING (SELECT N'maintenance_auto_unc_share' AS [key]) AS src ON target.[key] = src.[key]
-      WHEN MATCHED THEN
-        UPDATE SET [value] = @val, [updated_at] = SYSDATETIMEOFFSET()
-      WHEN NOT MATCHED THEN
-        INSERT ([key],[value]) VALUES (N'maintenance_auto_unc_share', @val);
+      INSERT INTO system_config ("key", "value", updated_at)
+      VALUES ('maintenance_auto_unc_share', @val, CURRENT_TIMESTAMP)
+      ON CONFLICT ("key") DO UPDATE
+      SET "value" = EXCLUDED."value",
+          updated_at = CURRENT_TIMESTAMP
     `);
   } catch (error) {
     console.error('[setUncShareAutoMaintenanceStatus] Error updating UNC auto-maintenance status:', error);

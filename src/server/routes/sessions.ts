@@ -1,6 +1,5 @@
 import express from 'express';
-import sql from 'mssql';
-import { getRequest } from '../db.js';
+import { getRequest, sql } from '../db.js';
 
 export interface SessionRequest extends express.Request {
   userId?: string;
@@ -31,9 +30,9 @@ export function createSessionRouter(options: SessionRouteOptions): express.Route
         is_current: boolean;
       }>(
         `SELECT id,ip_address,user_agent,created_at,expires_at,
-                CAST(CASE WHEN token_hash=@currentHash THEN 1 ELSE 0 END AS bit) AS is_current
+                CASE WHEN token_hash=@currentHash THEN TRUE ELSE FALSE END AS is_current
          FROM refresh_tokens
-         WHERE user_id=@uid AND revoked_at IS NULL AND expires_at>SYSDATETIMEOFFSET()
+         WHERE user_id=@uid AND revoked_at IS NULL AND expires_at>CURRENT_TIMESTAMP
          ORDER BY created_at DESC`
       );
       res.json({
@@ -58,9 +57,9 @@ export function createSessionRouter(options: SessionRouteOptions): express.Route
       request.input('currentHash', sql.Char(64), currentHash);
       const result = await request.query<{ revoked_current: boolean }>(
         `UPDATE refresh_tokens
-         SET revoked_at=COALESCE(revoked_at,SYSDATETIMEOFFSET())
-         OUTPUT CAST(CASE WHEN INSERTED.token_hash=@currentHash THEN 1 ELSE 0 END AS bit) AS revoked_current
-         WHERE id=@id AND user_id=@uid AND revoked_at IS NULL`
+        SET revoked_at=COALESCE(revoked_at,CURRENT_TIMESTAMP)
+        WHERE id=@id AND user_id=@uid AND revoked_at IS NULL
+        RETURNING token_hash=@currentHash AS revoked_current`
       );
       if (!result.rowsAffected[0]) return res.status(404).json({ error: 'Active session not found.' });
       const revokedCurrent = !!result.recordset[0]?.revoked_current;
@@ -81,7 +80,7 @@ export function createSessionRouter(options: SessionRouteOptions): express.Route
       request.input('currentHash', sql.Char(64), currentHash);
       await request.query(
         `UPDATE refresh_tokens
-         SET revoked_at=COALESCE(revoked_at,SYSDATETIMEOFFSET())
+        SET revoked_at=COALESCE(revoked_at,CURRENT_TIMESTAMP)
          WHERE user_id=@uid AND token_hash<>@currentHash AND revoked_at IS NULL`
       );
       res.json({ success: true });
@@ -100,7 +99,7 @@ export function createSessionRouter(options: SessionRouteOptions): express.Route
       request.input('currentHash', sql.Char(64), currentHash);
       const result = await request.query(
         `UPDATE refresh_tokens
-         SET revoked_at=COALESCE(revoked_at,SYSDATETIMEOFFSET())
+        SET revoked_at=COALESCE(revoked_at,CURRENT_TIMESTAMP)
          WHERE user_id=@uid AND token_hash=@currentHash AND revoked_at IS NULL`
       );
       if (!result.rowsAffected[0]) return res.status(404).json({ error: 'Current refresh session not found.' });
@@ -121,7 +120,7 @@ export function createSessionRouter(options: SessionRouteOptions): express.Route
       request.input('uid', sql.UniqueIdentifier, req.userId!);
       await request.query(
         `UPDATE refresh_tokens
-         SET revoked_at=COALESCE(revoked_at,SYSDATETIMEOFFSET())
+        SET revoked_at=COALESCE(revoked_at,CURRENT_TIMESTAMP)
          WHERE user_id=@uid AND revoked_at IS NULL`
       );
       options.clearAuth(res);

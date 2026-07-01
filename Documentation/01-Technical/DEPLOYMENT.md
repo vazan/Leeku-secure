@@ -25,8 +25,8 @@ Before beginning deployment, verify every item. Do not proceed if any box cannot
 
 - [ ] Windows Server 2022 (Build 20348+) with Node.js LTS (v22.x or later) installed — verify: `node --version`
 - [ ] npm v10+ installed — verify: `npm --version`
-- [ ] SQL Server 2022 instance accessible from this machine on TCP 1433 — verify: `Test-NetConnection -ComputerName <DB_SERVER> -Port 1433`
-- [ ] SQL Server login `leeku_app` created with `db_datareader`, `db_datawriter`, and `db_ddladmin` (for initial schema) on the `LeekuSecure` database
+- [ ] PostgreSQL 15+ instance accessible from this machine on TCP 5432 — verify: `Test-NetConnection -ComputerName <DB_SERVER> -Port 5432`
+- [ ] PostgreSQL role `leeku_app` created and granted ownership or `CREATE` on schema `public` in the `LeekuSecure` database
 - [ ] Bitdefender Endpoint Security Tools installed; CLI path known — verify one of:
   - `C:\Program Files\Bitdefender\Endpoint Security Tools\product.console.exe`
   - `C:\Program Files\Bitdefender\Endpoint Security Tools\bdscan.exe`
@@ -106,18 +106,27 @@ node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
 
 ### Step 4 — Database Initialization
 
-If the `LeekuSecure` database and schema do not yet exist, run the schema initialization script. The schema SQL file is not bundled in this repository; obtain it from the database administrator or from the project's `db/` directory if present.
+If the `LeekuSecure` database and schema do not yet exist, bootstrap PostgreSQL with an admin role first, then import the canonical branch schema.
+
+```sql
+CREATE DATABASE "LeekuSecure";
+CREATE USER leeku_app WITH ENCRYPTED PASSWORD 'CHANGE_ME_STRONG_PASSWORD';
+GRANT ALL PRIVILEGES ON DATABASE "LeekuSecure" TO leeku_app;
+ALTER DATABASE "LeekuSecure" OWNER TO leeku_app;
+GRANT USAGE, CREATE ON SCHEMA public TO leeku_app;
+ALTER SCHEMA public OWNER TO leeku_app;
+```
+
+Then import the schema:
 
 ```powershell
-# Connect with a DBA account and run:
-sqlcmd -S <DB_SERVER> -d master -Q "IF NOT EXISTS (SELECT name FROM sys.databases WHERE name='LeekuSecure') CREATE DATABASE LeekuSecure;"
-sqlcmd -S <DB_SERVER> -d LeekuSecure -i "C:\LeekuApp\db\schema.sql"
+psql -U leeku_app -d LeekuSecure -f "C:\LeekuApp\Documentation\SQL\postgresql_schema.sql"
 ```
 
 Verify the application user can connect:
 
 ```powershell
-sqlcmd -S <DB_SERVER> -d LeekuSecure -U leeku_app -P "<password>" -Q "SELECT 1 AS ready;"
+psql -U leeku_app -d LeekuSecure -c "SELECT 1 AS ready;"
 ```
 
 Expected output: `ready` = `1`.
@@ -138,9 +147,9 @@ Mandatory values that must not remain as placeholders (the application validates
 | `ALLOWED_ORIGINS` | CORS allow-list | Same as APP_URL |
 | `MASTER_KEY_BASE64` | 32-byte master encryption key | Step 3b above |
 | `COOKIE_SECRET_BASE64` | 32-byte cookie signing key | Step 3c above |
-| `DB_SERVER` | SQL Server hostname or IP | Network/DBA team |
-| `DB_USER` | SQL Server login | Network/DBA team |
-| `DB_PASSWORD` | SQL Server login password | Network/DBA team |
+| `DB_SERVER` | PostgreSQL hostname or IP | Network/DBA team |
+| `DB_USER` | PostgreSQL role name | Network/DBA team |
+| `DB_PASSWORD` | PostgreSQL role password | Network/DBA team |
 | `FILE_STORAGE_UNC_PATH` | UNC path to vault share | Storage admin |
 | `UPLOAD_TEMP_PATH` | Local temp dir for uploads | Use `C:\LeekuTemp\uploads` |
 | `JWT_PRIVATE_KEY_PATH` | Path to private PEM | Step 3a: `C:\LeekuSecure\keys\jwt_private.pem` |
@@ -150,7 +159,7 @@ Mandatory values that must not remain as placeholders (the application validates
 | `SMTP_PASSWORD` | SMTP auth password | Email/IT team |
 | `BITDEFENDER_SCAN_CLI_PATH` | Path to scanner binary | Pre-flight check above (or leave blank for auto-detect) |
 
-Set `NODE_ENV=production`, `COOKIE_SECURE=true`, `DB_ENCRYPT=true`.
+Set `NODE_ENV=production`, `COOKIE_SECURE=true`, `DB_SSL=true`.
 
 Protect the `.env.production` file so only the service account can read it:
 
@@ -325,7 +334,7 @@ Enable IIS W3C logging in `.env.production` by setting `IIS_LOGS_ENABLED=true` a
 | Bitdefender `Infected` scan result | Any occurrence | `leeku-stderr.log` + BD console |
 | Disk free on `C:\LeekuTemp` | Below 10 GB | Windows Performance Monitor |
 | UNC vault share connectivity | Any disconnection | External monitor |
-| SQL Server connection pool at max (`DB_POOL_MAX=10`) | Pool exhausted errors in logs | `leeku-stderr.log` |
+| PostgreSQL connection pool at max (`DB_POOL_MAX=10`) | Pool exhausted errors in logs | `leeku-stderr.log` |
 
 ---
 
@@ -377,9 +386,9 @@ Invoke-RestMethod -Uri "http://localhost:3000/api/health/ready"
 ```
 
 If `/api/health/ready` shows `"database": false`:
-- Verify SQL Server is running: `Test-NetConnection -ComputerName <DB_SERVER> -Port 1433`
-- Check SQL Server service: connect to `<DB_SERVER>` and run `Get-Service MSSQLSERVER`
-- Check `leeku_app` login is not locked: on SQL Server, `SELECT name, is_disabled FROM sys.sql_logins WHERE name='leeku_app'`
+- Verify PostgreSQL is reachable: `Test-NetConnection -ComputerName <DB_SERVER> -Port 5432`
+- Verify the role can connect: `psql -U leeku_app -d LeekuSecure -c "SELECT 1 AS ready;"`
+- Confirm `leeku_app` still has ownership or `CREATE` access on schema `public`
 
 If `/api/health/ready` shows `"vault": false`:
 - Verify UNC share: `Test-Path $env:FILE_STORAGE_UNC_PATH`
@@ -416,7 +425,7 @@ Next update: Within 30 minutes or sooner if resolved.
 - [ ] Time from page to first response: ___min (target: <5min)
 - [ ] Time to service restoration: ___min
 - [ ] Was the `.env.production` config the cause? (missing var, changed credential)
-- [ ] Was it a dependency failure (SQL Server, UNC share, Bitdefender)?
+- [ ] Was it a dependency failure (PostgreSQL, UNC share, Bitdefender)?
 - [ ] Was a code change deployed immediately before the outage?
 - [ ] Are monitoring thresholds adequate to catch this sooner next time?
 - [ ] Have runbooks been updated to cover the root cause?
@@ -498,25 +507,30 @@ Next update: Within 4 hours with user account decision.
 
 **Resolution steps:**
 
-1. Confirm pool exhaustion vs. SQL Server unavailability:
+1. Confirm pool exhaustion vs. PostgreSQL unavailability:
    ```powershell
-   Test-NetConnection -ComputerName $env:DB_SERVER -Port 1433
-   # If this fails: SQL Server network issue, not pool exhaustion
+   Test-NetConnection -ComputerName $env:DB_SERVER -Port 5432
+   # If this fails: PostgreSQL network issue, not pool exhaustion
    ```
 
-2. If SQL Server is reachable, check for long-running queries blocking connections:
+2. If PostgreSQL is reachable, check for long-running queries blocking connections:
    ```sql
-   -- Run on SQL Server with a DBA account:
-   SELECT session_id, status, wait_type, wait_time, blocking_session_id, sql_text = t.text
-   FROM sys.dm_exec_requests r
-   CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) t
-   WHERE r.database_id = DB_ID('LeekuSecure')
-   ORDER BY wait_time DESC;
+   -- Run on PostgreSQL with an admin role:
+   SELECT pid,
+          usename,
+          state,
+          wait_event_type,
+          wait_event,
+          query,
+          now() - query_start AS running_for
+   FROM pg_stat_activity
+   WHERE datname = 'LeekuSecure'
+   ORDER BY query_start ASC;
    ```
 
 3. Kill blocking sessions if identified (DBA action):
    ```sql
-   KILL <session_id>;
+   SELECT pg_terminate_backend(<pid>);
    ```
 
 4. If the pool is genuinely undersized for current traffic, increase `DB_POOL_MAX` in `.env.production` and restart the service:
@@ -547,7 +561,7 @@ Time: [HH:MM UTC]
 Database connection pool issues detected at [HH:MM UTC].
 
 Impact: API endpoints returning 500 errors for authenticated requests.
-SQL Server reachable: [Yes/No]
+PostgreSQL reachable: [Yes/No]
 Long-running queries identified: [Yes/No — list session IDs if yes]
 
 Action taken: [Killed blocking sessions / increased pool max / restarted service]
@@ -570,7 +584,7 @@ Users can resolve this themselves by:
 1. Deleting expired or unwanted files from their account.
 2. Waiting for TTL-based auto-expiry (TTLs: 1h, 4h, 1d, 2d, 5d, 7d — cleanup runs every 60 seconds by default).
 
-Ops can check and reset quotas via SQL Server if an admin override is needed:
+Ops can check and reset quotas via PostgreSQL if an admin override is needed:
 
 ```sql
 -- Check user's current file count and total size:
@@ -620,8 +634,8 @@ Assigned to: Dev (if quota logic needs adjustment) / Ops (if cleanup service is 
 
 2. Revoke all active refresh tokens to force re-authentication (prevents use of tokens signed with the old key):
    ```sql
-   -- Run on SQL Server (DBA or Dev team):
-   UPDATE refresh_tokens SET revoked_at = SYSDATETIMEOFFSET() WHERE revoked_at IS NULL;
+   -- Run on PostgreSQL (DBA or Dev team):
+   UPDATE refresh_tokens SET revoked_at = CURRENT_TIMESTAMP WHERE revoked_at IS NULL;
    ```
 
 3. Replace key files:
