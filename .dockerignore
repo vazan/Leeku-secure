@@ -1,0 +1,13 @@
+.git
+.gitignore
+node_modules
+dist
+.env
+.env.*
+!.env.example
+npm-debug.log*
+pnpm-debug.log*
+.DS_Store
+Documentation
+Documentations
+DEV-CHANGE-REPORT.md

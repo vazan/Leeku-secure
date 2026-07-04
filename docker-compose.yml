@@ -1,0 +1,62 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-LeekuSecure}
+      POSTGRES_USER: ${POSTGRES_USER:-leeku_app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me_in_production}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./Documentation/SQL/postgresql_schema.sql:/docker-entrypoint-initdb.d/001-postgresql_schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PORT: ${APP_PORT:-3000}
+      NODE_ENV: ${NODE_ENV:-development}
+      APP_URL: ${APP_URL:-http://localhost:3000}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000}
+      PROXY_TRUST_HOPS: ${PROXY_TRUST_HOPS:-0}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      DB_SERVER: db
+      DB_PORT: 5432
+      DB_NAME: ${POSTGRES_DB:-LeekuSecure}
+      DB_USER: ${POSTGRES_USER:-leeku_app}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-change_me_in_production}
+      DB_SSL: ${DB_SSL:-false}
+      DB_ENCRYPT: ${DB_ENCRYPT:-false}
+      DB_TRUST_SERVER_CERTIFICATE: ${DB_TRUST_SERVER_CERTIFICATE:-false}
+      MASTER_KEY_BASE64: ${MASTER_KEY_BASE64:-MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=}
+      COOKIE_SECRET_BASE64: ${COOKIE_SECRET_BASE64:-MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=}
+      FILE_STORAGE_UNC_PATH: ${FILE_STORAGE_UNC_PATH:-/app/vault}
+      UPLOAD_TEMP_PATH: ${UPLOAD_TEMP_PATH:-/app/uploads}
+      FILE_SCAN_TEMP_PATH: ${FILE_SCAN_TEMP_PATH:-/app/scan-temp}
+      JWT_PRIVATE_KEY_PATH: ${JWT_PRIVATE_KEY_PATH:-}
+      JWT_PUBLIC_KEY_PATH: ${JWT_PUBLIC_KEY_PATH:-}
+      BITDEFENDER_SCAN_CLI_PATH: ${BITDEFENDER_SCAN_CLI_PATH:-}
+      DB_WAIT_TIMEOUT: ${DB_WAIT_TIMEOUT:-90}
+    ports:
+      - "${APP_PORT:-3000}:3000"
+    volumes:
+      - app_vault:/app/vault
+      - app_uploads:/app/uploads
+
+volumes:
+  postgres_data:
+  app_vault:
+  app_uploads:

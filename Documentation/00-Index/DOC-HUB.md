@@ -20,6 +20,7 @@ Leeku Secure is a self-hosted encrypted file vault platform deployed on Windows 
 | Setup Guide | `Documentation/01-Technical/SETUP.md` | End-to-end developer setup guide including prerequisites, environment configuration, and database schema ✅ CONFIRMED |
 | API Reference | `Documentation/01-Technical/API.md` | Complete reference for all 48 API endpoints with request/response schemas and authentication requirements ✅ CONFIRMED |
 | Environment Variables | `Documentation/01-Technical/ENV_VARS.md` | All environment variables grouped by category (server, database, encryption, auth, AV, storage) ✅ CONFIRMED |
+| Docker Deployment Guide | `Documentation/01-Technical/DOCKER-DEPLOYMENT.md` | Docker-based development and production deployment steps, env fields to edit, and run commands ✅ CONFIRMED |
 | Deployment Guide | `Documentation/01-Technical/DEPLOYMENT.md` | Production deployment instructions for Windows Server 2022 with IIS ARR reverse proxy ✅ CONFIRMED |
 | Security Controls | `Documentation/04-Risk-And-Corrections/SECURITY.md` | Security controls catalogue and threat model covering encryption, authentication, AV scanning, and network hardening ✅ CONFIRMED |
 | QA Report | `Documentation/04-Risk-And-Corrections/DOC-QA-REPORT.md` | Documentation quality-assurance gate report with coverage scores and remediation log ✅ CONFIRMED |
