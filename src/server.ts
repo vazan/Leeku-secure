@@ -3551,12 +3551,43 @@ async function bootstrap() {
 
   // 7. Share link vanity path (Discord embeds) & SPA fallback
   const distPath = path.join(process.cwd(), 'dist');
+
+  // Serve an explicit robots policy. Without this, SPA fallback returns HTML for /robots.txt,
+  // which can confuse social unfurl crawlers and lead to missing link previews.
+  app.get('/robots.txt', (_req, res) => {
+    res.type('text/plain').send([
+      'User-agent: *',
+      'Allow: /',
+      '',
+      'User-agent: facebookexternalhit',
+      'Allow: /s/',
+      'Allow: /api/public/share/',
+      '',
+      'User-agent: facebot',
+      'Allow: /s/',
+      'Allow: /api/public/share/',
+      '',
+      'User-agent: meta-externalagent',
+      'Allow: /s/',
+      'Allow: /api/public/share/',
+      '',
+      'User-agent: meta-externalfetcher',
+      'Allow: /s/',
+      'Allow: /api/public/share/',
+      '',
+      'User-agent: discordbot',
+      'Allow: /s/',
+      'Allow: /api/public/share/',
+    ].join('\n'));
+  });
+
   app.use(express.static(distPath));
 
-  // Vanity path for share links — redirects to server-rendered OG HTML page
-  app.get('/s/:token', (req, res) => {
-    res.redirect(301, `/api/public/share/${req.params.token}/og`);
-  });  
+  // Vanity path for share links — internally dispatch to OG HTML handler (no redirect hop for crawlers).
+  app.get('/s/:token', (req, res, next) => {
+    req.url = `/api/public/share/${req.params.token}/og`;
+    (app as unknown as { _router: { handle: express.RequestHandler } })._router.handle(req, res, next);
+  });
 
   app.get('*', (req, res) => res.sendFile(path.join(distPath, 'index.html')));
   
