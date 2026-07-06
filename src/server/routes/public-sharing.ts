@@ -52,6 +52,7 @@ export function createPublicSharingRouter(options: {
   logDownload: (req: express.Request, fileId: string, originalName: string, token: string) => Promise<void>;
 }): express.Router {
   const router = express.Router();
+  const FACEBOOK_APP_ID = String(process.env.FACEBOOK_APP_ID || process.env.FB_APP_ID || '').trim();
   const EMBED_CACHE_PREFIX = 'leeku-embed-cache';
   const EMBED_CACHE_TTL_MS = (() => {
     const fallback = 30 * 60_000;
@@ -319,6 +320,20 @@ const buildPromise = (async () => {
     return `${(bytes / 1024 ** index).toFixed(index > 1 ? 1 : 0)} ${units[index]}`;
   };
 
+  const resolveOgImageUrl = (baseUrl: string): string | null => {
+    try {
+      const assetsDir = path.join(process.cwd(), 'dist', 'assets');
+      const entries = fs.readdirSync(assetsDir, { withFileTypes: true });
+      const mascotAsset = entries.find(
+        (entry) => entry.isFile() && /^leeku_mascot-.*\.png$/i.test(entry.name),
+      );
+      if (!mascotAsset) return null;
+      return `${baseUrl}/assets/${encodeURIComponent(mascotAsset.name)}`;
+    } catch {
+      return null;
+    }
+  };
+
   const ogErrorHtml = (label: string): string => `<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><title>${label}</title></head><body><p>${label}</p></body></html>`;
 
@@ -356,13 +371,36 @@ const buildPromise = (async () => {
     const uploader = decryptColumn(row.owner_username_encrypted, row.owner_username_iv, row.owner_username_auth_tag);
     const sizeLabel = ogFormatBytes(row.size_bytes);
     const appUrl = `${baseUrl}/#f/${token}`;
+    // Use a non-fragment URL for social crawlers (Messenger/Facebook may ignore hash-only URLs).
+    const previewUrl = `${baseUrl}/s/${token}`;
 
-    const esc = (s: string) => s.replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const esc = (s: string) => s
+      .replace(/&/g, '&amp;')
+      .replace(/"/g, '&quot;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/'/g, '&#39;');
     const safeFileName = esc(fileName);
     const safeUploader = esc(uploader);
     const safeAppUrl = esc(appUrl);
+    const safePreviewUrl = esc(previewUrl);
+    const ogImageUrl = resolveOgImageUrl(baseUrl);
+    const safeOgImageUrl = ogImageUrl ? esc(ogImageUrl) : null;
     const ogTitle = `${safeFileName} - Shared by ${safeUploader}`;
     const ogDescription = `${safeFileName} · ${sizeLabel} · Shared by ${safeUploader}`;
+    const ua = String(req.get('user-agent') || '').toLowerCase();
+    const isCrawlerUa =
+      ua.includes('facebookexternalhit') ||
+      ua.includes('facebot') ||
+      ua.includes('meta-externalagent') ||
+      ua.includes('meta-externalfetcher') ||
+      ua.includes('metaexternalagent') ||
+      ua.includes('metaexternalfetcher') ||
+      ua.includes('discordbot') ||
+      ua.includes('twitterbot') ||
+      ua.includes('slackbot') ||
+      ua.includes('linkedinbot') ||
+      ua.includes('whatsapp');
 
     const html = `<!DOCTYPE html>
 <html lang="en">
@@ -373,12 +411,21 @@ const buildPromise = (async () => {
 <meta property="og:title" content="${ogTitle}" />
 <meta property="og:description" content="${ogDescription}" />
 <meta property="og:type" content="website" />
-<meta property="og:url" content="${safeAppUrl}" />
+<meta property="og:url" content="${safePreviewUrl}" />
+<meta property="og:site_name" content="Leeku Secure" />
+<meta property="og:locale" content="en_US" />
+${FACEBOOK_APP_ID ? `<meta property="fb:app_id" content="${esc(FACEBOOK_APP_ID)}" />` : ''}
+${safeOgImageUrl ? `<meta property="og:image" content="${safeOgImageUrl}" />` : ''}
+${safeOgImageUrl ? `<meta property="og:image:secure_url" content="${safeOgImageUrl}" />` : ''}
+${safeOgImageUrl ? '<meta property="og:image:type" content="image/png" />' : ''}
+${safeOgImageUrl ? '<meta property="og:image:width" content="380" />' : ''}
+${safeOgImageUrl ? '<meta property="og:image:height" content="380" />' : ''}
 <meta name="twitter:card" content="summary" />
 <meta name="twitter:title" content="${ogTitle}" />
 <meta name="twitter:description" content="${ogDescription}" />
-<meta http-equiv="refresh" content="0;url=${safeAppUrl}" />
-<link rel="canonical" href="${safeAppUrl}" />
+${safeOgImageUrl ? `<meta name="twitter:image" content="${safeOgImageUrl}" />` : ''}
+<link rel="canonical" href="${safePreviewUrl}" />
+${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)});</script>`}
 </head>
 <body>
 <p><a href="${safeAppUrl}">${safeFileName}</a></p>
@@ -387,6 +434,7 @@ const buildPromise = (async () => {
 </html>`;
 
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-store, max-age=0');
     res.send(html);
   };
 
