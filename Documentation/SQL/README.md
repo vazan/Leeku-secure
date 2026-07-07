@@ -12,31 +12,53 @@ sqlcmd -S your-sql-server -U sa -P <password> -i production_schema.sql
 
 ### Development Setup
 ```powershell
-sqlcmd -S localhost -U sa -P <password> -d LeekuSecure -i migrations/001_initial_schema.sql
+# Same script as production — optimized for all environments
+sqlcmd -S localhost -U sa -P <password> -i production_schema.sql
 ```
 
 ---
 
 ## Files Overview
 
-### 1. `production_schema.sql` - Production-Ready Schema ⭐ **PRIMARY**
-**Purpose:** Enterprise-grade schema with optimized indexes, stored procedures, and security hardening.
+### 1. `production_schema.sql` - **Single Source of Truth** ⭐ **RECOMMENDED**
+**Purpose:** Complete, production-ready database schema in a single file.
 
 **Includes:**
-- ✅ Complete database creation (tables, constraints, defaults)
+- ✅ Complete database creation (all tables, constraints, defaults)
 - ✅ 12 optimized indexes (filtered, composite, covering)
-- ✅ 5 stored procedures for critical operations
+- ✅ 7 stored procedures for critical operations (including maintenance mode)
 - ✅ Table-valued parameter (TVP) type for safe batch operations
 - ✅ 9 check constraints for data validation
 - ✅ Database configuration (RECOVERY FULL, QUERY_STORE, etc.)
 - ✅ Application user with least-privilege roles
-- ✅ Default data seeding (guest quota)
+- ✅ Default data seeding (guest quota, maintenance_mode config)
+- ✅ System configuration table for operational settings
+
+**Tables Included:**
+1. **users** — User identity & auth (encrypted email/username)
+2. **quotas** — Storage tier definitions
+3. **files** — User-uploaded files with malware scan results
+4. **file_encryption_keys** — Per-file encryption metadata
+5. **share_links** — Public file sharing with access controls
+6. **refresh_tokens** — Session management
+7. **system_logs** — Immutable audit trail
+8. **system_config** — System-wide settings (maintenance mode, etc.)
+
+**Stored Procedures (7 Total):**
+1. **sp_GetExpiredFiles** — Retrieve files ready for vault deletion
+2. **sp_IncrementDownloadCount** — Atomic download counter (prevents race conditions)
+3. **sp_MarkFilesExpired** — Safe batch file expiration using TVP
+4. **sp_RecordFailedLogin** — Brute-force protection with automatic lockout
+5. **sp_ResetLoginAttempts** — Reset login counter on successful auth
+6. **sp_GetMaintenanceStatus** — Check maintenance mode status
+7. **sp_ToggleMaintenanceMode** — Enable/disable maintenance mode
 
 **Enhancements over initial migration:**
 - File queries: 50-80% faster (optimized indexes with INCLUDE columns)
 - Expired file cleanup: 90% faster (filtered indexes)
 - Login security: Race-condition safe (atomic stored procedures)
 - Data validation: Enforced at DB layer (check constraints)
+- Maintenance mode: Built-in system-wide downtime control
 
 **How to run:**
 ```powershell
@@ -58,54 +80,24 @@ sqlcmd -S your-sql-server -U sa -P <password> -i production_schema.sql
 
 ---
 
-### 3. `003_maintenance_mode.sql` - Maintenance Mode Configuration (Optional)
-**Purpose:** Adds system-wide maintenance mode control without downtime.
+### 2. `QUERIES-REFERENCE.md` - SQL Query Reference Guide
+**Purpose:** Documentation of common SQL patterns and parameterized queries.
 
-**Features:**
-- Creates `system_config` table for storing system settings
-- Implements `sp_GetMaintenanceStatus` to check maintenance state
-- Implements `sp_ToggleMaintenanceMode` to enable/disable maintenance
-- Initial value: maintenance mode disabled (normal operations)
-- Lightweight, non-intrusive addition to existing schema
+**Contains:**
+- Authentication & token management queries
+- User registration & account management patterns
+- File management operations
+- Share link operations
+- System logging & audit queries
+- Admin & monitoring queries
+- Maintenance & cleanup operations
+- GDPR compliance queries
+- Application integration examples
+- Performance optimization tips
 
-**When to apply:**
-- ✅ After `production_schema.sql` is deployed (optional enhancement)
-- ✅ When you need admin-controlled downtime for updates
-- ✅ For graceful system maintenance without data loss
+**Usage:** Reference guide for developers — **not** an executable SQL script.
 
-**How to run:**
-```powershell
-sqlcmd -S your-sql-server -U sa -P <password> -d LeekuSecure -i 003_maintenance_mode.sql
-```
-
-**Verify installation:**
-```sql
-SELECT * FROM system_config WHERE key = 'maintenance_mode'
--- Should return: | maintenance_mode | false | (current timestamp) |
-```
-
----
-
-### 4. `migrations/001_initial_schema.sql` - Initial Migration (Dev-Friendly)
-**Purpose:** Simple, idempotent migration for development and quick setup.
-
-**Features:**
-- Creates all 7 tables in dependency order
-- Idempotent: can be run multiple times safely (`IF NOT EXISTS` checks)
-- Automatic seeding of default 'guest' quota tier
-- Adds optional columns automatically
-- Minimal index overhead
-
-**Best for:**
-- Development environments
-- Local testing
-- Quick iteration
-- Learning the schema
-
-**How to run:**
-```powershell
-sqlcmd -S localhost -U sa -P <password> -d LeekuSecure -i migrations/001_initial_schema.sql
-```
+This file provides best practices and examples for building application code that safely and efficiently queries the database. All queries use parameterized queries to prevent SQL injection.
 
 ---
 
@@ -137,12 +129,12 @@ sqlcmd -S localhost -U sa -P <password> -d LeekuSecure -i migrations/001_initial
 - **TTL Whitelist:** Allowed values (1h, 4h, 1d, 2d, 5d, 7d)
 - **Scan Result Validation:** Only valid malware scan states accepted
 
-### 🔧 Stored Procedures (5 Total)
-1. **sp_GetExpiredFiles** — Retrieve files ready for vault deletion
-2. **sp_IncrementDownloadCount** — Atomic download counter (prevents race conditions)
-3. **sp_MarkFilesExpired** — Safe batch file expiration using TVP
-4. **sp_RecordFailedLogin** — Brute-force protection with automatic lockout
-5. **sp_ResetLoginAttempts** — Reset login counter on successful auth
+### 🔧 Maintenance & Operations
+- **system_config Table:** Stores operational settings (maintenance mode, etc.)
+- **sp_GetMaintenanceStatus** — Check if system is in maintenance mode
+- **sp_ToggleMaintenanceMode** — Admin API to enable/disable maintenance
+- **Graceful Degradation:** Application checks maintenance status before processing requests
+- **No Data Loss:** Maintenance mode prevents writes but preserves existing data
 
 ---
 
@@ -179,9 +171,7 @@ sqlcmd -S localhost -U sa -P <password> -d LeekuSecure -i migrations/001_initial
 |------|----------|-----|
 | **Production deployment** | `production_schema.sql` | ⭐ Optimized, secure, enterprise-ready |
 | **Staging environment** | `production_schema.sql` | Match prod for testing |
-| **Dev/local testing** | `migrations/001_initial_schema.sql` | Simple, fast, minimal overhead |
-| **Maintenance mode (optional)** | `003_maintenance_mode.sql` | Enable/disable file operations without downtime |
-| **Migration (001→002)** | See VALIDATION.md | Step-by-step guide (if file exists) |
+| **Dev/local testing** | `production_schema.sql` | Single source of truth for all environments |
 
 ---
 
@@ -293,8 +283,8 @@ sqlcmd -S your-server -U sa -P <password> -d LeekuSecure-Prod -Q `
 # 1. Create database
 sqlcmd -S localhost -U sa -P <password> -Q "CREATE DATABASE LeekuSecure"
 
-# 2. Run initial migration
-sqlcmd -S localhost -U sa -P <password> -d LeekuSecure -i migrations/001_initial_schema.sql
+# 2. Run schema deployment
+sqlcmd -S localhost -U sa -P <password> -i production_schema.sql
 
 # 3. Verify
 sqlcmd -S localhost -U sa -P <password> -d LeekuSecure -Q "SELECT COUNT(*) FROM users"
@@ -312,7 +302,7 @@ sqlcmd -S your-server -U leeku_app -P <password> -d LeekuSecure-Prod -Q "SELECT 
 
 1. **This README** — Overview and quick start
 2. **production_schema.sql** — Full schema with inline comments
-3. **migrations/001_initial_schema.sql** — Alternative for dev environments
+3. **QUERIES-REFERENCE.md** — SQL query patterns and best practices
 4. **Related documentation:**
    - [SETUP.md](../01-Technical/SETUP.md) — Original schema documentation
    - [DEPLOYMENT.md](../01-Technical/DEPLOYMENT.md) — Database deployment
@@ -405,12 +395,7 @@ UPDATE STATISTICS [dbo].[users]
 ```
 Documentation/SQL/
 ├── README.md                          — This file
-├── production_schema.sql              — ⭐ Production-ready schema
-└── migrations/
-    └── 001_initial_schema.sql         — Dev-friendly initial migration
+├── production_schema.sql              — ⭐ Single source of truth (all environments)
+├── QUERIES-REFERENCE.md               — SQL query patterns & best practices
+└── VALIDATION.md                      — Validation queries & verification
 ```
-
-Optional (if available):
-- `VALIDATION.md` — Detailed 001 vs production comparison & migration guide
-- `CHANGELOG.md` — Complete list of changes and improvements
-- `queries.sql` — Reference guide for common SQL patterns

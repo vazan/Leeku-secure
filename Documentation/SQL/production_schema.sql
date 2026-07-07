@@ -333,6 +333,19 @@ CREATE TABLE [dbo].[system_logs](
 ) ON [PRIMARY] TEXTIMAGE_ON [PRIMARY]
 GO
 
+-- Step 8: system_config (no hard dependencies - for maintenance mode & system settings)
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+CREATE TABLE [dbo].[system_config](
+    [key] [nvarchar](100) NOT NULL,
+    [value] [nvarchar](max) NOT NULL,
+    [updated_at] [datetimeoffset](7) NOT NULL DEFAULT SYSDATETIMEOFFSET(),
+    CONSTRAINT [PK_system_config] PRIMARY KEY CLUSTERED ([key] ASC)
+) ON [PRIMARY]
+GO
+
 -- ============================================================
 -- Create Indexes (optimized for common query patterns)
 -- ============================================================
@@ -508,6 +521,10 @@ GO
 
 -- Quotas defaults
 ALTER TABLE [dbo].[quotas] ADD DEFAULT (sysdatetimeoffset()) FOR [created_at]
+GO
+
+-- System config defaults
+ALTER TABLE [dbo].[system_config] ADD DEFAULT (sysdatetimeoffset()) FOR [updated_at]
 GO
 
 -- ============================================================
@@ -763,6 +780,49 @@ BEGIN
 END;
 GO
 
+-- Procedure: sp_GetMaintenanceStatus
+-- Retrieves the current maintenance mode status.
+-- Returns 1 (true) if maintenance is enabled, 0 (false) otherwise.
+CREATE OR ALTER PROCEDURE [dbo].[sp_GetMaintenanceStatus]
+AS
+BEGIN
+    SET NOCOUNT ON;
+    
+    DECLARE @value NVARCHAR(MAX);
+    
+    SELECT @value = [value]
+    FROM [dbo].[system_config]
+    WHERE [key] = N'maintenance_mode';
+    
+    SELECT CAST(ISNULL(@value, N'false') AS BIT) AS is_maintenance_enabled;
+END
+GO
+
+-- Procedure: sp_ToggleMaintenanceMode
+-- Updates the maintenance mode status.
+-- Called by admin endpoints to enable/disable maintenance mode.
+CREATE OR ALTER PROCEDURE [dbo].[sp_ToggleMaintenanceMode]
+    @enabled BIT
+AS
+BEGIN
+    SET NOCOUNT ON;
+    
+    UPDATE [dbo].[system_config]
+    SET [value] = CAST(@enabled AS NVARCHAR(MAX)),
+        [updated_at] = SYSDATETIMEOFFSET()
+    WHERE [key] = N'maintenance_mode';
+    
+    -- If no rows updated, insert
+    IF @@ROWCOUNT = 0
+    BEGIN
+        INSERT INTO [dbo].[system_config] ([key], [value], [updated_at])
+        VALUES (N'maintenance_mode', CAST(@enabled AS NVARCHAR(MAX)), SYSDATETIMEOFFSET());
+    END
+    
+    SELECT CAST(@enabled AS BIT) AS is_maintenance_enabled;
+END
+GO
+
 -- ============================================================
 -- Seed Initial Data
 -- ============================================================
@@ -773,6 +833,15 @@ BEGIN
     INSERT INTO quotas (id, name, storage_limit_bytes, max_file_size_bytes, max_files, daily_upload_limit_bytes, created_at)
     VALUES ('guest', 'Guest', 1073741824, 104857600, 10, 524288000, SYSDATETIMEOFFSET());
     PRINT 'Seeded default ''guest'' quota tier.';
+END
+GO
+
+-- Initialize maintenance_mode config (disabled by default)
+IF NOT EXISTS (SELECT 1 FROM system_config WHERE [key] = N'maintenance_mode')
+BEGIN
+    INSERT INTO [dbo].[system_config] ([key], [value], [updated_at])
+    VALUES (N'maintenance_mode', N'false', SYSDATETIMEOFFSET());
+    PRINT 'Seeded default maintenance_mode configuration (disabled).';
 END
 GO
 
@@ -789,11 +858,17 @@ PRINT '====================================================='
 PRINT 'LeekuSecure Database Creation Complete'
 PRINT '====================================================='
 PRINT 'Tables created: users, files, file_encryption_keys,'
-PRINT '                share_links, refresh_tokens, system_logs, quotas'
+PRINT '                share_links, refresh_tokens, system_logs,'
+PRINT '                system_config, quotas'
 PRINT 'Indexes created: 12 optimized indexes'
-PRINT 'Stored Procedures: 5 (sp_GetExpiredFiles, sp_IncrementDownloadCount,'
-PRINT '                      sp_MarkFilesExpired, sp_RecordFailedLogin,'
-PRINT '                      sp_ResetLoginAttempts)'
+PRINT 'Stored Procedures: 7'
+PRINT '  - sp_GetExpiredFiles'
+PRINT '  - sp_IncrementDownloadCount'
+PRINT '  - sp_MarkFilesExpired'
+PRINT '  - sp_RecordFailedLogin'
+PRINT '  - sp_ResetLoginAttempts'
+PRINT '  - sp_GetMaintenanceStatus'
+PRINT '  - sp_ToggleMaintenanceMode'
 PRINT 'User: leeku_app (db_datareader, db_datawriter)'
-PRINT 'Data Seeded: 1 quota tier (guest)'
+PRINT 'Data Seeded: 1 quota tier (guest), maintenance_mode config'
 PRINT '====================================================='
