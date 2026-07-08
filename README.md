@@ -1,4 +1,4 @@
-# Leeku Secure
+# Leeku Secure - MSSQL Edition
 
 **Encrypted file vault with zero-knowledge storage, AV scanning, and secure sharing.**
 
