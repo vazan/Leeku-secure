@@ -50,7 +50,6 @@ import FileTypeIcon, {
   getFileTypeBadge,
 } from "@/app/shared/components/common/file-type-icon";
 import { downloadWithProgress } from "@/app/shared/utils/download-with-progress";
-import { encryptFileForUploadWithSecret } from "@/app/shared/utils/client-file-secret";
 
 interface UserDashboardProps {
   user: User;
@@ -295,6 +294,11 @@ export default function UserDashboard({
 
   const openUploadFilePicker = () => {
     if (uploading) return;
+    if (dropzoneFileInputRef.current) {
+      // Reset before opening so re-selecting the same file still triggers change,
+      // without invalidating the selected File reference in Firefox.
+      dropzoneFileInputRef.current.value = "";
+    }
     dropzoneFileInputRef.current?.click();
   };
 
@@ -436,6 +440,7 @@ export default function UserDashboard({
     }
 
     const startedAt = Date.now();
+    const selectedFileSize = file.size;
     uploadStoppedRef.current = false;
     setUploading(true);
     setUploadProgress(0);
@@ -443,21 +448,21 @@ export default function UserDashboard({
       direction: "upload",
       name: file.name,
       loaded: 0,
-      total: file.size,
+      total: selectedFileSize,
       startedAt,
     });
 
-    // ── Encrypt with secret key if provided ──────────────────
+    // ── Secret key handling ───────────────────────────────────
     const secretMeta: Record<string, string> = {};
     let uploadTargetFile: globalThis.File = file;
     try {
       if (uploadSecretKey.trim()) {
-        const encrypted = await encryptFileForUploadWithSecret(file, uploadSecretKey);
-        uploadTargetFile = encrypted.encryptedFile;
-        secretMeta.upload_secret_key = uploadSecretKey.trim();
-        secretMeta.upload_secret_salt_b64 = encrypted.saltBase64;
-        secretMeta.upload_secret_iv_b64 = encrypted.ivBase64;
-        secretMeta.upload_secret_iterations = String(encrypted.iterations);
+        const trimmedSecret = uploadSecretKey.trim();
+        if (trimmedSecret.length < 8) {
+          throw new Error("Secret key must contain at least 8 characters.");
+        }
+
+        secretMeta.upload_secret_key = trimmedSecret;
       }
     } catch (reason) {
       setUploading(false);
@@ -466,20 +471,22 @@ export default function UserDashboard({
       return;
     }
 
-    const FILE_IS_LARGE = uploadTargetFile.size > RESUMABLE_CHUNK_SIZE;
+    const FILE_IS_LARGE = selectedFileSize > RESUMABLE_CHUNK_SIZE;
 
     // ═════════════════════════════════════════════════════════
     // LARGE FILES → Resumable.js chunked upload (50 MB each)
     // ═════════════════════════════════════════════════════════
     if (FILE_IS_LARGE) {
       const identifier = generateResumableIdentifier(file);
-      const totalChunks = Math.max(1, Math.ceil(uploadTargetFile.size / RESUMABLE_CHUNK_SIZE));
-      const totalSize = uploadTargetFile.size;
+      const totalChunks = Math.max(1, Math.ceil(selectedFileSize / RESUMABLE_CHUNK_SIZE));
+      const totalSize = selectedFileSize;
 
       // Build a query string for secret metadata (appended to every chunk request)
       const secretParams = new URLSearchParams();
       if (secretMeta.upload_secret_key) {
         secretParams.set("upload_secret_key", secretMeta.upload_secret_key);
+      }
+      if (secretMeta.upload_secret_salt_b64 && secretMeta.upload_secret_iv_b64 && secretMeta.upload_secret_iterations) {
         secretParams.set("upload_secret_salt_b64", secretMeta.upload_secret_salt_b64);
         secretParams.set("upload_secret_iv_b64", secretMeta.upload_secret_iv_b64);
         secretParams.set("upload_secret_iterations", secretMeta.upload_secret_iterations);
@@ -505,8 +512,12 @@ export default function UserDashboard({
           }
 
           const start = (chunkNumber - 1) * RESUMABLE_CHUNK_SIZE;
-          const end = Math.min(chunkNumber * RESUMABLE_CHUNK_SIZE, uploadTargetFile.size);
+          const end = Math.min(chunkNumber * RESUMABLE_CHUNK_SIZE, selectedFileSize);
           const chunkBlob = uploadTargetFile.slice(start, end);
+          const expectedChunkBytes = end - start;
+          if (chunkBlob.size !== expectedChunkBytes) {
+            throw new Error("Upload source changed while reading file. Please re-select the file and retry.");
+          }
 
           // ── Check if chunk already exists (GET) ──────────
           const checkUrl =
@@ -522,7 +533,7 @@ export default function UserDashboard({
             // Chunk already exists — skip
             totalBytesUploaded += chunkBlob.size;
             resumableUploadRef.current.currentChunk = chunkNumber + 1;
-            updateProgress(file, totalBytesUploaded, uploadTargetFile.size, startedAt, chunkNumber, totalChunks);
+            updateProgress(file, totalBytesUploaded, selectedFileSize, startedAt, chunkNumber, totalChunks);
             continue;
           }
 
@@ -569,8 +580,8 @@ export default function UserDashboard({
                       setTransfer({
                         direction: "upload",
                         name: file.name,
-                        loaded: uploadTargetFile.size,
-                        total: uploadTargetFile.size,
+                        loaded: selectedFileSize,
+                        total: selectedFileSize,
                         startedAt,
                         processing: true,
                         processingStartedAt: Date.now(),
@@ -588,13 +599,13 @@ export default function UserDashboard({
               xhr.upload.onprogress = (event) => {
                 if (event.lengthComputable) {
                   const chunkLoaded = totalBytesUploaded + event.loaded;
-                  const pct = Math.round((chunkLoaded / uploadTargetFile.size) * 100);
+                  const pct = Math.round((chunkLoaded / selectedFileSize) * 100);
                   setUploadProgress(pct);
                   setTransfer({
                     direction: "upload",
                     name: file.name,
                     loaded: chunkLoaded,
-                    total: uploadTargetFile.size,
+                    total: selectedFileSize,
                     startedAt,
                     phaseLabel: `Uploading chunk ${chunkNumber}/${totalChunks} (${Math.round(event.loaded / 1024 / 1024)} MB)`,
                   });
@@ -657,8 +668,8 @@ export default function UserDashboard({
         setTransfer({
           direction: "upload",
           name: file.name,
-          loaded: uploadTargetFile.size,
-          total: uploadTargetFile.size,
+          loaded: selectedFileSize,
+          total: selectedFileSize,
           startedAt,
           complete: true,
         });
@@ -692,6 +703,8 @@ export default function UserDashboard({
     // Append secret metadata if present
     if (secretMeta.upload_secret_key) {
       formData.append("upload_secret_key", secretMeta.upload_secret_key);
+    }
+    if (secretMeta.upload_secret_salt_b64 && secretMeta.upload_secret_iv_b64 && secretMeta.upload_secret_iterations) {
       formData.append("upload_secret_salt_b64", secretMeta.upload_secret_salt_b64);
       formData.append("upload_secret_iv_b64", secretMeta.upload_secret_iv_b64);
       formData.append("upload_secret_iterations", secretMeta.upload_secret_iterations);
@@ -1297,7 +1310,6 @@ export default function UserDashboard({
                     if (event.target.files?.[0]) {
                       uploadFile(event.target.files[0]);
                     }
-                    event.currentTarget.value = "";
                   }}
                 />
                 <div className="mx-auto grid h-11 w-11 place-items-center rounded-xl bg-[var(--bg-hover)]">

@@ -30,7 +30,7 @@ import {
   encryptFileStream, decryptFileStream, computeFileChecksum,
   encryptColumn, decryptColumn, hashColumnForLookup,
   hashPassword, verifyPassword, hashSharePassword, verifySharePassword,
-  hashFileSecret, verifyFileSecret, decryptClientProtectedPayload,
+  hashFileSecret, verifyFileSecret, decryptClientProtectedPayload, encryptClientProtectedFileInPlace, decryptClientProtectedFileInPlace,
   generateSecureToken, validateEncryptionConfig,
 } from './server/utils/encryption.js';
 import { scanFileBuffer, scanFilePath, heuristicPreScan } from './server/utils/scanner.js';
@@ -2097,6 +2097,10 @@ app.post(
       req.body.original_name = originalName;
       req.body.mime_type     = mimeType;
       req.body.ttl_hours     = (req.query.ttl_hours as string) || null;
+      req.body.upload_secret_key = (req.query.upload_secret_key as string) || req.body.upload_secret_key;
+      req.body.upload_secret_salt_b64 = (req.query.upload_secret_salt_b64 as string) || req.body.upload_secret_salt_b64;
+      req.body.upload_secret_iv_b64 = (req.query.upload_secret_iv_b64 as string) || req.body.upload_secret_iv_b64;
+      req.body.upload_secret_iterations = (req.query.upload_secret_iterations as string) || req.body.upload_secret_iterations;
 
       // Fall through to the shared processing pipeline below
     }
@@ -2141,6 +2145,7 @@ app.post(
     let uploadSecretSalt: Buffer | null = null;
     let uploadSecretIv: Buffer | null = null;
     let uploadSecretIterations: number | null = null;
+    let payloadAlreadyClientProtected = false;
 
     const finishUploadError = (statusCode: number, message: string) => {
       try { if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath); } catch {}
@@ -2172,19 +2177,25 @@ app.post(
       const uploadSecretSaltB64 = typeof req.body.upload_secret_salt_b64 === 'string' ? req.body.upload_secret_salt_b64 : '';
       const uploadSecretIvB64 = typeof req.body.upload_secret_iv_b64 === 'string' ? req.body.upload_secret_iv_b64 : '';
       const uploadSecretIterationsRaw = typeof req.body.upload_secret_iterations === 'string' ? req.body.upload_secret_iterations : '';
+      const hasClientMeta = !!(uploadSecretSaltB64 || uploadSecretIvB64 || uploadSecretIterationsRaw);
       if (uploadSecretRaw.length > 0) {
         if (uploadSecretRaw.length < 8) return finishUploadError(400, 'Secret key must contain at least 8 characters.');
-        if (!uploadSecretSaltB64 || !uploadSecretIvB64 || !uploadSecretIterationsRaw) return finishUploadError(400, 'Missing client encryption metadata for secret-protected upload.');
-        const parsedIterations = Number(uploadSecretIterationsRaw);
-        if (!Number.isInteger(parsedIterations) || parsedIterations < 100000 || parsedIterations > 1000000) return finishUploadError(400, 'Invalid client encryption iteration count.');
-        const parsedSalt = Buffer.from(uploadSecretSaltB64, 'base64');
-        const parsedIv   = Buffer.from(uploadSecretIvB64,   'base64');
-        if (parsedSalt.length !== 16 || parsedIv.length !== 12) return finishUploadError(400, 'Invalid client encryption salt or IV.');
-        uploadSecretIterations = parsedIterations;
-        uploadSecretSalt = parsedSalt;
-        uploadSecretIv   = parsedIv;
+        if (hasClientMeta) {
+          if (!uploadSecretSaltB64 || !uploadSecretIvB64 || !uploadSecretIterationsRaw) {
+            return finishUploadError(400, 'Incomplete client encryption metadata for secret-protected upload.');
+          }
+          const parsedIterations = Number(uploadSecretIterationsRaw);
+          if (!Number.isInteger(parsedIterations) || parsedIterations < 100000 || parsedIterations > 1000000) return finishUploadError(400, 'Invalid client encryption iteration count.');
+          const parsedSalt = Buffer.from(uploadSecretSaltB64, 'base64');
+          const parsedIv   = Buffer.from(uploadSecretIvB64,   'base64');
+          if (parsedSalt.length !== 16 || parsedIv.length !== 12) return finishUploadError(400, 'Invalid client encryption salt or IV.');
+          uploadSecretIterations = parsedIterations;
+          uploadSecretSalt = parsedSalt;
+          uploadSecretIv   = parsedIv;
+          payloadAlreadyClientProtected = true;
+        }
         uploadSecretHash = await hashFileSecret(uploadSecretRaw);
-      } else if (uploadSecretSaltB64 || uploadSecretIvB64 || uploadSecretIterationsRaw) {
+      } else if (hasClientMeta) {
         return finishUploadError(400, 'Secret metadata provided without a secret key.');
       }
 
@@ -2263,6 +2274,26 @@ app.post(
       const persistedScanMessage = acceptedWithoutScanner
         ? `Development bypass: Bitdefender scanner unavailable; file was not scanned. ${scanResult.message}`
         : scanResult.message;
+
+      if (uploadSecretHash && !payloadAlreadyClientProtected) {
+        currentStage = 'secret_protect_fallback';
+        uploadSecretIterations = 250000;
+        uploadSecretSalt = crypto.randomBytes(16);
+        uploadSecretIv = crypto.randomBytes(12);
+        sendUploadProgress({
+          type: 'processing',
+          phase: 'Applying secret-key protection',
+          loaded: 255,
+          total: processingTotal,
+        });
+        await encryptClientProtectedFileInPlace(
+          tempFilePath,
+          uploadSecretRaw,
+          uploadSecretSalt,
+          uploadSecretIv,
+          uploadSecretIterations,
+        );
+      }
 
       // ── Stream-encrypt directly to vault (constant memory) ─────
       currentStage = 'encrypt_file';
@@ -2618,19 +2649,11 @@ app.get('/api/files/:id/download', authenticateUser as express.RequestHandler, a
         cleanupTemp();
         return res.status(500).json({ error: 'Secret-key metadata is missing for this file.' });
       }
-      // ── Guard: client-secret protected files over 512 MB must use prepared download ──
-      const secretCheckStat = fs.statSync(tempPath);
-      if (secretCheckStat.size > 512 * 1024 * 1024) {
-        cleanupTemp();
-        return res.status(413).json({ error: 'Files over 512 MB with client-side encryption cannot use direct download. Use the prepared download endpoint instead.' });
-      }
-      const protectedPayload = fs.readFileSync(tempPath);
       try {
-        const plaintext = decryptClientProtectedPayload(
-          protectedPayload, providedSecret,
+        await decryptClientProtectedFileInPlace(
+          tempPath, providedSecret,
           file.client_crypto_salt, file.client_crypto_iv, file.client_crypto_iterations,
         );
-        fs.writeFileSync(tempPath, plaintext);
       } catch {
         cleanupTemp();
         return res.status(403).json({ error: 'Incorrect secret key.' });
@@ -2784,20 +2807,13 @@ app.post('/api/files/:id/download/prepare', authenticateUser as express.RequestH
           active.loaded = 0;
           active.total = 1;
 
-          // ── Guard: client-secret protected files over 512 MB cannot be decrypted in memory ──
-          const secretCheckStat = fs.statSync(tempFile);
-          if (secretCheckStat.size > 512 * 1024 * 1024) {
-            throw new Error('Client-secret protected files over 512 MB are not supported yet. Please re-upload without client-side encryption.');
-          }
-          const protectedPayload = fs.readFileSync(tempFile);
-          const plaintext = decryptClientProtectedPayload(
-            protectedPayload,
+          await decryptClientProtectedFileInPlace(
+            tempFile,
             providedSecret,
             file.client_crypto_salt,
             file.client_crypto_iv,
             file.client_crypto_iterations,
           );
-          fs.writeFileSync(tempFile, plaintext);
           active.loaded = 1;
           active.total = 1;
         }

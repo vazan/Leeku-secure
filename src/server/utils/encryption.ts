@@ -27,6 +27,7 @@
 
 import crypto from 'crypto';
 import fs from 'fs';
+import { pipeline } from 'stream/promises';
 import argon2 from 'argon2';
 import bcrypt from 'bcryptjs';
 
@@ -300,6 +301,91 @@ export function decryptClientProtectedPayload(
   const decipher = crypto.createDecipheriv(ALGORITHM, key, iv, { authTagLength: TAG_LENGTH });
   decipher.setAuthTag(authTag);
   return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+}
+
+/**
+ * Applies client-compatible secret protection to a file in place using streaming I/O.
+ * Output format is ciphertext followed by 16-byte GCM auth tag.
+ */
+export async function encryptClientProtectedFileInPlace(
+  filePath: string,
+  secret: string,
+  salt: Buffer,
+  iv: Buffer,
+  iterations: number,
+): Promise<void> {
+  if (iterations < 100_000 || iterations > 1_000_000) {
+    throw new Error('Invalid key-derivation iteration count.');
+  }
+  if (salt.length !== 16 || iv.length !== 12) {
+    throw new Error('Invalid client encryption salt or IV.');
+  }
+
+  const key = crypto.pbkdf2Sync(secret, salt, iterations, CLIENT_FILE_SECRET_KEY_LENGTH, 'sha256');
+  const cipher = crypto.createCipheriv(ALGORITHM, key, iv, { authTagLength: TAG_LENGTH });
+  const tmpPath = `${filePath}.clientsec`;
+
+  try {
+    await pipeline(
+      fs.createReadStream(filePath),
+      cipher,
+      fs.createWriteStream(tmpPath),
+    );
+    fs.appendFileSync(tmpPath, cipher.getAuthTag());
+    fs.renameSync(tmpPath, filePath);
+  } catch (error) {
+    try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch {}
+    throw error;
+  }
+}
+
+/**
+ * Decrypts client-compatible secret-protected payload in place using streaming I/O.
+ * Input format is ciphertext followed by 16-byte GCM auth tag.
+ */
+export async function decryptClientProtectedFileInPlace(
+  filePath: string,
+  secret: string,
+  salt: Buffer,
+  iv: Buffer,
+  iterations: number,
+): Promise<void> {
+  if (iterations < 100_000 || iterations > 1_000_000) {
+    throw new Error('Invalid key-derivation iteration count.');
+  }
+  if (salt.length !== 16 || iv.length !== 12) {
+    throw new Error('Invalid client encryption salt or IV.');
+  }
+
+  const stat = fs.statSync(filePath);
+  if (stat.size <= TAG_LENGTH) {
+    throw new Error('Invalid encrypted payload.');
+  }
+
+  const authTag = Buffer.alloc(TAG_LENGTH);
+  const fd = fs.openSync(filePath, 'r');
+  try {
+    fs.readSync(fd, authTag, 0, TAG_LENGTH, stat.size - TAG_LENGTH);
+  } finally {
+    fs.closeSync(fd);
+  }
+
+  const key = crypto.pbkdf2Sync(secret, salt, iterations, CLIENT_FILE_SECRET_KEY_LENGTH, 'sha256');
+  const decipher = crypto.createDecipheriv(ALGORITHM, key, iv, { authTagLength: TAG_LENGTH });
+  decipher.setAuthTag(authTag);
+  const tmpPath = `${filePath}.plain`;
+
+  try {
+    await pipeline(
+      fs.createReadStream(filePath, { start: 0, end: stat.size - TAG_LENGTH - 1 }),
+      decipher,
+      fs.createWriteStream(tmpPath),
+    );
+    fs.renameSync(tmpPath, filePath);
+  } catch (error) {
+    try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch {}
+    throw error;
+  }
 }
 
 // ──────────────────────────────────────────────────────────────
