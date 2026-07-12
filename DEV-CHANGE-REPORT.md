@@ -1,4 +1,137 @@
 Intent
+Extended the large secret-protected file fix to private downloads by replacing remaining in-memory client-secret decrypt branches (and their 512 MB limits) with streaming decrypt.
+
+Change class
+🟡 STANDARD
+
+Files changed
+- src/server.ts:
+  - `GET /api/files/:id/download` now uses `decryptClientProtectedFileInPlace(...)` instead of `readFileSync + decryptClientProtectedPayload`.
+  - `POST /api/files/:id/download/prepare` background worker now also uses the streaming helper in finalization.
+  - Removed hard 512 MB secret-protected guards in these private download paths.
+
+Public contracts impacted
+- No route/response shape changes.
+- Existing secret-key requirement behavior remains unchanged.
+
+Validation status
+- build: PASSED (`pnpm run build`)
+- Known unrelated baseline type issues remain in maintenance components / pre-existing server typing.
+
+Handoff notes
+- Verify private direct and prepared downloads for secret-protected files larger than 512 MB now succeed with correct secret key.
+- Verify wrong secret key still returns the expected 403.
+
+---
+
+Intent
+Removed public-sharing limitation that blocked secret-protected files over 512 MB by replacing in-memory decrypt with streaming decrypt in the share-download preparation pipeline.
+
+Change class
+🟡 STANDARD
+
+Files changed
+- src/server/utils/encryption.ts:
+  - Added `decryptClientProtectedFileInPlace(...)` to decrypt client-secret payloads from disk using streaming I/O (ciphertext body stream + trailing GCM tag handling), then replace temp file in place.
+- src/server/routes/public-sharing.ts:
+  - Replaced in-memory `readFileSync + decryptClientProtectedPayload` logic and hard 512 MB guard with streaming in-place decrypt helper in `POST /api/public/share/:token/download` preparation worker.
+
+Public contracts impacted
+- No route/response shape changes.
+- Existing secret_key requirement for protected shared files remains unchanged.
+
+Root cause
+- Public sharing path explicitly rejected client-secret protected payloads over 512 MB because decryption was implemented as in-memory buffer processing.
+
+Validation status
+- build: PASSED (`pnpm run build`)
+- file-level compile errors: none in changed files.
+
+Handoff notes
+- Verify shared-link download for a secret-protected file larger than 512 MB now prepares and downloads successfully with correct secret key.
+- Verify wrong secret key still returns the expected 403.
+
+---
+
+Intent
+Follow-up hardening for Firefox large-secret uploads: fully disabled browser-side whole-file secret encryption in upload UI to eliminate observed size-collapse behavior (e.g., 8.4 GB to ~405 MB) and resulting archive corruption.
+
+Change class
+🟡 STANDARD
+
+Files changed
+- src/app/features/files/pages/user-dashboard.tsx:
+  - Removed remaining browser-side secret encryption path (`encryptFileForUploadWithSecret`) from upload flow.
+  - Secret-key upload now always sends key-only metadata and keeps original file bytes/sizes client-side.
+
+Public contracts impacted
+- No endpoint changes.
+- Server-side key-only secret upload mode remains in effect.
+
+Validation status
+- build: PASSED (`pnpm run build`)
+- type-check: FAILED only on pre-existing unrelated JSX namespace baseline issues.
+
+Handoff notes
+- Verify upload progress total no longer changes after selecting a custom secret key in Firefox.
+- Verify downloaded archive integrity with correct secret key.
+
+---
+
+Intent
+Fixed Firefox-specific corruption risk for large uploads using a custom secret key, where client-side whole-file encryption could produce truncated/corrupted payloads (observed as sudden size drop during upload and broken 7z after download).
+
+Change class
+🟡 STANDARD
+
+Files changed
+- src/app/features/files/pages/user-dashboard.tsx:
+  - Added a size gate for browser-side secret encryption (`CLIENT_SECRET_BROWSER_ENCRYPT_MAX = 256 MB`).
+  - For files above this threshold, client sends only `upload_secret_key` and skips whole-file browser encryption.
+  - Keeps existing client encryption path for smaller files.
+- src/server.ts:
+  - Resumable uploads now forward `upload_secret_*` query parameters into `req.body` before shared validation.
+  - Upload secret validation now supports key-only mode (no metadata) in addition to legacy metadata mode.
+  - Added server-side fallback stage to apply secret payload protection when key is present but client metadata is absent.
+- src/server/utils/encryption.ts:
+  - Added `encryptClientProtectedFileInPlace(...)` (streaming, constant-memory) to encrypt temp file payload in the same ciphertext+auth-tag format expected by existing decrypt path.
+
+Public contracts impacted
+- No endpoint changes.
+- Existing secret fields remain valid and backward compatible:
+  - `upload_secret_key`
+  - `upload_secret_salt_b64`
+  - `upload_secret_iv_b64`
+  - `upload_secret_iterations`
+
+Root cause
+- The custom-secret path encrypted the entire file in-browser (`file.arrayBuffer()` + WebCrypto AES-GCM).
+- For very large files on Firefox/runtime combinations, this can cause payload truncation/corruption.
+- Result: upload size may suddenly drop and downloaded archives become invalid.
+
+Risks
+- Low: Fallback introduces one additional local encryption pass on upload temp files when metadata is absent.
+- Compatibility: Legacy clients sending full metadata continue unchanged.
+
+Test coverage status + handoff hint for test-engineer
+- No automated tests added (out of scope for DevEngineer mode).
+- Handoff focus:
+  - Firefox: upload very large file with custom secret key; confirm no mid-upload size collapse and downloaded 7z validates.
+  - Confirm large secret-key resumable upload works both from fresh and resumed chunk state.
+  - Confirm small secret-key uploads still use legacy client-encrypted metadata path and download decrypts correctly.
+  - Confirm wrong secret key still yields the expected 403 behavior.
+
+Validation status
+- build: PASSED (`pnpm run build`)
+- lint: FAILED (pre-existing baseline JSX namespace issues unrelated to this change)
+- type-check: FAILED (same pre-existing baseline issues)
+
+Approval trail
+- Not required (STANDARD change).
+
+---
+
+Intent
 Implemented GitHub issue #11 by adding an admin workflow to create user accounts with dummy emails and an explicit admin password reset action from the Users tab.
 
 Change class

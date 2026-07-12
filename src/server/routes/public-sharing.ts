@@ -7,7 +7,7 @@ import sql from 'mssql';
 import { getRequest } from '../db.js';
 import {
   computeFileChecksum,
-  decryptClientProtectedPayload,
+  decryptClientProtectedFileInPlace,
   decryptColumn,
   decryptFileStream,
   unwrapKey,
@@ -577,22 +577,14 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
             active.phase = 'finalizing';
             active.loaded = 0;
             active.total = 1;
-
-            // ── Guard: client-secret protected files over 512 MB cannot be decrypted in memory ──
-            const secretCheckStat = fs.statSync(tempFile);
-            if (secretCheckStat.size > 512 * 1024 * 1024) {
-                throw new Error('Client-secret protected files over 512 MB are not supported for public sharing. Please re-upload without client-side encryption.');
-            }
-            const protectedPayload = fs.readFileSync(tempFile);
             const providedSecret = typeof secret_key === 'string' ? secret_key.trim() : '';
-            const plaintext = decryptClientProtectedPayload(
-                protectedPayload,
+            await decryptClientProtectedFileInPlace(
+              tempFile,
                 providedSecret,
                 row.client_crypto_salt,
                 row.client_crypto_iv,
                 row.client_crypto_iterations,
             );
-            fs.writeFileSync(tempFile, plaintext);
 
             active.loaded = 1;
             active.total = 1;
