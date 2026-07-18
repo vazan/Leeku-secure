@@ -1,4 +1,58 @@
 Intent
+Added user-managed folders inside All Files so users can organize files into per-user folders, move files between folders/root, upload directly into the selected folder, and choose folder-only or folder-plus-files deletion.
+
+Change class
+🔴 CRITICAL
+
+Files changed
+- src/app/shared/types/index.ts:
+  - Added `FileFolder` DTO.
+  - Extended `FileMetadata` with nullable `folder_id` and `folder_name`.
+- src/server.ts:
+  - Added file folder schema bootstrap for `file_folders` and `files.folder_id`.
+  - Added folder list/create/rename/delete APIs.
+  - Added `POST /api/files/:id/folder` to move files to a folder or All Files root.
+  - Updated file listing/admin listing/upload mapping to include folder metadata.
+  - Updated direct and resumable uploads to accept `folder_id`.
+- src/app/features/files/pages/user-dashboard.tsx:
+  - Added folder navigation in All Files, folder cards, create/rename/delete controls, upload-to-current-folder, and per-file move selectors.
+- Documentation/SQL/production_schema.sql:
+  - Added canonical `file_folders` table, `files.folder_id`, indexes, defaults, and foreign keys.
+
+Public contracts impacted
+- Added API endpoint: GET /api/file-folders
+- Added API endpoint: POST /api/file-folders
+- Added API endpoint: POST /api/file-folders/:id/rename
+- Added API endpoint: POST /api/file-folders/:id/delete
+- Added API endpoint: POST /api/files/:id/folder
+- Extended `GET /api/files`, `GET /api/admin/files`, and upload responses with `folder_id` and `folder_name`.
+- Extended upload requests with optional `folder_id`.
+
+Risks
+- Persistence contract changed; deployed databases need the bootstrap migration to run or equivalent SQL applied.
+- Folder deletion with `delete_files=true` physically removes vault files and file rows for files in that folder.
+- Folder names are unique per owner and limited to 120 characters.
+- SQL Server does not allow `ON DELETE SET NULL` here because `users -> files` and `users -> file_folders -> files` create multiple cascade paths; `FK_files_file_folders` intentionally uses `ON DELETE NO ACTION`, and the app clears/moves folder files before deleting a folder.
+
+Test coverage status + handoff hint for test-engineer
+- No automated tests added (out of scope for DevEngineer mode).
+- Handoff focus:
+  - Verify creating, renaming, and deleting folders as a normal user.
+  - Verify deleting only grouping moves files back to All Files root.
+  - Verify deleting folder plus files removes file rows, vault files, share links via cascade, and decrements user storage usage.
+  - Verify direct and resumable uploads target the selected folder.
+  - Verify users cannot move files into another user's folder.
+
+Validation status
+- build: PASSED (`pnpm build`, rerun after SQL Server FK action correction)
+- lint/type-check: FAILED only on existing unrelated JSX namespace baseline issues in maintenance components.
+
+Approval trail
+- User explicitly approved CRITICAL contract change with `GO` on 2026-07-18.
+
+---
+
+Intent
 Extended the large secret-protected file fix to private downloads by replacing remaining in-memory client-secret decrypt branches (and their 512 MB limits) with streaming decrypt.
 
 Change class

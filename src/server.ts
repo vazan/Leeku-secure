@@ -56,7 +56,7 @@ import { createHealthRouter } from './server/routes/health.js';
 import { createPublicSharingRouter } from './server/routes/public-sharing.js';
 import { createMaintenanceModeRouter } from './server/routes/maintenance-mode.js';
 import { validateProductionConfig } from './server/utils/production.js';
-import type { Quota, User, FileMetadata, ShareLink, SystemLog, SystemStats } from './app/shared/types/index.js';
+import type { Quota, User, FileMetadata, FileFolder, ShareLink, SystemLog, SystemStats } from './app/shared/types/index.js';
 
 const runtimeDir = (() => {
   const moduleUrl = (import.meta as ImportMeta | undefined)?.url;
@@ -781,6 +781,7 @@ interface UserRow {
 
 interface FileRow {
   id: string; owner_user_id: string;
+  folder_id?: string | null; folder_name?: string | null;
   original_name_encrypted: Buffer; original_name_iv: Buffer; original_name_auth_tag: Buffer;
   stored_path: string; mime_type: string; size_bytes: number; encrypted_size_bytes: number;
   status: string; checksum_sha256: string; scan_result: string | null; scan_message: string | null;
@@ -790,6 +791,11 @@ interface FileRow {
   client_crypto_iv?: Buffer | null;
   client_crypto_iterations?: number | null;
   expires_at: Date | null; created_at: Date;
+}
+
+interface FolderRow {
+  id: string; owner_user_id: string; name: string; file_count?: number;
+  created_at: Date; updated_at: Date;
 }
 
 interface ShareRow {
@@ -826,6 +832,8 @@ function mapFileRow(row: FileRow, ownerUsername: string): FileMetadata {
     id:             row.id,
     owner_user_id:  row.owner_user_id,
     username:       ownerUsername,
+    folder_id:      row.folder_id || null,
+    folder_name:    row.folder_name || null,
     original_name:  decryptColumn(row.original_name_encrypted, row.original_name_iv, row.original_name_auth_tag),
     stored_name:    row.stored_path,
     mime_type:      row.mime_type,
@@ -838,6 +846,49 @@ function mapFileRow(row: FileRow, ownerUsername: string): FileMetadata {
     is_encrypted:   row.is_encrypted,
     created_at:     row.created_at.toISOString(),
   };
+}
+
+function mapFolderRow(row: FolderRow): FileFolder {
+  return {
+    id:            row.id,
+    owner_user_id: row.owner_user_id,
+    name:          row.name,
+    file_count:    Number(row.file_count || 0),
+    created_at:    row.created_at.toISOString(),
+    updated_at:    row.updated_at.toISOString(),
+  };
+}
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function normalizeFolderName(value: unknown): string {
+  return String(value || '').trim().replace(/\s+/g, ' ');
+}
+
+function validateFolderName(value: unknown): string | null {
+  const name = normalizeFolderName(value);
+  if (name.length < 1 || name.length > 120) return null;
+  return name;
+}
+
+function normalizeNullableFolderId(value: unknown): string | null | undefined {
+  if (value === undefined) return null;
+  if (value === null || value === '') return null;
+  const folderId = String(value).trim();
+  if (!folderId) return null;
+  return UUID_PATTERN.test(folderId) ? folderId : undefined;
+}
+
+async function getOwnedFolder(folderId: string, ownerId: string): Promise<FolderRow | null> {
+  const request = await getRequest();
+  request.input('id', sql.UniqueIdentifier, folderId);
+  request.input('ownerId', sql.UniqueIdentifier, ownerId);
+  const result = await request.query<FolderRow>(
+    `SELECT id, owner_user_id, name, created_at, updated_at
+     FROM file_folders
+     WHERE id=@id AND owner_user_id=@ownerId`
+  );
+  return result.recordset[0] || null;
 }
 
 function mapShareRow(row: ShareRow): ShareLink {
@@ -1757,13 +1808,19 @@ app.get('/api/files', authenticateUser as express.RequestHandler, async (req: Au
     try {
       result = await request.query<FileRow>(
         `SELECT id, owner_user_id,
+                folder_id, folder_name,
                 original_name_encrypted, original_name_iv, original_name_auth_tag,
                 stored_path, mime_type, size_bytes, encrypted_size_bytes,
                 status, checksum_sha256, scan_result, scan_message,
                 is_encrypted, leeku_vibe, ttl_hours,
                 client_secret_hash,
                 expires_at, created_at
-        FROM files WHERE owner_user_id=@ownerId AND COALESCE(status,'Available')!='Expired'
+        FROM (
+          SELECT f.*, ff.name AS folder_name
+          FROM files f
+          LEFT JOIN file_folders ff ON f.folder_id=ff.id
+          WHERE f.owner_user_id=@ownerId AND COALESCE(f.status,'Available')!='Expired'
+        ) files
          ORDER BY created_at DESC`
       );
     } catch (queryErr: any) {
@@ -1776,6 +1833,7 @@ app.get('/api/files', authenticateUser as express.RequestHandler, async (req: Au
       console.warn('[GET /api/files] client_secret_hash column missing, using legacy query fallback.');
       result = await request.query<FileRow>(
         `SELECT id, owner_user_id,
+                NULL AS folder_id, NULL AS folder_name,
                 original_name_encrypted, original_name_iv, original_name_auth_tag,
                 stored_path, mime_type, size_bytes, encrypted_size_bytes,
                 status, checksum_sha256, scan_result, scan_message,
@@ -1787,6 +1845,152 @@ app.get('/api/files', authenticateUser as express.RequestHandler, async (req: Au
     }
     res.json({ files: result.recordset.map(r => mapFileRow(r, req.user!.username)) });
   } catch (err) { console.error('[GET /api/files]', err); res.status(500).json({ error: 'Failed to load files.' }); }
+});
+
+app.get('/api/file-folders', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  try {
+    const request = await getRequest();
+    request.input('ownerId', sql.UniqueIdentifier, req.userId!);
+    const result = await request.query<FolderRow>(
+      `SELECT ff.id, ff.owner_user_id, ff.name, ff.created_at, ff.updated_at,
+              COUNT(f.id) AS file_count
+       FROM file_folders ff
+       LEFT JOIN files f ON f.folder_id=ff.id AND COALESCE(f.status,'Available')!='Expired'
+       WHERE ff.owner_user_id=@ownerId
+       GROUP BY ff.id, ff.owner_user_id, ff.name, ff.created_at, ff.updated_at
+       ORDER BY ff.name ASC`
+    );
+    res.json({ folders: result.recordset.map(mapFolderRow) });
+  } catch (err) { console.error('[GET /api/file-folders]', err); res.status(500).json({ error: 'Failed to load folders.' }); }
+});
+
+app.post('/api/file-folders', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  const name = validateFolderName(req.body?.name);
+  if (!name) return res.status(400).json({ error: 'Folder name must be between 1 and 120 characters.' });
+  try {
+    const request = await getRequest();
+    request.input('ownerId', sql.UniqueIdentifier, req.userId!);
+    request.input('name', sql.NVarChar(120), name);
+    const result = await request.query<FolderRow>(
+      `INSERT INTO file_folders (owner_user_id, name)
+       OUTPUT INSERTED.id, INSERTED.owner_user_id, INSERTED.name, 0 AS file_count, INSERTED.created_at, INSERTED.updated_at
+       VALUES (@ownerId, @name)`
+    );
+    await logSystemEvent(req.userId!, req.user!.username, 'Admin', 'Folder', result.recordset[0].id, req, `Created folder "${name}".`);
+    res.status(201).json({ folder: mapFolderRow(result.recordset[0]) });
+  } catch (err: any) {
+    if (err?.number === 2601 || err?.number === 2627) return res.status(409).json({ error: 'A folder with that name already exists.' });
+    console.error('[POST /api/file-folders]', err); res.status(500).json({ error: 'Failed to create folder.' });
+  }
+});
+
+app.post('/api/file-folders/:id/rename', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  const folderId = req.params.id;
+  if (!UUID_PATTERN.test(folderId)) return res.status(400).json({ error: 'Invalid folder id.' });
+  const name = validateFolderName(req.body?.name);
+  if (!name) return res.status(400).json({ error: 'Folder name must be between 1 and 120 characters.' });
+  try {
+    const request = await getRequest();
+    request.input('id', sql.UniqueIdentifier, folderId);
+    request.input('ownerId', sql.UniqueIdentifier, req.userId!);
+    request.input('name', sql.NVarChar(120), name);
+    const result = await request.query<FolderRow>(
+      `UPDATE file_folders
+       SET name=@name, updated_at=SYSDATETIMEOFFSET()
+       OUTPUT INSERTED.id, INSERTED.owner_user_id, INSERTED.name,
+              (SELECT COUNT(*) FROM files WHERE folder_id=INSERTED.id AND COALESCE(status,'Available')!='Expired') AS file_count,
+              INSERTED.created_at, INSERTED.updated_at
+       WHERE id=@id AND owner_user_id=@ownerId`
+    );
+    if (!result.recordset.length) return res.status(404).json({ error: 'Folder not found.' });
+    await logSystemEvent(req.userId!, req.user!.username, 'Admin', 'Folder', folderId, req, `Renamed folder to "${name}".`);
+    res.json({ folder: mapFolderRow(result.recordset[0]) });
+  } catch (err: any) {
+    if (err?.number === 2601 || err?.number === 2627) return res.status(409).json({ error: 'A folder with that name already exists.' });
+    console.error('[POST /api/file-folders/:id/rename]', err); res.status(500).json({ error: 'Failed to rename folder.' });
+  }
+});
+
+app.post('/api/file-folders/:id/delete', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  const folderId = req.params.id;
+  if (!UUID_PATTERN.test(folderId)) return res.status(400).json({ error: 'Invalid folder id.' });
+  const deleteFiles = !!req.body?.delete_files;
+  try {
+    const folder = await getOwnedFolder(folderId, req.userId!);
+    if (!folder) return res.status(404).json({ error: 'Folder not found.' });
+
+    if (!deleteFiles) {
+      const moveReq = await getRequest();
+      moveReq.input('folderId', sql.UniqueIdentifier, folderId);
+      moveReq.input('ownerId', sql.UniqueIdentifier, req.userId!);
+      await moveReq.query('UPDATE files SET folder_id=NULL WHERE folder_id=@folderId AND owner_user_id=@ownerId');
+    } else {
+      const filesReq = await getRequest();
+      filesReq.input('folderId', sql.UniqueIdentifier, folderId);
+      filesReq.input('ownerId', sql.UniqueIdentifier, req.userId!);
+      const folderFiles = await filesReq.query<{id:string;stored_path:string;size_bytes:number;status:string}>(
+        'SELECT id, stored_path, size_bytes, status FROM files WHERE folder_id=@folderId AND owner_user_id=@ownerId'
+      );
+      for (const file of folderFiles.recordset) {
+        const vaultPath = path.join(FILE_VAULT, file.stored_path);
+        try { if (fs.existsSync(vaultPath)) fs.unlinkSync(vaultPath); } catch {}
+      }
+      const storageToRemove = folderFiles.recordset
+        .filter((file) => file.status === 'Available')
+        .reduce((total, file) => total + Number(file.size_bytes || 0), 0);
+      const deleteReq = await getRequest();
+      deleteReq.input('folderId', sql.UniqueIdentifier, folderId);
+      deleteReq.input('ownerId', sql.UniqueIdentifier, req.userId!);
+      await deleteReq.query('DELETE FROM files WHERE folder_id=@folderId AND owner_user_id=@ownerId');
+      if (storageToRemove > 0) {
+        const storageReq = await getRequest();
+        storageReq.input('sz', sql.BigInt, storageToRemove);
+        storageReq.input('ownerId', sql.UniqueIdentifier, req.userId!);
+        await storageReq.query('UPDATE users SET storage_used_bytes=CASE WHEN storage_used_bytes-@sz<0 THEN 0 ELSE storage_used_bytes-@sz END WHERE id=@ownerId');
+      }
+    }
+
+    const deleteFolderReq = await getRequest();
+    deleteFolderReq.input('id', sql.UniqueIdentifier, folderId);
+    deleteFolderReq.input('ownerId', sql.UniqueIdentifier, req.userId!);
+    await deleteFolderReq.query('DELETE FROM file_folders WHERE id=@id AND owner_user_id=@ownerId');
+    await logSystemEvent(req.userId!, req.user!.username, 'Delete', 'Folder', folderId, req, deleteFiles ? `Deleted folder "${folder.name}" and its files.` : `Deleted folder "${folder.name}" and moved files to All Files root.`);
+    res.json({ success: true });
+  } catch (err) { console.error('[POST /api/file-folders/:id/delete]', err); res.status(500).json({ error: 'Failed to delete folder.' }); }
+});
+
+app.post('/api/files/:id/folder', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  const fileId = req.params.id;
+  if (!UUID_PATTERN.test(fileId)) return res.status(400).json({ error: 'Invalid file id.' });
+  const folderId = normalizeNullableFolderId(req.body?.folder_id);
+  if (folderId === undefined) return res.status(400).json({ error: 'Invalid folder id.' });
+  try {
+    let folderName: string | null = null;
+    if (folderId) {
+      const folder = await getOwnedFolder(folderId, req.userId!);
+      if (!folder) return res.status(404).json({ error: 'Folder not found.' });
+      folderName = folder.name;
+    }
+    const request = await getRequest();
+    request.input('id', sql.UniqueIdentifier, fileId);
+    request.input('ownerId', sql.UniqueIdentifier, req.userId!);
+    request.input('folderId', sql.UniqueIdentifier, folderId);
+    const result = await request.query<FileRow>(
+      `UPDATE files
+       SET folder_id=@folderId
+       OUTPUT INSERTED.id, INSERTED.owner_user_id, INSERTED.folder_id,
+              INSERTED.original_name_encrypted, INSERTED.original_name_iv, INSERTED.original_name_auth_tag,
+              INSERTED.stored_path, INSERTED.mime_type, INSERTED.size_bytes, INSERTED.encrypted_size_bytes,
+              INSERTED.status, INSERTED.checksum_sha256, INSERTED.scan_result, INSERTED.scan_message,
+              INSERTED.is_encrypted, INSERTED.leeku_vibe, INSERTED.ttl_hours, INSERTED.client_secret_hash,
+              INSERTED.expires_at, INSERTED.created_at
+       WHERE id=@id AND owner_user_id=@ownerId`
+    );
+    if (!result.recordset.length) return res.status(404).json({ error: 'File not found.' });
+    const row = result.recordset[0];
+    row.folder_name = folderName;
+    res.json({ file: mapFileRow(row, req.user!.username) });
+  } catch (err) { console.error('[POST /api/files/:id/folder]', err); res.status(500).json({ error: 'Failed to move file.' }); }
 });
 
 // ──────────────────────────────────────────────────────────────
@@ -2099,6 +2303,7 @@ app.post(
       req.body.upload_secret_salt_b64 = (req.query.upload_secret_salt_b64 as string) || req.body.upload_secret_salt_b64;
       req.body.upload_secret_iv_b64 = (req.query.upload_secret_iv_b64 as string) || req.body.upload_secret_iv_b64;
       req.body.upload_secret_iterations = (req.query.upload_secret_iterations as string) || req.body.upload_secret_iterations;
+      req.body.folder_id = (req.query.folder_id as string) || req.body.folder_id;
 
       // Fall through to the shared processing pipeline below
     }
@@ -2120,6 +2325,7 @@ app.post(
     const tempFilePath  = multerFile.path;
 
     const user = req.user!;
+  let uploadFolder: FolderRow | null = null;
     let currentStage = 'quota_lookup';
     let vaultFilePath: string | null = null;
     const streamsProgress = String(req.headers.accept || '').includes('application/x-ndjson');
@@ -2168,6 +2374,14 @@ app.post(
         tempPath: tempFilePath,
         isResumable,
       });
+
+      currentStage = 'validate_folder';
+      const requestedFolderId = normalizeNullableFolderId(req.body.folder_id);
+      if (requestedFolderId === undefined) return finishUploadError(400, 'Invalid folder id.');
+      if (requestedFolderId) {
+        uploadFolder = await getOwnedFolder(requestedFolderId, req.userId!);
+        if (!uploadFolder) return finishUploadError(404, 'Folder not found.');
+      }
 
       // ── Optional client-side file secret metadata ─────────────
       currentStage = 'validate_upload_secret';
@@ -2358,28 +2572,30 @@ app.post(
       fileReq.input('clientCryptoSalt', sql.VarBinary(32), uploadSecretSalt);
       fileReq.input('clientCryptoIv',   sql.VarBinary(16), uploadSecretIv);
       fileReq.input('clientCryptoIterations', sql.Int, uploadSecretIterations);
+       fileReq.input('folderId', sql.UniqueIdentifier, uploadFolder?.id || null);
 
       const fileResult = await fileReq.query<FileRow>(
         `INSERT INTO files (
-           owner_user_id, original_name_encrypted, original_name_iv, original_name_auth_tag,
+         owner_user_id, folder_id, original_name_encrypted, original_name_iv, original_name_auth_tag,
            stored_path, mime_type, size_bytes, encrypted_size_bytes,
            checksum_sha256, scan_result, scan_message, scanned_at,
            leeku_vibe, ttl_hours,
            client_secret_hash, client_crypto_salt, client_crypto_iv, client_crypto_iterations,
            expires_at, is_encrypted
          )
-         OUTPUT INSERTED.id, INSERTED.owner_user_id,
+          OUTPUT INSERTED.id, INSERTED.owner_user_id, INSERTED.folder_id,
                 INSERTED.original_name_encrypted, INSERTED.original_name_iv, INSERTED.original_name_auth_tag,
                 INSERTED.stored_path, INSERTED.mime_type, INSERTED.size_bytes, INSERTED.encrypted_size_bytes,
                 INSERTED.status, INSERTED.checksum_sha256, INSERTED.scan_result, INSERTED.scan_message,
                 INSERTED.is_encrypted, INSERTED.leeku_vibe, INSERTED.ttl_hours,
                 INSERTED.client_secret_hash, INSERTED.client_crypto_salt, INSERTED.client_crypto_iv, INSERTED.client_crypto_iterations,
                 INSERTED.expires_at, INSERTED.created_at
-         VALUES (@ownerId,@nEnc,@nIv,@nTag, @spath,@mime,@sz,@esz, @chk,@scan,@smsg,SYSDATETIMEOFFSET(), @vibe,@ttl,
+        VALUES (@ownerId,@folderId,@nEnc,@nIv,@nTag, @spath,@mime,@sz,@esz, @chk,@scan,@smsg,SYSDATETIMEOFFSET(), @vibe,@ttl,
                  @clientSecretHash,@clientCryptoSalt,@clientCryptoIv,@clientCryptoIterations,
                  @exp,1)`
       );
       const newFile = fileResult.recordset[0];
+      newFile.folder_name = uploadFolder?.name || null;
       console.info('[upload] File record inserted.', { userId: user.id, originalName: original_name, fileId: newFile.id });
 
       currentStage = 'insert_key_record';
@@ -3331,11 +3547,14 @@ app.get('/api/admin/files', authenticateUser as express.RequestHandler, verifyAd
   try {
     const request = await getRequest();
     const result = await request.query<FileRow & {username_encrypted:Buffer;username_iv:Buffer;username_auth_tag:Buffer}>(
-      `SELECT f.id,f.owner_user_id,f.original_name_encrypted,f.original_name_iv,f.original_name_auth_tag,
+      `SELECT f.id,f.owner_user_id,f.folder_id,ff.name AS folder_name,f.original_name_encrypted,f.original_name_iv,f.original_name_auth_tag,
               f.stored_path,f.mime_type,f.size_bytes,f.encrypted_size_bytes,f.status,f.checksum_sha256,
               f.scan_result,f.scan_message,f.is_encrypted,f.leeku_vibe,f.ttl_hours,f.expires_at,f.created_at,
               u.username_encrypted,u.username_iv,u.username_auth_tag
-       FROM files f INNER JOIN users u ON f.owner_user_id=u.id ORDER BY f.created_at DESC`
+       FROM files f
+       INNER JOIN users u ON f.owner_user_id=u.id
+       LEFT JOIN file_folders ff ON f.folder_id=ff.id
+       ORDER BY f.created_at DESC`
     );
     res.json({ files: result.recordset.map(r => mapFileRow(r, decryptColumn(r.username_encrypted, r.username_iv, r.username_auth_tag))) });
   } catch (err) { console.error('[GET /api/admin/files]', err); res.status(500).json({ error: 'Failed to load files.' }); }
@@ -3514,6 +3733,33 @@ async function ensureOptionalShareLinkColumns(): Promise<void> {
   `);
 }
 
+async function ensureFileFolderSchema(): Promise<void> {
+  const request = await getRequest();
+  await request.query(`
+    IF OBJECT_ID('dbo.file_folders', 'U') IS NULL
+    BEGIN
+      CREATE TABLE dbo.file_folders (
+        id UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_file_folders_id DEFAULT NEWSEQUENTIALID(),
+        owner_user_id UNIQUEIDENTIFIER NOT NULL,
+        name NVARCHAR(120) NOT NULL,
+        created_at DATETIMEOFFSET(7) NOT NULL CONSTRAINT DF_file_folders_created_at DEFAULT SYSDATETIMEOFFSET(),
+        updated_at DATETIMEOFFSET(7) NOT NULL CONSTRAINT DF_file_folders_updated_at DEFAULT SYSDATETIMEOFFSET(),
+        CONSTRAINT PK_file_folders PRIMARY KEY CLUSTERED (id ASC),
+        CONSTRAINT FK_file_folders_users FOREIGN KEY (owner_user_id) REFERENCES dbo.users(id) ON DELETE CASCADE,
+        CONSTRAINT UQ_file_folders_owner_name UNIQUE (owner_user_id, name)
+      );
+    END;
+    IF COL_LENGTH('files', 'folder_id') IS NULL
+      ALTER TABLE files ADD folder_id UNIQUEIDENTIFIER NULL;
+    IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name='FK_files_file_folders')
+      ALTER TABLE files ADD CONSTRAINT FK_files_file_folders FOREIGN KEY (folder_id) REFERENCES dbo.file_folders(id) ON DELETE NO ACTION;
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_file_folders_owner' AND object_id=OBJECT_ID('dbo.file_folders'))
+      CREATE INDEX IX_file_folders_owner ON dbo.file_folders(owner_user_id, name);
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_files_folder_id' AND object_id=OBJECT_ID('dbo.files'))
+      CREATE INDEX IX_files_folder_id ON dbo.files(folder_id, owner_user_id);
+  `);
+}
+
 async function bootstrap() {
   // 1. Validate production requirements and master encryption key
   validateProductionConfig();
@@ -3526,6 +3772,7 @@ async function bootstrap() {
   // 2b. Lightweight schema migration for optional user-provided file secrets.
   await ensureOptionalFileSecretColumns();
   await ensureOptionalShareLinkColumns();
+  await ensureFileFolderSchema();
 
   app.use('/api/health', createHealthRouter(FILE_VAULT, NODE_ENV === 'production'));
 

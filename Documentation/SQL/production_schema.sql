@@ -222,7 +222,23 @@ CREATE TABLE [dbo].[users](
 ) ON [PRIMARY]
 GO
 
--- Step 3: files (depends on users)
+-- Step 3: file_folders (depends on users)
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+CREATE TABLE [dbo].[file_folders](
+    [id] [uniqueidentifier] NOT NULL,
+    [owner_user_id] [uniqueidentifier] NOT NULL,
+    [name] [nvarchar](120) NOT NULL,
+    [created_at] [datetimeoffset](7) NOT NULL,
+    [updated_at] [datetimeoffset](7) NOT NULL,
+    CONSTRAINT [PK_file_folders] PRIMARY KEY CLUSTERED ([id] ASC),
+    CONSTRAINT [UQ_file_folders_owner_name] UNIQUE NONCLUSTERED ([owner_user_id] ASC, [name] ASC)
+) ON [PRIMARY]
+GO
+
+-- Step 4: files (depends on users and file_folders)
 SET ANSI_NULLS ON
 GO
 SET QUOTED_IDENTIFIER ON
@@ -230,6 +246,7 @@ GO
 CREATE TABLE [dbo].[files](
     [id] [uniqueidentifier] NOT NULL,
     [owner_user_id] [uniqueidentifier] NOT NULL,
+    [folder_id] [uniqueidentifier] NULL,
     [original_name_encrypted] [varbinary](2048) NOT NULL,
     [original_name_iv] [varbinary](16) NOT NULL,
     [original_name_auth_tag] [varbinary](16) NOT NULL,
@@ -256,7 +273,7 @@ CREATE TABLE [dbo].[files](
 ) ON [PRIMARY] TEXTIMAGE_ON [PRIMARY]
 GO
 
--- Step 4: file_encryption_keys (depends on files)
+-- Step 5: file_encryption_keys (depends on files)
 SET ANSI_NULLS ON
 GO
 SET QUOTED_IDENTIFIER ON
@@ -274,7 +291,7 @@ CREATE TABLE [dbo].[file_encryption_keys](
 ) ON [PRIMARY]
 GO
 
--- Step 5: share_links (depends on files)
+-- Step 6: share_links (depends on files)
 SET ANSI_NULLS ON
 GO
 SET QUOTED_IDENTIFIER ON
@@ -295,7 +312,7 @@ CREATE TABLE [dbo].[share_links](
 ) ON [PRIMARY]
 GO
 
--- Step 6: refresh_tokens (depends on users)
+-- Step 7: refresh_tokens (depends on users)
 SET ANSI_NULLS ON
 GO
 SET QUOTED_IDENTIFIER ON
@@ -314,7 +331,7 @@ CREATE TABLE [dbo].[refresh_tokens](
 ) ON [PRIMARY]
 GO
 
--- Step 7: system_logs (no hard dependencies)
+-- Step 8: system_logs (no hard dependencies)
 SET ANSI_NULLS ON
 GO
 SET QUOTED_IDENTIFIER ON
@@ -333,7 +350,7 @@ CREATE TABLE [dbo].[system_logs](
 ) ON [PRIMARY] TEXTIMAGE_ON [PRIMARY]
 GO
 
--- Step 8: system_config (no hard dependencies - for maintenance mode & system settings)
+-- Step 9: system_config (no hard dependencies - for maintenance mode & system settings)
 SET ANSI_NULLS ON
 GO
 SET QUOTED_IDENTIFIER ON
@@ -351,6 +368,13 @@ GO
 -- ============================================================
 
 -- Files indexes
+CREATE NONCLUSTERED INDEX [IX_file_folders_owner] ON [dbo].[file_folders]
+([owner_user_id] ASC, [name] ASC)
+WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, SORT_IN_TEMPDB = OFF, 
+    DROP_EXISTING = OFF, ONLINE = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON, 
+    OPTIMIZE_FOR_SEQUENTIAL_KEY = OFF) ON [PRIMARY]
+GO
+
 CREATE NONCLUSTERED INDEX [IX_files_owner_id] ON [dbo].[files]
 ([owner_user_id] ASC)
 INCLUDE([status],[created_at])
@@ -373,6 +397,14 @@ WHERE ([expires_at] IS NOT NULL AND [status]='Available')
 WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, SORT_IN_TEMPDB = OFF, 
       DROP_EXISTING = OFF, ONLINE = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON, 
       OPTIMIZE_FOR_SEQUENTIAL_KEY = OFF) ON [PRIMARY]
+GO
+
+CREATE NONCLUSTERED INDEX [IX_files_folder_id] ON [dbo].[files]
+([folder_id] ASC, [owner_user_id] ASC)
+INCLUDE([status],[created_at])
+WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, SORT_IN_TEMPDB = OFF, 
+    DROP_EXISTING = OFF, ONLINE = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON, 
+    OPTIMIZE_FOR_SEQUENTIAL_KEY = OFF) ON [PRIMARY]
 GO
 
 -- Users indexes
@@ -484,6 +516,15 @@ GO
 -- Files defaults
 ALTER TABLE [dbo].[files] ADD DEFAULT (newsequentialid()) FOR [id]
 GO
+
+-- File folders defaults
+ALTER TABLE [dbo].[file_folders] ADD DEFAULT (newsequentialid()) FOR [id]
+GO
+ALTER TABLE [dbo].[file_folders] ADD DEFAULT (sysdatetimeoffset()) FOR [created_at]
+GO
+ALTER TABLE [dbo].[file_folders] ADD DEFAULT (sysdatetimeoffset()) FOR [updated_at]
+GO
+
 ALTER TABLE [dbo].[files] ADD DEFAULT ('Available') FOR [status]
 GO
 ALTER TABLE [dbo].[files] ADD DEFAULT ((1)) FOR [is_encrypted]
@@ -539,12 +580,28 @@ GO
 ALTER TABLE [dbo].[file_encryption_keys] CHECK CONSTRAINT [FK_file_keys_files]
 GO
 
+ALTER TABLE [dbo].[file_folders] WITH CHECK ADD CONSTRAINT [FK_file_folders_users]
+FOREIGN KEY([owner_user_id])
+REFERENCES [dbo].[users] ([id])
+ON DELETE CASCADE
+GO
+ALTER TABLE [dbo].[file_folders] CHECK CONSTRAINT [FK_file_folders_users]
+GO
+
 ALTER TABLE [dbo].[files] WITH CHECK ADD CONSTRAINT [FK_files_users] 
 FOREIGN KEY([owner_user_id])
 REFERENCES [dbo].[users] ([id])
 ON DELETE CASCADE
 GO
 ALTER TABLE [dbo].[files] CHECK CONSTRAINT [FK_files_users]
+GO
+
+ALTER TABLE [dbo].[files] WITH CHECK ADD CONSTRAINT [FK_files_file_folders]
+FOREIGN KEY([folder_id])
+REFERENCES [dbo].[file_folders] ([id])
+ON DELETE NO ACTION
+GO
+ALTER TABLE [dbo].[files] CHECK CONSTRAINT [FK_files_file_folders]
 GO
 
 ALTER TABLE [dbo].[refresh_tokens] WITH CHECK ADD CONSTRAINT [FK_refresh_tokens_users] 
