@@ -1,4 +1,57 @@
 Intent
+Replicated the All Files folder organization feature onto the PostgreSQL branch with PostgreSQL-native runtime DDL and canonical bootstrap schema support.
+
+Change class
+🔴 CRITICAL
+
+Files changed
+- src/app/shared/types/index.ts:
+  - Added `FileFolder` DTO.
+  - Extended `FileMetadata` with nullable `folder_id` and `folder_name`.
+- src/server.ts:
+  - Added folder list/create/rename/delete APIs using PostgreSQL-compatible queries and `RETURNING`.
+  - Added file move API for assigning files to folders or All Files root.
+  - Extended file listing/admin listing/upload responses with folder metadata.
+  - Added PostgreSQL runtime bootstrap for `file_folders`, `files.folder_id`, FK, and indexes.
+- src/app/features/files/pages/user-dashboard.tsx:
+  - Added folder navigation, folder cards, create/rename/delete controls, upload-to-current-folder, and per-file move selectors.
+- Documentation/SQL/postgresql_schema.sql:
+  - Added canonical PostgreSQL `file_folders` table, `files.folder_id`, indexes, and FK for fresh product deployments.
+
+Public contracts impacted
+- Added API endpoint: GET /api/file-folders
+- Added API endpoint: POST /api/file-folders
+- Added API endpoint: POST /api/file-folders/:id/rename
+- Added API endpoint: POST /api/file-folders/:id/delete
+- Added API endpoint: POST /api/files/:id/folder
+- Extended `GET /api/files`, `GET /api/admin/files`, and upload responses with `folder_id` and `folder_name`.
+- Extended upload requests with optional `folder_id`.
+
+Risks
+- Persistence contract changed; deployed PostgreSQL databases need the runtime bootstrap migration to run or equivalent SQL applied.
+- Folder deletion with `delete_files=true` physically removes vault files and file rows for files in that folder.
+- Folder names are unique per owner and limited to 120 characters.
+- `FK files(folder_id) -> file_folders(id)` uses `ON DELETE NO ACTION`; the app clears or deletes folder files before deleting a folder.
+
+Test coverage status + handoff hint for test-engineer
+- No automated tests added (out of scope for DevEngineer mode).
+- Handoff focus:
+  - Verify create/rename/delete folder flows on PostgreSQL.
+  - Verify folder-only delete moves files back to root.
+  - Verify folder-plus-files delete removes rows, cascaded share links, vault files, and decrements storage.
+  - Verify direct and resumable uploads target the selected folder.
+  - Verify users cannot move files into another user's folder.
+
+Validation status
+- lint/type-check: PASSED (`pnpm lint`)
+- build: PASSED (`pnpm build`)
+
+Approval trail
+- User requested replication onto `postgresql` branch on 2026-07-18.
+
+---
+
+Intent
 Extended the large secret-protected file fix to private downloads by replacing remaining in-memory client-secret decrypt branches (and their 512 MB limits) with streaming decrypt.
 
 Change class

@@ -5,6 +5,7 @@ import {
   CalendarDays,
   Copy,
   Folder,
+  FolderPlus,
   LayoutGrid,
   Link2,
   Lock,
@@ -29,6 +30,7 @@ import {
 } from "@/app/shared/components/ui/popover";
 import { MaintenanceModeBanner } from "@/app/shared/components/maintenance-mode-banner";
 import type {
+  FileFolder,
   FileMetadata,
   Quota,
   ShareLink,
@@ -241,6 +243,8 @@ export default function UserDashboard({
     getSavedDashboardView(user),
   );
   const [files, setFiles] = useState<FileMetadata[]>([]);
+  const [folders, setFolders] = useState<FileFolder[]>([]);
+  const [activeFolderId, setActiveFolderId] = useState<string | null>(null);
   const [links, setLinks] = useState<ShareLink[]>([]);
   const [adminUsers, setAdminUsers] = useState<User[]>([]);
   const [adminFiles, setAdminFiles] = useState<FileMetadata[]>([]);
@@ -288,6 +292,7 @@ export default function UserDashboard({
   const storageLimit = activeQuota?.storage_limit_bytes || 1;
   const maxFiles = activeQuota?.max_files || 0;
   const filesLeft = Math.max(maxFiles - files.length, 0);
+  const activeFolder = folders.find((folder) => folder.id === activeFolderId) || null;
 
   const notify = (message: string) => toast(message);
   const notifyError = (message: string) => toast.error(message);
@@ -303,9 +308,10 @@ export default function UserDashboard({
   };
 
   const loadFilesAndLinks = async () => {
-    const [filesResponse, linksResponse] = await Promise.all([
+    const [filesResponse, linksResponse, foldersResponse] = await Promise.all([
       fetch("/api/files", { headers: authHeaders(token) }),
       fetch("/api/sharing/links", { headers: authHeaders(token) }),
+      fetch("/api/file-folders", { headers: authHeaders(token) }),
     ]);
     if (filesResponse.ok) {
       setFiles((await filesResponse.json()).files || []);
@@ -326,6 +332,23 @@ export default function UserDashboard({
       let message = "Could not load sharing links.";
       try {
         const payload = await linksResponse.json();
+        message = payload?.error || message;
+      } catch {
+        // Keep generic message when response is not JSON.
+      }
+      notifyError(message);
+    }
+
+    if (foldersResponse.ok) {
+      const nextFolders = ((await foldersResponse.json()).folders || []) as FileFolder[];
+      setFolders(nextFolders);
+      setActiveFolderId((current) =>
+        current && !nextFolders.some((folder) => folder.id === current) ? null : current,
+      );
+    } else {
+      let message = "Could not load folders.";
+      try {
+        const payload = await foldersResponse.json();
         message = payload?.error || message;
       } catch {
         // Keep generic message when response is not JSON.
@@ -388,12 +411,23 @@ export default function UserDashboard({
   };
 
   const normalizedSearch = search.trim().toLowerCase();
+  const currentFolderFiles = useMemo(
+    () => files.filter((file) => (activeFolderId ? file.folder_id === activeFolderId : !file.folder_id)),
+    [activeFolderId, files],
+  );
+
   const visibleFiles = useMemo(() => {
-    if (!normalizedSearch) return files;
-    return files.filter((file) =>
+    if (!normalizedSearch) return currentFolderFiles;
+    return currentFolderFiles.filter((file) =>
       file.original_name.toLowerCase().includes(normalizedSearch),
     );
-  }, [files, normalizedSearch]);
+  }, [currentFolderFiles, normalizedSearch]);
+
+  const visibleFolders = useMemo(() => {
+    if (activeFolderId) return [];
+    if (!normalizedSearch) return folders;
+    return folders.filter((folder) => folder.name.toLowerCase().includes(normalizedSearch));
+  }, [activeFolderId, folders, normalizedSearch]);
 
   useEffect(() => {
     if (!uploading) return undefined;
@@ -472,6 +506,7 @@ export default function UserDashboard({
     }
 
     const FILE_IS_LARGE = selectedFileSize > RESUMABLE_CHUNK_SIZE;
+    const uploadFolderId = view === "files" ? activeFolderId : null;
 
     // ═════════════════════════════════════════════════════════
     // LARGE FILES → Resumable.js chunked upload (50 MB each)
@@ -490,6 +525,9 @@ export default function UserDashboard({
         secretParams.set("upload_secret_salt_b64", secretMeta.upload_secret_salt_b64);
         secretParams.set("upload_secret_iv_b64", secretMeta.upload_secret_iv_b64);
         secretParams.set("upload_secret_iterations", secretMeta.upload_secret_iterations);
+      }
+      if (uploadFolderId) {
+        secretParams.set("folder_id", uploadFolderId);
       }
 
       resumableUploadRef.current = {
@@ -713,6 +751,7 @@ export default function UserDashboard({
     formData.append("file", uploadTargetFile);
     formData.append("original_name", file.name);
     formData.append("mime_type", file.type || "application/octet-stream");
+    if (uploadFolderId) formData.append("folder_id", uploadFolderId);
     const xhr = new XMLHttpRequest();
     uploadRequestRef.current = xhr;
     let responseCursor = 0;
@@ -1001,6 +1040,76 @@ export default function UserDashboard({
       await loadFilesAndLinks();
       onTriggerRefreshUser();
     } else notifyError("Could not delete the file.");
+  };
+
+  const createFolder = async () => {
+    const name = window.prompt("Folder name")?.trim();
+    if (!name) return;
+    const response = await fetch("/api/file-folders", {
+      method: "POST",
+      headers: { ...authHeaders(token), "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    const data = await response.json();
+    if (response.ok) {
+      setFolders((current) => [...current, data.folder].sort((a, b) => a.name.localeCompare(b.name)));
+      setActiveFolderId(data.folder.id);
+      notify("Folder created.");
+    } else notifyError(data.error || "Could not create folder.");
+  };
+
+  const renameFolder = async (folder: FileFolder) => {
+    const name = window.prompt("Folder name", folder.name)?.trim();
+    if (!name || name === folder.name) return;
+    const response = await fetch(`/api/file-folders/${folder.id}/rename`, {
+      method: "POST",
+      headers: { ...authHeaders(token), "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    const data = await response.json();
+    if (response.ok) {
+      setFolders((current) => current.map((item) => (item.id === folder.id ? data.folder : item)).sort((a, b) => a.name.localeCompare(b.name)));
+      notify("Folder renamed.");
+    } else notifyError(data.error || "Could not rename folder.");
+  };
+
+  const deleteFolder = async (folder: FileFolder) => {
+    if (!window.confirm(`Delete folder "${folder.name}"?`)) return;
+    const deleteFiles = window.confirm(
+      `Delete all files inside "${folder.name}" too?\n\nOK deletes the files. Cancel deletes only the folder and moves files back to All Files.`,
+    );
+    const response = await fetch(`/api/file-folders/${folder.id}/delete`, {
+      method: "POST",
+      headers: { ...authHeaders(token), "Content-Type": "application/json" },
+      body: JSON.stringify({ delete_files: deleteFiles }),
+    });
+    if (response.ok) {
+      notify(deleteFiles ? "Folder and files deleted." : "Folder deleted. Files moved to All Files.");
+      setActiveFolderId(null);
+      await loadFilesAndLinks();
+      onTriggerRefreshUser();
+    } else notifyError((await response.json()).error || "Could not delete folder.");
+  };
+
+  const moveFileToFolder = async (file: FileMetadata, folderId: string | null) => {
+    const response = await fetch(`/api/files/${file.id}/folder`, {
+      method: "POST",
+      headers: { ...authHeaders(token), "Content-Type": "application/json" },
+      body: JSON.stringify({ folder_id: folderId }),
+    });
+    const data = await response.json();
+    if (response.ok) {
+      setFiles((current) => current.map((item) => (item.id === file.id ? data.file : item)));
+      setFolders((current) =>
+        current.map((folder) => ({
+          ...folder,
+          file_count: files
+            .map((item) => (item.id === file.id ? data.file : item))
+            .filter((item) => item.folder_id === folder.id).length,
+        })),
+      );
+      notify(folderId ? "File moved to folder." : "File moved to All Files.");
+    } else notifyError(data.error || "Could not move file.");
   };
 
   const toShareUrl = (publicToken: string, allowExternalPreview: boolean) =>
@@ -1398,10 +1507,10 @@ export default function UserDashboard({
             <section className="mx-auto max-w-5xl">
               <div className="mb-6 text-center">
                 <h1 className="text-2xl font-semibold tracking-[-0.03em]">
-                  All files
+                  {activeFolder ? activeFolder.name : "All files"}
                 </h1>
                 <p className="mt-1 text-sm text-[var(--text-muted)]">
-                  {files.length} files in your account.
+                  {currentFolderFiles.length} file{currentFolderFiles.length === 1 ? "" : "s"} {activeFolder ? "in this folder" : "in All Files root"}.
                   {normalizedSearch && (
                     <>
                       {" "}
@@ -1409,7 +1518,68 @@ export default function UserDashboard({
                     </>
                   )}
                 </p>
+                <div className="mt-4 flex flex-wrap items-center justify-center gap-2">
+                  {activeFolder && (
+                    <button
+                      type="button"
+                      onClick={() => setActiveFolderId(null)}
+                      className="rounded-lg border border-[var(--border-subtle)] px-3 py-2 text-xs font-medium text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]"
+                    >
+                      Back to All Files
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={createFolder}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--border-subtle)] px-3 py-2 text-xs font-medium text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]"
+                  >
+                    <FolderPlus className="h-3.5 w-3.5" />
+                    New folder
+                  </button>
+                  {activeFolder && (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => renameFolder(activeFolder)}
+                        className="rounded-lg border border-[var(--border-subtle)] px-3 py-2 text-xs font-medium text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]"
+                      >
+                        Rename folder
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => deleteFolder(activeFolder)}
+                        className="rounded-lg border border-[color-mix(in_srgb,var(--error-linear)_42%,transparent)] px-3 py-2 text-xs font-medium text-[var(--error-linear)] hover:bg-[color-mix(in_srgb,var(--error-linear)_12%,transparent)]"
+                      >
+                        Delete folder
+                      </button>
+                    </>
+                  )}
+                </div>
               </div>
+
+              {visibleFolders.length > 0 && (
+                <div className="mb-6 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                  {visibleFolders.map((folder) => (
+                    <button
+                      key={folder.id}
+                      type="button"
+                      onClick={() => setActiveFolderId(folder.id)}
+                      className="flex items-center gap-3 rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] p-4 text-left shadow-[var(--shadow-hairline)] hover:bg-[var(--bg-hover)]"
+                    >
+                      <span className="grid h-10 w-10 shrink-0 place-items-center rounded-lg bg-[var(--bg-hover)] text-[var(--text-muted)]">
+                        <Folder className="h-5 w-5" />
+                      </span>
+                      <span className="min-w-0">
+                        <span className="block truncate text-sm font-medium">{folder.name}</span>
+                        <span className="text-xs text-[var(--text-muted)]">
+                          {folder.file_count} file{folder.file_count === 1 ? "" : "s"}
+                        </span>
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              )}
+
               {visibleFiles.length === 0 ? (
                 <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] p-8 text-center shadow-[var(--shadow-hairline)]">
                   <p className="text-sm font-medium">No matching files</p>
@@ -1468,6 +1638,11 @@ export default function UserDashboard({
                           <Trash2 className="h-3.5 w-3.5" />
                         </FileActionButton>
                       </div>
+                      <MoveFileSelect
+                        file={file}
+                        folders={folders}
+                        onMove={moveFileToFolder}
+                      />
                     </div>
                   ))}
                 </div>
@@ -1486,6 +1661,9 @@ export default function UserDashboard({
                       </th>
                       <th className="hidden px-4 py-3 font-medium lg:table-cell">
                         Added
+                      </th>
+                      <th className="hidden px-4 py-3 font-medium md:table-cell">
+                        Folder
                       </th>
                       <th className="px-4 py-3" />
                     </tr>
@@ -1522,6 +1700,13 @@ export default function UserDashboard({
                         </td>
                         <td className="hidden px-4 py-3 text-[var(--text-muted)] lg:table-cell">
                           {new Date(file.created_at).toLocaleDateString()}
+                        </td>
+                        <td className="hidden px-4 py-3 md:table-cell">
+                          <MoveFileSelect
+                            file={file}
+                            folders={folders}
+                            onMove={moveFileToFolder}
+                          />
                         </td>
                         <td className="px-4 py-3">
                           <div className="flex justify-end gap-1">
@@ -1858,6 +2043,34 @@ function FileActionButton({
       {children}
       <span className="truncate">{label}</span>
     </button>
+  );
+}
+
+function MoveFileSelect({
+  file,
+  folders,
+  onMove,
+}: {
+  file: FileMetadata;
+  folders: FileFolder[];
+  onMove: (file: FileMetadata, folderId: string | null) => void;
+}) {
+  return (
+    <label className="mt-3 block text-xs text-[var(--text-muted)] sm:mt-0">
+      <span className="sr-only">Move {file.original_name}</span>
+      <select
+        value={file.folder_id || ""}
+        onChange={(event) => onMove(file, event.target.value || null)}
+        className="h-9 w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-elevated)] px-2 text-xs text-[var(--text-secondary)] outline-none focus:border-[var(--accent-linear)] md:w-40"
+      >
+        <option value="">All Files root</option>
+        {folders.map((folder) => (
+          <option key={folder.id} value={folder.id}>
+            {folder.name}
+          </option>
+        ))}
+      </select>
+    </label>
   );
 }
 

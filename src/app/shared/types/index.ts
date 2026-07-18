@@ -27,6 +27,8 @@ export interface FileMetadata {
   id: string;
   owner_user_id: string;
   username: string;
+  folder_id: string | null;
+  folder_name: string | null;
   original_name: string;
   stored_name: string;
   mime_type: string;
@@ -38,6 +40,15 @@ export interface FileMetadata {
   is_encrypted: boolean;
   has_user_secret: boolean;
   created_at: string;
+}
+
+export interface FileFolder {
+  id: string;
+  owner_user_id: string;
+  name: string;
+  file_count: number;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface ShareLink {

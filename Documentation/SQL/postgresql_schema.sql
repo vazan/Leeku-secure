@@ -45,9 +45,19 @@ CREATE TABLE IF NOT EXISTS users (
 	created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS file_folders (
+	id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+	owner_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+	name VARCHAR(120) NOT NULL,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+	CONSTRAINT uq_file_folders_owner_name UNIQUE (owner_user_id, name)
+);
+
 CREATE TABLE IF NOT EXISTS files (
 	id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 	owner_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+	folder_id UUID NULL REFERENCES file_folders(id) ON DELETE NO ACTION,
 	original_name_encrypted BYTEA NOT NULL,
 	original_name_iv BYTEA NOT NULL,
 	original_name_auth_tag BYTEA NOT NULL,
@@ -133,6 +143,12 @@ ON CONFLICT ("key") DO NOTHING;
 
 CREATE INDEX IF NOT EXISTS ix_files_owner_status_created_at
 	ON files (owner_user_id, status, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS ix_file_folders_owner
+	ON file_folders (owner_user_id, name);
+
+CREATE INDEX IF NOT EXISTS ix_files_folder_id
+	ON files (folder_id, owner_user_id);
 
 CREATE INDEX IF NOT EXISTS ix_files_expires_at_available
 	ON files (expires_at)
