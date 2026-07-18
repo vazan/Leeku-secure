@@ -292,7 +292,29 @@ export default function UserDashboard({
   const storageLimit = activeQuota?.storage_limit_bytes || 1;
   const maxFiles = activeQuota?.max_files || 0;
   const filesLeft = Math.max(maxFiles - files.length, 0);
-  const activeFolder = folders.find((folder) => folder.id === activeFolderId) || null;
+  const folderById = useMemo(
+    () => new Map(folders.map((folder) => [folder.id, folder] as const)),
+    [folders],
+  );
+  const activeFolder = activeFolderId ? folderById.get(activeFolderId) || null : null;
+
+  const folderPath = useMemo(() => {
+    if (!activeFolderId) return [] as FileFolder[];
+    const chain: FileFolder[] = [];
+    const seen = new Set<string>();
+    let currentId: string | null = activeFolderId;
+    while (currentId) {
+      if (seen.has(currentId)) break;
+      seen.add(currentId);
+      const current = folderById.get(currentId);
+      if (!current) break;
+      chain.push(current);
+      currentId = current.parent_folder_id || null;
+    }
+    return chain.reverse();
+  }, [activeFolderId, folderById]);
+
+  const activeFolderDepth = folderPath.length;
 
   const notify = (message: string) => toast(message);
   const notifyError = (message: string) => toast.error(message);
@@ -424,9 +446,13 @@ export default function UserDashboard({
   }, [currentFolderFiles, normalizedSearch]);
 
   const visibleFolders = useMemo(() => {
-    if (activeFolderId) return [];
-    if (!normalizedSearch) return folders;
-    return folders.filter((folder) => folder.name.toLowerCase().includes(normalizedSearch));
+    const children = folders.filter(
+      (folder) => (folder.parent_folder_id || null) === activeFolderId,
+    );
+    if (!normalizedSearch) return children;
+    return children.filter((folder) =>
+      folder.name.toLowerCase().includes(normalizedSearch),
+    );
   }, [activeFolderId, folders, normalizedSearch]);
 
   useEffect(() => {
@@ -1043,12 +1069,16 @@ export default function UserDashboard({
   };
 
   const createFolder = async () => {
+    if (activeFolderDepth >= 5) {
+      notifyError("Maximum folder depth is 5.");
+      return;
+    }
     const name = window.prompt("Folder name")?.trim();
     if (!name) return;
     const response = await fetch("/api/file-folders", {
       method: "POST",
       headers: { ...authHeaders(token), "Content-Type": "application/json" },
-      body: JSON.stringify({ name }),
+      body: JSON.stringify({ name, parent_folder_id: activeFolderId }),
     });
     const data = await response.json();
     if (response.ok) {
@@ -1085,7 +1115,7 @@ export default function UserDashboard({
     });
     if (response.ok) {
       notify(deleteFiles ? "Folder and files deleted." : "Folder deleted. Files moved to All Files.");
-      setActiveFolderId(null);
+      setActiveFolderId(folder.parent_folder_id || null);
       await loadFilesAndLinks();
       onTriggerRefreshUser();
     } else notifyError((await response.json()).error || "Could not delete folder.");
@@ -1522,10 +1552,12 @@ export default function UserDashboard({
                   {activeFolder && (
                     <button
                       type="button"
-                      onClick={() => setActiveFolderId(null)}
+                      onClick={() =>
+                        setActiveFolderId(activeFolder.parent_folder_id || null)
+                      }
                       className="rounded-lg border border-[var(--border-subtle)] px-3 py-2 text-xs font-medium text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]"
                     >
-                      Back to All Files
+                      Back
                     </button>
                   )}
                   <button
@@ -1534,7 +1566,7 @@ export default function UserDashboard({
                     className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--border-subtle)] px-3 py-2 text-xs font-medium text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]"
                   >
                     <FolderPlus className="h-3.5 w-3.5" />
-                    New folder
+                    {activeFolder ? "New sub-folder" : "New folder"}
                   </button>
                   {activeFolder && (
                     <>
@@ -1555,6 +1587,29 @@ export default function UserDashboard({
                     </>
                   )}
                 </div>
+                {folderPath.length > 0 && (
+                  <div className="mt-3 flex flex-wrap items-center justify-center gap-1 text-xs text-[var(--text-muted)]">
+                    <button
+                      type="button"
+                      onClick={() => setActiveFolderId(null)}
+                      className="hover:text-[var(--text-primary)]"
+                    >
+                      All Files
+                    </button>
+                    {folderPath.map((folder) => (
+                      <React.Fragment key={folder.id}>
+                        <span>/</span>
+                        <button
+                          type="button"
+                          onClick={() => setActiveFolderId(folder.id)}
+                          className="max-w-[10rem] truncate hover:text-[var(--text-primary)]"
+                        >
+                          {folder.name}
+                        </button>
+                      </React.Fragment>
+                    ))}
+                  </div>
+                )}
               </div>
 
               {visibleFolders.length > 0 && (
@@ -2055,6 +2110,32 @@ function MoveFileSelect({
   folders: FileFolder[];
   onMove: (file: FileMetadata, folderId: string | null) => void;
 }) {
+  const folderById = useMemo(
+    () => new Map(folders.map((folder) => [folder.id, folder] as const)),
+    [folders],
+  );
+
+  const folderOptions = useMemo(() => {
+    const toPathLabel = (folder: FileFolder) => {
+      const names = [folder.name];
+      const seen = new Set<string>([folder.id]);
+      let parentId = folder.parent_folder_id || null;
+      while (parentId) {
+        if (seen.has(parentId)) break;
+        seen.add(parentId);
+        const parent = folderById.get(parentId);
+        if (!parent) break;
+        names.unshift(parent.name);
+        parentId = parent.parent_folder_id || null;
+      }
+      return names.join(" / ");
+    };
+
+    return folders
+      .map((folder) => ({ id: folder.id, label: toPathLabel(folder) }))
+      .sort((a, b) => a.label.localeCompare(b.label));
+  }, [folderById, folders]);
+
   return (
     <label className="mt-3 block text-xs text-[var(--text-muted)] sm:mt-0">
       <span className="sr-only">Move {file.original_name}</span>
@@ -2064,9 +2145,9 @@ function MoveFileSelect({
         className="h-9 w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-elevated)] px-2 text-xs text-[var(--text-secondary)] outline-none focus:border-[var(--accent-linear)] md:w-40"
       >
         <option value="">All Files root</option>
-        {folders.map((folder) => (
+        {folderOptions.map((folder) => (
           <option key={folder.id} value={folder.id}>
-            {folder.name}
+            {folder.label}
           </option>
         ))}
       </select>

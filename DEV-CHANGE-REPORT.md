@@ -53,6 +53,41 @@ Approval trail
 ---
 
 Intent
+Extended All Files folders to support nested sub-folders on the MSSQL branch with a maximum depth of 5 (Google Drive-like hierarchy), plus recursive folder deletion behavior.
+
+Change class
+🔴 CRITICAL
+
+Files changed
+- src/app/shared/types/index.ts:
+  - Added `parent_folder_id` to `FileFolder`.
+- src/server.ts:
+  - Added parent-aware folder model and max-depth enforcement (`MAX_FOLDER_DEPTH = 5`).
+  - Updated folder list/create/rename APIs to include `parent_folder_id` and parent validation.
+  - Updated folder delete API to operate on full descendant tree (move files to root or delete files recursively).
+  - Updated runtime MSSQL schema bootstrap for `parent_folder_id`, self-FK, and parent-scoped uniqueness/indexing.
+- src/app/features/files/pages/user-dashboard.tsx:
+  - Added nested folder navigation with breadcrumbs.
+  - Added create sub-folder behavior in current folder context.
+  - Added hierarchical folder labels in move-file selector.
+- Documentation/SQL/production_schema.sql:
+  - Added `file_folders.parent_folder_id`, self-FK, and parent-scoped unique/index definitions.
+
+Public contracts impacted
+- Extended folder payloads (`/api/file-folders`) with `parent_folder_id`.
+- `POST /api/file-folders` now accepts optional `parent_folder_id` and enforces max depth 5.
+- Folder delete endpoints now apply to subtree descendants.
+
+Validation status
+- lint/type-check: FAILED only on existing unrelated baseline JSX namespace issues in maintenance components.
+- build: PASSED (`pnpm build`)
+
+Approval trail
+- User approved CRITICAL nested folder change and requested max depth of 5 on 2026-07-18.
+
+---
+
+Intent
 Extended the large secret-protected file fix to private downloads by replacing remaining in-memory client-secret decrypt branches (and their 512 MB limits) with streaming decrypt.
 
 Change class

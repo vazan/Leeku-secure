@@ -45,6 +45,7 @@ export interface FileMetadata {
 export interface FileFolder {
   id: string;
   owner_user_id: string;
+  parent_folder_id: string | null;
   name: string;
   file_count: number;
   created_at: string;

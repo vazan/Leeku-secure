@@ -230,11 +230,12 @@ GO
 CREATE TABLE [dbo].[file_folders](
     [id] [uniqueidentifier] NOT NULL,
     [owner_user_id] [uniqueidentifier] NOT NULL,
+    [parent_folder_id] [uniqueidentifier] NULL,
     [name] [nvarchar](120) NOT NULL,
     [created_at] [datetimeoffset](7) NOT NULL,
     [updated_at] [datetimeoffset](7) NOT NULL,
     CONSTRAINT [PK_file_folders] PRIMARY KEY CLUSTERED ([id] ASC),
-    CONSTRAINT [UQ_file_folders_owner_name] UNIQUE NONCLUSTERED ([owner_user_id] ASC, [name] ASC)
+    CONSTRAINT [UQ_file_folders_owner_parent_name] UNIQUE NONCLUSTERED ([owner_user_id] ASC, [parent_folder_id] ASC, [name] ASC)
 ) ON [PRIMARY]
 GO
 
@@ -368,8 +369,8 @@ GO
 -- ============================================================
 
 -- Files indexes
-CREATE NONCLUSTERED INDEX [IX_file_folders_owner] ON [dbo].[file_folders]
-([owner_user_id] ASC, [name] ASC)
+CREATE NONCLUSTERED INDEX [IX_file_folders_owner_parent] ON [dbo].[file_folders]
+([owner_user_id] ASC, [parent_folder_id] ASC, [name] ASC)
 WITH (PAD_INDEX = OFF, STATISTICS_NORECOMPUTE = OFF, SORT_IN_TEMPDB = OFF, 
     DROP_EXISTING = OFF, ONLINE = OFF, ALLOW_ROW_LOCKS = ON, ALLOW_PAGE_LOCKS = ON, 
     OPTIMIZE_FOR_SEQUENTIAL_KEY = OFF) ON [PRIMARY]
@@ -586,6 +587,14 @@ REFERENCES [dbo].[users] ([id])
 ON DELETE CASCADE
 GO
 ALTER TABLE [dbo].[file_folders] CHECK CONSTRAINT [FK_file_folders_users]
+GO
+
+ALTER TABLE [dbo].[file_folders] WITH CHECK ADD CONSTRAINT [FK_file_folders_parent]
+FOREIGN KEY([parent_folder_id])
+REFERENCES [dbo].[file_folders] ([id])
+ON DELETE NO ACTION
+GO
+ALTER TABLE [dbo].[file_folders] CHECK CONSTRAINT [FK_file_folders_parent]
 GO
 
 ALTER TABLE [dbo].[files] WITH CHECK ADD CONSTRAINT [FK_files_users] 
