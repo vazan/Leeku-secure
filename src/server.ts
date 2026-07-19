@@ -796,7 +796,7 @@ interface FileRow {
 }
 
 interface FolderRow {
-  id: string; owner_user_id: string; name: string; file_count?: number;
+  id: string; owner_user_id: string; parent_folder_id?: string | null; name: string; file_count?: number;
   created_at: Date; updated_at: Date;
 }
 
@@ -854,6 +854,7 @@ function mapFolderRow(row: FolderRow): FileFolder {
   return {
     id:            row.id,
     owner_user_id: row.owner_user_id,
+    parent_folder_id: row.parent_folder_id || null,
     name:          row.name,
     file_count:    Number(row.file_count || 0),
     created_at:    row.created_at.toISOString(),
@@ -862,6 +863,7 @@ function mapFolderRow(row: FolderRow): FileFolder {
 }
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const MAX_FOLDER_DEPTH = 5;
 
 function normalizeFolderName(value: unknown): string {
   return String(value || '').trim().replace(/\s+/g, ' ');
@@ -886,11 +888,31 @@ async function getOwnedFolder(folderId: string, ownerId: string): Promise<Folder
   request.input('id', sql.UniqueIdentifier, folderId);
   request.input('ownerId', sql.UniqueIdentifier, ownerId);
   const result = await request.query<FolderRow>(
-    `SELECT id, owner_user_id, name, created_at, updated_at
+    `SELECT id, owner_user_id, parent_folder_id, name, created_at, updated_at
      FROM file_folders
      WHERE id=@id AND owner_user_id=@ownerId`
   );
   return result.recordset[0] || null;
+}
+
+async function getFolderDepth(folderId: string, ownerId: string): Promise<number> {
+  const request = await getRequest();
+  request.input('id', sql.UniqueIdentifier, folderId);
+  request.input('ownerId', sql.UniqueIdentifier, ownerId);
+  const result = await request.query<{ depth: number }>(
+    `WITH RECURSIVE folder_tree AS (
+       SELECT id, parent_folder_id, 1 AS depth
+       FROM file_folders
+       WHERE id=@id AND owner_user_id=@ownerId
+       UNION ALL
+       SELECT ff.id, ff.parent_folder_id, ft.depth + 1 AS depth
+       FROM file_folders ff
+       INNER JOIN folder_tree ft ON ff.id=ft.parent_folder_id
+       WHERE ff.owner_user_id=@ownerId
+     )
+     SELECT COALESCE(MAX(depth), 0) AS depth FROM folder_tree`
+  );
+  return Number(result.recordset[0]?.depth || 0);
 }
 
 function mapShareRow(row: ShareRow): ShareLink {
@@ -1854,13 +1876,13 @@ app.get('/api/file-folders', authenticateUser as express.RequestHandler, async (
     const request = await getRequest();
     request.input('ownerId', sql.UniqueIdentifier, req.userId!);
     const result = await request.query<FolderRow>(
-      `SELECT ff.id, ff.owner_user_id, ff.name, ff.created_at, ff.updated_at,
+      `SELECT ff.id, ff.owner_user_id, ff.parent_folder_id, ff.name, ff.created_at, ff.updated_at,
               COUNT(f.id)::int AS file_count
        FROM file_folders ff
        LEFT JOIN files f ON f.folder_id=ff.id AND COALESCE(f.status,'Available')!='Expired'
        WHERE ff.owner_user_id=@ownerId
-       GROUP BY ff.id, ff.owner_user_id, ff.name, ff.created_at, ff.updated_at
-       ORDER BY ff.name ASC`
+       GROUP BY ff.id, ff.owner_user_id, ff.parent_folder_id, ff.name, ff.created_at, ff.updated_at
+       ORDER BY ff.parent_folder_id ASC, ff.name ASC`
     );
     res.json({ folders: result.recordset.map(mapFolderRow) });
   } catch (err) { console.error('[GET /api/file-folders]', err); res.status(500).json({ error: 'Failed to load folders.' }); }
@@ -1869,14 +1891,24 @@ app.get('/api/file-folders', authenticateUser as express.RequestHandler, async (
 app.post('/api/file-folders', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
   const name = validateFolderName(req.body?.name);
   if (!name) return res.status(400).json({ error: 'Folder name must be between 1 and 120 characters.' });
+  const parentFolderId = normalizeNullableFolderId(req.body?.parent_folder_id);
+  if (parentFolderId === undefined) return res.status(400).json({ error: 'Invalid parent folder id.' });
   try {
+    if (parentFolderId) {
+      const parentFolder = await getOwnedFolder(parentFolderId, req.userId!);
+      if (!parentFolder) return res.status(404).json({ error: 'Parent folder not found.' });
+      const depth = await getFolderDepth(parentFolderId, req.userId!);
+      if (depth >= MAX_FOLDER_DEPTH) return res.status(400).json({ error: `Maximum folder depth is ${MAX_FOLDER_DEPTH}.` });
+    }
+
     const request = await getRequest();
     request.input('ownerId', sql.UniqueIdentifier, req.userId!);
+    request.input('parentFolderId', sql.UniqueIdentifier, parentFolderId);
     request.input('name', sql.NVarChar(120), name);
     const result = await request.query<FolderRow>(
-      `INSERT INTO file_folders (owner_user_id, name)
-       VALUES (@ownerId, @name)
-       RETURNING id, owner_user_id, name, 0 AS file_count, created_at, updated_at`
+      `INSERT INTO file_folders (owner_user_id, parent_folder_id, name)
+       VALUES (@ownerId, @parentFolderId, @name)
+       RETURNING id, owner_user_id, parent_folder_id, name, 0 AS file_count, created_at, updated_at`
     );
     await logSystemEvent(req.userId!, req.user!.username, 'Admin', 'Folder', result.recordset[0].id, req, `Created folder "${name}".`);
     res.status(201).json({ folder: mapFolderRow(result.recordset[0]) });
@@ -1900,7 +1932,7 @@ app.post('/api/file-folders/:id/rename', authenticateUser as express.RequestHand
       `UPDATE file_folders
        SET name=@name, updated_at=CURRENT_TIMESTAMP
        WHERE id=@id AND owner_user_id=@ownerId
-       RETURNING id, owner_user_id, name,
+      RETURNING id, owner_user_id, parent_folder_id, name,
               (SELECT COUNT(*)::int FROM files WHERE folder_id=file_folders.id AND COALESCE(status,'Available')!='Expired') AS file_count,
               created_at, updated_at`
     );
@@ -1925,13 +1957,35 @@ app.post('/api/file-folders/:id/delete', authenticateUser as express.RequestHand
       const moveReq = await getRequest();
       moveReq.input('folderId', sql.UniqueIdentifier, folderId);
       moveReq.input('ownerId', sql.UniqueIdentifier, req.userId!);
-      await moveReq.query('UPDATE files SET folder_id=NULL WHERE folder_id=@folderId AND owner_user_id=@ownerId');
+      await moveReq.query(
+        `WITH RECURSIVE folder_tree AS (
+           SELECT id FROM file_folders WHERE id=@folderId AND owner_user_id=@ownerId
+           UNION ALL
+           SELECT ff.id
+           FROM file_folders ff
+           INNER JOIN folder_tree ft ON ff.parent_folder_id=ft.id
+           WHERE ff.owner_user_id=@ownerId
+         )
+         UPDATE files
+         SET folder_id=NULL
+         WHERE owner_user_id=@ownerId AND folder_id IN (SELECT id FROM folder_tree)`
+      );
     } else {
       const filesReq = await getRequest();
       filesReq.input('folderId', sql.UniqueIdentifier, folderId);
       filesReq.input('ownerId', sql.UniqueIdentifier, req.userId!);
       const folderFiles = await filesReq.query<{id:string;stored_path:string;size_bytes:number;status:string}>(
-        'SELECT id, stored_path, size_bytes, status FROM files WHERE folder_id=@folderId AND owner_user_id=@ownerId'
+        `WITH RECURSIVE folder_tree AS (
+           SELECT id FROM file_folders WHERE id=@folderId AND owner_user_id=@ownerId
+           UNION ALL
+           SELECT ff.id
+           FROM file_folders ff
+           INNER JOIN folder_tree ft ON ff.parent_folder_id=ft.id
+           WHERE ff.owner_user_id=@ownerId
+         )
+         SELECT id, stored_path, size_bytes, status
+         FROM files
+         WHERE owner_user_id=@ownerId AND folder_id IN (SELECT id FROM folder_tree)`
       );
       for (const file of folderFiles.recordset) {
         const vaultPath = path.join(FILE_VAULT, file.stored_path);
@@ -1943,7 +1997,18 @@ app.post('/api/file-folders/:id/delete', authenticateUser as express.RequestHand
       const deleteReq = await getRequest();
       deleteReq.input('folderId', sql.UniqueIdentifier, folderId);
       deleteReq.input('ownerId', sql.UniqueIdentifier, req.userId!);
-      await deleteReq.query('DELETE FROM files WHERE folder_id=@folderId AND owner_user_id=@ownerId');
+      await deleteReq.query(
+        `WITH RECURSIVE folder_tree AS (
+           SELECT id FROM file_folders WHERE id=@folderId AND owner_user_id=@ownerId
+           UNION ALL
+           SELECT ff.id
+           FROM file_folders ff
+           INNER JOIN folder_tree ft ON ff.parent_folder_id=ft.id
+           WHERE ff.owner_user_id=@ownerId
+         )
+         DELETE FROM files
+         WHERE owner_user_id=@ownerId AND folder_id IN (SELECT id FROM folder_tree)`
+      );
       if (storageToRemove > 0) {
         const storageReq = await getRequest();
         storageReq.input('sz', sql.BigInt, storageToRemove);
@@ -1955,8 +2020,19 @@ app.post('/api/file-folders/:id/delete', authenticateUser as express.RequestHand
     const deleteFolderReq = await getRequest();
     deleteFolderReq.input('id', sql.UniqueIdentifier, folderId);
     deleteFolderReq.input('ownerId', sql.UniqueIdentifier, req.userId!);
-    await deleteFolderReq.query('DELETE FROM file_folders WHERE id=@id AND owner_user_id=@ownerId');
-    await logSystemEvent(req.userId!, req.user!.username, 'Delete', 'Folder', folderId, req, deleteFiles ? `Deleted folder "${folder.name}" and its files.` : `Deleted folder "${folder.name}" and moved files to All Files root.`);
+    await deleteFolderReq.query(
+      `WITH RECURSIVE folder_tree AS (
+         SELECT id FROM file_folders WHERE id=@id AND owner_user_id=@ownerId
+         UNION ALL
+         SELECT ff.id
+         FROM file_folders ff
+         INNER JOIN folder_tree ft ON ff.parent_folder_id=ft.id
+         WHERE ff.owner_user_id=@ownerId
+       )
+       DELETE FROM file_folders
+       WHERE id IN (SELECT id FROM folder_tree)`
+    );
+    await logSystemEvent(req.userId!, req.user!.username, 'Delete', 'Folder', folderId, req, deleteFiles ? `Deleted folder tree "${folder.name}" and its files.` : `Deleted folder tree "${folder.name}" and moved files to All Files root.`);
     res.json({ success: true });
   } catch (err) { console.error('[POST /api/file-folders/:id/delete]', err); res.status(500).json({ error: 'Failed to delete folder.' }); }
 });
@@ -3742,12 +3818,50 @@ async function ensureFileFolderSchema(): Promise<void> {
     CREATE TABLE IF NOT EXISTS file_folders (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       owner_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      parent_folder_id UUID NULL,
       name VARCHAR(120) NOT NULL,
       created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      CONSTRAINT uq_file_folders_owner_name UNIQUE (owner_user_id, name)
+      CONSTRAINT uq_file_folders_owner_parent_name UNIQUE (owner_user_id, parent_folder_id, name)
     )
   `);
+
+  const addParentFolderId = await getRequest();
+  await addParentFolderId.query('ALTER TABLE file_folders ADD COLUMN IF NOT EXISTS parent_folder_id UUID');
+
+  const addParentFk = await getRequest();
+  await addParentFk.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'fk_file_folders_parent'
+      ) THEN
+        ALTER TABLE file_folders
+          ADD CONSTRAINT fk_file_folders_parent
+          FOREIGN KEY (parent_folder_id) REFERENCES file_folders(id) ON DELETE NO ACTION;
+      END IF;
+    END $$;
+  `);
+
+  const renameUnique = await getRequest();
+  await renameUnique.query(`
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'uq_file_folders_owner_name'
+      ) THEN
+        ALTER TABLE file_folders DROP CONSTRAINT uq_file_folders_owner_name;
+      END IF;
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'uq_file_folders_owner_parent_name'
+      ) THEN
+        ALTER TABLE file_folders
+          ADD CONSTRAINT uq_file_folders_owner_parent_name
+          UNIQUE (owner_user_id, parent_folder_id, name);
+      END IF;
+    END $$;
+  `);
+
   const addFolderId = await getRequest();
   await addFolderId.query('ALTER TABLE files ADD COLUMN IF NOT EXISTS folder_id UUID');
   const addFk = await getRequest();
@@ -3763,8 +3877,10 @@ async function ensureFileFolderSchema(): Promise<void> {
       END IF;
     END $$;
   `);
-  const folderOwnerIndex = await getRequest();
-  await folderOwnerIndex.query('CREATE INDEX IF NOT EXISTS ix_file_folders_owner ON file_folders (owner_user_id, name)');
+  const dropLegacyFolderOwnerIndex = await getRequest();
+  await dropLegacyFolderOwnerIndex.query('DROP INDEX IF EXISTS ix_file_folders_owner');
+  const folderOwnerParentIndex = await getRequest();
+  await folderOwnerParentIndex.query('CREATE INDEX IF NOT EXISTS ix_file_folders_owner_parent ON file_folders (owner_user_id, parent_folder_id, name)');
   const fileFolderIndex = await getRequest();
   await fileFolderIndex.query('CREATE INDEX IF NOT EXISTS ix_files_folder_id ON files (folder_id, owner_user_id)');
 }

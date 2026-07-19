@@ -1,4 +1,39 @@
 Intent
+Extended folder organization on the PostgreSQL branch to support nested sub-folders with a maximum depth of 5 (Google Drive-like hierarchy).
+
+Change class
+🔴 CRITICAL
+
+Files changed
+- src/app/shared/types/index.ts:
+  - Added `parent_folder_id` to `FileFolder`.
+- src/server.ts:
+  - Added parent-aware folder model and depth validation (`MAX_FOLDER_DEPTH = 5`).
+  - Updated folder list/create/rename APIs to include `parent_folder_id`.
+  - Updated folder delete behavior to include descendants using recursive queries.
+  - Updated PostgreSQL runtime schema migration to support parent folders, parent-scoped uniqueness, and parent-aware indexes.
+- src/app/features/files/pages/user-dashboard.tsx:
+  - Added nested navigation with breadcrumbs.
+  - Added create-subfolder behavior in current context.
+  - Added hierarchical folder path labels in file move selector.
+- Documentation/SQL/postgresql_schema.sql:
+  - Added `parent_folder_id` and parent-scoped uniqueness/index definitions for canonical PostgreSQL bootstrap schema.
+
+Public contracts impacted
+- Extended `FileFolder` payloads with `parent_folder_id`.
+- `POST /api/file-folders` accepts optional `parent_folder_id` and enforces depth <= 5.
+- Folder delete endpoint now applies subtree behavior for move/delete modes.
+
+Validation status
+- lint/type-check: pending final validation in this task.
+- build: pending final validation in this task.
+
+Approval trail
+- User requested matching nested-folder support on PostgreSQL branch with max depth 5 on 2026-07-18.
+
+---
+
+Intent
 Replicated the All Files folder organization feature onto the PostgreSQL branch with PostgreSQL-native runtime DDL and canonical bootstrap schema support.
 
 Change class
