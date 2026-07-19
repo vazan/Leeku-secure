@@ -254,6 +254,7 @@ export default function UserDashboard({
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [uploadSecretKey, setUploadSecretKey] = useState("");
+  const [uploadTargetFolderId, setUploadTargetFolderId] = useState<string | null>(null);
   const [transfer, setTransfer] = useState<TransferState | null>(null);
   const [dragging, setDragging] = useState(false);
   const [shareFile, setShareFile] = useState<FileMetadata | null>(null);
@@ -315,6 +316,27 @@ export default function UserDashboard({
   }, [activeFolderId, folderById]);
 
   const activeFolderDepth = folderPath.length;
+
+  const uploadFolderOptions = useMemo(() => {
+    const toPathLabel = (folder: FileFolder) => {
+      const names = [folder.name];
+      const seen = new Set<string>([folder.id]);
+      let parentId = folder.parent_folder_id || null;
+      while (parentId) {
+        if (seen.has(parentId)) break;
+        seen.add(parentId);
+        const parent = folderById.get(parentId);
+        if (!parent) break;
+        names.unshift(parent.name);
+        parentId = parent.parent_folder_id || null;
+      }
+      return names.join(" / ");
+    };
+
+    return folders
+      .map((folder) => ({ id: folder.id, label: toPathLabel(folder) }))
+      .sort((a, b) => a.label.localeCompare(b.label));
+  }, [folderById, folders]);
 
   const notify = (message: string) => toast(message);
   const notifyError = (message: string) => toast.error(message);
@@ -381,6 +403,9 @@ export default function UserDashboard({
       const nextFolders = ((await foldersResponse.json()).folders || []) as FileFolder[];
       setFolders(nextFolders);
       setActiveFolderId((current) =>
+        current && !nextFolders.some((folder) => folder.id === current) ? null : current,
+      );
+      setUploadTargetFolderId((current) =>
         current && !nextFolders.some((folder) => folder.id === current) ? null : current,
       );
     } else {
@@ -548,7 +573,8 @@ export default function UserDashboard({
     }
 
     const FILE_IS_LARGE = selectedFileSize > RESUMABLE_CHUNK_SIZE;
-    const uploadFolderId = view === "files" ? activeFolderId : null;
+    const uploadFolderId =
+      view === "files" ? activeFolderId : uploadTargetFolderId;
 
     // ═════════════════════════════════════════════════════════
     // LARGE FILES → Resumable.js chunked upload (50 MB each)
@@ -1537,6 +1563,24 @@ export default function UserDashboard({
                     placeholder="Ex.: Leeku-secret-1"
                     className="h-10 w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-muted)] px-3 text-sm outline-none focus:border-[var(--accent-linear)]"
                   />
+                  <label className="mb-1 mt-3 block text-xs font-medium text-[var(--text-muted)]">
+                    Upload folder
+                  </label>
+                  <select
+                    value={uploadTargetFolderId || ""}
+                    onChange={(event) =>
+                      setUploadTargetFolderId(event.target.value || null)
+                    }
+                    disabled={uploading}
+                    className="h-10 w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-muted)] px-3 text-sm text-[var(--text-secondary)] outline-none focus:border-[var(--accent-linear)] disabled:cursor-not-allowed disabled:opacity-70"
+                  >
+                    <option value="">All Files root</option>
+                    {uploadFolderOptions.map((folder) => (
+                      <option key={folder.id} value={folder.id}>
+                        {folder.label}
+                      </option>
+                    ))}
+                  </select>
                   <div className="mt-3 rounded-lg border border-[var(--accent-linear)]/30 bg-[color-mix(in_srgb,var(--accent-linear)_10%,transparent)] px-3 py-2 text-xs font-medium text-[var(--text-secondary)] shadow-sm">
                     {filesLeft} file{filesLeft === 1 ? "" : "s"} left in your quota. <br/> Maximum file size: {formatBytes(activeQuota?.max_file_size_bytes || 0)}.
                   </div>
