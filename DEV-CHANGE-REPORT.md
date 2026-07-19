@@ -1,4 +1,43 @@
 Intent
+Ported the validated Android All Files view rendering fix to the PostgreSQL branch, preventing the files area from overflowing the phone viewport or appearing tiny/left-aligned.
+
+Change class
+🟡 STANDARD
+
+Files changed
+- src/app/features/files/pages/user-dashboard.tsx:
+  - Added `min-w-0` and `overflow-x-hidden` constraints to the dashboard root, main, content shell, and files section.
+  - Reduced phone padding around the dashboard content so file cards fit the usable viewport.
+  - Forced mobile folder/file grids, cards, and controls to stay within `w-full min-w-0` containers.
+  - Tightened mobile card spacing and thumbnail size.
+  - Split file metadata into wrapping rows instead of dot-separated single lines.
+  - Changed mobile file actions from three fixed columns to a phone-first stacked layout that becomes two columns on wider phones.
+
+Public contracts impacted
+- None. File data shape, routes, action handlers, and move-folder behavior remain unchanged.
+
+Risks
+- Low: responsive class-only UI change scoped to the dashboard/files layout and mobile All Files cards.
+- Visual verification should include narrow Android viewports, long filenames, long file-type labels, and folder selector labels.
+
+Test coverage status + handoff hint for test-engineer
+- No automated tests added (out of scope for DevEngineer mode).
+- Handoff focus:
+  - Verify All Files mobile cards show file name, type, size, status, date, Download, Share, Delete, and folder selector without clipping or horizontal overflow.
+  - Verify desktop file table remains unchanged.
+  - Verify Download, Share, Delete, and move-folder actions still work from the mobile card.
+
+Validation status
+- file diagnostics: PASSED for `src/app/features/files/pages/user-dashboard.tsx`
+- build: PASSED (`pnpm run build`)
+- lint/type-check: PASSED (`pnpm run lint`)
+
+Approval trail
+- Not required (STANDARD change). User validated the MSSQL branch fix and requested the same changes on PostgreSQL on 2026-07-19.
+
+---
+
+Intent
 Extended folder organization on the PostgreSQL branch to support nested sub-folders with a maximum depth of 5 (Google Drive-like hierarchy).
 
 Change class
