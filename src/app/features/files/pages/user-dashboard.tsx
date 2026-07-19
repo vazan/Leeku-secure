@@ -329,6 +329,22 @@ export default function UserDashboard({
     dropzoneFileInputRef.current?.click();
   };
 
+  const uploadFiles = async (selectedFiles: globalThis.File[]) => {
+    const filesToUpload = selectedFiles.filter((file): file is globalThis.File => !!file);
+    if (!filesToUpload.length) return;
+
+    if (uploading || uploadRequestRef.current || resumableUploadRef.current) {
+      notifyError("An upload is already running.");
+      return;
+    }
+
+    for (const file of filesToUpload) {
+      if (uploadStoppedRef.current) break;
+      await uploadFile(file);
+      if (uploadStoppedRef.current) break;
+    }
+  };
+
   const loadFilesAndLinks = async () => {
     const [filesResponse, linksResponse, foldersResponse] = await Promise.all([
       fetch("/api/files", { headers: authHeaders(token) }),
@@ -491,12 +507,12 @@ export default function UserDashboard({
     return (hash >>> 0).toString(36) + "-" + Date.now().toString(36);
   };
 
-  const uploadFile = async (file: globalThis.File) => {
+  const uploadFile = async (file: globalThis.File): Promise<boolean> => {
     console.log("[uploadFile] called with", file.name, file.size, "RESUMABLE_CHUNK_SIZE:", RESUMABLE_CHUNK_SIZE);
     console.log("[uploadFile] FILE_IS_LARGE?", file.size > RESUMABLE_CHUNK_SIZE);
     if (uploadRequestRef.current || resumableUploadRef.current) {
       notifyError("An upload is already running.");
-      return;
+      return false;
     }
 
     const startedAt = Date.now();
@@ -528,7 +544,7 @@ export default function UserDashboard({
       setUploading(false);
       setTransfer(null);
       notifyError(reason instanceof Error ? reason.message : "Could not encrypt the file with your secret key.");
-      return;
+      return false;
     }
 
     const FILE_IS_LARGE = selectedFileSize > RESUMABLE_CHUNK_SIZE;
@@ -744,6 +760,7 @@ export default function UserDashboard({
         notify("Upload complete.");
         await loadFilesAndLinks();
         onTriggerRefreshUser();
+        return true;
       } catch (err) {
         setUploading(false);
         setUploadProgress(0);
@@ -752,11 +769,11 @@ export default function UserDashboard({
         if (msg !== "Upload aborted.") {
           notifyError(msg);
         }
+        return false;
       } finally {
         resumableUploadRef.current = null;
         uploadRequestRef.current = null;
       }
-      return;
     }
 
     // ═════════════════════════════════════════════════════════
@@ -778,101 +795,42 @@ export default function UserDashboard({
     formData.append("original_name", file.name);
     formData.append("mime_type", file.type || "application/octet-stream");
     if (uploadFolderId) formData.append("folder_id", uploadFolderId);
-    const xhr = new XMLHttpRequest();
-    uploadRequestRef.current = xhr;
-    let responseCursor = 0;
-    let responseBuffer = "";
-    let processingStartedAt = 0;
-    let uploadStreamError = "";
-    let uploadStreamComplete = false;
 
-    const handleStreamEvent = (event: UploadStreamEvent) => {
-      if (event.type === "processing") {
-        processingStartedAt ||= Date.now();
-        setTransfer({
-          direction: "upload",
-          name: file.name,
-          loaded: file.size,
-          total: file.size,
-          startedAt,
-          processing: true,
-          processingStartedAt,
-          processingLoaded: event.loaded ?? 0,
-          processingTotal: event.total ?? 0,
-          phaseLabel: event.phase || "Securing file",
-        });
-        return;
-      }
-      if (event.type === "complete") {
-        uploadStreamComplete = true;
-        setTransfer({
-          direction: "upload",
-          name: file.name,
-          loaded: file.size,
-          total: file.size,
-          startedAt,
-          complete: true,
-        });
-        return;
-      }
-      if (event.type === "error") {
-        uploadStreamError = event.error || "Upload failed.";
-      }
-    };
+    return await new Promise<boolean>((resolve) => {
+      const xhr = new XMLHttpRequest();
+      uploadRequestRef.current = xhr;
+      let responseCursor = 0;
+      let responseBuffer = "";
+      let processingStartedAt = 0;
+      let uploadStreamError = "";
+      let uploadStreamComplete = false;
+      let settled = false;
 
-    const readUploadStream = () => {
-      const chunk = xhr.responseText.slice(responseCursor);
-      responseCursor = xhr.responseText.length;
-      if (!chunk) return;
-      responseBuffer += chunk;
-      const lines = responseBuffer.split("\n");
-      responseBuffer = lines.pop() || "";
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        try {
-          handleStreamEvent(JSON.parse(line) as UploadStreamEvent);
-        } catch {
-          // Non-streaming JSON responses are handled when the request finishes.
-        }
-      }
-    };
+      const finish = (result: boolean) => {
+        if (settled) return;
+        settled = true;
+        resolve(result);
+      };
 
-    xhr.upload.onprogress = (event) => {
-      if (event.lengthComputable)
-        setUploadProgress(Math.round((event.loaded / event.total) * 100));
-      setTransfer({
-        direction: "upload",
-        name: file.name,
-        loaded: event.loaded,
-        total: event.lengthComputable ? event.total : file.size,
-        startedAt,
-      });
-    };
-    xhr.upload.onload = () =>
-      setTransfer({
-        direction: "upload",
-        name: file.name,
-        loaded: file.size,
-        total: file.size,
-        startedAt,
-        processing: true,
-        processingStartedAt: Date.now(),
-        processingLoaded: 0,
-        processingTotal: 1000,
-        phaseLabel: "Preparing scan",
-      });
-    xhr.onprogress = readUploadStream;
-    xhr.onload = async () => {
-      readUploadStream();
-      setUploading(false);
-      uploadRequestRef.current = null;
-      if (xhr.status >= 200 && xhr.status < 300) {
-        if (uploadStreamError) {
-          setTransfer(null);
-          notifyError(uploadStreamError);
+      const handleStreamEvent = (event: UploadStreamEvent) => {
+        if (event.type === "processing") {
+          processingStartedAt ||= Date.now();
+          setTransfer({
+            direction: "upload",
+            name: file.name,
+            loaded: file.size,
+            total: file.size,
+            startedAt,
+            processing: true,
+            processingStartedAt,
+            processingLoaded: event.loaded ?? 0,
+            processingTotal: event.total ?? 1000,
+            phaseLabel: event.phase || "Securing file",
+          });
           return;
         }
-        if (!uploadStreamComplete) {
+        if (event.type === "complete") {
+          uploadStreamComplete = true;
           setTransfer({
             direction: "upload",
             name: file.name,
@@ -881,47 +839,126 @@ export default function UserDashboard({
             startedAt,
             complete: true,
           });
+          return;
         }
-        window.setTimeout(
-          () =>
-            setTransfer((current) =>
-              current?.startedAt === startedAt ? null : current,
-            ),
-          1800,
-        );
-        notify("Upload complete.");
-        await loadFilesAndLinks();
-        onTriggerRefreshUser();
-      } else {
+        if (event.type === "error") {
+          uploadStreamError = event.error || "Upload failed.";
+        }
+      };
+
+      const readUploadStream = () => {
+        const chunk = xhr.responseText.slice(responseCursor);
+        responseCursor = xhr.responseText.length;
+        if (!chunk) return;
+        responseBuffer += chunk;
+        const lines = responseBuffer.split("\n");
+        responseBuffer = lines.pop() || "";
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            handleStreamEvent(JSON.parse(line) as UploadStreamEvent);
+          } catch {
+            // Non-streaming JSON responses are handled when the request finishes.
+          }
+        }
+      };
+
+      xhr.upload.onprogress = (event) => {
+        if (event.lengthComputable) {
+          setUploadProgress(Math.round((event.loaded / event.total) * 100));
+        }
+        setTransfer({
+          direction: "upload",
+          name: file.name,
+          loaded: event.loaded,
+          total: event.lengthComputable ? event.total : file.size,
+          startedAt,
+        });
+      };
+      xhr.upload.onload = () =>
+        setTransfer({
+          direction: "upload",
+          name: file.name,
+          loaded: file.size,
+          total: file.size,
+          startedAt,
+          processing: true,
+          processingStartedAt: Date.now(),
+          processingLoaded: 0,
+          processingTotal: 1000,
+          phaseLabel: "Preparing scan",
+        });
+      xhr.onprogress = readUploadStream;
+      xhr.onload = async () => {
+        readUploadStream();
+        setUploading(false);
+        uploadRequestRef.current = null;
+        if (xhr.status >= 200 && xhr.status < 300) {
+          if (uploadStreamError) {
+            setTransfer(null);
+            notifyError(uploadStreamError);
+            finish(false);
+            return;
+          }
+          if (!uploadStreamComplete) {
+            setTransfer({
+              direction: "upload",
+              name: file.name,
+              loaded: file.size,
+              total: file.size,
+              startedAt,
+              complete: true,
+            });
+          }
+          window.setTimeout(
+            () =>
+              setTransfer((current) =>
+                current?.startedAt === startedAt ? null : current,
+              ),
+            1800,
+          );
+          notify("Upload complete.");
+          try {
+            await loadFilesAndLinks();
+            onTriggerRefreshUser();
+          } catch {
+            // Keep the queue moving even if the refresh fails.
+          }
+          finish(true);
+        } else {
+          setTransfer(null);
+          let data: { error?: string } = {};
+          try {
+            data = JSON.parse(xhr.responseText || "{}");
+          } catch {
+            data = {};
+          }
+          notifyError(data.error || "Upload failed.");
+          finish(false);
+        }
+      };
+      xhr.onabort = () => {
+        setUploading(false);
+        setUploadProgress(0);
         setTransfer(null);
-        let data: { error?: string } = {};
-        try {
-          data = JSON.parse(xhr.responseText || "{}");
-        } catch {
-          data = {};
-        }
-        notifyError(data.error || "Upload failed.");
-      }
-    };
-    xhr.onabort = () => {
-      setUploading(false);
-      setUploadProgress(0);
-      setTransfer(null);
-      uploadRequestRef.current = null;
-      if (uploadStoppedRef.current) notify("Upload stopped.");
-      else notifyError("Upload interrupted.");
-    };
-    xhr.onerror = () => {
-      setUploading(false);
-      setUploadProgress(0);
-      setTransfer(null);
-      uploadRequestRef.current = null;
-      notifyError("Upload interrupted.");
-    };
-    xhr.open("POST", "/api/files/upload");
-    xhr.setRequestHeader("Accept", "application/x-ndjson");
-    xhr.setRequestHeader("X-CSRF-Token", getCsrfToken());
-    xhr.send(formData);
+        uploadRequestRef.current = null;
+        if (uploadStoppedRef.current) notify("Upload stopped.");
+        else notifyError("Upload interrupted.");
+        finish(false);
+      };
+      xhr.onerror = () => {
+        setUploading(false);
+        setUploadProgress(0);
+        setTransfer(null);
+        uploadRequestRef.current = null;
+        notifyError("Upload interrupted.");
+        finish(false);
+      };
+      xhr.open("POST", "/api/files/upload");
+      xhr.setRequestHeader("Accept", "application/x-ndjson");
+      xhr.setRequestHeader("X-CSRF-Token", getCsrfToken());
+      xhr.send(formData);
+    });
   };
 
   // ── Helper: update progress bar during resumable upload ──────
@@ -1353,14 +1390,17 @@ export default function UserDashboard({
               <label className="flex h-11 w-11 shrink-0 cursor-pointer items-center justify-center gap-2 rounded-lg bg-[var(--accent-linear)] px-0 text-sm font-medium text-[var(--accent-contrast)] transition-colors hover:bg-[var(--accent-linear-bright)] sm:w-auto sm:rounded-full sm:px-5">
                 <input
                   type="file"
+                  multiple
                   className="hidden"
                   disabled={uploading}
-                  onChange={(event) =>
-                    event.target.files?.[0] && uploadFile(event.target.files[0])
-                  }
+                  onChange={(event) => {
+                    const selectedFiles = Array.from(event.target.files || []);
+                    event.target.value = "";
+                    void uploadFiles(selectedFiles);
+                  }}
                 />
                 <Upload className="h-4 w-4" />
-                <span className="hidden sm:inline">Upload file</span>
+                <span className="hidden sm:inline">Upload files</span>
               </label>
             </>
           )}
@@ -1435,20 +1475,20 @@ export default function UserDashboard({
                 onDrop={(event) => {
                   event.preventDefault();
                   setDragging(false);
-                  event.dataTransfer.files[0] &&
-                    uploadFile(event.dataTransfer.files[0]);
+                  void uploadFiles(Array.from(event.dataTransfer.files || []));
                 }}
                 className={`rounded-2xl border border-dashed p-8 text-center ${dragging ? "border-[var(--accent-linear)] bg-[color-mix(in_srgb,var(--accent-linear)_14%,transparent)]" : "border-[var(--border-subtle)] bg-[var(--bg-panel)]"}`}
               >
                 <input
                   ref={dropzoneFileInputRef}
                   type="file"
+                  multiple
                   className="hidden"
                   disabled={uploading}
                   onChange={(event) => {
-                    if (event.target.files?.[0]) {
-                      uploadFile(event.target.files[0]);
-                    }
+                    const selectedFiles = Array.from(event.target.files || []);
+                    event.target.value = "";
+                    void uploadFiles(selectedFiles);
                   }}
                 />
                 <div className="mx-auto grid h-11 w-11 place-items-center rounded-xl bg-[var(--bg-hover)]">
@@ -1457,12 +1497,12 @@ export default function UserDashboard({
                 <p className="mt-4 text-sm font-medium">
                   {uploading
                     ? `Uploading · ${uploadProgress}%`
-                    : "Drop a file here to upload it securely"}
+                    : "Drop files here to upload them securely"}
                 </p>
                 <p className="mt-1 text-xs text-[var(--text-muted)]">
                   {uploading
                     ? "We will let you know when it is ready."
-                    : `One file at a time.`}
+                    : `Files will upload one at a time.`}
                 </p>
                 {!uploading && (
                   <p className="mt-2 text-sm text-[var(--text-muted)]">
