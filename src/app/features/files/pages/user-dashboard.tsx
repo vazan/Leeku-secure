@@ -1385,7 +1385,7 @@ export default function UserDashboard({
     navItems.push(["admin", <Shield className="h-4 w-4" />, "Admin"]);
 
   return (
-    <div className="min-h-screen bg-[var(--bg-primary)] text-[var(--text-primary)]">
+    <div className="min-h-screen min-w-0 overflow-x-hidden bg-[var(--bg-primary)] text-[var(--text-primary)]">
       <MaintenanceModeBanner />
       <DashboardSidebar
         user={user}
@@ -1396,8 +1396,8 @@ export default function UserDashboard({
         onLogout={onLogout}
       />
 
-      <main className="lg:pl-64">
-        <header className="sticky top-0 z-10 flex min-h-20 flex-wrap items-center gap-3 border-b border-[var(--border-subtle)] bg-[color-mix(in_srgb,var(--bg-panel)_92%,transparent)] px-4 py-3 backdrop-blur-[var(--blur-header)] sm:h-20 sm:flex-nowrap sm:px-5 sm:pr-64 lg:px-8 lg:pr-72">
+      <main className="min-w-0 overflow-x-hidden lg:pl-64">
+        <header className="sticky top-0 z-10 flex min-h-20 min-w-0 flex-wrap items-center gap-3 border-b border-[var(--border-subtle)] bg-[color-mix(in_srgb,var(--bg-panel)_92%,transparent)] px-3 py-3 backdrop-blur-[var(--blur-header)] sm:h-20 sm:flex-nowrap sm:px-5 sm:pr-64 lg:px-8 lg:pr-72">
           <select
             value={view}
             onChange={(event) =>
@@ -1430,7 +1430,7 @@ export default function UserDashboard({
               </label>
             </>
           )}
-          <div className="relative order-3 w-full sm:order-none sm:max-w-xl">
+          <div className="relative order-3 min-w-0 w-full sm:order-none sm:max-w-xl">
           {view === "files" && (
             <>
               <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[var(--text-faint)]" />
@@ -1466,7 +1466,7 @@ export default function UserDashboard({
           </div>
         </header>
 
-        <div className="mx-auto max-w-7xl p-5 lg:p-8">
+        <div className="mx-auto w-full min-w-0 max-w-7xl overflow-x-hidden px-3 py-5 sm:p-5 lg:p-8">
           {transfer && (
             <div className="mx-auto mb-6 max-w-5xl">
               <TransferProgress
@@ -1618,7 +1618,7 @@ export default function UserDashboard({
           )}
 
           {view === "files" && (
-            <section className="mx-auto max-w-5xl">
+            <section className="mx-auto w-full min-w-0 max-w-5xl overflow-x-hidden">
               <div className="mb-6 text-center">
                 <h1 className="text-2xl font-semibold tracking-[-0.03em]">
                   {activeFolder ? activeFolder.name : "All files"}
@@ -1697,13 +1697,13 @@ export default function UserDashboard({
               </div>
 
               {visibleFolders.length > 0 && (
-                <div className="mb-6 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                <div className="mb-6 grid w-full min-w-0 gap-3 sm:grid-cols-2 lg:grid-cols-3">
                   {visibleFolders.map((folder) => (
                     <button
                       key={folder.id}
                       type="button"
                       onClick={() => setActiveFolderId(folder.id)}
-                      className="flex items-center gap-3 rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] p-4 text-left shadow-[var(--shadow-hairline)] hover:bg-[var(--bg-hover)]"
+                      className="flex w-full min-w-0 items-center gap-3 rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] p-4 text-left shadow-[var(--shadow-hairline)] hover:bg-[var(--bg-hover)]"
                     >
                       <span className="grid h-10 w-10 shrink-0 place-items-center rounded-lg bg-[var(--bg-hover)] text-[var(--text-muted)]">
                         <Folder className="h-5 w-5" />
@@ -1727,36 +1727,37 @@ export default function UserDashboard({
                   </p>
                 </div>
               ) : (
-                <div className="grid gap-3 sm:hidden">
+                <div className="grid w-full min-w-0 gap-3 sm:hidden">
                   {visibleFiles.map((file) => (
                     <div
                       key={file.id}
-                      className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] p-4 shadow-[var(--shadow-hairline)]"
+                      className="w-full min-w-0 overflow-hidden rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] p-3 shadow-[var(--shadow-hairline)]"
                     >
                       <div className="flex min-w-0 items-start gap-3">
                         <FileThumbnail
                           file={file}
                           token={token}
-                          className="h-12 w-12 rounded-lg"
+                          className="h-11 w-11 rounded-lg"
                           iconClassName="h-5 w-5"
                         />
                         <div className="min-w-0 flex-1">
-                          <p className="flex items-center gap-1 truncate text-sm font-medium">
+                          <p className="flex min-w-0 items-start gap-1 text-sm font-medium leading-5">
                             <span className="truncate">{file.original_name}</span>
                             {file.has_user_secret && (
-                              <Lock className="h-3.5 w-3.5 shrink-0 text-[var(--text-faint)]" aria-label="Secret key required" />
+                              <Lock className="mt-0.5 h-3.5 w-3.5 shrink-0 text-[var(--text-faint)]" aria-label="Secret key required" />
                             )}
                           </p>
-                          <p className="mt-1 text-xs text-[var(--text-muted)]">
-                            {fileKind(file)} · {formatBytes(file.size)}
-                          </p>
-                          <p className="mt-0.5 text-xs text-[var(--text-faint)]">
-                            {file.status} ·{" "}
-                            {new Date(file.created_at).toLocaleDateString()}
-                          </p>
+                          <div className="mt-1 flex flex-wrap gap-x-2 gap-y-1 text-xs leading-4 text-[var(--text-muted)]">
+                            <span className="max-w-full truncate">{fileKind(file)}</span>
+                            <span className="shrink-0">{formatBytes(file.size)}</span>
+                          </div>
+                          <div className="mt-1 flex flex-wrap gap-x-2 gap-y-1 text-xs leading-4 text-[var(--text-faint)]">
+                            <span className="capitalize">{file.status}</span>
+                            <span>{new Date(file.created_at).toLocaleDateString()}</span>
+                          </div>
                         </div>
                       </div>
-                      <div className="mt-4 grid grid-cols-3 gap-2">
+                      <div className="mt-4 grid w-full min-w-0 gap-2 min-[380px]:grid-cols-2">
                         <FileActionButton
                           label="Download"
                           onClick={() => downloadFile(file)}

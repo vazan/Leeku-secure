@@ -1,4 +1,43 @@
 Intent
+Fixed the Android All Files view rendering issue where the files area could overflow the phone viewport and appear tiny, left-aligned, or horizontally stretched.
+
+Change class
+🟡 STANDARD
+
+Files changed
+- src/app/features/files/pages/user-dashboard.tsx:
+  - Added `min-w-0` and `overflow-x-hidden` constraints to the dashboard root, main, content shell, and files section.
+  - Reduced phone padding around the dashboard content so file cards fit the usable viewport.
+  - Forced mobile folder/file grids, cards, and controls to stay within `w-full min-w-0` containers.
+  - Tightened mobile card spacing and thumbnail size.
+  - Split file metadata into wrapping rows instead of dot-separated single lines.
+  - Changed mobile file actions from three fixed columns to a phone-first stacked layout that becomes two columns on wider phones.
+
+Public contracts impacted
+- None. File data shape, routes, action handlers, and move-folder behavior remain unchanged.
+
+Risks
+- Low: responsive class-only UI change scoped to the dashboard/files layout and mobile All Files cards.
+- Visual verification should include narrow Android viewports, long filenames, long file-type labels, and folder selector labels.
+
+Test coverage status + handoff hint for test-engineer
+- No automated tests added (out of scope for DevEngineer mode).
+- Handoff focus:
+  - Verify All Files mobile cards show file name, type, size, status, date, Download, Share, Delete, and folder selector without clipping or horizontal overflow.
+  - Verify desktop file table remains unchanged.
+  - Verify Download, Share, Delete, and move-folder actions still work from the mobile card.
+
+Validation status
+- file diagnostics: PASSED for `src/app/features/files/pages/user-dashboard.tsx`
+- build: PASSED (`pnpm run build`)
+- lint/type-check: FAILED only on existing unrelated JSX namespace baseline issues in maintenance components.
+
+Approval trail
+- Not required (STANDARD change).
+
+---
+
+Intent
 Added user-managed folders inside All Files so users can organize files into per-user folders, move files between folders/root, upload directly into the selected folder, and choose folder-only or folder-plus-files deletion.
 
 Change class
