@@ -21,6 +21,7 @@ Scope: Documentation/
 | Documentation/01-Technical/DEPLOYMENT-TOPOLOGY.md | 3613 | DocArchitect + DocEngineer |
 | Documentation/01-Technical/DISCOVERY-REPORT.md | 6336 | DocArchitect + DocEngineer |
 | Documentation/01-Technical/FEATURE-MAPPING.md | 4006 | DocArchitect + DocEngineer |
+| Documentation/01-Technical/UPLOAD-FLOW-MERMAID.md | 6985 | DocHub |
 | Documentation/01-Technical/GETTING-STARTED.md | 2950 | DocArchitect + DocEngineer |
 | Documentation/01-Technical/SYSTEM-COMPONENTS.md | 4136 | DocArchitect + DocEngineer |
 | Documentation/02-Non-Technical/EXECUTIVE-SUMMARY.md | 2260 | DocEngineer + DocOps |
