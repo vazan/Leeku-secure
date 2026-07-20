@@ -2229,10 +2229,10 @@ function MoveFileSelect({
         onChange={(event) => onMove(file, event.target.value || null)}
         className="h-9 w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-elevated)] px-2 text-xs text-[var(--text-secondary)] outline-none focus:border-[var(--accent-linear)] md:w-40"
       >
-        <option value="">Root Folder</option>
+        <option value="">/</option>
         {folderOptions.map((folder) => (
           <option key={folder.id} value={folder.id}>
-            {folder.label}
+            /{folder.label}
           </option>
         ))}
       </select>
