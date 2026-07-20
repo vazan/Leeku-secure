@@ -1573,10 +1573,10 @@ export default function UserDashboard({
                     disabled={uploading}
                     className="h-10 w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-muted)] px-3 text-sm text-[var(--text-secondary)] outline-none focus:border-[var(--accent-linear)] disabled:cursor-not-allowed disabled:opacity-70"
                   >
-                    <option value="">Root Folder</option>
+                    <option value="">/</option>
                     {uploadFolderOptions.map((folder) => (
                       <option key={folder.id} value={folder.id}>
-                        {folder.label}
+                        /{folder.label}
                       </option>
                     ))}
                   </select>
