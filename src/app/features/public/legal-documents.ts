@@ -145,7 +145,7 @@ export const legalDocuments: LegalDocument[] = [
     id: "aup",
     label: "Acceptable Use Policy",
     title: "Acceptable Use Policy (AUP)",
-    lastUpdated: "June 13, 2026",
+    lastUpdated: "July 20, 2026",
     sections: [
       {
         heading: "Leeku's Secure Vault (leeks.miku.rip)",
@@ -159,6 +159,10 @@ export const legalDocuments: LegalDocument[] = [
           "Copyright infringement",
           "Harmful or abusive content",
           "Pornography",
+          "Zoophilia",
+          "Terroristic propaganda",
+          "Gore",
+          "Doxing"
         ],
       },
       {
@@ -183,7 +187,7 @@ export const legalDocuments: LegalDocument[] = [
     id: "dmca",
     label: "Copyright & DMCA Policy",
     title: "Copyright & DMCA Policy",
-    lastUpdated: "June 13, 2026",
+    lastUpdated: "July 20, 2026",
     sections: [
       {
         heading: "Leeku's Secure Vault (leeks.miku.rip)",
@@ -206,7 +210,7 @@ export const legalDocuments: LegalDocument[] = [
       },
       {
         heading: "Repeat Infringers",
-        paragraphs: ["Repeat offenders may have their accounts terminated."],
+        paragraphs: ["Repeat offenders may have their accounts and all related files terminated & deleted."],
       },
       {
         heading: "Counter-Notification",

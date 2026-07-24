@@ -6,4 +6,6 @@ coverage/
 *.log
 .env*
 !.env.example
+!.env.docker.dev.example
+!.env.docker.prod.example
 vault/

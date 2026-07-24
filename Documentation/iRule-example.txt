@@ -1,0 +1,72 @@
+# --------------------------------------------------------
+# Routage par chemin (HTTP_REQUEST)
+# --------------------------------------------------------
+when HTTP_REQUEST {
+    # Initialize variable unconditionally to prevent errors in HTTP_RESPONSE
+    set request_path [HTTP::path]
+
+    # Only execute routing logic if the host matches
+    if { [HTTP::host] equals "leeks.domain.local" } {
+
+        # ----------------------------------------------------
+        # SOCIAL PREVIEW BYPASS (Messenger/Facebook/Discord/etc.)
+        # ----------------------------------------------------
+        # Some link unfurlers are classified as bots and get blocked by generic anti-scraper rules.
+        # Allow GET/HEAD on preview-safe public paths before generic security blocks.
+        set req_path [string tolower [HTTP::path]]
+        set is_public_preview_path 0
+        if { ($req_path starts_with "/s/") || ($req_path starts_with "/api/public/share/") || ($req_path starts_with "/assets/") || ($req_path eq "/robots.txt") } {
+            set is_public_preview_path 1
+        }
+
+        if { ( [HTTP::method] eq "GET" || [HTTP::method] eq "HEAD" ) && $is_public_preview_path } {
+
+            HTTP::header replace "X-Forwarded-Proto" "https"
+            HTTP::header replace "X-Forwarded-Host"  "leeks.domain.local"
+
+            pool pool_leeks
+            return
+        }
+
+        # ----------------------------------------------------
+        # SECURITY BLOCK: [REQUEST METHOD]
+        # ----------------------------------------------------
+        switch -glob [string tolower [HTTP::method]] {
+            "debug" - "move" - "trace" - "track" {
+                HTTP::respond 403 content "Access Denied" "Content-Type" "text/plain"
+                return
+            }
+        }
+
+        # ----------------------------------------------------
+        # SECURITY BLOCK: [HTTP COOKIE]
+        # ----------------------------------------------------
+        if { [HTTP::header exists "Cookie"] } {
+            set low_cookie [string tolower [HTTP::header "Cookie"]]
+            switch -glob -- $low_cookie {
+                "*<*" - "*>*" - "*'*" - "*%0a*" - "*%0d*" - "*%27*" - "*%3c*" - "*%3e*" - "*%00*" {
+                    HTTP::respond 403 content "Access Denied" "Content-Type" "text/plain"
+                    return
+                }
+            }
+        }
+
+        # ----------------------------------------------------
+        # CORE ROUTING ENGINE
+        # ----------------------------------------------------
+        switch [HTTP::method] {
+            "GET" - "POST" - "HEAD" - "PUT" - "CONNECT" {
+                set uri  [HTTP::uri]
+                set path [HTTP::path]
+
+                HTTP::header replace "X-Forwarded-Proto" "https"
+                HTTP::header replace "X-Forwarded-Host"  "leeks.domain.local"
+
+                pool pool_leeks
+            }
+            default {
+                HTTP::respond 405 content "Method Not Allowed"
+            }
+        }
+    }
+}

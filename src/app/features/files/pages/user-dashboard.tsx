@@ -5,6 +5,7 @@ import {
   CalendarDays,
   Copy,
   Folder,
+  FolderPlus,
   LayoutGrid,
   Link2,
   Lock,
@@ -29,6 +30,7 @@ import {
 } from "@/app/shared/components/ui/popover";
 import { MaintenanceModeBanner } from "@/app/shared/components/maintenance-mode-banner";
 import type {
+  FileFolder,
   FileMetadata,
   Quota,
   ShareLink,
@@ -50,7 +52,6 @@ import FileTypeIcon, {
   getFileTypeBadge,
 } from "@/app/shared/components/common/file-type-icon";
 import { downloadWithProgress } from "@/app/shared/utils/download-with-progress";
-import { encryptFileForUploadWithSecret } from "@/app/shared/utils/client-file-secret";
 
 interface UserDashboardProps {
   user: User;
@@ -242,6 +243,8 @@ export default function UserDashboard({
     getSavedDashboardView(user),
   );
   const [files, setFiles] = useState<FileMetadata[]>([]);
+  const [folders, setFolders] = useState<FileFolder[]>([]);
+  const [activeFolderId, setActiveFolderId] = useState<string | null>(null);
   const [links, setLinks] = useState<ShareLink[]>([]);
   const [adminUsers, setAdminUsers] = useState<User[]>([]);
   const [adminFiles, setAdminFiles] = useState<FileMetadata[]>([]);
@@ -251,6 +254,7 @@ export default function UserDashboard({
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [uploadSecretKey, setUploadSecretKey] = useState("");
+  const [uploadTargetFolderId, setUploadTargetFolderId] = useState<string | null>(null);
   const [transfer, setTransfer] = useState<TransferState | null>(null);
   const [dragging, setDragging] = useState(false);
   const [shareFile, setShareFile] = useState<FileMetadata | null>(null);
@@ -289,19 +293,85 @@ export default function UserDashboard({
   const storageLimit = activeQuota?.storage_limit_bytes || 1;
   const maxFiles = activeQuota?.max_files || 0;
   const filesLeft = Math.max(maxFiles - files.length, 0);
+  const folderById = useMemo(
+    () => new Map(folders.map((folder) => [folder.id, folder] as const)),
+    [folders],
+  );
+  const activeFolder = activeFolderId ? folderById.get(activeFolderId) || null : null;
+
+  const folderPath = useMemo(() => {
+    if (!activeFolderId) return [] as FileFolder[];
+    const chain: FileFolder[] = [];
+    const seen = new Set<string>();
+    let currentId: string | null = activeFolderId;
+    while (currentId) {
+      if (seen.has(currentId)) break;
+      seen.add(currentId);
+      const current = folderById.get(currentId);
+      if (!current) break;
+      chain.push(current);
+      currentId = current.parent_folder_id || null;
+    }
+    return chain.reverse();
+  }, [activeFolderId, folderById]);
+
+  const activeFolderDepth = folderPath.length;
+
+  const uploadFolderOptions = useMemo(() => {
+    const toPathLabel = (folder: FileFolder) => {
+      const names = [folder.name];
+      const seen = new Set<string>([folder.id]);
+      let parentId = folder.parent_folder_id || null;
+      while (parentId) {
+        if (seen.has(parentId)) break;
+        seen.add(parentId);
+        const parent = folderById.get(parentId);
+        if (!parent) break;
+        names.unshift(parent.name);
+        parentId = parent.parent_folder_id || null;
+      }
+      return names.join(" / ");
+    };
+
+    return folders
+      .map((folder) => ({ id: folder.id, label: toPathLabel(folder) }))
+      .sort((a, b) => a.label.localeCompare(b.label));
+  }, [folderById, folders]);
 
   const notify = (message: string) => toast(message);
   const notifyError = (message: string) => toast.error(message);
 
   const openUploadFilePicker = () => {
     if (uploading) return;
+    if (dropzoneFileInputRef.current) {
+      // Reset before opening so re-selecting the same file still triggers change,
+      // without invalidating the selected File reference in Firefox.
+      dropzoneFileInputRef.current.value = "";
+    }
     dropzoneFileInputRef.current?.click();
   };
 
+  const uploadFiles = async (selectedFiles: globalThis.File[]) => {
+    const filesToUpload = selectedFiles.filter((file): file is globalThis.File => !!file);
+    if (!filesToUpload.length) return;
+
+    if (uploading || uploadRequestRef.current || resumableUploadRef.current) {
+      notifyError("An upload is already running.");
+      return;
+    }
+
+    for (const file of filesToUpload) {
+      if (uploadStoppedRef.current) break;
+      await uploadFile(file);
+      if (uploadStoppedRef.current) break;
+    }
+  };
+
   const loadFilesAndLinks = async () => {
-    const [filesResponse, linksResponse] = await Promise.all([
+    const [filesResponse, linksResponse, foldersResponse] = await Promise.all([
       fetch("/api/files", { headers: authHeaders(token) }),
       fetch("/api/sharing/links", { headers: authHeaders(token) }),
+      fetch("/api/file-folders", { headers: authHeaders(token) }),
     ]);
     if (filesResponse.ok) {
       setFiles((await filesResponse.json()).files || []);
@@ -322,6 +392,26 @@ export default function UserDashboard({
       let message = "Could not load sharing links.";
       try {
         const payload = await linksResponse.json();
+        message = payload?.error || message;
+      } catch {
+        // Keep generic message when response is not JSON.
+      }
+      notifyError(message);
+    }
+
+    if (foldersResponse.ok) {
+      const nextFolders = ((await foldersResponse.json()).folders || []) as FileFolder[];
+      setFolders(nextFolders);
+      setActiveFolderId((current) =>
+        current && !nextFolders.some((folder) => folder.id === current) ? null : current,
+      );
+      setUploadTargetFolderId((current) =>
+        current && !nextFolders.some((folder) => folder.id === current) ? null : current,
+      );
+    } else {
+      let message = "Could not load folders.";
+      try {
+        const payload = await foldersResponse.json();
         message = payload?.error || message;
       } catch {
         // Keep generic message when response is not JSON.
@@ -384,12 +474,27 @@ export default function UserDashboard({
   };
 
   const normalizedSearch = search.trim().toLowerCase();
+  const currentFolderFiles = useMemo(
+    () => files.filter((file) => (activeFolderId ? file.folder_id === activeFolderId : !file.folder_id)),
+    [activeFolderId, files],
+  );
+
   const visibleFiles = useMemo(() => {
-    if (!normalizedSearch) return files;
-    return files.filter((file) =>
+    if (!normalizedSearch) return currentFolderFiles;
+    return currentFolderFiles.filter((file) =>
       file.original_name.toLowerCase().includes(normalizedSearch),
     );
-  }, [files, normalizedSearch]);
+  }, [currentFolderFiles, normalizedSearch]);
+
+  const visibleFolders = useMemo(() => {
+    const children = folders.filter(
+      (folder) => (folder.parent_folder_id || null) === activeFolderId,
+    );
+    if (!normalizedSearch) return children;
+    return children.filter((folder) =>
+      folder.name.toLowerCase().includes(normalizedSearch),
+    );
+  }, [activeFolderId, folders, normalizedSearch]);
 
   useEffect(() => {
     if (!uploading) return undefined;
@@ -427,15 +532,16 @@ export default function UserDashboard({
     return (hash >>> 0).toString(36) + "-" + Date.now().toString(36);
   };
 
-  const uploadFile = async (file: globalThis.File) => {
+  const uploadFile = async (file: globalThis.File): Promise<boolean> => {
     console.log("[uploadFile] called with", file.name, file.size, "RESUMABLE_CHUNK_SIZE:", RESUMABLE_CHUNK_SIZE);
     console.log("[uploadFile] FILE_IS_LARGE?", file.size > RESUMABLE_CHUNK_SIZE);
     if (uploadRequestRef.current || resumableUploadRef.current) {
       notifyError("An upload is already running.");
-      return;
+      return false;
     }
 
     const startedAt = Date.now();
+    const selectedFileSize = file.size;
     uploadStoppedRef.current = false;
     setUploading(true);
     setUploadProgress(0);
@@ -443,46 +549,53 @@ export default function UserDashboard({
       direction: "upload",
       name: file.name,
       loaded: 0,
-      total: file.size,
+      total: selectedFileSize,
       startedAt,
     });
 
-    // ── Encrypt with secret key if provided ──────────────────
+    // ── Secret key handling ───────────────────────────────────
     const secretMeta: Record<string, string> = {};
     let uploadTargetFile: globalThis.File = file;
     try {
       if (uploadSecretKey.trim()) {
-        const encrypted = await encryptFileForUploadWithSecret(file, uploadSecretKey);
-        uploadTargetFile = encrypted.encryptedFile;
-        secretMeta.upload_secret_key = uploadSecretKey.trim();
-        secretMeta.upload_secret_salt_b64 = encrypted.saltBase64;
-        secretMeta.upload_secret_iv_b64 = encrypted.ivBase64;
-        secretMeta.upload_secret_iterations = String(encrypted.iterations);
+        const trimmedSecret = uploadSecretKey.trim();
+        if (trimmedSecret.length < 8) {
+          throw new Error("Secret key must contain at least 8 characters.");
+        }
+
+        secretMeta.upload_secret_key = trimmedSecret;
       }
     } catch (reason) {
       setUploading(false);
       setTransfer(null);
       notifyError(reason instanceof Error ? reason.message : "Could not encrypt the file with your secret key.");
-      return;
+      return false;
     }
 
-    const FILE_IS_LARGE = uploadTargetFile.size > RESUMABLE_CHUNK_SIZE;
+    const FILE_IS_LARGE = selectedFileSize > RESUMABLE_CHUNK_SIZE;
+    const uploadFolderId =
+      view === "files" ? activeFolderId : uploadTargetFolderId;
 
     // ═════════════════════════════════════════════════════════
     // LARGE FILES → Resumable.js chunked upload (50 MB each)
     // ═════════════════════════════════════════════════════════
     if (FILE_IS_LARGE) {
       const identifier = generateResumableIdentifier(file);
-      const totalChunks = Math.max(1, Math.ceil(uploadTargetFile.size / RESUMABLE_CHUNK_SIZE));
-      const totalSize = uploadTargetFile.size;
+      const totalChunks = Math.max(1, Math.ceil(selectedFileSize / RESUMABLE_CHUNK_SIZE));
+      const totalSize = selectedFileSize;
 
       // Build a query string for secret metadata (appended to every chunk request)
       const secretParams = new URLSearchParams();
       if (secretMeta.upload_secret_key) {
         secretParams.set("upload_secret_key", secretMeta.upload_secret_key);
+      }
+      if (secretMeta.upload_secret_salt_b64 && secretMeta.upload_secret_iv_b64 && secretMeta.upload_secret_iterations) {
         secretParams.set("upload_secret_salt_b64", secretMeta.upload_secret_salt_b64);
         secretParams.set("upload_secret_iv_b64", secretMeta.upload_secret_iv_b64);
         secretParams.set("upload_secret_iterations", secretMeta.upload_secret_iterations);
+      }
+      if (uploadFolderId) {
+        secretParams.set("folder_id", uploadFolderId);
       }
 
       resumableUploadRef.current = {
@@ -505,8 +618,12 @@ export default function UserDashboard({
           }
 
           const start = (chunkNumber - 1) * RESUMABLE_CHUNK_SIZE;
-          const end = Math.min(chunkNumber * RESUMABLE_CHUNK_SIZE, uploadTargetFile.size);
+          const end = Math.min(chunkNumber * RESUMABLE_CHUNK_SIZE, selectedFileSize);
           const chunkBlob = uploadTargetFile.slice(start, end);
+          const expectedChunkBytes = end - start;
+          if (chunkBlob.size !== expectedChunkBytes) {
+            throw new Error("Upload source changed while reading file. Please re-select the file and retry.");
+          }
 
           // ── Check if chunk already exists (GET) ──────────
           const checkUrl =
@@ -522,7 +639,7 @@ export default function UserDashboard({
             // Chunk already exists — skip
             totalBytesUploaded += chunkBlob.size;
             resumableUploadRef.current.currentChunk = chunkNumber + 1;
-            updateProgress(file, totalBytesUploaded, uploadTargetFile.size, startedAt, chunkNumber, totalChunks);
+            updateProgress(file, totalBytesUploaded, selectedFileSize, startedAt, chunkNumber, totalChunks);
             continue;
           }
 
@@ -569,8 +686,8 @@ export default function UserDashboard({
                       setTransfer({
                         direction: "upload",
                         name: file.name,
-                        loaded: uploadTargetFile.size,
-                        total: uploadTargetFile.size,
+                        loaded: selectedFileSize,
+                        total: selectedFileSize,
                         startedAt,
                         processing: true,
                         processingStartedAt: Date.now(),
@@ -588,13 +705,13 @@ export default function UserDashboard({
               xhr.upload.onprogress = (event) => {
                 if (event.lengthComputable) {
                   const chunkLoaded = totalBytesUploaded + event.loaded;
-                  const pct = Math.round((chunkLoaded / uploadTargetFile.size) * 100);
+                  const pct = Math.round((chunkLoaded / selectedFileSize) * 100);
                   setUploadProgress(pct);
                   setTransfer({
                     direction: "upload",
                     name: file.name,
                     loaded: chunkLoaded,
-                    total: uploadTargetFile.size,
+                    total: selectedFileSize,
                     startedAt,
                     phaseLabel: `Uploading chunk ${chunkNumber}/${totalChunks} (${Math.round(event.loaded / 1024 / 1024)} MB)`,
                   });
@@ -657,8 +774,8 @@ export default function UserDashboard({
         setTransfer({
           direction: "upload",
           name: file.name,
-          loaded: uploadTargetFile.size,
-          total: uploadTargetFile.size,
+          loaded: selectedFileSize,
+          total: selectedFileSize,
           startedAt,
           complete: true,
         });
@@ -669,6 +786,7 @@ export default function UserDashboard({
         notify("Upload complete.");
         await loadFilesAndLinks();
         onTriggerRefreshUser();
+        return true;
       } catch (err) {
         setUploading(false);
         setUploadProgress(0);
@@ -677,11 +795,11 @@ export default function UserDashboard({
         if (msg !== "Upload aborted.") {
           notifyError(msg);
         }
+        return false;
       } finally {
         resumableUploadRef.current = null;
         uploadRequestRef.current = null;
       }
-      return;
     }
 
     // ═════════════════════════════════════════════════════════
@@ -692,6 +810,8 @@ export default function UserDashboard({
     // Append secret metadata if present
     if (secretMeta.upload_secret_key) {
       formData.append("upload_secret_key", secretMeta.upload_secret_key);
+    }
+    if (secretMeta.upload_secret_salt_b64 && secretMeta.upload_secret_iv_b64 && secretMeta.upload_secret_iterations) {
       formData.append("upload_secret_salt_b64", secretMeta.upload_secret_salt_b64);
       formData.append("upload_secret_iv_b64", secretMeta.upload_secret_iv_b64);
       formData.append("upload_secret_iterations", secretMeta.upload_secret_iterations);
@@ -700,101 +820,42 @@ export default function UserDashboard({
     formData.append("file", uploadTargetFile);
     formData.append("original_name", file.name);
     formData.append("mime_type", file.type || "application/octet-stream");
-    const xhr = new XMLHttpRequest();
-    uploadRequestRef.current = xhr;
-    let responseCursor = 0;
-    let responseBuffer = "";
-    let processingStartedAt = 0;
-    let uploadStreamError = "";
-    let uploadStreamComplete = false;
+    if (uploadFolderId) formData.append("folder_id", uploadFolderId);
+    return await new Promise<boolean>((resolve) => {
+      const xhr = new XMLHttpRequest();
+      uploadRequestRef.current = xhr;
+      let responseCursor = 0;
+      let responseBuffer = "";
+      let processingStartedAt = 0;
+      let uploadStreamError = "";
+      let uploadStreamComplete = false;
+      let settled = false;
 
-    const handleStreamEvent = (event: UploadStreamEvent) => {
-      if (event.type === "processing") {
-        processingStartedAt ||= Date.now();
-        setTransfer({
-          direction: "upload",
-          name: file.name,
-          loaded: file.size,
-          total: file.size,
-          startedAt,
-          processing: true,
-          processingStartedAt,
-          processingLoaded: event.loaded ?? 0,
-          processingTotal: event.total ?? 0,
-          phaseLabel: event.phase || "Securing file",
-        });
-        return;
-      }
-      if (event.type === "complete") {
-        uploadStreamComplete = true;
-        setTransfer({
-          direction: "upload",
-          name: file.name,
-          loaded: file.size,
-          total: file.size,
-          startedAt,
-          complete: true,
-        });
-        return;
-      }
-      if (event.type === "error") {
-        uploadStreamError = event.error || "Upload failed.";
-      }
-    };
+      const finish = (result: boolean) => {
+        if (settled) return;
+        settled = true;
+        resolve(result);
+      };
 
-    const readUploadStream = () => {
-      const chunk = xhr.responseText.slice(responseCursor);
-      responseCursor = xhr.responseText.length;
-      if (!chunk) return;
-      responseBuffer += chunk;
-      const lines = responseBuffer.split("\n");
-      responseBuffer = lines.pop() || "";
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        try {
-          handleStreamEvent(JSON.parse(line) as UploadStreamEvent);
-        } catch {
-          // Non-streaming JSON responses are handled when the request finishes.
-        }
-      }
-    };
-
-    xhr.upload.onprogress = (event) => {
-      if (event.lengthComputable)
-        setUploadProgress(Math.round((event.loaded / event.total) * 100));
-      setTransfer({
-        direction: "upload",
-        name: file.name,
-        loaded: event.loaded,
-        total: event.lengthComputable ? event.total : file.size,
-        startedAt,
-      });
-    };
-    xhr.upload.onload = () =>
-      setTransfer({
-        direction: "upload",
-        name: file.name,
-        loaded: file.size,
-        total: file.size,
-        startedAt,
-        processing: true,
-        processingStartedAt: Date.now(),
-        processingLoaded: 0,
-        processingTotal: 1000,
-        phaseLabel: "Preparing scan",
-      });
-    xhr.onprogress = readUploadStream;
-    xhr.onload = async () => {
-      readUploadStream();
-      setUploading(false);
-      uploadRequestRef.current = null;
-      if (xhr.status >= 200 && xhr.status < 300) {
-        if (uploadStreamError) {
-          setTransfer(null);
-          notifyError(uploadStreamError);
+      const handleStreamEvent = (event: UploadStreamEvent) => {
+        if (event.type === "processing") {
+          processingStartedAt ||= Date.now();
+          setTransfer({
+            direction: "upload",
+            name: file.name,
+            loaded: file.size,
+            total: file.size,
+            startedAt,
+            processing: true,
+            processingStartedAt,
+            processingLoaded: event.loaded ?? 0,
+            processingTotal: event.total ?? 1000,
+            phaseLabel: event.phase || "Securing file",
+          });
           return;
         }
-        if (!uploadStreamComplete) {
+        if (event.type === "complete") {
+          uploadStreamComplete = true;
           setTransfer({
             direction: "upload",
             name: file.name,
@@ -803,47 +864,128 @@ export default function UserDashboard({
             startedAt,
             complete: true,
           });
+          return;
         }
-        window.setTimeout(
-          () =>
-            setTransfer((current) =>
-              current?.startedAt === startedAt ? null : current,
-            ),
-          1800,
-        );
-        notify("Upload complete.");
-        await loadFilesAndLinks();
-        onTriggerRefreshUser();
-      } else {
+        if (event.type === "error") {
+          uploadStreamError = event.error || "Upload failed.";
+        }
+      };
+
+      const readUploadStream = () => {
+        const chunk = xhr.responseText.slice(responseCursor);
+        responseCursor = xhr.responseText.length;
+        if (!chunk) return;
+        responseBuffer += chunk;
+        const lines = responseBuffer.split("\n");
+        responseBuffer = lines.pop() || "";
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            handleStreamEvent(JSON.parse(line) as UploadStreamEvent);
+          } catch {
+            // Non-streaming JSON responses are handled when the request finishes.
+          }
+        }
+      };
+
+      xhr.upload.onprogress = (event) => {
+        if (event.lengthComputable) {
+          setUploadProgress(Math.round((event.loaded / event.total) * 100));
+        }
+        setTransfer({
+          direction: "upload",
+          name: file.name,
+          loaded: event.loaded,
+          total: event.lengthComputable ? event.total : file.size,
+          startedAt,
+        });
+      };
+      xhr.upload.onload = () =>
+        setTransfer({
+          direction: "upload",
+          name: file.name,
+          loaded: file.size,
+          total: file.size,
+          startedAt,
+          processing: true,
+          processingStartedAt: Date.now(),
+          processingLoaded: 0,
+          processingTotal: 1000,
+          phaseLabel: "Preparing scan",
+        });
+      xhr.onprogress = readUploadStream;
+      xhr.onload = () => {
+        void (async () => {
+          readUploadStream();
+          setUploading(false);
+          uploadRequestRef.current = null;
+          if (xhr.status >= 200 && xhr.status < 300) {
+            if (uploadStreamError) {
+              setTransfer(null);
+              notifyError(uploadStreamError);
+              finish(false);
+              return;
+            }
+            if (!uploadStreamComplete) {
+              setTransfer({
+                direction: "upload",
+                name: file.name,
+                loaded: file.size,
+                total: file.size,
+                startedAt,
+                complete: true,
+              });
+            }
+            window.setTimeout(
+              () =>
+                setTransfer((current) =>
+                  current?.startedAt === startedAt ? null : current,
+                ),
+              1800,
+            );
+            notify("Upload complete.");
+            try {
+              await loadFilesAndLinks();
+              onTriggerRefreshUser();
+            } catch {
+              // Keep the queue moving even if the refresh fails.
+            }
+            finish(true);
+          } else {
+            setTransfer(null);
+            let data: { error?: string } = {};
+            try {
+              data = JSON.parse(xhr.responseText || "{}");
+            } catch {
+              data = {};
+            }
+            notifyError(data.error || "Upload failed.");
+            finish(false);
+          }
+        })();
+      };
+      xhr.onabort = () => {
+        setUploading(false);
+        setUploadProgress(0);
         setTransfer(null);
-        let data: { error?: string } = {};
-        try {
-          data = JSON.parse(xhr.responseText || "{}");
-        } catch {
-          data = {};
-        }
-        notifyError(data.error || "Upload failed.");
-      }
-    };
-    xhr.onabort = () => {
-      setUploading(false);
-      setUploadProgress(0);
-      setTransfer(null);
-      uploadRequestRef.current = null;
-      if (uploadStoppedRef.current) notify("Upload stopped.");
-      else notifyError("Upload interrupted.");
-    };
-    xhr.onerror = () => {
-      setUploading(false);
-      setUploadProgress(0);
-      setTransfer(null);
-      uploadRequestRef.current = null;
-      notifyError("Upload interrupted.");
-    };
-    xhr.open("POST", "/api/files/upload");
-    xhr.setRequestHeader("Accept", "application/x-ndjson");
-    xhr.setRequestHeader("X-CSRF-Token", getCsrfToken());
-    xhr.send(formData);
+        uploadRequestRef.current = null;
+        if (uploadStoppedRef.current) notify("Upload stopped.");
+        else notifyError("Upload interrupted.");
+        finish(false);
+      };
+      xhr.onerror = () => {
+        setUploading(false);
+        setUploadProgress(0);
+        setTransfer(null);
+        uploadRequestRef.current = null;
+        notifyError("Upload interrupted.");
+        finish(false);
+      };
+      xhr.open("POST", "/api/files/upload");
+      xhr.setRequestHeader("Accept", "application/x-ndjson");
+      xhr.setRequestHeader("X-CSRF-Token", getCsrfToken());
+      xhr.send(formData);
+    });
   };
 
   // ── Helper: update progress bar during resumable upload ──────
@@ -988,6 +1130,80 @@ export default function UserDashboard({
       await loadFilesAndLinks();
       onTriggerRefreshUser();
     } else notifyError("Could not delete the file.");
+  };
+
+  const createFolder = async () => {
+    if (activeFolderDepth >= 5) {
+      notifyError("Maximum folder depth is 5.");
+      return;
+    }
+    const name = window.prompt("Folder name")?.trim();
+    if (!name) return;
+    const response = await fetch("/api/file-folders", {
+      method: "POST",
+      headers: { ...authHeaders(token), "Content-Type": "application/json" },
+      body: JSON.stringify({ name, parent_folder_id: activeFolderId }),
+    });
+    const data = await response.json();
+    if (response.ok) {
+      setFolders((current) => [...current, data.folder].sort((a, b) => a.name.localeCompare(b.name)));
+      setActiveFolderId(data.folder.id);
+      notify("Folder created.");
+    } else notifyError(data.error || "Could not create folder.");
+  };
+
+  const renameFolder = async (folder: FileFolder) => {
+    const name = window.prompt("Folder name", folder.name)?.trim();
+    if (!name || name === folder.name) return;
+    const response = await fetch(`/api/file-folders/${folder.id}/rename`, {
+      method: "POST",
+      headers: { ...authHeaders(token), "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    const data = await response.json();
+    if (response.ok) {
+      setFolders((current) => current.map((item) => (item.id === folder.id ? data.folder : item)).sort((a, b) => a.name.localeCompare(b.name)));
+      notify("Folder renamed.");
+    } else notifyError(data.error || "Could not rename folder.");
+  };
+
+  const deleteFolder = async (folder: FileFolder) => {
+    if (!window.confirm(`Delete folder "${folder.name}"?`)) return;
+    const deleteFiles = window.confirm(
+      `Delete all files inside "${folder.name}" too?\n\nOK deletes the files. Cancel deletes only the folder and moves files back to All Files.`,
+    );
+    const response = await fetch(`/api/file-folders/${folder.id}/delete`, {
+      method: "POST",
+      headers: { ...authHeaders(token), "Content-Type": "application/json" },
+      body: JSON.stringify({ delete_files: deleteFiles }),
+    });
+    if (response.ok) {
+      notify(deleteFiles ? "Folder and files deleted." : "Folder deleted. Files moved to All Files.");
+      setActiveFolderId(folder.parent_folder_id || null);
+      await loadFilesAndLinks();
+      onTriggerRefreshUser();
+    } else notifyError((await response.json()).error || "Could not delete folder.");
+  };
+
+  const moveFileToFolder = async (file: FileMetadata, folderId: string | null) => {
+    const response = await fetch(`/api/files/${file.id}/folder`, {
+      method: "POST",
+      headers: { ...authHeaders(token), "Content-Type": "application/json" },
+      body: JSON.stringify({ folder_id: folderId }),
+    });
+    const data = await response.json();
+    if (response.ok) {
+      setFiles((current) => current.map((item) => (item.id === file.id ? data.file : item)));
+      setFolders((current) =>
+        current.map((folder) => ({
+          ...folder,
+          file_count: files
+            .map((item) => (item.id === file.id ? data.file : item))
+            .filter((item) => item.folder_id === folder.id).length,
+        })),
+      );
+      notify(folderId ? "File moved to folder." : "File moved to All Files.");
+    } else notifyError(data.error || "Could not move file.");
   };
 
   const toShareUrl = (publicToken: string, allowExternalPreview: boolean) =>
@@ -1170,7 +1386,7 @@ export default function UserDashboard({
     navItems.push(["admin", <Shield className="h-4 w-4" />, "Admin"]);
 
   return (
-    <div className="min-h-screen bg-[var(--bg-primary)] text-[var(--text-primary)]">
+    <div className="min-h-screen min-w-0 overflow-x-hidden bg-[var(--bg-primary)] text-[var(--text-primary)]">
       <MaintenanceModeBanner />
       <DashboardSidebar
         user={user}
@@ -1181,8 +1397,8 @@ export default function UserDashboard({
         onLogout={onLogout}
       />
 
-      <main className="lg:pl-64">
-        <header className="sticky top-0 z-10 flex min-h-20 flex-wrap items-center gap-3 border-b border-[var(--border-subtle)] bg-[color-mix(in_srgb,var(--bg-panel)_92%,transparent)] px-4 py-3 backdrop-blur-[var(--blur-header)] sm:h-20 sm:flex-nowrap sm:px-5 sm:pr-64 lg:px-8 lg:pr-72">
+      <main className="min-w-0 overflow-x-hidden lg:pl-64">
+        <header className="sticky top-0 z-10 flex min-h-20 min-w-0 flex-wrap items-center gap-3 border-b border-[var(--border-subtle)] bg-[color-mix(in_srgb,var(--bg-panel)_92%,transparent)] px-3 py-3 backdrop-blur-[var(--blur-header)] sm:h-20 sm:flex-nowrap sm:px-5 sm:pr-64 lg:px-8 lg:pr-72">
           <select
             value={view}
             onChange={(event) =>
@@ -1201,18 +1417,21 @@ export default function UserDashboard({
               <label className="flex h-11 w-11 shrink-0 cursor-pointer items-center justify-center gap-2 rounded-lg bg-[var(--accent-linear)] px-0 text-sm font-medium text-[var(--accent-contrast)] transition-colors hover:bg-[var(--accent-linear-bright)] sm:w-auto sm:rounded-full sm:px-5">
                 <input
                   type="file"
+                  multiple
                   className="hidden"
                   disabled={uploading}
-                  onChange={(event) =>
-                    event.target.files?.[0] && uploadFile(event.target.files[0])
-                  }
+                  onChange={(event) => {
+                    const selectedFiles = Array.from(event.target.files || []);
+                    event.target.value = "";
+                    void uploadFiles(selectedFiles);
+                  }}
                 />
                 <Upload className="h-4 w-4" />
-                <span className="hidden sm:inline">Upload file</span>
+                <span className="hidden sm:inline">Upload files</span>
               </label>
             </>
           )}
-          <div className="relative order-3 w-full sm:order-none sm:max-w-xl">
+          <div className="relative order-3 min-w-0 w-full sm:order-none sm:max-w-xl">
           {view === "files" && (
             <>
               <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-[var(--text-faint)]" />
@@ -1248,7 +1467,7 @@ export default function UserDashboard({
           </div>
         </header>
 
-        <div className="mx-auto max-w-7xl p-5 lg:p-8">
+        <div className="mx-auto w-full min-w-0 max-w-7xl overflow-x-hidden px-3 py-5 sm:p-5 lg:p-8">
           {transfer && (
             <div className="mx-auto mb-6 max-w-5xl">
               <TransferProgress
@@ -1283,21 +1502,20 @@ export default function UserDashboard({
                 onDrop={(event) => {
                   event.preventDefault();
                   setDragging(false);
-                  event.dataTransfer.files[0] &&
-                    uploadFile(event.dataTransfer.files[0]);
+                  void uploadFiles(Array.from(event.dataTransfer.files || []));
                 }}
                 className={`rounded-2xl border border-dashed p-8 text-center ${dragging ? "border-[var(--accent-linear)] bg-[color-mix(in_srgb,var(--accent-linear)_14%,transparent)]" : "border-[var(--border-subtle)] bg-[var(--bg-panel)]"}`}
               >
                 <input
                   ref={dropzoneFileInputRef}
                   type="file"
+                  multiple
                   className="hidden"
                   disabled={uploading}
                   onChange={(event) => {
-                    if (event.target.files?.[0]) {
-                      uploadFile(event.target.files[0]);
-                    }
-                    event.currentTarget.value = "";
+                    const selectedFiles = Array.from(event.target.files || []);
+                    event.target.value = "";
+                    void uploadFiles(selectedFiles);
                   }}
                 />
                 <div className="mx-auto grid h-11 w-11 place-items-center rounded-xl bg-[var(--bg-hover)]">
@@ -1306,12 +1524,12 @@ export default function UserDashboard({
                 <p className="mt-4 text-sm font-medium">
                   {uploading
                     ? `Uploading · ${uploadProgress}%`
-                    : "Drop a file here to upload it securely"}
+                    : "Drop files here to upload them securely"}
                 </p>
                 <p className="mt-1 text-xs text-[var(--text-muted)]">
                   {uploading
                     ? "We will let you know when it is ready."
-                    : `One file at a time.`}
+                    : `Files will upload one at a time.`}
                 </p>
                 {!uploading && (
                   <p className="mt-2 text-sm text-[var(--text-muted)]">
@@ -1345,6 +1563,24 @@ export default function UserDashboard({
                     placeholder="Ex.: Leeku-secret-1"
                     className="h-10 w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-muted)] px-3 text-sm outline-none focus:border-[var(--accent-linear)]"
                   />
+                  <label className="mb-1 mt-3 block text-xs font-medium text-[var(--text-muted)]">
+                    Upload folder
+                  </label>
+                  <select
+                    value={uploadTargetFolderId || ""}
+                    onChange={(event) =>
+                      setUploadTargetFolderId(event.target.value || null)
+                    }
+                    disabled={uploading}
+                    className="h-10 w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-muted)] px-3 text-sm text-[var(--text-secondary)] outline-none focus:border-[var(--accent-linear)] disabled:cursor-not-allowed disabled:opacity-70"
+                  >
+                    <option value="">/</option>
+                    {uploadFolderOptions.map((folder) => (
+                      <option key={folder.id} value={folder.id}>
+                        /{folder.label}
+                      </option>
+                    ))}
+                  </select>
                   <div className="mt-3 rounded-lg border border-[var(--accent-linear)]/30 bg-[color-mix(in_srgb,var(--accent-linear)_10%,transparent)] px-3 py-2 text-xs font-medium text-[var(--text-secondary)] shadow-sm">
                     {filesLeft} file{filesLeft === 1 ? "" : "s"} left in your quota. <br/> Maximum file size: {formatBytes(activeQuota?.max_file_size_bytes || 0)}.
                   </div>
@@ -1383,13 +1619,13 @@ export default function UserDashboard({
           )}
 
           {view === "files" && (
-            <section className="mx-auto max-w-5xl">
+            <section className="mx-auto w-full min-w-0 max-w-5xl overflow-x-hidden">
               <div className="mb-6 text-center">
                 <h1 className="text-2xl font-semibold tracking-[-0.03em]">
-                  All files
+                  {activeFolder ? activeFolder.name : "All files"}
                 </h1>
                 <p className="mt-1 text-sm text-[var(--text-muted)]">
-                  {files.length} files in your account.
+                  {currentFolderFiles.length} file{currentFolderFiles.length === 1 ? "" : "s"} {activeFolder ? "in this folder" : "in All Files root"}.
                   {normalizedSearch && (
                     <>
                       {" "}
@@ -1397,7 +1633,93 @@ export default function UserDashboard({
                     </>
                   )}
                 </p>
+                <div className="mt-4 flex flex-wrap items-center justify-center gap-2">
+                  {activeFolder && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setActiveFolderId(activeFolder.parent_folder_id || null)
+                      }
+                      className="rounded-lg border border-[var(--border-subtle)] px-3 py-2 text-xs font-medium text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]"
+                    >
+                      Back
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={createFolder}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--border-subtle)] px-3 py-2 text-xs font-medium text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]"
+                  >
+                    <FolderPlus className="h-3.5 w-3.5" />
+                    {activeFolder ? "New sub-folder" : "New folder"}
+                  </button>
+                  {activeFolder && (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => renameFolder(activeFolder)}
+                        className="rounded-lg border border-[var(--border-subtle)] px-3 py-2 text-xs font-medium text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]"
+                      >
+                        Rename folder
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => deleteFolder(activeFolder)}
+                        className="rounded-lg border border-[color-mix(in_srgb,var(--error-linear)_42%,transparent)] px-3 py-2 text-xs font-medium text-[var(--error-linear)] hover:bg-[color-mix(in_srgb,var(--error-linear)_12%,transparent)]"
+                      >
+                        Delete folder
+                      </button>
+                    </>
+                  )}
+                </div>
+                {folderPath.length > 0 && (
+                  <div className="mt-3 flex flex-wrap items-center justify-center gap-1 text-xs text-[var(--text-muted)]">
+                    <button
+                      type="button"
+                      onClick={() => setActiveFolderId(null)}
+                      className="hover:text-[var(--text-primary)]"
+                    >
+                      All Files
+                    </button>
+                    {folderPath.map((folder) => (
+                      <React.Fragment key={folder.id}>
+                        <span>/</span>
+                        <button
+                          type="button"
+                          onClick={() => setActiveFolderId(folder.id)}
+                          className="max-w-[10rem] truncate hover:text-[var(--text-primary)]"
+                        >
+                          {folder.name}
+                        </button>
+                      </React.Fragment>
+                    ))}
+                  </div>
+                )}
               </div>
+
+              {visibleFolders.length > 0 && (
+                <div className="mb-6 grid w-full min-w-0 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                  {visibleFolders.map((folder) => (
+                    <button
+                      key={folder.id}
+                      type="button"
+                      onClick={() => setActiveFolderId(folder.id)}
+                      className="flex w-full min-w-0 items-center gap-3 rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] p-4 text-left shadow-[var(--shadow-hairline)] hover:bg-[var(--bg-hover)]"
+                    >
+                      <span className="grid h-10 w-10 shrink-0 place-items-center rounded-lg bg-[var(--bg-hover)] text-[var(--text-muted)]">
+                        <Folder className="h-5 w-5" />
+                      </span>
+                      <span className="min-w-0">
+                        <span className="block truncate text-sm font-medium">{folder.name}</span>
+                        <span className="text-xs text-[var(--text-muted)]">
+                          {folder.file_count} file{folder.file_count === 1 ? "" : "s"}
+                        </span>
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              )}
+
               {visibleFiles.length === 0 ? (
                 <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] p-8 text-center shadow-[var(--shadow-hairline)]">
                   <p className="text-sm font-medium">No matching files</p>
@@ -1406,36 +1728,37 @@ export default function UserDashboard({
                   </p>
                 </div>
               ) : (
-                <div className="grid gap-3 sm:hidden">
+                <div className="grid w-full min-w-0 gap-3 sm:hidden">
                   {visibleFiles.map((file) => (
                     <div
                       key={file.id}
-                      className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] p-4 shadow-[var(--shadow-hairline)]"
+                      className="w-full min-w-0 overflow-hidden rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] p-3 shadow-[var(--shadow-hairline)]"
                     >
                       <div className="flex min-w-0 items-start gap-3">
                         <FileThumbnail
                           file={file}
                           token={token}
-                          className="h-12 w-12 rounded-lg"
+                          className="h-11 w-11 rounded-lg"
                           iconClassName="h-5 w-5"
                         />
                         <div className="min-w-0 flex-1">
-                          <p className="flex items-center gap-1 truncate text-sm font-medium">
+                          <p className="flex min-w-0 items-start gap-1 text-sm font-medium leading-5">
                             <span className="truncate">{file.original_name}</span>
                             {file.has_user_secret && (
-                              <Lock className="h-3.5 w-3.5 shrink-0 text-[var(--text-faint)]" aria-label="Secret key required" />
+                              <Lock className="mt-0.5 h-3.5 w-3.5 shrink-0 text-[var(--text-faint)]" aria-label="Secret key required" />
                             )}
                           </p>
-                          <p className="mt-1 text-xs text-[var(--text-muted)]">
-                            {fileKind(file)} · {formatBytes(file.size)}
-                          </p>
-                          <p className="mt-0.5 text-xs text-[var(--text-faint)]">
-                            {file.status} ·{" "}
-                            {new Date(file.created_at).toLocaleDateString()}
-                          </p>
+                          <div className="mt-1 flex flex-wrap gap-x-2 gap-y-1 text-xs leading-4 text-[var(--text-muted)]">
+                            <span className="max-w-full truncate">{fileKind(file)}</span>
+                            <span className="shrink-0">{formatBytes(file.size)}</span>
+                          </div>
+                          <div className="mt-1 flex flex-wrap gap-x-2 gap-y-1 text-xs leading-4 text-[var(--text-faint)]">
+                            <span className="capitalize">{file.status}</span>
+                            <span>{new Date(file.created_at).toLocaleDateString()}</span>
+                          </div>
                         </div>
                       </div>
-                      <div className="mt-4 grid grid-cols-3 gap-2">
+                      <div className="mt-4 grid w-full min-w-0 gap-2 min-[380px]:grid-cols-2">
                         <FileActionButton
                           label="Download"
                           onClick={() => downloadFile(file)}
@@ -1456,6 +1779,11 @@ export default function UserDashboard({
                           <Trash2 className="h-3.5 w-3.5" />
                         </FileActionButton>
                       </div>
+                      <MoveFileSelect
+                        file={file}
+                        folders={folders}
+                        onMove={moveFileToFolder}
+                      />
                     </div>
                   ))}
                 </div>
@@ -1474,6 +1802,9 @@ export default function UserDashboard({
                       </th>
                       <th className="hidden px-4 py-3 font-medium lg:table-cell">
                         Added
+                      </th>
+                      <th className="hidden px-4 py-3 font-medium md:table-cell">
+                        Folder
                       </th>
                       <th className="px-4 py-3" />
                     </tr>
@@ -1510,6 +1841,13 @@ export default function UserDashboard({
                         </td>
                         <td className="hidden px-4 py-3 text-[var(--text-muted)] lg:table-cell">
                           {new Date(file.created_at).toLocaleDateString()}
+                        </td>
+                        <td className="hidden px-4 py-3 md:table-cell">
+                          <MoveFileSelect
+                            file={file}
+                            folders={folders}
+                            onMove={moveFileToFolder}
+                          />
                         </td>
                         <td className="px-4 py-3">
                           <div className="flex justify-end gap-1">
@@ -1846,6 +2184,60 @@ function FileActionButton({
       {children}
       <span className="truncate">{label}</span>
     </button>
+  );
+}
+
+function MoveFileSelect({
+  file,
+  folders,
+  onMove,
+}: {
+  file: FileMetadata;
+  folders: FileFolder[];
+  onMove: (file: FileMetadata, folderId: string | null) => void;
+}) {
+  const folderById = useMemo(
+    () => new Map(folders.map((folder) => [folder.id, folder] as const)),
+    [folders],
+  );
+
+  const folderOptions = useMemo(() => {
+    const toPathLabel = (folder: FileFolder) => {
+      const names = [folder.name];
+      const seen = new Set<string>([folder.id]);
+      let parentId = folder.parent_folder_id || null;
+      while (parentId) {
+        if (seen.has(parentId)) break;
+        seen.add(parentId);
+        const parent = folderById.get(parentId);
+        if (!parent) break;
+        names.unshift(parent.name);
+        parentId = parent.parent_folder_id || null;
+      }
+      return names.join(" / ");
+    };
+
+    return folders
+      .map((folder) => ({ id: folder.id, label: toPathLabel(folder) }))
+      .sort((a, b) => a.label.localeCompare(b.label));
+  }, [folderById, folders]);
+
+  return (
+    <label className="mt-3 block text-xs text-[var(--text-muted)] sm:mt-0">
+      <span className="sr-only">Move {file.original_name}</span>
+      <select
+        value={file.folder_id || ""}
+        onChange={(event) => onMove(file, event.target.value || null)}
+        className="h-9 w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-elevated)] px-2 text-xs text-[var(--text-secondary)] outline-none focus:border-[var(--accent-linear)] md:w-40"
+      >
+        <option value="">/</option>
+        {folderOptions.map((folder) => (
+          <option key={folder.id} value={folder.id}>
+            /{folder.label}
+          </option>
+        ))}
+      </select>
+    </label>
   );
 }
 

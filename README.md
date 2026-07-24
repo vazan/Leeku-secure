@@ -1,4 +1,4 @@
-# Leeku Secure
+# Leeku Secure - POSTGRESQL Edition
 
 **Encrypted file vault with zero-knowledge storage, AV scanning, and secure sharing.**
 
@@ -230,4 +230,12 @@ Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for:
 | **Documentation** | ✅ Comprehensive | 16+ technical guides, API reference, runbooks |
 | **Test Framework** | ⚠️ Planned | Gap identified in CONTRIBUTING.md; discussion needed |
 
-Apache-2.0 — see source file headers (`SPDX-License-Identifier: Apache-2.0`).
+## License and AI Disclosure
+
+This project is licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for the full license text.
+
+Portions of this codebase were generated with assistance from Claude, Gemini AI Studio, and GitHub Copilot.
+
+Make with ❤️ from Quebec / Canada.
+
+Use this project at your own risk. It is provided "AS IS", without warranties or conditions of any kind, express or implied, including any warranty that it is secure, error-free, fit for a particular purpose, or suitable for production use. This disclaimer is in addition to the warranty disclaimer and limitation of liability included in the Apache License, Version 2.0.

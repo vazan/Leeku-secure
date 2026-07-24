@@ -30,7 +30,7 @@ import {
   encryptFileStream, decryptFileStream, computeFileChecksum,
   encryptColumn, decryptColumn, hashColumnForLookup,
   hashPassword, verifyPassword, hashSharePassword, verifySharePassword,
-  hashFileSecret, verifyFileSecret, decryptClientProtectedPayload,
+  hashFileSecret, verifyFileSecret, decryptClientProtectedPayload, encryptClientProtectedFileInPlace, decryptClientProtectedFileInPlace,
   generateSecureToken, validateEncryptionConfig,
 } from './server/utils/encryption.js';
 import { scanFileBuffer, scanFilePath, heuristicPreScan } from './server/utils/scanner.js';
@@ -56,7 +56,7 @@ import { createPublicSharingRouter } from './server/routes/public-sharing.js';
 import { createMaintenanceModeRouter } from './server/routes/maintenance-mode.js';
 import { createDesktopUpdatesRouter, SYSTEM_UPDATE_FOLDER_NAME } from './server/routes/desktop-updates.js';
 import { validateProductionConfig } from './server/utils/production.js';
-import type { Quota, User, FileMetadata, ShareLink, SystemLog, SystemStats } from './app/shared/types/index.js';
+import type { Quota, User, FileMetadata, FileFolder, ShareLink, SystemLog, SystemStats } from './app/shared/types/index.js';
 
 const runtimeDir = (() => {
   const moduleUrl = (import.meta as ImportMeta | undefined)?.url;
@@ -784,6 +784,7 @@ interface UserRow {
 
 interface FileRow {
   id: string; owner_user_id: string;
+  folder_id?: string | null; folder_name?: string | null;
   original_name_encrypted: Buffer; original_name_iv: Buffer; original_name_auth_tag: Buffer;
   stored_path: string; mime_type: string; size_bytes: number; encrypted_size_bytes: number;
   status: string; checksum_sha256: string; scan_result: string | null; scan_message: string | null;
@@ -793,6 +794,11 @@ interface FileRow {
   client_crypto_iv?: Buffer | null;
   client_crypto_iterations?: number | null;
   expires_at: Date | null; created_at: Date;
+}
+
+interface FolderRow {
+  id: string; owner_user_id: string; parent_folder_id?: string | null; name: string; file_count?: number;
+  created_at: Date; updated_at: Date;
 }
 
 interface ShareRow {
@@ -829,6 +835,8 @@ function mapFileRow(row: FileRow, ownerUsername: string): FileMetadata {
     id:             row.id,
     owner_user_id:  row.owner_user_id,
     username:       ownerUsername,
+    folder_id:      row.folder_id || null,
+    folder_name:    row.folder_name || null,
     original_name:  decryptColumn(row.original_name_encrypted, row.original_name_iv, row.original_name_auth_tag),
     stored_name:    row.stored_path,
     mime_type:      row.mime_type,
@@ -1890,6 +1898,7 @@ app.get('/api/files', authenticateUser as express.RequestHandler, async (req: Au
     try {
       result = await request.query<FileRow>(
         `SELECT id, owner_user_id,
+                folder_id, folder_name,
                 original_name_encrypted, original_name_iv, original_name_auth_tag,
                 stored_path, mime_type, size_bytes, encrypted_size_bytes,
                 status, checksum_sha256, scan_result, scan_message,
@@ -1926,6 +1935,7 @@ app.get('/api/files', authenticateUser as express.RequestHandler, async (req: Au
       console.warn('[GET /api/files] client_secret_hash column missing, using legacy query fallback.');
       result = await request.query<FileRow>(
         `SELECT id, owner_user_id,
+                NULL AS folder_id, NULL AS folder_name,
                 original_name_encrypted, original_name_iv, original_name_auth_tag,
                 stored_path, mime_type, size_bytes, encrypted_size_bytes,
                 status, checksum_sha256, scan_result, scan_message,
@@ -2503,6 +2513,11 @@ app.post(
       req.body.original_name = originalName;
       req.body.mime_type     = mimeType;
       req.body.ttl_hours     = (req.query.ttl_hours as string) || null;
+      req.body.upload_secret_key = (req.query.upload_secret_key as string) || req.body.upload_secret_key;
+      req.body.upload_secret_salt_b64 = (req.query.upload_secret_salt_b64 as string) || req.body.upload_secret_salt_b64;
+      req.body.upload_secret_iv_b64 = (req.query.upload_secret_iv_b64 as string) || req.body.upload_secret_iv_b64;
+      req.body.upload_secret_iterations = (req.query.upload_secret_iterations as string) || req.body.upload_secret_iterations;
+      req.body.folder_id = (req.query.folder_id as string) || req.body.folder_id;
 
       // Fall through to the shared processing pipeline below
     }
@@ -2524,6 +2539,7 @@ app.post(
     const tempFilePath  = multerFile.path;
 
     const user = req.user!;
+  let uploadFolder: FolderRow | null = null;
     let currentStage = 'quota_lookup';
     let vaultFilePath: string | null = null;
     const streamsProgress = String(req.headers.accept || '').includes('application/x-ndjson');
@@ -2547,6 +2563,7 @@ app.post(
     let uploadSecretSalt: Buffer | null = null;
     let uploadSecretIv: Buffer | null = null;
     let uploadSecretIterations: number | null = null;
+    let payloadAlreadyClientProtected = false;
 
     const finishUploadError = (statusCode: number, message: string) => {
       try { if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath); } catch {}
@@ -2598,19 +2615,25 @@ app.post(
       const uploadSecretSaltB64 = typeof req.body.upload_secret_salt_b64 === 'string' ? req.body.upload_secret_salt_b64 : '';
       const uploadSecretIvB64 = typeof req.body.upload_secret_iv_b64 === 'string' ? req.body.upload_secret_iv_b64 : '';
       const uploadSecretIterationsRaw = typeof req.body.upload_secret_iterations === 'string' ? req.body.upload_secret_iterations : '';
+      const hasClientMeta = !!(uploadSecretSaltB64 || uploadSecretIvB64 || uploadSecretIterationsRaw);
       if (uploadSecretRaw.length > 0) {
         if (uploadSecretRaw.length < 8) return finishUploadError(400, 'Secret key must contain at least 8 characters.');
-        if (!uploadSecretSaltB64 || !uploadSecretIvB64 || !uploadSecretIterationsRaw) return finishUploadError(400, 'Missing client encryption metadata for secret-protected upload.');
-        const parsedIterations = Number(uploadSecretIterationsRaw);
-        if (!Number.isInteger(parsedIterations) || parsedIterations < 100000 || parsedIterations > 1000000) return finishUploadError(400, 'Invalid client encryption iteration count.');
-        const parsedSalt = Buffer.from(uploadSecretSaltB64, 'base64');
-        const parsedIv   = Buffer.from(uploadSecretIvB64,   'base64');
-        if (parsedSalt.length !== 16 || parsedIv.length !== 12) return finishUploadError(400, 'Invalid client encryption salt or IV.');
-        uploadSecretIterations = parsedIterations;
-        uploadSecretSalt = parsedSalt;
-        uploadSecretIv   = parsedIv;
+        if (hasClientMeta) {
+          if (!uploadSecretSaltB64 || !uploadSecretIvB64 || !uploadSecretIterationsRaw) {
+            return finishUploadError(400, 'Incomplete client encryption metadata for secret-protected upload.');
+          }
+          const parsedIterations = Number(uploadSecretIterationsRaw);
+          if (!Number.isInteger(parsedIterations) || parsedIterations < 100000 || parsedIterations > 1000000) return finishUploadError(400, 'Invalid client encryption iteration count.');
+          const parsedSalt = Buffer.from(uploadSecretSaltB64, 'base64');
+          const parsedIv   = Buffer.from(uploadSecretIvB64,   'base64');
+          if (parsedSalt.length !== 16 || parsedIv.length !== 12) return finishUploadError(400, 'Invalid client encryption salt or IV.');
+          uploadSecretIterations = parsedIterations;
+          uploadSecretSalt = parsedSalt;
+          uploadSecretIv   = parsedIv;
+          payloadAlreadyClientProtected = true;
+        }
         uploadSecretHash = await hashFileSecret(uploadSecretRaw);
-      } else if (uploadSecretSaltB64 || uploadSecretIvB64 || uploadSecretIterationsRaw) {
+      } else if (hasClientMeta) {
         return finishUploadError(400, 'Secret metadata provided without a secret key.');
       }
 
@@ -2690,6 +2713,26 @@ app.post(
         ? `Development bypass: Bitdefender scanner unavailable; file was not scanned. ${scanResult.message}`
         : scanResult.message;
 
+      if (uploadSecretHash && !payloadAlreadyClientProtected) {
+        currentStage = 'secret_protect_fallback';
+        uploadSecretIterations = 250000;
+        uploadSecretSalt = crypto.randomBytes(16);
+        uploadSecretIv = crypto.randomBytes(12);
+        sendUploadProgress({
+          type: 'processing',
+          phase: 'Applying secret-key protection',
+          loaded: 255,
+          total: processingTotal,
+        });
+        await encryptClientProtectedFileInPlace(
+          tempFilePath,
+          uploadSecretRaw,
+          uploadSecretSalt,
+          uploadSecretIv,
+          uploadSecretIterations,
+        );
+      }
+
       // ── Stream-encrypt directly to vault (constant memory) ─────
       currentStage = 'encrypt_file';
       const vaultFileName = generateSecureToken(16) + '.vault';
@@ -2755,20 +2798,21 @@ app.post(
       fileReq.input('clientCryptoSalt', sql.VarBinary(32), uploadSecretSalt);
       fileReq.input('clientCryptoIv',   sql.VarBinary(16), uploadSecretIv);
       fileReq.input('clientCryptoIterations', sql.Int, uploadSecretIterations);
+       fileReq.input('folderId', sql.UniqueIdentifier, uploadFolder?.id || null);
 
       const fileResult = await fileReq.query<FileRow>(
         `INSERT INTO files (
-           owner_user_id, original_name_encrypted, original_name_iv, original_name_auth_tag,
+         owner_user_id, folder_id, original_name_encrypted, original_name_iv, original_name_auth_tag,
            stored_path, mime_type, size_bytes, encrypted_size_bytes,
            checksum_sha256, scan_result, scan_message, scanned_at,
            leeku_vibe, ttl_hours,
            client_secret_hash, client_crypto_salt, client_crypto_iv, client_crypto_iterations,
            expires_at, is_encrypted
          )
-         VALUES (@ownerId,@nEnc,@nIv,@nTag, @spath,@mime,@sz,@esz, @chk,@scan,@smsg,SYSDATETIMEOFFSET(), @vibe,@ttl,
+         VALUES (@ownerId,@folderId,@nEnc,@nIv,@nTag, @spath,@mime,@sz,@esz, @chk,@scan,@smsg,SYSDATETIMEOFFSET(), @vibe,@ttl,
                  @clientSecretHash,@clientCryptoSalt,@clientCryptoIv,@clientCryptoIterations,
                  @exp,TRUE)
-               RETURNING id, owner_user_id,
+               RETURNING id, owner_user_id, folder_id,
              original_name_encrypted, original_name_iv, original_name_auth_tag,
              stored_path, mime_type, size_bytes, encrypted_size_bytes,
              status, checksum_sha256, scan_result, scan_message,
@@ -2777,6 +2821,7 @@ app.post(
              expires_at, created_at`
       );
       const newFile = fileResult.recordset[0];
+                newFile.folder_name = uploadFolder?.name || null;
       console.info('[upload] File record inserted.', { userId: user.id, originalName: original_name, fileId: newFile.id });
 
       currentStage = 'insert_key_record';
@@ -3050,19 +3095,11 @@ app.get('/api/files/:id/download', authenticateUser as express.RequestHandler, a
         cleanupTemp();
         return res.status(500).json({ error: 'Secret-key metadata is missing for this file.' });
       }
-      // ── Guard: client-secret protected files over 512 MB must use prepared download ──
-      const secretCheckStat = fs.statSync(tempPath);
-      if (secretCheckStat.size > 512 * 1024 * 1024) {
-        cleanupTemp();
-        return res.status(413).json({ error: 'Files over 512 MB with client-side encryption cannot use direct download. Use the prepared download endpoint instead.' });
-      }
-      const protectedPayload = fs.readFileSync(tempPath);
       try {
-        const plaintext = decryptClientProtectedPayload(
-          protectedPayload, providedSecret,
+        await decryptClientProtectedFileInPlace(
+          tempPath, providedSecret,
           file.client_crypto_salt, file.client_crypto_iv, file.client_crypto_iterations,
         );
-        fs.writeFileSync(tempPath, plaintext);
       } catch {
         cleanupTemp();
         return res.status(403).json({ error: 'Incorrect secret key.' });
@@ -3219,20 +3256,13 @@ app.post('/api/files/:id/download/prepare', authenticateUser as express.RequestH
           active.loaded = 0;
           active.total = 1;
 
-          // ── Guard: client-secret protected files over 512 MB cannot be decrypted in memory ──
-          const secretCheckStat = fs.statSync(tempFile);
-          if (secretCheckStat.size > 512 * 1024 * 1024) {
-            throw new Error('Client-secret protected files over 512 MB are not supported yet. Please re-upload without client-side encryption.');
-          }
-          const protectedPayload = fs.readFileSync(tempFile);
-          const plaintext = decryptClientProtectedPayload(
-            protectedPayload,
+          await decryptClientProtectedFileInPlace(
+            tempFile,
             providedSecret,
             file.client_crypto_salt,
             file.client_crypto_iv,
             file.client_crypto_iterations,
           );
-          fs.writeFileSync(tempFile, plaintext);
           active.loaded = 1;
           active.total = 1;
         }
@@ -3770,11 +3800,14 @@ app.get('/api/admin/files', authenticateUser as express.RequestHandler, verifyAd
   try {
     const request = await getRequest();
     const result = await request.query<FileRow & {username_encrypted:Buffer;username_iv:Buffer;username_auth_tag:Buffer}>(
-      `SELECT f.id,f.owner_user_id,f.original_name_encrypted,f.original_name_iv,f.original_name_auth_tag,
+      `SELECT f.id,f.owner_user_id,f.folder_id,ff.name AS folder_name,f.original_name_encrypted,f.original_name_iv,f.original_name_auth_tag,
               f.stored_path,f.mime_type,f.size_bytes,f.encrypted_size_bytes,f.status,f.checksum_sha256,
               f.scan_result,f.scan_message,f.is_encrypted,f.leeku_vibe,f.ttl_hours,f.expires_at,f.created_at,
               u.username_encrypted,u.username_iv,u.username_auth_tag
-       FROM files f INNER JOIN users u ON f.owner_user_id=u.id ORDER BY f.created_at DESC`
+       FROM files f
+       INNER JOIN users u ON f.owner_user_id=u.id
+       LEFT JOIN file_folders ff ON f.folder_id=ff.id
+       ORDER BY f.created_at DESC`
     );
     res.json({ files: result.recordset.map(r => mapFileRow(r, decryptColumn(r.username_encrypted, r.username_iv, r.username_auth_tag))) });
   } catch (err) { console.error('[GET /api/admin/files]', err); res.status(500).json({ error: 'Failed to load files.' }); }
@@ -3954,6 +3987,79 @@ async function ensureOptionalShareLinkColumns(): Promise<void> {
   );
 }
 
+async function ensureFileFolderSchema(): Promise<void> {
+  const createFolders = await getRequest();
+  await createFolders.query(`
+    CREATE TABLE IF NOT EXISTS file_folders (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      owner_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      parent_folder_id UUID NULL,
+      name VARCHAR(120) NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      CONSTRAINT uq_file_folders_owner_parent_name UNIQUE (owner_user_id, parent_folder_id, name)
+    )
+  `);
+
+  const addParentFolderId = await getRequest();
+  await addParentFolderId.query('ALTER TABLE file_folders ADD COLUMN IF NOT EXISTS parent_folder_id UUID');
+
+  const addParentFk = await getRequest();
+  await addParentFk.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'fk_file_folders_parent'
+      ) THEN
+        ALTER TABLE file_folders
+          ADD CONSTRAINT fk_file_folders_parent
+          FOREIGN KEY (parent_folder_id) REFERENCES file_folders(id) ON DELETE NO ACTION;
+      END IF;
+    END $$;
+  `);
+
+  const renameUnique = await getRequest();
+  await renameUnique.query(`
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'uq_file_folders_owner_name'
+      ) THEN
+        ALTER TABLE file_folders DROP CONSTRAINT uq_file_folders_owner_name;
+      END IF;
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'uq_file_folders_owner_parent_name'
+      ) THEN
+        ALTER TABLE file_folders
+          ADD CONSTRAINT uq_file_folders_owner_parent_name
+          UNIQUE (owner_user_id, parent_folder_id, name);
+      END IF;
+    END $$;
+  `);
+
+  const addFolderId = await getRequest();
+  await addFolderId.query('ALTER TABLE files ADD COLUMN IF NOT EXISTS folder_id UUID');
+  const addFk = await getRequest();
+  await addFk.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'fk_files_file_folders'
+      ) THEN
+        ALTER TABLE files
+          ADD CONSTRAINT fk_files_file_folders
+          FOREIGN KEY (folder_id) REFERENCES file_folders(id) ON DELETE NO ACTION;
+      END IF;
+    END $$;
+  `);
+  const dropLegacyFolderOwnerIndex = await getRequest();
+  await dropLegacyFolderOwnerIndex.query('DROP INDEX IF EXISTS ix_file_folders_owner');
+  const folderOwnerParentIndex = await getRequest();
+  await folderOwnerParentIndex.query('CREATE INDEX IF NOT EXISTS ix_file_folders_owner_parent ON file_folders (owner_user_id, parent_folder_id, name)');
+  const fileFolderIndex = await getRequest();
+  await fileFolderIndex.query('CREATE INDEX IF NOT EXISTS ix_files_folder_id ON files (folder_id, owner_user_id)');
+}
+
 async function bootstrap() {
   // 1. Validate production requirements and master encryption key
   validateProductionConfig();
@@ -3966,6 +4072,7 @@ async function bootstrap() {
   // 2b. Lightweight schema migration for optional user-provided file secrets.
   await ensureOptionalFileSecretColumns();
   await ensureOptionalShareLinkColumns();
+  await ensureFileFolderSchema();
 
   app.use('/api/health', createHealthRouter(FILE_VAULT, NODE_ENV === 'production'));
 
@@ -4004,12 +4111,43 @@ async function bootstrap() {
 
   // 7. Share link vanity path (Discord embeds) & SPA fallback
   const distPath = path.join(process.cwd(), 'dist');
+
+  // Serve an explicit robots policy. Without this, SPA fallback returns HTML for /robots.txt,
+  // which can confuse social unfurl crawlers and lead to missing link previews.
+  app.get('/robots.txt', (_req, res) => {
+    res.type('text/plain').send([
+      'User-agent: *',
+      'Allow: /',
+      '',
+      'User-agent: facebookexternalhit',
+      'Allow: /s/',
+      'Allow: /api/public/share/',
+      '',
+      'User-agent: facebot',
+      'Allow: /s/',
+      'Allow: /api/public/share/',
+      '',
+      'User-agent: meta-externalagent',
+      'Allow: /s/',
+      'Allow: /api/public/share/',
+      '',
+      'User-agent: meta-externalfetcher',
+      'Allow: /s/',
+      'Allow: /api/public/share/',
+      '',
+      'User-agent: discordbot',
+      'Allow: /s/',
+      'Allow: /api/public/share/',
+    ].join('\n'));
+  });
+
   app.use(express.static(distPath));
 
-  // Vanity path for share links — redirects to server-rendered OG HTML page
-  app.get('/s/:token', (req, res) => {
-    res.redirect(301, `/api/public/share/${req.params.token}/og`);
-  });  
+  // Vanity path for share links — internally dispatch to OG HTML handler (no redirect hop for crawlers).
+  app.get('/s/:token', (req, res, next) => {
+    req.url = `/api/public/share/${req.params.token}/og`;
+    (app as unknown as { _router: { handle: express.RequestHandler } })._router.handle(req, res, next);
+  });
 
   app.get('*', (req, res) => res.sendFile(path.join(distPath, 'index.html')));
   
