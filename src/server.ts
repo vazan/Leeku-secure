@@ -54,6 +54,7 @@ import { createSessionRouter } from './server/routes/sessions.js';
 import { createHealthRouter } from './server/routes/health.js';
 import { createPublicSharingRouter } from './server/routes/public-sharing.js';
 import { createMaintenanceModeRouter } from './server/routes/maintenance-mode.js';
+import { createDesktopUpdatesRouter, SYSTEM_UPDATE_FOLDER_NAME } from './server/routes/desktop-updates.js';
 import { validateProductionConfig } from './server/utils/production.js';
 import type { Quota, User, FileMetadata, ShareLink, SystemLog, SystemStats } from './app/shared/types/index.js';
 
@@ -840,6 +841,134 @@ function mapFileRow(row: FileRow, ownerUsername: string): FileMetadata {
     is_encrypted:   row.is_encrypted,
     created_at:     row.created_at.toISOString(),
   };
+}
+
+function mapFolderRow(row: FolderRow): FileFolder {
+  return {
+    id:            row.id,
+    owner_user_id: row.owner_user_id,
+    parent_folder_id: row.parent_folder_id || null,
+    name:          row.name,
+    file_count:    Number(row.file_count || 0),
+    created_at:    row.created_at.toISOString(),
+    updated_at:    row.updated_at.toISOString(),
+  };
+}
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const MAX_FOLDER_DEPTH = 5;
+
+function normalizeFolderName(value: unknown): string {
+  return String(value || '').trim().replace(/\s+/g, ' ');
+}
+
+function validateFolderName(value: unknown): string | null {
+  const name = normalizeFolderName(value);
+  if (name.length < 1 || name.length > 120) return null;
+  return name;
+}
+
+function normalizeNullableFolderId(value: unknown): string | null | undefined {
+  if (value === undefined) return null;
+  if (value === null || value === '') return null;
+  const folderId = String(value).trim();
+  if (!folderId) return null;
+  return UUID_PATTERN.test(folderId) ? folderId : undefined;
+}
+
+function isAllowedDesktopUpdateFileName(fileName: string, version: string): boolean {
+  const windows = `Leeku-Desktop-Setup-${version}.exe`;
+  return new Set([
+    'latest.yml',
+    'latest-linux.yml',
+    `${windows}.zip`,
+    `${windows}.blockmap`,
+    `leeku-desktop-${version}-x86_64.AppImage`,
+  ]).has(fileName) || /^leeku-activation--(draft|active|scheduled)--\d+--\d+\.json$/.test(fileName);
+}
+
+async function isDesktopUpdateFile(fileId: string): Promise<boolean> {
+  const request = await getRequest();
+  request.input('fileId', sql.UniqueIdentifier, fileId);
+  request.input('systemFolderName', sql.NVarChar(120), SYSTEM_UPDATE_FOLDER_NAME);
+  const result = await request.query<{ id: string }>(
+    `SELECT TOP 1 f.id
+     FROM files f
+     INNER JOIN file_folders release_folder ON release_folder.id=f.folder_id
+     INNER JOIN file_folders update_root ON update_root.id=release_folder.parent_folder_id
+     WHERE f.id=@fileId
+       AND update_root.parent_folder_id IS NULL
+       AND update_root.name=@systemFolderName`
+  );
+  return result.recordset.length > 0;
+}
+
+async function desktopUpdateFolderActivation(
+  folderId: string,
+  ownerId: string,
+): Promise<'draft' | 'active' | 'scheduled' | null> {
+  const request = await getRequest();
+  request.input('folderId', sql.UniqueIdentifier, folderId);
+  request.input('ownerId', sql.UniqueIdentifier, ownerId);
+  const result = await request.query<{
+    original_name_encrypted: Buffer;
+    original_name_iv: Buffer;
+    original_name_auth_tag: Buffer;
+  }>(
+    `SELECT original_name_encrypted, original_name_iv, original_name_auth_tag
+     FROM files
+     WHERE folder_id=@folderId AND owner_user_id=@ownerId
+       AND COALESCE(status,'Available')!='Expired'`
+  );
+  let latest: { mode: 'draft' | 'active' | 'scheduled'; createdAt: number } | null = null;
+  for (const row of result.recordset) {
+    try {
+      const fileName = decryptColumn(row.original_name_encrypted, row.original_name_iv, row.original_name_auth_tag);
+      const match = /^leeku-activation--(draft|active|scheduled)--\d+--(\d+)\.json$/.exec(fileName);
+      if (!match) continue;
+      const createdAt = Number(match[2]);
+      if (!Number.isFinite(createdAt)) continue;
+      if (!latest || createdAt > latest.createdAt) {
+        latest = { mode: match[1] as 'draft' | 'active' | 'scheduled', createdAt };
+      }
+    } catch {
+      // Ignore unrelated or unreadable metadata. A folder without a marker is
+      // treated as an incomplete draft so an administrator can clean it up.
+    }
+  }
+  return latest?.mode ?? null;
+}
+
+async function getOwnedFolder(folderId: string, ownerId: string): Promise<FolderRow | null> {
+  const request = await getRequest();
+  request.input('id', sql.UniqueIdentifier, folderId);
+  request.input('ownerId', sql.UniqueIdentifier, ownerId);
+  const result = await request.query<FolderRow>(
+    `SELECT id, owner_user_id, parent_folder_id, name, created_at, updated_at
+     FROM file_folders
+     WHERE id=@id AND owner_user_id=@ownerId`
+  );
+  return result.recordset[0] || null;
+}
+
+async function getFolderDepth(folderId: string, ownerId: string): Promise<number> {
+  const request = await getRequest();
+  request.input('id', sql.UniqueIdentifier, folderId);
+  request.input('ownerId', sql.UniqueIdentifier, ownerId);
+  const result = await request.query<{ depth: number }>(
+    `;WITH folder_tree AS (
+       SELECT id, parent_folder_id, 1 AS depth
+       FROM file_folders
+       WHERE id=@id AND owner_user_id=@ownerId
+       UNION ALL
+       SELECT ff.id, ff.parent_folder_id, ft.depth + 1 AS depth
+       FROM file_folders ff
+       INNER JOIN folder_tree ft ON ff.id=ft.parent_folder_id
+       WHERE ff.owner_user_id=@ownerId
+     )
+     SELECT TOP 1 depth FROM folder_tree ORDER BY depth DESC OPTION (MAXRECURSION 100)`
+  );
+  return Number(result.recordset[0]?.depth || 0);
 }
 
 function mapShareRow(row: ShareRow): ShareLink {
@@ -1755,6 +1884,8 @@ app.get('/api/files', authenticateUser as express.RequestHandler, async (req: Au
   try {
     const request = await getRequest();
     request.input('ownerId', sql.UniqueIdentifier, req.userId!);
+    request.input('includeSystem', sql.Bit, req.user?.role === 'Admin' && req.query.include_system === '1' ? 1 : 0);
+    request.input('systemFolderName', sql.NVarChar(120), SYSTEM_UPDATE_FOLDER_NAME);
     let result;
     try {
       result = await request.query<FileRow>(
@@ -1765,7 +1896,24 @@ app.get('/api/files', authenticateUser as express.RequestHandler, async (req: Au
                 is_encrypted, leeku_vibe, ttl_hours,
                 client_secret_hash,
                 expires_at, created_at
-        FROM files WHERE owner_user_id=@ownerId AND COALESCE(status,'Available')!='Expired'
+        FROM (
+          SELECT f.*, ff.name AS folder_name
+          FROM files f
+          LEFT JOIN file_folders ff ON f.folder_id=ff.id
+          WHERE f.owner_user_id=@ownerId AND COALESCE(f.status,'Available')!='Expired'
+            AND (
+              @includeSystem=1 OR NOT EXISTS (
+                SELECT 1
+                FROM file_folders candidate
+                LEFT JOIN file_folders parent ON parent.id=candidate.parent_folder_id
+                WHERE candidate.id=f.folder_id
+                  AND (
+                    (candidate.parent_folder_id IS NULL AND candidate.name=@systemFolderName)
+                    OR (parent.parent_folder_id IS NULL AND parent.name=@systemFolderName)
+                  )
+              )
+            )
+        ) files
          ORDER BY created_at DESC`
       );
     } catch (queryErr: any) {
@@ -1789,6 +1937,264 @@ app.get('/api/files', authenticateUser as express.RequestHandler, async (req: Au
     }
     res.json({ files: result.recordset.map(r => mapFileRow(r, req.user!.username)) });
   } catch (err) { console.error('[GET /api/files]', err); res.status(500).json({ error: 'Failed to load files.' }); }
+});
+
+app.get('/api/file-folders', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  try {
+    const request = await getRequest();
+    request.input('ownerId', sql.UniqueIdentifier, req.userId!);
+    request.input('includeSystem', sql.Bit, req.user?.role === 'Admin' && req.query.include_system === '1' ? 1 : 0);
+    request.input('systemFolderName', sql.NVarChar(120), SYSTEM_UPDATE_FOLDER_NAME);
+    const result = await request.query<FolderRow>(
+      `SELECT ff.id, ff.owner_user_id, ff.parent_folder_id, ff.name, ff.created_at, ff.updated_at,
+              COUNT(f.id) AS file_count
+       FROM file_folders ff
+       LEFT JOIN files f ON f.folder_id=ff.id AND COALESCE(f.status,'Available')!='Expired'
+       WHERE ff.owner_user_id=@ownerId
+         AND (
+           @includeSystem=1 OR NOT (
+             (ff.parent_folder_id IS NULL AND ff.name=@systemFolderName)
+             OR ff.parent_folder_id IN (
+               SELECT id FROM file_folders
+               WHERE owner_user_id=@ownerId AND parent_folder_id IS NULL AND name=@systemFolderName
+             )
+           )
+         )
+       GROUP BY ff.id, ff.owner_user_id, ff.parent_folder_id, ff.name, ff.created_at, ff.updated_at
+       ORDER BY ff.parent_folder_id ASC, ff.name ASC`
+    );
+    res.json({ folders: result.recordset.map(mapFolderRow) });
+  } catch (err) { console.error('[GET /api/file-folders]', err); res.status(500).json({ error: 'Failed to load folders.' }); }
+});
+
+app.post('/api/file-folders', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  const name = validateFolderName(req.body?.name);
+  if (!name) return res.status(400).json({ error: 'Folder name must be between 1 and 120 characters.' });
+  const parentFolderId = normalizeNullableFolderId(req.body?.parent_folder_id);
+  if (parentFolderId === undefined) return res.status(400).json({ error: 'Invalid parent folder id.' });
+  if (name === SYSTEM_UPDATE_FOLDER_NAME && (req.user?.role !== 'Admin' || parentFolderId !== null)) {
+    return res.status(403).json({ error: 'The Leeku Desktop update folder is reserved for administrators.' });
+  }
+  try {
+    let parentFolder: FolderRow | null = null;
+    if (parentFolderId) {
+      parentFolder = await getOwnedFolder(parentFolderId, req.userId!);
+      if (!parentFolder) return res.status(404).json({ error: 'Parent folder not found.' });
+      if (parentFolder.name === SYSTEM_UPDATE_FOLDER_NAME && parentFolder.parent_folder_id === null) {
+        if (req.user?.role !== 'Admin') return res.status(403).json({ error: 'Administrator access is required.' });
+        if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(name)) {
+          return res.status(400).json({ error: 'Update folders must use a semantic version such as 1.2.0.' });
+        }
+      } else if (parentFolder.parent_folder_id) {
+        const grandParent = await getOwnedFolder(parentFolder.parent_folder_id, req.userId!);
+        if (grandParent?.name === SYSTEM_UPDATE_FOLDER_NAME && grandParent.parent_folder_id === null) {
+          return res.status(400).json({ error: 'Update release folders cannot contain subfolders.' });
+        }
+      }
+      const depth = await getFolderDepth(parentFolderId, req.userId!);
+      if (depth >= MAX_FOLDER_DEPTH) {
+        return res.status(400).json({ error: `Maximum folder depth is ${MAX_FOLDER_DEPTH}.` });
+      }
+    }
+
+    const request = await getRequest();
+    request.input('ownerId', sql.UniqueIdentifier, req.userId!);
+    request.input('parentFolderId', sql.UniqueIdentifier, parentFolderId);
+    request.input('name', sql.NVarChar(120), name);
+    const result = await request.query<FolderRow>(
+      `INSERT INTO file_folders (owner_user_id, parent_folder_id, name)
+       OUTPUT INSERTED.id, INSERTED.owner_user_id, INSERTED.parent_folder_id, INSERTED.name, 0 AS file_count, INSERTED.created_at, INSERTED.updated_at
+       VALUES (@ownerId, @parentFolderId, @name)`
+    );
+    await logSystemEvent(req.userId!, req.user!.username, 'Admin', 'Folder', result.recordset[0].id, req, `Created folder "${name}".`);
+    res.status(201).json({ folder: mapFolderRow(result.recordset[0]) });
+  } catch (err: any) {
+    if (err?.number === 2601 || err?.number === 2627) return res.status(409).json({ error: 'A folder with that name already exists.' });
+    console.error('[POST /api/file-folders]', err); res.status(500).json({ error: 'Failed to create folder.' });
+  }
+});
+
+app.post('/api/file-folders/:id/rename', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  const folderId = req.params.id;
+  if (!UUID_PATTERN.test(folderId)) return res.status(400).json({ error: 'Invalid folder id.' });
+  const name = validateFolderName(req.body?.name);
+  if (!name) return res.status(400).json({ error: 'Folder name must be between 1 and 120 characters.' });
+  try {
+    const folder = await getOwnedFolder(folderId, req.userId!);
+    if (!folder) return res.status(404).json({ error: 'Folder not found.' });
+    const parent = folder.parent_folder_id ? await getOwnedFolder(folder.parent_folder_id, req.userId!) : null;
+    if (folder.name === SYSTEM_UPDATE_FOLDER_NAME || parent?.name === SYSTEM_UPDATE_FOLDER_NAME) {
+      return res.status(403).json({ error: 'The system update folder structure cannot be renamed.' });
+    }
+    const request = await getRequest();
+    request.input('id', sql.UniqueIdentifier, folderId);
+    request.input('ownerId', sql.UniqueIdentifier, req.userId!);
+    request.input('name', sql.NVarChar(120), name);
+    const result = await request.query<FolderRow>(
+      `UPDATE file_folders
+       SET name=@name, updated_at=SYSDATETIMEOFFSET()
+      OUTPUT INSERTED.id, INSERTED.owner_user_id, INSERTED.parent_folder_id, INSERTED.name,
+              (SELECT COUNT(*) FROM files WHERE folder_id=INSERTED.id AND COALESCE(status,'Available')!='Expired') AS file_count,
+              INSERTED.created_at, INSERTED.updated_at
+       WHERE id=@id AND owner_user_id=@ownerId`
+    );
+    if (!result.recordset.length) return res.status(404).json({ error: 'Folder not found.' });
+    await logSystemEvent(req.userId!, req.user!.username, 'Admin', 'Folder', folderId, req, `Renamed folder to "${name}".`);
+    res.json({ folder: mapFolderRow(result.recordset[0]) });
+  } catch (err: any) {
+    if (err?.number === 2601 || err?.number === 2627) return res.status(409).json({ error: 'A folder with that name already exists.' });
+    console.error('[POST /api/file-folders/:id/rename]', err); res.status(500).json({ error: 'Failed to rename folder.' });
+  }
+});
+
+app.post('/api/file-folders/:id/delete', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  const folderId = req.params.id;
+  if (!UUID_PATTERN.test(folderId)) return res.status(400).json({ error: 'Invalid folder id.' });
+  const deleteFiles = !!req.body?.delete_files;
+  try {
+    const folder = await getOwnedFolder(folderId, req.userId!);
+    if (!folder) return res.status(404).json({ error: 'Folder not found.' });
+    const parent = folder.parent_folder_id ? await getOwnedFolder(folder.parent_folder_id, req.userId!) : null;
+    if (folder.name === SYSTEM_UPDATE_FOLDER_NAME && folder.parent_folder_id === null) {
+      return res.status(403).json({ error: 'The desktop update system root cannot be deleted.' });
+    }
+    if (parent?.name === SYSTEM_UPDATE_FOLDER_NAME && parent.parent_folder_id === null) {
+      if (req.user?.role !== 'Admin') {
+        return res.status(403).json({ error: 'Administrator access is required.' });
+      }
+      if (!deleteFiles) {
+        return res.status(400).json({ error: 'Draft update folders must be deleted together with their files.' });
+      }
+      const activation = await desktopUpdateFolderActivation(folder.id, req.userId!);
+      if (activation && activation !== 'draft') {
+        return res.status(409).json({ error: 'Only draft desktop updates can be deleted.' });
+      }
+    }
+
+    if (!deleteFiles) {
+      const moveReq = await getRequest();
+      moveReq.input('folderId', sql.UniqueIdentifier, folderId);
+      moveReq.input('ownerId', sql.UniqueIdentifier, req.userId!);
+      await moveReq.query(
+        `;WITH folder_tree AS (
+           SELECT id FROM file_folders WHERE id=@folderId AND owner_user_id=@ownerId
+           UNION ALL
+           SELECT ff.id
+           FROM file_folders ff
+           INNER JOIN folder_tree ft ON ff.parent_folder_id=ft.id
+           WHERE ff.owner_user_id=@ownerId
+         )
+         UPDATE files
+         SET folder_id=NULL
+         WHERE owner_user_id=@ownerId AND folder_id IN (SELECT id FROM folder_tree) OPTION (MAXRECURSION 100)`
+      );
+    } else {
+      const filesReq = await getRequest();
+      filesReq.input('folderId', sql.UniqueIdentifier, folderId);
+      filesReq.input('ownerId', sql.UniqueIdentifier, req.userId!);
+      const folderFiles = await filesReq.query<{id:string;stored_path:string;size_bytes:number;status:string}>(
+        `;WITH folder_tree AS (
+           SELECT id FROM file_folders WHERE id=@folderId AND owner_user_id=@ownerId
+           UNION ALL
+           SELECT ff.id
+           FROM file_folders ff
+           INNER JOIN folder_tree ft ON ff.parent_folder_id=ft.id
+           WHERE ff.owner_user_id=@ownerId
+         )
+         SELECT id, stored_path, size_bytes, status
+         FROM files
+         WHERE owner_user_id=@ownerId AND folder_id IN (SELECT id FROM folder_tree) OPTION (MAXRECURSION 100)`
+      );
+      for (const file of folderFiles.recordset) {
+        const vaultPath = path.join(FILE_VAULT, file.stored_path);
+        try { if (fs.existsSync(vaultPath)) fs.unlinkSync(vaultPath); } catch {}
+      }
+      const storageToRemove = folderFiles.recordset
+        .filter((file) => file.status === 'Available')
+        .reduce((total, file) => total + Number(file.size_bytes || 0), 0);
+      const deleteReq = await getRequest();
+      deleteReq.input('folderId', sql.UniqueIdentifier, folderId);
+      deleteReq.input('ownerId', sql.UniqueIdentifier, req.userId!);
+      await deleteReq.query(
+        `;WITH folder_tree AS (
+           SELECT id FROM file_folders WHERE id=@folderId AND owner_user_id=@ownerId
+           UNION ALL
+           SELECT ff.id
+           FROM file_folders ff
+           INNER JOIN folder_tree ft ON ff.parent_folder_id=ft.id
+           WHERE ff.owner_user_id=@ownerId
+         )
+         DELETE FROM files
+         WHERE owner_user_id=@ownerId AND folder_id IN (SELECT id FROM folder_tree) OPTION (MAXRECURSION 100)`
+      );
+      if (storageToRemove > 0) {
+        const storageReq = await getRequest();
+        storageReq.input('sz', sql.BigInt, storageToRemove);
+        storageReq.input('ownerId', sql.UniqueIdentifier, req.userId!);
+        await storageReq.query('UPDATE users SET storage_used_bytes=CASE WHEN storage_used_bytes-@sz<0 THEN 0 ELSE storage_used_bytes-@sz END WHERE id=@ownerId');
+      }
+    }
+
+    const deleteFolderReq = await getRequest();
+    deleteFolderReq.input('id', sql.UniqueIdentifier, folderId);
+    deleteFolderReq.input('ownerId', sql.UniqueIdentifier, req.userId!);
+    await deleteFolderReq.query(
+      `;WITH folder_tree AS (
+         SELECT id FROM file_folders WHERE id=@id AND owner_user_id=@ownerId
+         UNION ALL
+         SELECT ff.id
+         FROM file_folders ff
+         INNER JOIN folder_tree ft ON ff.parent_folder_id=ft.id
+         WHERE ff.owner_user_id=@ownerId
+       )
+       DELETE ff
+       FROM file_folders ff
+       INNER JOIN folder_tree ft ON ff.id=ft.id OPTION (MAXRECURSION 100)`
+    );
+    await logSystemEvent(req.userId!, req.user!.username, 'Delete', 'Folder', folderId, req, deleteFiles ? `Deleted folder tree "${folder.name}" and its files.` : `Deleted folder tree "${folder.name}" and moved files to All Files root.`);
+    res.json({ success: true });
+  } catch (err) { console.error('[POST /api/file-folders/:id/delete]', err); res.status(500).json({ error: 'Failed to delete folder.' }); }
+});
+
+app.post('/api/files/:id/folder', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  const fileId = req.params.id;
+  if (!UUID_PATTERN.test(fileId)) return res.status(400).json({ error: 'Invalid file id.' });
+  const folderId = normalizeNullableFolderId(req.body?.folder_id);
+  if (folderId === undefined) return res.status(400).json({ error: 'Invalid folder id.' });
+  try {
+    if (await isDesktopUpdateFile(fileId)) {
+      return res.status(403).json({ error: 'Desktop update artifacts cannot be moved manually.' });
+    }
+    let folderName: string | null = null;
+    if (folderId) {
+      const folder = await getOwnedFolder(folderId, req.userId!);
+      if (!folder) return res.status(404).json({ error: 'Folder not found.' });
+      const parent = folder.parent_folder_id ? await getOwnedFolder(folder.parent_folder_id, req.userId!) : null;
+      if (folder.name === SYSTEM_UPDATE_FOLDER_NAME || parent?.name === SYSTEM_UPDATE_FOLDER_NAME) {
+        return res.status(403).json({ error: 'Files cannot be moved manually into the system update folder.' });
+      }
+      folderName = folder.name;
+    }
+    const request = await getRequest();
+    request.input('id', sql.UniqueIdentifier, fileId);
+    request.input('ownerId', sql.UniqueIdentifier, req.userId!);
+    request.input('folderId', sql.UniqueIdentifier, folderId);
+    const result = await request.query<FileRow>(
+      `UPDATE files
+       SET folder_id=@folderId
+       OUTPUT INSERTED.id, INSERTED.owner_user_id, INSERTED.folder_id,
+              INSERTED.original_name_encrypted, INSERTED.original_name_iv, INSERTED.original_name_auth_tag,
+              INSERTED.stored_path, INSERTED.mime_type, INSERTED.size_bytes, INSERTED.encrypted_size_bytes,
+              INSERTED.status, INSERTED.checksum_sha256, INSERTED.scan_result, INSERTED.scan_message,
+              INSERTED.is_encrypted, INSERTED.leeku_vibe, INSERTED.ttl_hours, INSERTED.client_secret_hash,
+              INSERTED.expires_at, INSERTED.created_at
+       WHERE id=@id AND owner_user_id=@ownerId`
+    );
+    if (!result.recordset.length) return res.status(404).json({ error: 'File not found.' });
+    const row = result.recordset[0];
+    row.folder_name = folderName;
+    res.json({ file: mapFileRow(row, req.user!.username) });
+  } catch (err) { console.error('[POST /api/files/:id/folder]', err); res.status(500).json({ error: 'Failed to move file.' }); }
 });
 
 // ──────────────────────────────────────────────────────────────
@@ -2166,6 +2572,26 @@ app.post(
         isResumable,
       });
 
+      currentStage = 'validate_folder';
+      const requestedFolderId = normalizeNullableFolderId(req.body.folder_id);
+      if (requestedFolderId === undefined) return finishUploadError(400, 'Invalid folder id.');
+      if (requestedFolderId) {
+        uploadFolder = await getOwnedFolder(requestedFolderId, req.userId!);
+        if (!uploadFolder) return finishUploadError(404, 'Folder not found.');
+        if (uploadFolder.name === SYSTEM_UPDATE_FOLDER_NAME && uploadFolder.parent_folder_id === null) {
+          return finishUploadError(400, 'Files must be uploaded into a version folder, not the update root.');
+        }
+        if (uploadFolder.parent_folder_id) {
+          const updateRoot = await getOwnedFolder(uploadFolder.parent_folder_id, req.userId!);
+          if (updateRoot?.name === SYSTEM_UPDATE_FOLDER_NAME && updateRoot.parent_folder_id === null) {
+            if (req.user?.role !== 'Admin') return finishUploadError(403, 'Administrator access is required.');
+            if (!isAllowedDesktopUpdateFileName(String(original_name), uploadFolder.name)) {
+              return finishUploadError(400, 'Only Leeku Desktop update artifacts and activation markers are allowed in this folder.');
+            }
+          }
+        }
+      }
+
       // ── Optional client-side file secret metadata ─────────────
       currentStage = 'validate_upload_secret';
       const uploadSecretRaw = typeof req.body.upload_secret_key === 'string' ? req.body.upload_secret_key.trim() : '';
@@ -2454,6 +2880,8 @@ app.post('/api/files/:id/delete', authenticateUser as express.RequestHandler, as
     const file = fileResult.recordset[0];
     if (file.owner_user_id !== req.userId && req.user!.role !== 'Admin')
       return res.status(403).json({ error: 'You do not have permission to delete this file.' });
+    if (await isDesktopUpdateFile(fileId) && req.user!.role !== 'Admin')
+      return res.status(403).json({ error: 'Administrator access is required for desktop update artifacts.' });
 
     const originalName = decryptColumn(file.original_name_encrypted, file.original_name_iv, file.original_name_auth_tag);
     const vaultPath = path.join(FILE_VAULT, file.stored_path);
@@ -2489,6 +2917,8 @@ app.get('/api/files/:id/preview', authenticateUser as express.RequestHandler, as
     const file = fileResult.recordset[0];
     if (file.owner_user_id !== req.userId && req.user!.role !== 'Admin')
       return res.status(403).json({ error: 'You do not have permission to preview this file.' });
+    if (await isDesktopUpdateFile(fileId) && req.user!.role !== 'Admin')
+      return res.status(403).json({ error: 'Administrator access is required for desktop update artifacts.' });
     if (file.status === 'Blocked')
       return res.status(410).json({ error: 'Blocked files cannot be previewed.' });
     if (file.client_secret_hash)
@@ -2570,6 +3000,8 @@ app.get('/api/files/:id/download', authenticateUser as express.RequestHandler, a
     const file = fileResult.recordset[0];
     if (file.owner_user_id !== req.userId && req.user!.role !== 'Admin')
       { cleanupTemp(); return res.status(403).json({ error: 'You do not have permission to download this file.' }); }
+    if (await isDesktopUpdateFile(fileId) && req.user!.role !== 'Admin')
+      { cleanupTemp(); return res.status(403).json({ error: 'Administrator access is required for desktop update artifacts.' }); }
     if (file.status === 'Blocked')
       { cleanupTemp(); return res.status(410).json({ error: 'Blocked files cannot be downloaded.' }); }
 
@@ -2682,6 +3114,9 @@ app.post('/api/files/:id/download/prepare', authenticateUser as express.RequestH
     const file = fileResult.recordset[0];
     if (file.owner_user_id !== req.userId && req.user!.role !== 'Admin') {
       return res.status(403).json({ error: 'You do not have permission to download this file.' });
+    }
+    if (await isDesktopUpdateFile(fileId) && req.user!.role !== 'Admin') {
+      return res.status(403).json({ error: 'Administrator access is required for desktop update artifacts.' });
     }
     if (file.status === 'Blocked') {
       return res.status(410).json({ error: 'Blocked files cannot be downloaded.' });
@@ -2911,10 +3346,21 @@ app.get('/api/sharing/links', authenticateUser as express.RequestHandler, async 
   try {
     const request = await getRequest();
     request.input('ownerId', sql.UniqueIdentifier, req.userId!);
+    request.input('systemFolderName', sql.NVarChar(120), SYSTEM_UPDATE_FOLDER_NAME);
     const result = await request.query<ShareRow & { stored_path: string }>(
       `SELECT sl.id,sl.file_id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.allow_external_preview,sl.created_at,f.stored_path
-       FROM share_links sl INNER JOIN files f ON sl.file_id=f.id
-       WHERE f.owner_user_id=@ownerId ORDER BY sl.created_at DESC`
+       FROM share_links sl
+       INNER JOIN files f ON sl.file_id=f.id
+       WHERE f.owner_user_id=@ownerId
+         AND NOT EXISTS (
+           SELECT 1
+           FROM file_folders release_folder
+           INNER JOIN file_folders update_root ON update_root.id=release_folder.parent_folder_id
+           WHERE release_folder.id=f.folder_id
+             AND update_root.parent_folder_id IS NULL
+             AND update_root.name=@systemFolderName
+         )
+       ORDER BY sl.created_at DESC`
     );
     res.json({
       links: result.recordset.map((row) => ({
@@ -2965,6 +3411,8 @@ app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, asy
     const file = fRes.recordset[0];
     if (file.owner_user_id !== req.userId && req.user!.role !== 'Admin')
       return res.status(403).json({ error: 'Only the file owner can manage share links.' });
+    if (await isDesktopUpdateFile(fileId))
+      return res.status(403).json({ error: 'Desktop update artifacts cannot be shared.' });
     if (file.status === 'Blocked') return res.status(400).json({ error: 'Blocked files cannot be shared.' });
     if (!fs.existsSync(path.join(FILE_VAULT, file.stored_path)))
       return res.status(410).json({ error: 'This file is no longer available in the vault.' });
@@ -3060,6 +3508,11 @@ app.use('/api/public/share', createPublicSharingRouter({
   tempPath: UPLOAD_TEMP,
   logDownload: (req, fileId, originalName, token) =>
     logSystemEvent(null, 'Anonymous', 'Download', 'File', fileId, req, `Anonymous download of "${originalName}" via token ${token}.`),
+}));
+
+app.use(createDesktopUpdatesRouter({
+  vaultPath: FILE_VAULT,
+  tempPath: UPLOAD_TEMP,
 }));
 
 // ──────────────────────────────────────────────────────────────

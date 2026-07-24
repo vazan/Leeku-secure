@@ -9,6 +9,7 @@
     "preview": "cross-env NODE_ENV=production node dist/server.cjs",
     "start": "cross-env NODE_ENV=production node dist/server.cjs",
     "clean": "rimraf dist",
+    "test:desktop-updates": "tsx --test tests/desktop-updates-path.test.ts",
     "lint": "tsc --noEmit"
   },
   "dependencies": {
