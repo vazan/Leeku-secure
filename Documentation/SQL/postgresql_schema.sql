@@ -55,6 +55,90 @@ CREATE TABLE IF NOT EXISTS file_folders (
 	CONSTRAINT uq_file_folders_owner_parent_name UNIQUE (owner_user_id, parent_folder_id, name)
 );
 
+-- Compatibility fix for legacy schemas that still enforce UNIQUE(owner_user_id, name)
+ALTER TABLE file_folders
+	ADD COLUMN IF NOT EXISTS parent_folder_id UUID;
+
+DO $$
+BEGIN
+	IF NOT EXISTS (
+		SELECT 1
+		FROM pg_constraint c
+		INNER JOIN pg_class t ON t.oid = c.conrelid
+		INNER JOIN pg_namespace n ON n.oid = t.relnamespace
+		WHERE t.relname = 'file_folders'
+			AND n.nspname = current_schema()
+			AND c.conname = 'fk_file_folders_parent'
+	) THEN
+		ALTER TABLE file_folders
+			ADD CONSTRAINT fk_file_folders_parent
+			FOREIGN KEY (parent_folder_id) REFERENCES file_folders(id) ON DELETE NO ACTION;
+	END IF;
+END $$;
+
+DO $$
+DECLARE legacy_constraint_name TEXT;
+BEGIN
+	FOR legacy_constraint_name IN
+		SELECT c.conname
+		FROM pg_constraint c
+		INNER JOIN pg_class t ON t.oid = c.conrelid
+		INNER JOIN pg_namespace n ON n.oid = t.relnamespace
+		WHERE t.relname = 'file_folders'
+			AND n.nspname = current_schema()
+			AND c.contype = 'u'
+			AND c.conname <> 'uq_file_folders_owner_parent_name'
+			AND pg_get_constraintdef(c.oid) ILIKE 'UNIQUE (owner_user_id, name)%'
+	LOOP
+		EXECUTE format('ALTER TABLE %I.%I DROP CONSTRAINT %I', current_schema(), 'file_folders', legacy_constraint_name);
+	END LOOP;
+END $$;
+
+DO $$
+DECLARE legacy_unique_index_name TEXT;
+BEGIN
+	FOR legacy_unique_index_name IN
+		SELECT idx.relname
+		FROM pg_class idx
+		INNER JOIN pg_index i ON i.indexrelid = idx.oid
+		INNER JOIN pg_class tbl ON tbl.oid = i.indrelid
+		INNER JOIN pg_namespace ns ON ns.oid = tbl.relnamespace
+		LEFT JOIN pg_constraint c ON c.conindid = idx.oid
+		WHERE tbl.relname = 'file_folders'
+			AND ns.nspname = current_schema()
+			AND i.indisunique
+			AND c.oid IS NULL
+			AND pg_get_indexdef(idx.oid) ILIKE '%(owner_user_id, name)%'
+	LOOP
+		EXECUTE format('DROP INDEX IF EXISTS %I.%I', current_schema(), legacy_unique_index_name);
+	END LOOP;
+END $$;
+
+DO $$
+DECLARE duplicate_group_count INTEGER;
+BEGIN
+	SELECT COUNT(*) INTO duplicate_group_count
+	FROM (
+		SELECT owner_user_id, parent_folder_id, name, COUNT(*) AS c
+		FROM file_folders
+		GROUP BY owner_user_id, parent_folder_id, name
+		HAVING COUNT(*) > 1
+	) d;
+
+	IF duplicate_group_count > 0 THEN
+		RAISE EXCEPTION
+			'Cannot enforce uq_file_folders_owner_parent_name: % duplicate group(s) already exist in (owner_user_id, parent_folder_id, name).',
+			duplicate_group_count;
+	END IF;
+END $$;
+
+ALTER TABLE file_folders
+	DROP CONSTRAINT IF EXISTS uq_file_folders_owner_parent_name;
+
+ALTER TABLE file_folders
+	ADD CONSTRAINT uq_file_folders_owner_parent_name
+	UNIQUE (owner_user_id, parent_folder_id, name);
+
 CREATE TABLE IF NOT EXISTS files (
 	id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 	owner_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,

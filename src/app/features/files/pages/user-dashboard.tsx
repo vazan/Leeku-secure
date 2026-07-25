@@ -487,14 +487,46 @@ export default function UserDashboard({
   }, [currentFolderFiles, normalizedSearch]);
 
   const visibleFolders = useMemo(() => {
-    const children = folders.filter(
-      (folder) => (folder.parent_folder_id || null) === activeFolderId,
-    );
-    if (!normalizedSearch) return children;
-    return children.filter((folder) =>
-      folder.name.toLowerCase().includes(normalizedSearch),
-    );
-  }, [activeFolderId, folders, normalizedSearch]);
+    const toPathParts = (folder: FileFolder) => {
+      const names = [folder.name];
+      const seen = new Set<string>([folder.id]);
+      let parentId = folder.parent_folder_id || null;
+      while (parentId) {
+        if (seen.has(parentId)) break;
+        seen.add(parentId);
+        const parent = folderById.get(parentId);
+        if (!parent) break;
+        names.unshift(parent.name);
+        parentId = parent.parent_folder_id || null;
+      }
+      return names;
+    };
+
+    const scopedFolders = activeFolderId
+      ? folders.filter(
+          (folder) => (folder.parent_folder_id || null) === activeFolderId,
+        )
+      : folders;
+
+    const decorated = scopedFolders.map((folder) => {
+      const pathParts = toPathParts(folder);
+      return {
+        ...folder,
+        pathLabel: pathParts.join(" / "),
+        depth: Math.max(0, pathParts.length - 1),
+      };
+    });
+
+    const filtered = !normalizedSearch
+      ? decorated
+      : decorated.filter(
+          (folder) =>
+            folder.name.toLowerCase().includes(normalizedSearch) ||
+            folder.pathLabel.toLowerCase().includes(normalizedSearch),
+        );
+
+    return filtered.sort((a, b) => a.pathLabel.localeCompare(b.pathLabel));
+  }, [activeFolderId, folderById, folders, normalizedSearch]);
 
   useEffect(() => {
     if (!uploading) return undefined;
@@ -1149,7 +1181,29 @@ export default function UserDashboard({
       setFolders((current) => [...current, data.folder].sort((a, b) => a.name.localeCompare(b.name)));
       setActiveFolderId(data.folder.id);
       notify("Folder created.");
-    } else notifyError(data.error || "Could not create folder.");
+      return;
+    }
+
+    if (response.status === 409) {
+      await loadFilesAndLinks();
+
+      const existingFolder = data?.existing_folder as FileFolder | undefined;
+      if (existingFolder) {
+        setActiveFolderId(existingFolder.parent_folder_id || null);
+      }
+
+      if (data?.existing_folder_hidden_by_system_filter) {
+        notifyError("This folder already exists in a system area hidden from My Leeku file.");
+        return;
+      }
+
+      if (data?.existing_folder_path) {
+        notifyError(`This folder already exists at: ${data.existing_folder_path}`);
+        return;
+      }
+    }
+
+    notifyError(data.error || "Could not create folder.");
   };
 
   const renameFolder = async (folder: FileFolder) => {
@@ -1705,12 +1759,18 @@ export default function UserDashboard({
                       type="button"
                       onClick={() => setActiveFolderId(folder.id)}
                       className="flex w-full min-w-0 items-center gap-3 rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] p-4 text-left shadow-[var(--shadow-hairline)] hover:bg-[var(--bg-hover)]"
+                      style={{ paddingLeft: `${Math.min(2.5 + folder.depth * 0.55, 4.4)}rem` }}
                     >
                       <span className="grid h-10 w-10 shrink-0 place-items-center rounded-lg bg-[var(--bg-hover)] text-[var(--text-muted)]">
                         <Folder className="h-5 w-5" />
                       </span>
                       <span className="min-w-0">
                         <span className="block truncate text-sm font-medium">{folder.name}</span>
+                        {!activeFolder && folder.depth > 0 && (
+                          <span className="block truncate text-[11px] text-[var(--text-faint)]">
+                            /{folder.pathLabel}
+                          </span>
+                        )}
                         <span className="text-xs text-[var(--text-muted)]">
                           {folder.file_count} file{folder.file_count === 1 ? "" : "s"}
                         </span>

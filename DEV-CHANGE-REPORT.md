@@ -1,3 +1,50 @@
+---
+agent: DevEngineer | date: 2026-07-25 | model: GPT-5.3-Codex
+plan: /memories/session/dev-plan.md
+---
+
+## Intention
+Corriger le cas "dossier existe" alors qu'il n'est pas visible dans My Leeku file, en rendant le conflit compréhensible et en éliminant les anciens uniques globaux hérités.
+
+## Changement
+Classe : STANDARD — 2 fichiers modifiés, correction ciblée, pas de refactor opportuniste.
+
+## Fichiers
+| Fichier | Raison |
+|---|---|
+| src/server.ts | Gestion fiable des conflits d'unicité PostgreSQL + enrichissement de la réponse 409 + migration de nettoyage des contraintes/index uniques legacy (owner_user_id, name) |
+| src/app/features/files/pages/user-dashboard.tsx | En cas de 409 à la création: refresh dossiers, navigation vers le parent existant, message explicite (chemin réel ou zone système cachée) |
+
+## Contrats publics impactés
+OUI (additif, rétrocompatible): `POST /api/file-folders` conserve `error` et ajoute éventuellement `existing_folder`, `existing_folder_path`, `existing_folder_hidden_by_system_filter` lors d'un 409.
+
+## Risques
+Perf/Sécu/Régression/Compat : Faible / Faible / Faible / Faible.
+
+## Dette observée
+MINOR — Base de code avec quelques blocs SQL Server historiques encore présents dans branche PostgreSQL.
+
+## Validation
+Build: ✅  Lint: ❌  Type-check: ❌  Smoke: ⚠️SKIPPED
+
+Détail validation:
+- `pnpm build` : PASS
+- `pnpm lint` (`tsc --noEmit`) : FAIL sur erreur préexistante non liée dans `src/server/routes/desktop-updates.ts` (incompatibilité de type `ISqlTypeWithLength`)
+
+## Approbation CRITICAL
+N/A
+
+## Handoff TestEngineer
+Surfaces à tester:
+- Création dossier déjà existant même parent: vérifier message + absence de faux "disparus".
+- Création dossier en conflit avec ancien unique global: vérifier message chemin et navigation parent.
+- Conflit dans arborescence système cachée: vérifier message explicite.
+
+## Handoff QaEngineer
+Correction STANDARD livrée avec preuve build PASS, et échec type-check global préexistant documenté hors surface modifiée.
+
+---
+
 Intent
 Ported the validated Android All Files view rendering fix to the PostgreSQL branch, preventing the files area from overflowing the phone viewport or appearing tiny/left-aligned.
 

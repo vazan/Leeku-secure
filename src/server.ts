@@ -884,6 +884,10 @@ function normalizeNullableFolderId(value: unknown): string | null | undefined {
   return UUID_PATTERN.test(folderId) ? folderId : undefined;
 }
 
+function isDuplicateKeyError(err: any): boolean {
+  return err?.number === 2601 || err?.number === 2627 || err?.code === '23505';
+}
+
 function isAllowedDesktopUpdateFileName(fileName: string, version: string): boolean {
   const windows = `Leeku-Desktop-Setup-${version}.exe`;
   return new Set([
@@ -957,6 +961,73 @@ async function getOwnedFolder(folderId: string, ownerId: string): Promise<Folder
      WHERE id=@id AND owner_user_id=@ownerId`
   );
   return result.recordset[0] || null;
+}
+
+async function getFolderPath(folderId: string, ownerId: string): Promise<string> {
+  const request = await getRequest();
+  request.input('id', sql.UniqueIdentifier, folderId);
+  request.input('ownerId', sql.UniqueIdentifier, ownerId);
+  const result = await request.query<{ name: string; depth: number }>(
+    `WITH RECURSIVE folder_chain AS (
+       SELECT id, owner_user_id, parent_folder_id, name, 1 AS depth
+       FROM file_folders
+       WHERE id=@id AND owner_user_id=@ownerId
+       UNION ALL
+       SELECT parent.id, parent.owner_user_id, parent.parent_folder_id, parent.name, child.depth + 1
+       FROM file_folders parent
+       INNER JOIN folder_chain child ON child.parent_folder_id=parent.id
+       WHERE parent.owner_user_id=@ownerId
+     )
+     SELECT name, depth
+     FROM folder_chain
+     ORDER BY depth DESC`
+  );
+  return result.recordset.map((row) => row.name).join(' / ');
+}
+
+async function findExistingFolderConflict(
+  ownerId: string,
+  parentFolderId: string | null,
+  name: string,
+): Promise<{ folder: FolderRow; path: string; hiddenBySystemFilter: boolean } | null> {
+  const sameScopeRequest = await getRequest();
+  sameScopeRequest.input('ownerId', sql.UniqueIdentifier, ownerId);
+  sameScopeRequest.input('parentFolderId', sql.UniqueIdentifier, parentFolderId);
+  sameScopeRequest.input('name', sql.NVarChar(120), name);
+  const sameScope = await sameScopeRequest.query<FolderRow>(
+    `SELECT id, owner_user_id, parent_folder_id, name,
+            (SELECT COUNT(*) FROM files WHERE folder_id=file_folders.id AND COALESCE(status,'Available')!='Expired') AS file_count,
+            created_at, updated_at
+     FROM file_folders
+     WHERE owner_user_id=@ownerId
+       AND parent_folder_id IS NOT DISTINCT FROM @parentFolderId
+       AND name=@name
+     LIMIT 1`
+  );
+
+  const legacyScopeRequest = await getRequest();
+  legacyScopeRequest.input('ownerId', sql.UniqueIdentifier, ownerId);
+  legacyScopeRequest.input('name', sql.NVarChar(120), name);
+  const legacyScope = await legacyScopeRequest.query<FolderRow>(
+    `SELECT id, owner_user_id, parent_folder_id, name,
+            (SELECT COUNT(*) FROM files WHERE folder_id=file_folders.id AND COALESCE(status,'Available')!='Expired') AS file_count,
+            created_at, updated_at
+     FROM file_folders
+     WHERE owner_user_id=@ownerId
+       AND name=@name
+     ORDER BY updated_at DESC
+     LIMIT 1`
+  );
+
+  const folder = sameScope.recordset[0] || legacyScope.recordset[0];
+  if (!folder) return null;
+
+  const parent = folder.parent_folder_id ? await getOwnedFolder(folder.parent_folder_id, ownerId) : null;
+  const hiddenBySystemFilter =
+    (folder.parent_folder_id === null && folder.name === SYSTEM_UPDATE_FOLDER_NAME) ||
+    (parent?.name === SYSTEM_UPDATE_FOLDER_NAME && parent.parent_folder_id === null);
+  const path = await getFolderPath(folder.id, ownerId);
+  return { folder, path, hiddenBySystemFilter };
 }
 
 async function getFolderDepth(folderId: string, ownerId: string): Promise<number> {
@@ -2019,7 +2090,15 @@ app.post('/api/file-folders', authenticateUser as express.RequestHandler, async 
     await logSystemEvent(req.userId!, req.user!.username, 'Admin', 'Folder', result.recordset[0].id, req, `Created folder "${name}".`);
     res.status(201).json({ folder: mapFolderRow(result.recordset[0]) });
   } catch (err: any) {
-    if (err?.number === 2601 || err?.number === 2627) return res.status(409).json({ error: 'A folder with that name already exists.' });
+    if (isDuplicateKeyError(err)) {
+      const existing = await findExistingFolderConflict(req.userId!, parentFolderId, name);
+      return res.status(409).json({
+        error: 'A folder with that name already exists.',
+        existing_folder: existing ? mapFolderRow(existing.folder) : null,
+        existing_folder_path: existing?.path || null,
+        existing_folder_hidden_by_system_filter: existing?.hiddenBySystemFilter || false,
+      });
+    }
     console.error('[POST /api/file-folders]', err); res.status(500).json({ error: 'Failed to create folder.' });
   }
 });
@@ -2052,7 +2131,7 @@ app.post('/api/file-folders/:id/rename', authenticateUser as express.RequestHand
     await logSystemEvent(req.userId!, req.user!.username, 'Admin', 'Folder', folderId, req, `Renamed folder to "${name}".`);
     res.json({ folder: mapFolderRow(result.recordset[0]) });
   } catch (err: any) {
-    if (err?.number === 2601 || err?.number === 2627) return res.status(409).json({ error: 'A folder with that name already exists.' });
+    if (isDuplicateKeyError(err)) return res.status(409).json({ error: 'A folder with that name already exists.' });
     console.error('[POST /api/file-folders/:id/rename]', err); res.status(500).json({ error: 'Failed to rename folder.' });
   }
 });
@@ -4021,12 +4100,45 @@ async function ensureFileFolderSchema(): Promise<void> {
   const renameUnique = await getRequest();
   await renameUnique.query(`
     DO $$
+    DECLARE legacy_constraint_name TEXT;
+    DECLARE legacy_unique_index_name TEXT;
     BEGIN
+      FOR legacy_constraint_name IN
+        SELECT c.conname
+        FROM pg_constraint c
+        INNER JOIN pg_class t ON t.oid=c.conrelid
+        INNER JOIN pg_namespace n ON n.oid=t.relnamespace
+        WHERE t.relname='file_folders'
+          AND n.nspname=current_schema()
+          AND c.contype='u'
+          AND c.conname <> 'uq_file_folders_owner_parent_name'
+          AND pg_get_constraintdef(c.oid) ILIKE 'UNIQUE (owner_user_id, name)%'
+      LOOP
+        EXECUTE format('ALTER TABLE %I.%I DROP CONSTRAINT %I', current_schema(), 'file_folders', legacy_constraint_name);
+      END LOOP;
+
       IF EXISTS (
         SELECT 1 FROM pg_constraint WHERE conname = 'uq_file_folders_owner_name'
       ) THEN
         ALTER TABLE file_folders DROP CONSTRAINT uq_file_folders_owner_name;
       END IF;
+
+      FOR legacy_unique_index_name IN
+        SELECT idx.relname
+        FROM pg_class idx
+        INNER JOIN pg_index i ON i.indexrelid=idx.oid
+        INNER JOIN pg_class tbl ON tbl.oid=i.indrelid
+        INNER JOIN pg_namespace ns ON ns.oid=tbl.relnamespace
+        LEFT JOIN pg_constraint c ON c.conindid=idx.oid
+        WHERE tbl.relname='file_folders'
+          AND ns.nspname=current_schema()
+          AND i.indisunique
+          AND c.oid IS NULL
+          AND pg_get_indexdef(idx.oid) ILIKE '%(owner_user_id, name)%'
+      LOOP
+        EXECUTE format('DROP INDEX IF EXISTS %I.%I', current_schema(), legacy_unique_index_name);
+      END LOOP;
+
       IF NOT EXISTS (
         SELECT 1 FROM pg_constraint WHERE conname = 'uq_file_folders_owner_parent_name'
       ) THEN
