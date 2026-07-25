@@ -52,6 +52,10 @@ export interface FileFolder {
   updated_at: string;
 }
 
+export interface AdminFileFolder extends FileFolder {
+  username: string;
+}
+
 export interface ShareLink {
   id: string;
   file_id: string;

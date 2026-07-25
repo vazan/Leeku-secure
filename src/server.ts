@@ -56,7 +56,7 @@ import { createPublicSharingRouter } from './server/routes/public-sharing.js';
 import { createMaintenanceModeRouter } from './server/routes/maintenance-mode.js';
 import { createDesktopUpdatesRouter, SYSTEM_UPDATE_FOLDER_NAME } from './server/routes/desktop-updates.js';
 import { validateProductionConfig } from './server/utils/production.js';
-import type { Quota, User, FileMetadata, FileFolder, ShareLink, SystemLog, SystemStats } from './app/shared/types/index.js';
+import type { AdminFileFolder, Quota, User, FileMetadata, FileFolder, ShareLink, SystemLog, SystemStats } from './app/shared/types/index.js';
 
 const runtimeDir = (() => {
   const moduleUrl = (import.meta as ImportMeta | undefined)?.url;
@@ -706,12 +706,11 @@ async function issueRefreshSession(
   request.input('ua', sql.NVarChar(500), String(req.headers['user-agent'] || '').substring(0, 500) || null);
   await request.query(
     `DELETE FROM refresh_tokens
-     WHERE user_id=@uid AND (expires_at<=CURRENT_TIMESTAMP OR revoked_at<CURRENT_TIMESTAMP - INTERVAL '1 day')`
+     WHERE user_id=@uid AND (expires_at<=SYSDATETIMEOFFSET() OR revoked_at<DATEADD(day,-1,SYSDATETIMEOFFSET()));`
   );
-  request.input('id', sql.UniqueIdentifier, crypto.randomUUID());
   await request.query(
     `INSERT INTO refresh_tokens (id,user_id,token_hash,expires_at,created_at,revoked_at,ip_address,user_agent)
-     VALUES (@id,@uid,@hash,@exp,CURRENT_TIMESTAMP,NULL,@ip,@ua)`
+     VALUES (NEWID(),@uid,@hash,@exp,SYSDATETIMEOFFSET(),NULL,@ip,@ua)`
   );
   setRefreshCookie(res, token);
 }
@@ -799,6 +798,12 @@ interface FileRow {
 interface FolderRow {
   id: string; owner_user_id: string; parent_folder_id?: string | null; name: string; file_count?: number;
   created_at: Date; updated_at: Date;
+}
+
+interface AdminFolderRow extends FolderRow {
+  username_encrypted: Buffer;
+  username_iv: Buffer;
+  username_auth_tag: Buffer;
 }
 
 interface ShareRow {
@@ -968,7 +973,7 @@ async function getFolderPath(folderId: string, ownerId: string): Promise<string>
   request.input('id', sql.UniqueIdentifier, folderId);
   request.input('ownerId', sql.UniqueIdentifier, ownerId);
   const result = await request.query<{ name: string; depth: number }>(
-    `WITH RECURSIVE folder_chain AS (
+    `;WITH folder_chain AS (
        SELECT id, owner_user_id, parent_folder_id, name, 1 AS depth
        FROM file_folders
        WHERE id=@id AND owner_user_id=@ownerId
@@ -980,7 +985,8 @@ async function getFolderPath(folderId: string, ownerId: string): Promise<string>
      )
      SELECT name, depth
      FROM folder_chain
-     ORDER BY depth DESC`
+     ORDER BY depth DESC
+     OPTION (MAXRECURSION 100)`
   );
   return result.recordset.map((row) => row.name).join(' / ');
 }
@@ -995,28 +1001,28 @@ async function findExistingFolderConflict(
   sameScopeRequest.input('parentFolderId', sql.UniqueIdentifier, parentFolderId);
   sameScopeRequest.input('name', sql.NVarChar(120), name);
   const sameScope = await sameScopeRequest.query<FolderRow>(
-    `SELECT id, owner_user_id, parent_folder_id, name,
+    `SELECT TOP 1 id, owner_user_id, parent_folder_id, name,
             (SELECT COUNT(*) FROM files WHERE folder_id=file_folders.id AND COALESCE(status,'Available')!='Expired') AS file_count,
             created_at, updated_at
      FROM file_folders
      WHERE owner_user_id=@ownerId
-       AND parent_folder_id IS NOT DISTINCT FROM @parentFolderId
+       AND ((@parentFolderId IS NULL AND parent_folder_id IS NULL) OR parent_folder_id=@parentFolderId)
        AND name=@name
-     LIMIT 1`
+     ORDER BY updated_at DESC`
   );
 
   const legacyScopeRequest = await getRequest();
   legacyScopeRequest.input('ownerId', sql.UniqueIdentifier, ownerId);
   legacyScopeRequest.input('name', sql.NVarChar(120), name);
   const legacyScope = await legacyScopeRequest.query<FolderRow>(
-    `SELECT id, owner_user_id, parent_folder_id, name,
+    `SELECT TOP 1 id, owner_user_id, parent_folder_id, name,
             (SELECT COUNT(*) FROM files WHERE folder_id=file_folders.id AND COALESCE(status,'Available')!='Expired') AS file_count,
             created_at, updated_at
      FROM file_folders
      WHERE owner_user_id=@ownerId
        AND name=@name
      ORDER BY updated_at DESC
-     LIMIT 1`
+    `
   );
 
   const folder = sameScope.recordset[0] || legacyScope.recordset[0];
@@ -1304,12 +1310,12 @@ app.post('/api/auth/register', async (req, res) => {
          username_encrypted, username_iv, username_auth_tag, username_hash,
          password_hash, quota_id, email_verified, email_verification_token, email_verification_expires
        )
-      VALUES (@eEnc,@eIv,@eTag,@eHash, @uEnc,@uIv,@uTag,@uHash, @pw, @quota, @vOk, @vTok, @vExp)
-      RETURNING id, email_encrypted, email_iv, email_auth_tag,
-           username_encrypted, username_iv, username_auth_tag,
-           role, quota_id, storage_used_bytes,
-           status, created_at, failed_login_count, locked_until,
-           email_verified, email_verification_token, email_verification_expires`
+      OUTPUT INSERTED.id, INSERTED.email_encrypted, INSERTED.email_iv, INSERTED.email_auth_tag,
+        INSERTED.username_encrypted, INSERTED.username_iv, INSERTED.username_auth_tag,
+        INSERTED.role, INSERTED.quota_id, INSERTED.storage_used_bytes,
+        INSERTED.status, INSERTED.created_at, INSERTED.failed_login_count, INSERTED.locked_until,
+        INSERTED.email_verified, INSERTED.email_verification_token, INSERTED.email_verification_expires
+      VALUES (@eEnc,@eIv,@eTag,@eHash, @uEnc,@uIv,@uTag,@uHash, @pw, @quota, @vOk, @vTok, @vExp)`
     );
 
     const row = newUser.recordset[0];
@@ -1373,7 +1379,7 @@ app.get('/api/auth/verify-email', async (req, res) => {
     const upReq = await getRequest();
     upReq.input('id', sql.UniqueIdentifier, row.id);
     await upReq.query(
-      `UPDATE users SET email_verified=TRUE, email_verification_token=NULL, email_verification_expires=NULL WHERE id=@id`
+      `UPDATE users SET email_verified=1, email_verification_token=NULL, email_verification_expires=NULL WHERE id=@id`
     );
 
     await logSystemEvent(row.id, null, 'Auth', 'User', row.id, req, 'Email verified successfully.');
@@ -1563,11 +1569,11 @@ app.post('/api/users/me/update', authenticateUser as express.RequestHandler, asy
 
     const updated = await upReq.query<UserRow>(
       `UPDATE users SET ${sets.join(',')}
-      WHERE id=@id
-      RETURNING id, email_encrypted, email_iv, email_auth_tag,
-           username_encrypted, username_iv, username_auth_tag,
-           role, quota_id, storage_used_bytes,
-           status, created_at, failed_login_count, locked_until`
+      OUTPUT INSERTED.id, INSERTED.email_encrypted, INSERTED.email_iv, INSERTED.email_auth_tag,
+        INSERTED.username_encrypted, INSERTED.username_iv, INSERTED.username_auth_tag,
+        INSERTED.role, INSERTED.quota_id, INSERTED.storage_used_bytes,
+        INSERTED.status, INSERTED.created_at, INSERTED.failed_login_count, INSERTED.locked_until
+      WHERE id=@id`
     );
     const user = mapUserRow(updated.recordset[0]);
     if (password?.trim()) {
@@ -2888,16 +2894,16 @@ app.post(
            client_secret_hash, client_crypto_salt, client_crypto_iv, client_crypto_iterations,
            expires_at, is_encrypted
          )
-         VALUES (@ownerId,@folderId,@nEnc,@nIv,@nTag, @spath,@mime,@sz,@esz, @chk,@scan,@smsg,SYSDATETIMEOFFSET(), @vibe,@ttl,
+          OUTPUT INSERTED.id, INSERTED.owner_user_id, INSERTED.folder_id,
+                INSERTED.original_name_encrypted, INSERTED.original_name_iv, INSERTED.original_name_auth_tag,
+                INSERTED.stored_path, INSERTED.mime_type, INSERTED.size_bytes, INSERTED.encrypted_size_bytes,
+                INSERTED.status, INSERTED.checksum_sha256, INSERTED.scan_result, INSERTED.scan_message,
+                INSERTED.is_encrypted, INSERTED.leeku_vibe, INSERTED.ttl_hours,
+                INSERTED.client_secret_hash, INSERTED.client_crypto_salt, INSERTED.client_crypto_iv, INSERTED.client_crypto_iterations,
+                INSERTED.expires_at, INSERTED.created_at
+        VALUES (@ownerId,@folderId,@nEnc,@nIv,@nTag, @spath,@mime,@sz,@esz, @chk,@scan,@smsg,SYSDATETIMEOFFSET(), @vibe,@ttl,
                  @clientSecretHash,@clientCryptoSalt,@clientCryptoIv,@clientCryptoIterations,
-                 @exp,TRUE)
-               RETURNING id, owner_user_id, folder_id,
-             original_name_encrypted, original_name_iv, original_name_auth_tag,
-             stored_path, mime_type, size_bytes, encrypted_size_bytes,
-             status, checksum_sha256, scan_result, scan_message,
-             is_encrypted, leeku_vibe, ttl_hours,
-             client_secret_hash, client_crypto_salt, client_crypto_iv, client_crypto_iterations,
-             expires_at, created_at`
+                 @exp,1)`
       );
       const newFile = fileResult.recordset[0];
                 newFile.folder_name = uploadFolder?.name || null;
@@ -3554,9 +3560,9 @@ app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, asy
       insReq.input('allowExternalPreview', sql.Bit, allowExternalPreview ? 1 : 0);
       const insRes = await insReq.query<ShareRow>(
         `INSERT INTO share_links (file_id,public_token,password_hash,expires_at,max_downloads,is_active,allow_external_preview)
-          VALUES (@fid,@tok,@pwH,@exp,@md,@act,@allowExternalPreview)
-          RETURNING id,file_id,public_token,password_hash,
-               expires_at,max_downloads,download_count,is_active,allow_external_preview,created_at`
+         OUTPUT INSERTED.id,INSERTED.file_id,INSERTED.public_token,INSERTED.password_hash,
+                INSERTED.expires_at,INSERTED.max_downloads,INSERTED.download_count,INSERTED.is_active,INSERTED.allow_external_preview,INSERTED.created_at
+         VALUES (@fid,@tok,@pwH,@exp,@md,@act,@allowExternalPreview)`
       );
       shareRow = insRes.recordset[0];
     } else {
@@ -3599,9 +3605,9 @@ app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, asy
       if (sets.length) {
         const upRes = await upReq.query<ShareRow>(
           `UPDATE share_links SET ${sets.join(',')}
-           WHERE id=@id
-           RETURNING id,file_id,public_token,password_hash,
-                     expires_at,max_downloads,download_count,is_active,allow_external_preview,created_at`
+           OUTPUT INSERTED.id,INSERTED.file_id,INSERTED.public_token,INSERTED.password_hash,
+                  INSERTED.expires_at,INSERTED.max_downloads,INSERTED.download_count,INSERTED.is_active,INSERTED.allow_external_preview,INSERTED.created_at
+           WHERE id=@id`
         );
         shareRow = upRes.recordset[0];
       }
@@ -3706,11 +3712,11 @@ app.post('/api/admin/users/create-dummy', authenticateUser as express.RequestHan
          password_hash, quota_id, role, status,
          email_verified, email_verification_token, email_verification_expires
        )
-            VALUES (@eEnc,@eIv,@eTag,@eHash, @uEnc,@uIv,@uTag,@uHash, @pw,@quota, N'User', N'Active', TRUE, NULL, NULL)
-           RETURNING id, email_encrypted, email_iv, email_auth_tag,
-           username_encrypted, username_iv, username_auth_tag,
-           role, quota_id, storage_used_bytes,
-           status, created_at, failed_login_count, locked_until`
+      OUTPUT INSERTED.id, INSERTED.email_encrypted, INSERTED.email_iv, INSERTED.email_auth_tag,
+        INSERTED.username_encrypted, INSERTED.username_iv, INSERTED.username_auth_tag,
+        INSERTED.role, INSERTED.quota_id, INSERTED.storage_used_bytes,
+        INSERTED.status, INSERTED.created_at, INSERTED.failed_login_count, INSERTED.locked_until
+      VALUES (@eEnc,@eIv,@eTag,@eHash, @uEnc,@uIv,@uTag,@uHash, @pw,@quota, N'User', N'Active', 1, NULL, NULL)`
     );
 
     const user = mapUserRow(created.recordset[0]);
@@ -3757,10 +3763,10 @@ app.post('/api/admin/users/:id/reset-password', authenticateUser as express.Requ
     const updated = await updateReq.query<UserRow>(
       `UPDATE users
        SET password_hash=@pw, failed_login_count=0, locked_until=NULL
-      WHERE id=@id
-      RETURNING id,email_encrypted,email_iv,email_auth_tag,
-           username_encrypted,username_iv,username_auth_tag,
-           role,quota_id,storage_used_bytes,status,created_at,failed_login_count,locked_until`
+      OUTPUT INSERTED.id,INSERTED.email_encrypted,INSERTED.email_iv,INSERTED.email_auth_tag,
+        INSERTED.username_encrypted,INSERTED.username_iv,INSERTED.username_auth_tag,
+        INSERTED.role,INSERTED.quota_id,INSERTED.storage_used_bytes,INSERTED.status,INSERTED.created_at,INSERTED.failed_login_count,INSERTED.locked_until
+      WHERE id=@id`
     );
     const user = mapUserRow(updated.recordset[0]);
 
@@ -3799,10 +3805,10 @@ app.post('/api/admin/users/:id/suspend', authenticateUser as express.RequestHand
     const upReq = await getRequest(); upReq.input('s', sql.NVarChar(20), newStatus); upReq.input('id', sql.UniqueIdentifier, userId);
     const updated = await upReq.query<UserRow>(
       `UPDATE users SET status=@s
-      WHERE id=@id
-      RETURNING id,email_encrypted,email_iv,email_auth_tag,
-           username_encrypted,username_iv,username_auth_tag,
-           role,quota_id,storage_used_bytes,status,created_at,failed_login_count,locked_until`
+      OUTPUT INSERTED.id,INSERTED.email_encrypted,INSERTED.email_iv,INSERTED.email_auth_tag,
+        INSERTED.username_encrypted,INSERTED.username_iv,INSERTED.username_auth_tag,
+        INSERTED.role,INSERTED.quota_id,INSERTED.storage_used_bytes,INSERTED.status,INSERTED.created_at,INSERTED.failed_login_count,INSERTED.locked_until
+      WHERE id=@id`
     );
     const user = mapUserRow(updated.recordset[0]);
     await logSystemEvent(req.userId!, req.user!.username, 'Admin', 'User', userId, req, `Toggled status of "${user.username}" to ${newStatus}.`);
@@ -3820,10 +3826,10 @@ app.post('/api/admin/users/:id/quota', authenticateUser as express.RequestHandle
     const upReq = await getRequest(); upReq.input('q', sql.NVarChar(50), quota_id); upReq.input('id', sql.UniqueIdentifier, userId);
     const updated = await upReq.query<UserRow>(
       `UPDATE users SET quota_id=@q
-      WHERE id=@id
-      RETURNING id,email_encrypted,email_iv,email_auth_tag,
-           username_encrypted,username_iv,username_auth_tag,
-           role,quota_id,storage_used_bytes,status,created_at,failed_login_count,locked_until`
+      OUTPUT INSERTED.id,INSERTED.email_encrypted,INSERTED.email_iv,INSERTED.email_auth_tag,
+        INSERTED.username_encrypted,INSERTED.username_iv,INSERTED.username_auth_tag,
+        INSERTED.role,INSERTED.quota_id,INSERTED.storage_used_bytes,INSERTED.status,INSERTED.created_at,INSERTED.failed_login_count,INSERTED.locked_until
+      WHERE id=@id`
     );
     if (!updated.recordset.length) return res.status(404).json({ error: 'User not found.' });
     const user = mapUserRow(updated.recordset[0]);
@@ -3863,10 +3869,10 @@ app.post('/api/admin/users/:id/edit', authenticateUser as express.RequestHandler
 
     const updated = await upReq.query<UserRow>(
       `UPDATE users SET ${sets.join(',')}
-      WHERE id=@id
-      RETURNING id,email_encrypted,email_iv,email_auth_tag,
-           username_encrypted,username_iv,username_auth_tag,
-           role,quota_id,storage_used_bytes,status,created_at,failed_login_count,locked_until`
+      OUTPUT INSERTED.id,INSERTED.email_encrypted,INSERTED.email_iv,INSERTED.email_auth_tag,
+        INSERTED.username_encrypted,INSERTED.username_iv,INSERTED.username_auth_tag,
+        INSERTED.role,INSERTED.quota_id,INSERTED.storage_used_bytes,INSERTED.status,INSERTED.created_at,INSERTED.failed_login_count,INSERTED.locked_until
+      WHERE id=@id`
     );
     if (!updated.recordset.length) return res.status(404).json({ error: 'User not found.' });
     const user = mapUserRow(updated.recordset[0]);
@@ -3890,6 +3896,166 @@ app.get('/api/admin/files', authenticateUser as express.RequestHandler, verifyAd
     );
     res.json({ files: result.recordset.map(r => mapFileRow(r, decryptColumn(r.username_encrypted, r.username_iv, r.username_auth_tag))) });
   } catch (err) { console.error('[GET /api/admin/files]', err); res.status(500).json({ error: 'Failed to load files.' }); }
+});
+
+app.get('/api/admin/file-folders', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, async (req, res) => {
+  try {
+    const request = await getRequest();
+    const result = await request.query<AdminFolderRow>(
+      `SELECT ff.id, ff.owner_user_id, ff.parent_folder_id, ff.name, ff.created_at, ff.updated_at,
+              COUNT(f.id) AS file_count,
+              u.username_encrypted, u.username_iv, u.username_auth_tag
+       FROM file_folders ff
+       INNER JOIN users u ON u.id=ff.owner_user_id
+       LEFT JOIN files f ON f.folder_id=ff.id AND COALESCE(f.status,'Available')!='Expired'
+       GROUP BY ff.id, ff.owner_user_id, ff.parent_folder_id, ff.name, ff.created_at, ff.updated_at,
+                u.username_encrypted, u.username_iv, u.username_auth_tag
+       ORDER BY ff.owner_user_id ASC, ff.parent_folder_id ASC, ff.name ASC`
+    );
+    const folders: AdminFileFolder[] = result.recordset.map((row) => ({
+      ...mapFolderRow(row),
+      username: decryptColumn(row.username_encrypted, row.username_iv, row.username_auth_tag),
+    }));
+    res.json({ folders });
+  } catch (err) {
+    console.error('[GET /api/admin/file-folders]', err);
+    res.status(500).json({ error: 'Failed to load folders.' });
+  }
+});
+
+app.post('/api/admin/file-folders/:id/delete', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  const folderId = req.params.id;
+  if (!UUID_PATTERN.test(folderId)) return res.status(400).json({ error: 'Invalid folder id.' });
+  const deleteFiles = !!req.body?.delete_files;
+
+  try {
+    const folderReq = await getRequest();
+    folderReq.input('id', sql.UniqueIdentifier, folderId);
+    const folderResult = await folderReq.query<FolderRow>(
+      `SELECT id, owner_user_id, parent_folder_id, name, created_at, updated_at
+       FROM file_folders
+       WHERE id=@id`
+    );
+    const folder = folderResult.recordset[0];
+    if (!folder) return res.status(404).json({ error: 'Folder not found.' });
+
+    const ownerId = folder.owner_user_id;
+    const parent = folder.parent_folder_id ? await getOwnedFolder(folder.parent_folder_id, ownerId) : null;
+    if (folder.name === SYSTEM_UPDATE_FOLDER_NAME && folder.parent_folder_id === null) {
+      return res.status(403).json({ error: 'The desktop update system root cannot be deleted.' });
+    }
+    if (parent?.name === SYSTEM_UPDATE_FOLDER_NAME && parent.parent_folder_id === null) {
+      if (!deleteFiles) {
+        return res.status(400).json({ error: 'Draft update folders must be deleted together with their files.' });
+      }
+      const activation = await desktopUpdateFolderActivation(folder.id, ownerId);
+      if (activation && activation !== 'draft') {
+        return res.status(409).json({ error: 'Only draft desktop updates can be deleted.' });
+      }
+    }
+
+    if (!deleteFiles) {
+      const moveReq = await getRequest();
+      moveReq.input('folderId', sql.UniqueIdentifier, folderId);
+      moveReq.input('ownerId', sql.UniqueIdentifier, ownerId);
+      await moveReq.query(
+        `;WITH folder_tree AS (
+           SELECT id FROM file_folders WHERE id=@folderId AND owner_user_id=@ownerId
+           UNION ALL
+           SELECT ff.id
+           FROM file_folders ff
+           INNER JOIN folder_tree ft ON ff.parent_folder_id=ft.id
+           WHERE ff.owner_user_id=@ownerId
+         )
+         UPDATE files
+         SET folder_id=NULL
+         WHERE owner_user_id=@ownerId AND folder_id IN (SELECT id FROM folder_tree) OPTION (MAXRECURSION 100)`
+      );
+    } else {
+      const filesReq = await getRequest();
+      filesReq.input('folderId', sql.UniqueIdentifier, folderId);
+      filesReq.input('ownerId', sql.UniqueIdentifier, ownerId);
+      const folderFiles = await filesReq.query<{id:string;stored_path:string;size_bytes:number;status:string}>(
+        `;WITH folder_tree AS (
+           SELECT id FROM file_folders WHERE id=@folderId AND owner_user_id=@ownerId
+           UNION ALL
+           SELECT ff.id
+           FROM file_folders ff
+           INNER JOIN folder_tree ft ON ff.parent_folder_id=ft.id
+           WHERE ff.owner_user_id=@ownerId
+         )
+         SELECT id, stored_path, size_bytes, status
+         FROM files
+         WHERE owner_user_id=@ownerId AND folder_id IN (SELECT id FROM folder_tree) OPTION (MAXRECURSION 100)`
+      );
+
+      for (const file of folderFiles.recordset) {
+        const vaultPath = path.join(FILE_VAULT, file.stored_path);
+        try { if (fs.existsSync(vaultPath)) fs.unlinkSync(vaultPath); } catch {}
+      }
+
+      const storageToRemove = folderFiles.recordset
+        .filter((file) => file.status === 'Available')
+        .reduce((total, file) => total + Number(file.size_bytes || 0), 0);
+
+      const deleteReq = await getRequest();
+      deleteReq.input('folderId', sql.UniqueIdentifier, folderId);
+      deleteReq.input('ownerId', sql.UniqueIdentifier, ownerId);
+      await deleteReq.query(
+        `;WITH folder_tree AS (
+           SELECT id FROM file_folders WHERE id=@folderId AND owner_user_id=@ownerId
+           UNION ALL
+           SELECT ff.id
+           FROM file_folders ff
+           INNER JOIN folder_tree ft ON ff.parent_folder_id=ft.id
+           WHERE ff.owner_user_id=@ownerId
+         )
+         DELETE FROM files
+         WHERE owner_user_id=@ownerId AND folder_id IN (SELECT id FROM folder_tree) OPTION (MAXRECURSION 100)`
+      );
+
+      if (storageToRemove > 0) {
+        const storageReq = await getRequest();
+        storageReq.input('sz', sql.BigInt, storageToRemove);
+        storageReq.input('ownerId', sql.UniqueIdentifier, ownerId);
+        await storageReq.query('UPDATE users SET storage_used_bytes=CASE WHEN storage_used_bytes-@sz<0 THEN 0 ELSE storage_used_bytes-@sz END WHERE id=@ownerId');
+      }
+    }
+
+    const deleteFolderReq = await getRequest();
+    deleteFolderReq.input('id', sql.UniqueIdentifier, folderId);
+    deleteFolderReq.input('ownerId', sql.UniqueIdentifier, ownerId);
+    await deleteFolderReq.query(
+      `;WITH folder_tree AS (
+         SELECT id FROM file_folders WHERE id=@id AND owner_user_id=@ownerId
+         UNION ALL
+         SELECT ff.id
+         FROM file_folders ff
+         INNER JOIN folder_tree ft ON ff.parent_folder_id=ft.id
+         WHERE ff.owner_user_id=@ownerId
+       )
+       DELETE ff
+       FROM file_folders ff
+       INNER JOIN folder_tree ft ON ff.id=ft.id OPTION (MAXRECURSION 100)`
+    );
+
+    await logSystemEvent(
+      req.userId!,
+      req.user!.username,
+      'Delete',
+      'Folder',
+      folderId,
+      req,
+      deleteFiles
+        ? `Admin deleted folder tree "${folder.name}" and its files.`
+        : `Admin deleted folder tree "${folder.name}" and moved files to owner root.`,
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[POST /api/admin/file-folders/:id/delete]', err);
+    res.status(500).json({ error: 'Failed to delete folder.' });
+  }
 });
 
 app.post('/api/admin/files/:id/block', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
@@ -3958,14 +4124,9 @@ app.post('/api/admin/quotas', authenticateUser as express.RequestHandler, verify
     request.input('sl', sql.BigInt, Number(storage_limit_bytes)); request.input('mf', sql.BigInt, Number(max_file_size_bytes));
     request.input('mfi', sql.Int, Number(max_files)); request.input('dl', sql.BigInt, Number(daily_upload_limit_bytes));
     await request.query(
-      `INSERT INTO quotas (id,name,storage_limit_bytes,max_file_size_bytes,max_files,daily_upload_limit_bytes)
-       VALUES (@id,@name,@sl,@mf,@mfi,@dl)
-       ON CONFLICT (id) DO UPDATE SET
-         name=EXCLUDED.name,
-         storage_limit_bytes=EXCLUDED.storage_limit_bytes,
-         max_file_size_bytes=EXCLUDED.max_file_size_bytes,
-         max_files=EXCLUDED.max_files,
-         daily_upload_limit_bytes=EXCLUDED.daily_upload_limit_bytes`
+      `MERGE quotas AS target USING (SELECT @id AS id) AS src ON target.id=src.id
+       WHEN MATCHED THEN UPDATE SET name=@name,storage_limit_bytes=@sl,max_file_size_bytes=@mf,max_files=@mfi,daily_upload_limit_bytes=@dl
+       WHEN NOT MATCHED THEN INSERT (id,name,storage_limit_bytes,max_file_size_bytes,max_files,daily_upload_limit_bytes) VALUES (@id,@name,@sl,@mf,@mfi,@dl);`
     );
     const allReq = await getRequest();
     const allQuotas = await allReq.query<Quota>('SELECT id,name,storage_limit_bytes,max_file_size_bytes,max_files,daily_upload_limit_bytes FROM quotas ORDER BY storage_limit_bytes');

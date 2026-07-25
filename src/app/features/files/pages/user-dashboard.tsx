@@ -30,6 +30,7 @@ import {
 } from "@/app/shared/components/ui/popover";
 import { MaintenanceModeBanner } from "@/app/shared/components/maintenance-mode-banner";
 import type {
+  AdminFileFolder,
   FileFolder,
   FileMetadata,
   Quota,
@@ -248,6 +249,7 @@ export default function UserDashboard({
   const [links, setLinks] = useState<ShareLink[]>([]);
   const [adminUsers, setAdminUsers] = useState<User[]>([]);
   const [adminFiles, setAdminFiles] = useState<FileMetadata[]>([]);
+  const [adminFolders, setAdminFolders] = useState<AdminFileFolder[]>([]);
   const [logs, setLogs] = useState<SystemLog[]>([]);
   const [stats, setStats] = useState<SystemStats | null>(null);
   const [search, setSearch] = useState("");
@@ -423,10 +425,11 @@ export default function UserDashboard({
   const loadAdmin = async () => {
     if (user.role !== "Admin") return;
     const headers = authHeaders(token);
-    const [usersResponse, filesResponse, logsResponse, statsResponse] =
+    const [usersResponse, filesResponse, foldersResponse, logsResponse, statsResponse] =
       await Promise.all([
         fetch("/api/admin/users", { headers }),
         fetch("/api/admin/files", { headers }),
+        fetch("/api/admin/file-folders", { headers }),
         fetch("/api/admin/logs", { headers }),
         fetch("/api/stats"),
       ]);
@@ -434,6 +437,8 @@ export default function UserDashboard({
       setAdminUsers((await usersResponse.json()).users || []);
     if (filesResponse.ok)
       setAdminFiles((await filesResponse.json()).files || []);
+    if (foldersResponse.ok)
+      setAdminFolders((await foldersResponse.json()).folders || []);
     if (logsResponse.ok) setLogs((await logsResponse.json()).logs || []);
     if (statsResponse.ok) setStats(await statsResponse.json());
   };
@@ -506,7 +511,7 @@ export default function UserDashboard({
       ? folders.filter(
           (folder) => (folder.parent_folder_id || null) === activeFolderId,
         )
-      : folders;
+      : folders.filter((folder) => !folder.parent_folder_id);
 
     const decorated = scopedFolders.map((folder) => {
       const pathParts = toPathParts(folder);
@@ -2162,6 +2167,7 @@ export default function UserDashboard({
             <AdminWorkspace
               users={adminUsers}
               files={adminFiles}
+              folders={adminFolders}
               logs={logs}
               stats={stats}
               quotas={quotas}
