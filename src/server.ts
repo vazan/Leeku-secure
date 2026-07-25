@@ -22,10 +22,9 @@ import cluster from 'cluster';
 import { fileURLToPath } from 'url';
 import { execFileSync } from 'child_process';
 import { GoogleGenAI } from '@google/genai';
-import sql from 'mssql';
 import si from 'systeminformation';
 
-import { getPool, closePool, getRequest } from './server/db.js';
+import { getPool, closePool, getRequest, sql } from './server/db.js';
 import {
   encryptFile, wrapKey, unwrapKey,
   encryptFileStream, decryptFileStream, computeFileChecksum,
@@ -707,8 +706,10 @@ async function issueRefreshSession(
   request.input('ua', sql.NVarChar(500), String(req.headers['user-agent'] || '').substring(0, 500) || null);
   await request.query(
     `DELETE FROM refresh_tokens
-     WHERE user_id=@uid AND (expires_at<=SYSDATETIMEOFFSET() OR revoked_at<DATEADD(day,-1,SYSDATETIMEOFFSET()));
-     INSERT INTO refresh_tokens (id,user_id,token_hash,expires_at,created_at,revoked_at,ip_address,user_agent)
+     WHERE user_id=@uid AND (expires_at<=SYSDATETIMEOFFSET() OR revoked_at<DATEADD(day,-1,SYSDATETIMEOFFSET()));`
+  );
+  await request.query(
+    `INSERT INTO refresh_tokens (id,user_id,token_hash,expires_at,created_at,revoked_at,ip_address,user_agent)
      VALUES (NEWID(),@uid,@hash,@exp,SYSDATETIMEOFFSET(),NULL,@ip,@ua)`
   );
   setRefreshCookie(res, token);
@@ -882,6 +883,10 @@ function normalizeNullableFolderId(value: unknown): string | null | undefined {
   return UUID_PATTERN.test(folderId) ? folderId : undefined;
 }
 
+function isDuplicateKeyError(err: any): boolean {
+  return err?.number === 2601 || err?.number === 2627 || err?.code === '23505';
+}
+
 function isAllowedDesktopUpdateFileName(fileName: string, version: string): boolean {
   const windows = `Leeku-Desktop-Setup-${version}.exe`;
   return new Set([
@@ -955,6 +960,74 @@ async function getOwnedFolder(folderId: string, ownerId: string): Promise<Folder
      WHERE id=@id AND owner_user_id=@ownerId`
   );
   return result.recordset[0] || null;
+}
+
+async function getFolderPath(folderId: string, ownerId: string): Promise<string> {
+  const request = await getRequest();
+  request.input('id', sql.UniqueIdentifier, folderId);
+  request.input('ownerId', sql.UniqueIdentifier, ownerId);
+  const result = await request.query<{ name: string; depth: number }>(
+    `;WITH folder_chain AS (
+       SELECT id, owner_user_id, parent_folder_id, name, 1 AS depth
+       FROM file_folders
+       WHERE id=@id AND owner_user_id=@ownerId
+       UNION ALL
+       SELECT parent.id, parent.owner_user_id, parent.parent_folder_id, parent.name, child.depth + 1
+       FROM file_folders parent
+       INNER JOIN folder_chain child ON child.parent_folder_id=parent.id
+       WHERE parent.owner_user_id=@ownerId
+     )
+     SELECT name, depth
+     FROM folder_chain
+     ORDER BY depth DESC
+     OPTION (MAXRECURSION 100)`
+  );
+  return result.recordset.map((row) => row.name).join(' / ');
+}
+
+async function findExistingFolderConflict(
+  ownerId: string,
+  parentFolderId: string | null,
+  name: string,
+): Promise<{ folder: FolderRow; path: string; hiddenBySystemFilter: boolean } | null> {
+  const sameScopeRequest = await getRequest();
+  sameScopeRequest.input('ownerId', sql.UniqueIdentifier, ownerId);
+  sameScopeRequest.input('parentFolderId', sql.UniqueIdentifier, parentFolderId);
+  sameScopeRequest.input('name', sql.NVarChar(120), name);
+  const sameScope = await sameScopeRequest.query<FolderRow>(
+    `SELECT TOP 1 id, owner_user_id, parent_folder_id, name,
+            (SELECT COUNT(*) FROM files WHERE folder_id=file_folders.id AND COALESCE(status,'Available')!='Expired') AS file_count,
+            created_at, updated_at
+     FROM file_folders
+     WHERE owner_user_id=@ownerId
+       AND ((@parentFolderId IS NULL AND parent_folder_id IS NULL) OR parent_folder_id=@parentFolderId)
+       AND name=@name
+     ORDER BY updated_at DESC`
+  );
+
+  const legacyScopeRequest = await getRequest();
+  legacyScopeRequest.input('ownerId', sql.UniqueIdentifier, ownerId);
+  legacyScopeRequest.input('name', sql.NVarChar(120), name);
+  const legacyScope = await legacyScopeRequest.query<FolderRow>(
+    `SELECT TOP 1 id, owner_user_id, parent_folder_id, name,
+            (SELECT COUNT(*) FROM files WHERE folder_id=file_folders.id AND COALESCE(status,'Available')!='Expired') AS file_count,
+            created_at, updated_at
+     FROM file_folders
+     WHERE owner_user_id=@ownerId
+       AND name=@name
+     ORDER BY updated_at DESC
+    `
+  );
+
+  const folder = sameScope.recordset[0] || legacyScope.recordset[0];
+  if (!folder) return null;
+
+  const parent = folder.parent_folder_id ? await getOwnedFolder(folder.parent_folder_id, ownerId) : null;
+  const hiddenBySystemFilter =
+    (folder.parent_folder_id === null && folder.name === SYSTEM_UPDATE_FOLDER_NAME) ||
+    (parent?.name === SYSTEM_UPDATE_FOLDER_NAME && parent.parent_folder_id === null);
+  const path = await getFolderPath(folder.id, ownerId);
+  return { folder, path, hiddenBySystemFilter };
 }
 
 async function getFolderDepth(folderId: string, ownerId: string): Promise<number> {
@@ -1231,12 +1304,12 @@ app.post('/api/auth/register', async (req, res) => {
          username_encrypted, username_iv, username_auth_tag, username_hash,
          password_hash, quota_id, email_verified, email_verification_token, email_verification_expires
        )
-       OUTPUT INSERTED.id, INSERTED.email_encrypted, INSERTED.email_iv, INSERTED.email_auth_tag,
-              INSERTED.username_encrypted, INSERTED.username_iv, INSERTED.username_auth_tag,
-              INSERTED.role, INSERTED.quota_id, INSERTED.storage_used_bytes,
-              INSERTED.status, INSERTED.created_at, INSERTED.failed_login_count, INSERTED.locked_until,
-              INSERTED.email_verified, INSERTED.email_verification_token, INSERTED.email_verification_expires
-       VALUES (@eEnc,@eIv,@eTag,@eHash, @uEnc,@uIv,@uTag,@uHash, @pw, @quota, @vOk, @vTok, @vExp)`
+      OUTPUT INSERTED.id, INSERTED.email_encrypted, INSERTED.email_iv, INSERTED.email_auth_tag,
+        INSERTED.username_encrypted, INSERTED.username_iv, INSERTED.username_auth_tag,
+        INSERTED.role, INSERTED.quota_id, INSERTED.storage_used_bytes,
+        INSERTED.status, INSERTED.created_at, INSERTED.failed_login_count, INSERTED.locked_until,
+        INSERTED.email_verified, INSERTED.email_verification_token, INSERTED.email_verification_expires
+      VALUES (@eEnc,@eIv,@eTag,@eHash, @uEnc,@uIv,@uTag,@uHash, @pw, @quota, @vOk, @vTok, @vExp)`
     );
 
     const row = newUser.recordset[0];
@@ -1490,11 +1563,11 @@ app.post('/api/users/me/update', authenticateUser as express.RequestHandler, asy
 
     const updated = await upReq.query<UserRow>(
       `UPDATE users SET ${sets.join(',')}
-       OUTPUT INSERTED.id, INSERTED.email_encrypted, INSERTED.email_iv, INSERTED.email_auth_tag,
-              INSERTED.username_encrypted, INSERTED.username_iv, INSERTED.username_auth_tag,
-              INSERTED.role, INSERTED.quota_id, INSERTED.storage_used_bytes,
-              INSERTED.status, INSERTED.created_at, INSERTED.failed_login_count, INSERTED.locked_until
-       WHERE id=@id`
+      OUTPUT INSERTED.id, INSERTED.email_encrypted, INSERTED.email_iv, INSERTED.email_auth_tag,
+        INSERTED.username_encrypted, INSERTED.username_iv, INSERTED.username_auth_tag,
+        INSERTED.role, INSERTED.quota_id, INSERTED.storage_used_bytes,
+        INSERTED.status, INSERTED.created_at, INSERTED.failed_login_count, INSERTED.locked_until
+      WHERE id=@id`
     );
     const user = mapUserRow(updated.recordset[0]);
     if (password?.trim()) {
@@ -2017,7 +2090,15 @@ app.post('/api/file-folders', authenticateUser as express.RequestHandler, async 
     await logSystemEvent(req.userId!, req.user!.username, 'Admin', 'Folder', result.recordset[0].id, req, `Created folder "${name}".`);
     res.status(201).json({ folder: mapFolderRow(result.recordset[0]) });
   } catch (err: any) {
-    if (err?.number === 2601 || err?.number === 2627) return res.status(409).json({ error: 'A folder with that name already exists.' });
+    if (isDuplicateKeyError(err)) {
+      const existing = await findExistingFolderConflict(req.userId!, parentFolderId, name);
+      return res.status(409).json({
+        error: 'A folder with that name already exists.',
+        existing_folder: existing ? mapFolderRow(existing.folder) : null,
+        existing_folder_path: existing?.path || null,
+        existing_folder_hidden_by_system_filter: existing?.hiddenBySystemFilter || false,
+      });
+    }
     console.error('[POST /api/file-folders]', err); res.status(500).json({ error: 'Failed to create folder.' });
   }
 });
@@ -2050,7 +2131,7 @@ app.post('/api/file-folders/:id/rename', authenticateUser as express.RequestHand
     await logSystemEvent(req.userId!, req.user!.username, 'Admin', 'Folder', folderId, req, `Renamed folder to "${name}".`);
     res.json({ folder: mapFolderRow(result.recordset[0]) });
   } catch (err: any) {
-    if (err?.number === 2601 || err?.number === 2627) return res.status(409).json({ error: 'A folder with that name already exists.' });
+    if (isDuplicateKeyError(err)) return res.status(409).json({ error: 'A folder with that name already exists.' });
     console.error('[POST /api/file-folders/:id/rename]', err); res.status(500).json({ error: 'Failed to rename folder.' });
   }
 });
@@ -2819,7 +2900,7 @@ app.post(
                  @exp,1)`
       );
       const newFile = fileResult.recordset[0];
-      newFile.folder_name = uploadFolder?.name || null;
+                newFile.folder_name = uploadFolder?.name || null;
       console.info('[upload] File record inserted.', { userId: user.id, originalName: original_name, fileId: newFile.id });
 
       currentStage = 'insert_key_record';
@@ -3625,11 +3706,11 @@ app.post('/api/admin/users/create-dummy', authenticateUser as express.RequestHan
          password_hash, quota_id, role, status,
          email_verified, email_verification_token, email_verification_expires
        )
-       OUTPUT INSERTED.id, INSERTED.email_encrypted, INSERTED.email_iv, INSERTED.email_auth_tag,
-              INSERTED.username_encrypted, INSERTED.username_iv, INSERTED.username_auth_tag,
-              INSERTED.role, INSERTED.quota_id, INSERTED.storage_used_bytes,
-              INSERTED.status, INSERTED.created_at, INSERTED.failed_login_count, INSERTED.locked_until
-       VALUES (@eEnc,@eIv,@eTag,@eHash, @uEnc,@uIv,@uTag,@uHash, @pw,@quota, N'User', N'Active', 1, NULL, NULL)`
+      OUTPUT INSERTED.id, INSERTED.email_encrypted, INSERTED.email_iv, INSERTED.email_auth_tag,
+        INSERTED.username_encrypted, INSERTED.username_iv, INSERTED.username_auth_tag,
+        INSERTED.role, INSERTED.quota_id, INSERTED.storage_used_bytes,
+        INSERTED.status, INSERTED.created_at, INSERTED.failed_login_count, INSERTED.locked_until
+      VALUES (@eEnc,@eIv,@eTag,@eHash, @uEnc,@uIv,@uTag,@uHash, @pw,@quota, N'User', N'Active', 1, NULL, NULL)`
     );
 
     const user = mapUserRow(created.recordset[0]);
@@ -3676,10 +3757,10 @@ app.post('/api/admin/users/:id/reset-password', authenticateUser as express.Requ
     const updated = await updateReq.query<UserRow>(
       `UPDATE users
        SET password_hash=@pw, failed_login_count=0, locked_until=NULL
-       OUTPUT INSERTED.id,INSERTED.email_encrypted,INSERTED.email_iv,INSERTED.email_auth_tag,
-              INSERTED.username_encrypted,INSERTED.username_iv,INSERTED.username_auth_tag,
-              INSERTED.role,INSERTED.quota_id,INSERTED.storage_used_bytes,INSERTED.status,INSERTED.created_at,INSERTED.failed_login_count,INSERTED.locked_until
-       WHERE id=@id`
+      OUTPUT INSERTED.id,INSERTED.email_encrypted,INSERTED.email_iv,INSERTED.email_auth_tag,
+        INSERTED.username_encrypted,INSERTED.username_iv,INSERTED.username_auth_tag,
+        INSERTED.role,INSERTED.quota_id,INSERTED.storage_used_bytes,INSERTED.status,INSERTED.created_at,INSERTED.failed_login_count,INSERTED.locked_until
+      WHERE id=@id`
     );
     const user = mapUserRow(updated.recordset[0]);
 
@@ -3718,10 +3799,10 @@ app.post('/api/admin/users/:id/suspend', authenticateUser as express.RequestHand
     const upReq = await getRequest(); upReq.input('s', sql.NVarChar(20), newStatus); upReq.input('id', sql.UniqueIdentifier, userId);
     const updated = await upReq.query<UserRow>(
       `UPDATE users SET status=@s
-       OUTPUT INSERTED.id,INSERTED.email_encrypted,INSERTED.email_iv,INSERTED.email_auth_tag,
-              INSERTED.username_encrypted,INSERTED.username_iv,INSERTED.username_auth_tag,
-              INSERTED.role,INSERTED.quota_id,INSERTED.storage_used_bytes,INSERTED.status,INSERTED.created_at,INSERTED.failed_login_count,INSERTED.locked_until
-       WHERE id=@id`
+      OUTPUT INSERTED.id,INSERTED.email_encrypted,INSERTED.email_iv,INSERTED.email_auth_tag,
+        INSERTED.username_encrypted,INSERTED.username_iv,INSERTED.username_auth_tag,
+        INSERTED.role,INSERTED.quota_id,INSERTED.storage_used_bytes,INSERTED.status,INSERTED.created_at,INSERTED.failed_login_count,INSERTED.locked_until
+      WHERE id=@id`
     );
     const user = mapUserRow(updated.recordset[0]);
     await logSystemEvent(req.userId!, req.user!.username, 'Admin', 'User', userId, req, `Toggled status of "${user.username}" to ${newStatus}.`);
@@ -3739,10 +3820,10 @@ app.post('/api/admin/users/:id/quota', authenticateUser as express.RequestHandle
     const upReq = await getRequest(); upReq.input('q', sql.NVarChar(50), quota_id); upReq.input('id', sql.UniqueIdentifier, userId);
     const updated = await upReq.query<UserRow>(
       `UPDATE users SET quota_id=@q
-       OUTPUT INSERTED.id,INSERTED.email_encrypted,INSERTED.email_iv,INSERTED.email_auth_tag,
-              INSERTED.username_encrypted,INSERTED.username_iv,INSERTED.username_auth_tag,
-              INSERTED.role,INSERTED.quota_id,INSERTED.storage_used_bytes,INSERTED.status,INSERTED.created_at,INSERTED.failed_login_count,INSERTED.locked_until
-       WHERE id=@id`
+      OUTPUT INSERTED.id,INSERTED.email_encrypted,INSERTED.email_iv,INSERTED.email_auth_tag,
+        INSERTED.username_encrypted,INSERTED.username_iv,INSERTED.username_auth_tag,
+        INSERTED.role,INSERTED.quota_id,INSERTED.storage_used_bytes,INSERTED.status,INSERTED.created_at,INSERTED.failed_login_count,INSERTED.locked_until
+      WHERE id=@id`
     );
     if (!updated.recordset.length) return res.status(404).json({ error: 'User not found.' });
     const user = mapUserRow(updated.recordset[0]);
@@ -3782,10 +3863,10 @@ app.post('/api/admin/users/:id/edit', authenticateUser as express.RequestHandler
 
     const updated = await upReq.query<UserRow>(
       `UPDATE users SET ${sets.join(',')}
-       OUTPUT INSERTED.id,INSERTED.email_encrypted,INSERTED.email_iv,INSERTED.email_auth_tag,
-              INSERTED.username_encrypted,INSERTED.username_iv,INSERTED.username_auth_tag,
-              INSERTED.role,INSERTED.quota_id,INSERTED.storage_used_bytes,INSERTED.status,INSERTED.created_at,INSERTED.failed_login_count,INSERTED.locked_until
-       WHERE id=@id`
+      OUTPUT INSERTED.id,INSERTED.email_encrypted,INSERTED.email_iv,INSERTED.email_auth_tag,
+        INSERTED.username_encrypted,INSERTED.username_iv,INSERTED.username_auth_tag,
+        INSERTED.role,INSERTED.quota_id,INSERTED.storage_used_bytes,INSERTED.status,INSERTED.created_at,INSERTED.failed_login_count,INSERTED.locked_until
+      WHERE id=@id`
     );
     if (!updated.recordset.length) return res.status(404).json({ error: 'User not found.' });
     const user = mapUserRow(updated.recordset[0]);

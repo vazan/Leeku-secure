@@ -20,6 +20,26 @@ sqlcmd -S localhost -U sa -P <password> -i production_schema.sql
 
 ## Files Overview
 
+### 0. `2026-07-25-mssql-folder-and-share-migration.sql` - Targeted MSSQL Patch
+**Purpose:** Idempotent migration for folder/share schema alignment required by recent backend and dashboard changes.
+
+**Applies/ensures:**
+- `file_folders` parent-aware uniqueness: `(owner_user_id, parent_folder_id, name)`
+- `files.folder_id` relation and supporting index
+- optional file secret columns used by current upload/download flows
+- `share_links.allow_external_preview` default/non-null integrity
+
+**How to run:**
+```powershell
+sqlcmd -S your-sql-server -d LeekuSecure -U sa -P <password> -i 2026-07-25-mssql-folder-and-share-migration.sql
+```
+
+**When to run:**
+- Existing environments already created with older schema versions.
+- Safe to rerun (idempotent).
+
+---
+
 ### 1. `production_schema.sql` - **Single Source of Truth** ⭐ **RECOMMENDED**
 **Purpose:** Complete, production-ready database schema in a single file.
 
@@ -140,14 +160,16 @@ This file provides best practices and examples for building application code tha
 
 ## Database Schema
 
-### Tables (7 Total)
+### Tables (9 Total)
 1. **users** — User accounts, authentication, quotas
 2. **quotas** — Storage tiers and limits
-3. **files** — File metadata, encryption keys, scan results
-4. **file_encryption_keys** — Per-file encryption keys
-5. **share_links** — Public file sharing
-6. **refresh_tokens** — OAuth2 session management
-7. **system_logs** — Audit trail
+3. **file_folders** — User folders and hierarchy
+4. **files** — File metadata, encryption keys, scan results
+5. **file_encryption_keys** — Per-file encryption keys
+6. **share_links** — Public file sharing
+7. **refresh_tokens** — OAuth2 session management
+8. **system_logs** — Audit trail
+9. **system_config** — Operational settings (maintenance mode)
 
 ### Indexes (12 Total)
 - **files:** owner_id, status, expires_at (filtered)
@@ -156,8 +178,11 @@ This file provides best practices and examples for building application code tha
 - **share_links:** file_id
 - **system_logs:** created_at, event_type
 
-### Foreign Keys (5 Total)
+### Foreign Keys (8 Total)
+- `file_folders.owner_user_id` → `users.id` (CASCADE)
+- `file_folders.parent_folder_id` → `file_folders.id` (NO ACTION)
 - `files.owner_user_id` → `users.id` (CASCADE)
+- `files.folder_id` → `file_folders.id` (NO ACTION)
 - `file_encryption_keys.file_id` → `files.id` (CASCADE)
 - `share_links.file_id` → `files.id` (CASCADE)
 - `refresh_tokens.user_id` → `users.id` (CASCADE)
@@ -250,6 +275,8 @@ SELECT name FROM sys.databases WHERE name = 'LeekuSecure-Prod';
 -- Check all tables exist (should return 7)
 SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES 
 WHERE TABLE_CATALOG = 'LeekuSecure-Prod' AND TABLE_SCHEMA = 'dbo';
+
+-- Current schema expected: 9 tables
 
 -- Check indexes (should return 12)
 SELECT COUNT(*) FROM sys.indexes 

@@ -7,6 +7,7 @@
 ## Overview
 
 The `production_schema.sql` schema is enterprise-ready with optimized performance, security hardening, and operational automation.
+For existing environments, run `2026-07-25-mssql-folder-and-share-migration.sql` before validation.
 
 ## Key Validation Points
 
@@ -19,9 +20,9 @@ The `production_schema.sql` schema is enterprise-ready with optimized performanc
 - **File Locations:** Separate data (P:\DATA) and logs (L:\LOGS) for optimal I/O
 
 ### ✅ Schema Structure
-- **7 Tables:** users, quotas, files, file_encryption_keys, share_links, refresh_tokens, system_logs
+- **9 Tables:** users, quotas, file_folders, files, file_encryption_keys, share_links, refresh_tokens, system_logs, system_config
 - **12 Indexes:** Optimized for common query patterns
-- **5 Stored Procedures:** Encapsulate critical operations
+- **7 Stored Procedures:** Encapsulate critical operations
 - **9 Check Constraints:** Validate data at DB layer
 - **1 Custom Type:** Table-valued parameter (TVP) for batch operations
 
@@ -43,7 +44,7 @@ Run these in SQL Server Management Studio to verify schema correctness:
 ```sql
 SELECT COUNT(*) AS table_count FROM INFORMATION_SCHEMA.TABLES 
 WHERE TABLE_SCHEMA = 'dbo' AND TABLE_TYPE = 'BASE TABLE';
--- Expected result: 7
+-- Expected result: 9
 ```
 
 ### 2. Verify All Indexes
@@ -64,9 +65,10 @@ ORDER BY name;
 SELECT name FROM sys.objects 
 WHERE type = 'P' AND schema_id = SCHEMA_ID('dbo')
 ORDER BY name;
--- Expected: 5 procedures
--- sp_GetExpiredFiles, sp_IncrementDownloadCount, sp_MarkFilesExpired, 
--- sp_RecordFailedLogin, sp_ResetLoginAttempts
+-- Expected: 7 procedures
+-- sp_GetExpiredFiles, sp_IncrementDownloadCount, sp_MarkFilesExpired,
+-- sp_RecordFailedLogin, sp_ResetLoginAttempts, sp_GetMaintenanceStatus,
+-- sp_ToggleMaintenanceMode
 ```
 
 ### 4. Verify Check Constraints
@@ -82,7 +84,29 @@ ORDER BY constraint_name;
 SELECT CONSTRAINT_NAME, TABLE_NAME, REFERENCED_TABLE_NAME 
 FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS
 ORDER BY CONSTRAINT_NAME;
--- Expected: 5 foreign keys with CASCADE DELETE
+-- Expected: 8 foreign keys (mix of CASCADE and NO ACTION depending on path safety)
+```
+
+### 5b. Verify Folder Hierarchy Constraints (MSSQL)
+```sql
+-- Unique folder name per parent scope
+SELECT name
+FROM sys.key_constraints
+WHERE parent_object_id = OBJECT_ID('dbo.file_folders')
+        AND [type] = 'UQ'
+        AND name = 'UQ_file_folders_owner_parent_name';
+
+-- Parent FK for nested folders
+SELECT name
+FROM sys.foreign_keys
+WHERE parent_object_id = OBJECT_ID('dbo.file_folders')
+        AND name = 'FK_file_folders_parent';
+
+-- files.folder_id FK
+SELECT name
+FROM sys.foreign_keys
+WHERE parent_object_id = OBJECT_ID('dbo.files')
+        AND name = 'FK_files_file_folders';
 ```
 
 ### 6. Test Application User

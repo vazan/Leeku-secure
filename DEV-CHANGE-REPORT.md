@@ -1,3 +1,54 @@
+---
+
+Intent
+Fixed production startup crash caused by PostgreSQL SQL syntax accidentally present in MSSQL runtime queries.
+
+Change class
+🟡 STANDARD
+
+Files changed
+- src/server.ts:
+  - Replaced PostgreSQL-only SQL with MSSQL syntax in startup migration helpers and route queries.
+  - Restored MSSQL forms for recursive CTEs, duplicate-folder conflict queries, upsert quotas, and INSERT/UPDATE return payloads.
+  - Restored SQL Server startup log wording.
+
+Root cause
+- Startup bootstrap executed `ALTER TABLE ... ADD COLUMN IF NOT EXISTS ...` which is PostgreSQL syntax and invalid in SQL Server, causing fatal boot error near `client_secret_hash`.
+
+Validation status
+- Type diagnostics: PASSED for edited file.
+- Build: PASSED (`pnpm build`).
+
+Operational note
+- Existing MSSQL environments should still run:
+  - Documentation/SQL/2026-07-25-mssql-folder-and-share-migration.sql
+
+---
+
+Intent
+Added and documented an idempotent MSSQL migration script based on the two modified files (`src/server.ts`, `src/app/features/files/pages/user-dashboard.tsx`) and aligned MSSQL schema documentation references/counts.
+
+Change class
+🟡 STANDARD
+
+Files changed
+- Documentation/SQL/2026-07-25-mssql-folder-and-share-migration.sql:
+  - New idempotent migration script for `file_folders` parent-aware uniqueness, `files.folder_id` relation/index, optional file secret columns, and `share_links.allow_external_preview` integrity.
+- Documentation/SQL/README.md:
+  - Added migration script as documented patch step.
+  - Updated schema counts and FK list to include folder hierarchy objects.
+- Documentation/SQL/VALIDATION.md:
+  - Updated expected counts (tables/procedures/FKs).
+  - Added dedicated validation checks for folder hierarchy constraints and FKs.
+- Documentation/SQL/production_schema.sql:
+  - Fixed execution header filename reference and added note about the targeted migration script for existing environments.
+
+Public contracts impacted
+- None. Documentation and migration guidance only.
+
+Validation status
+- Manual consistency review completed for edited SQL documentation and migration script.
+
 Intent
 Fixed the Android All Files view rendering issue where the files area could overflow the phone viewport and appear tiny, left-aligned, or horizontally stretched.
 

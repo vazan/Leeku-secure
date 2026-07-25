@@ -8,8 +8,12 @@
 -- IMPORTANT: Adjust file paths (P:\DATA, L:\LOGS) for your environment.
 -- 
 -- Execution:
---   sqlcmd -S <server> -U sa -P <password> -i 002_production_schema.sql
+--   sqlcmd -S <server> -U sa -P <password> -i production_schema.sql
 --   or in SSMS: File > Open > Execute
+--
+-- Existing environments:
+--   Run 2026-07-25-mssql-folder-and-share-migration.sql after this script (or standalone)
+--   to enforce latest folder/share schema alignment idempotently.
 --
 -- ============================================================
 
