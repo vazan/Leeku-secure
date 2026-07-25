@@ -869,7 +869,7 @@ function mapFolderRow(row: FolderRow): FileFolder {
 }
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const MAX_FOLDER_DEPTH = 5;
+const MAX_FOLDER_DEPTH = 10;
 
 function normalizeFolderName(value: unknown): string {
   return String(value || '').trim().replace(/\s+/g, ' ');
