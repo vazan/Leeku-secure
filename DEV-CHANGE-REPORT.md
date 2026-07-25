@@ -1,6 +1,42 @@
 ---
 
 Intent
+Added admin-side folder navigation in the Admin Files panel so admins can browse root folders, open subfolders by clicking, and delete folders/subtrees.
+
+Change class
+🟡 STANDARD
+
+Files changed
+- src/app/shared/types/index.ts:
+  - Added `AdminFileFolder` shared type (`FileFolder` + owner username).
+- src/server.ts:
+  - Added `GET /api/admin/file-folders` to return folder tree metadata for all owners with decrypted owner usernames.
+  - Added `POST /api/admin/file-folders/:id/delete` for admin folder-tree deletion with `delete_files` option.
+- src/app/features/files/pages/user-dashboard.tsx:
+  - Added admin folder data loading in `loadAdmin` and passed folders to AdminWorkspace.
+- src/app/features/files/components/admin-workspace.tsx:
+  - Added folder breadcrumb navigation state in Admin Files tab.
+  - Added current-level folder cards with click-to-open behavior.
+  - Added folder delete action with choice: delete contained files or move them to owner root.
+  - Scoped file table to active folder context.
+
+Public contracts impacted
+- Added API endpoint: GET /api/admin/file-folders
+- Added API endpoint: POST /api/admin/file-folders/:id/delete
+
+Validation status
+- Type diagnostics for edited files: PASSED.
+- Workspace type-check: FAILED only on existing unrelated baseline JSX namespace issues in maintenance components.
+
+Handoff notes
+- Verify Admin > Files root shows only root-level folders.
+- Verify opening folders reveals only direct subfolders and files in that folder.
+- Verify deleting folder with files removal updates owner storage usage.
+- Verify deleting folder without files moves files to the owner's root.
+
+---
+
+Intent
 Fixed production startup crash caused by PostgreSQL SQL syntax accidentally present in MSSQL runtime queries.
 
 Change class

@@ -56,7 +56,7 @@ import { createPublicSharingRouter } from './server/routes/public-sharing.js';
 import { createMaintenanceModeRouter } from './server/routes/maintenance-mode.js';
 import { createDesktopUpdatesRouter, SYSTEM_UPDATE_FOLDER_NAME } from './server/routes/desktop-updates.js';
 import { validateProductionConfig } from './server/utils/production.js';
-import type { Quota, User, FileMetadata, FileFolder, ShareLink, SystemLog, SystemStats } from './app/shared/types/index.js';
+import type { AdminFileFolder, Quota, User, FileMetadata, FileFolder, ShareLink, SystemLog, SystemStats } from './app/shared/types/index.js';
 
 const runtimeDir = (() => {
   const moduleUrl = (import.meta as ImportMeta | undefined)?.url;
@@ -798,6 +798,12 @@ interface FileRow {
 interface FolderRow {
   id: string; owner_user_id: string; parent_folder_id?: string | null; name: string; file_count?: number;
   created_at: Date; updated_at: Date;
+}
+
+interface AdminFolderRow extends FolderRow {
+  username_encrypted: Buffer;
+  username_iv: Buffer;
+  username_auth_tag: Buffer;
 }
 
 interface ShareRow {
@@ -3890,6 +3896,166 @@ app.get('/api/admin/files', authenticateUser as express.RequestHandler, verifyAd
     );
     res.json({ files: result.recordset.map(r => mapFileRow(r, decryptColumn(r.username_encrypted, r.username_iv, r.username_auth_tag))) });
   } catch (err) { console.error('[GET /api/admin/files]', err); res.status(500).json({ error: 'Failed to load files.' }); }
+});
+
+app.get('/api/admin/file-folders', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, async (req, res) => {
+  try {
+    const request = await getRequest();
+    const result = await request.query<AdminFolderRow>(
+      `SELECT ff.id, ff.owner_user_id, ff.parent_folder_id, ff.name, ff.created_at, ff.updated_at,
+              COUNT(f.id) AS file_count,
+              u.username_encrypted, u.username_iv, u.username_auth_tag
+       FROM file_folders ff
+       INNER JOIN users u ON u.id=ff.owner_user_id
+       LEFT JOIN files f ON f.folder_id=ff.id AND COALESCE(f.status,'Available')!='Expired'
+       GROUP BY ff.id, ff.owner_user_id, ff.parent_folder_id, ff.name, ff.created_at, ff.updated_at,
+                u.username_encrypted, u.username_iv, u.username_auth_tag
+       ORDER BY ff.owner_user_id ASC, ff.parent_folder_id ASC, ff.name ASC`
+    );
+    const folders: AdminFileFolder[] = result.recordset.map((row) => ({
+      ...mapFolderRow(row),
+      username: decryptColumn(row.username_encrypted, row.username_iv, row.username_auth_tag),
+    }));
+    res.json({ folders });
+  } catch (err) {
+    console.error('[GET /api/admin/file-folders]', err);
+    res.status(500).json({ error: 'Failed to load folders.' });
+  }
+});
+
+app.post('/api/admin/file-folders/:id/delete', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  const folderId = req.params.id;
+  if (!UUID_PATTERN.test(folderId)) return res.status(400).json({ error: 'Invalid folder id.' });
+  const deleteFiles = !!req.body?.delete_files;
+
+  try {
+    const folderReq = await getRequest();
+    folderReq.input('id', sql.UniqueIdentifier, folderId);
+    const folderResult = await folderReq.query<FolderRow>(
+      `SELECT id, owner_user_id, parent_folder_id, name, created_at, updated_at
+       FROM file_folders
+       WHERE id=@id`
+    );
+    const folder = folderResult.recordset[0];
+    if (!folder) return res.status(404).json({ error: 'Folder not found.' });
+
+    const ownerId = folder.owner_user_id;
+    const parent = folder.parent_folder_id ? await getOwnedFolder(folder.parent_folder_id, ownerId) : null;
+    if (folder.name === SYSTEM_UPDATE_FOLDER_NAME && folder.parent_folder_id === null) {
+      return res.status(403).json({ error: 'The desktop update system root cannot be deleted.' });
+    }
+    if (parent?.name === SYSTEM_UPDATE_FOLDER_NAME && parent.parent_folder_id === null) {
+      if (!deleteFiles) {
+        return res.status(400).json({ error: 'Draft update folders must be deleted together with their files.' });
+      }
+      const activation = await desktopUpdateFolderActivation(folder.id, ownerId);
+      if (activation && activation !== 'draft') {
+        return res.status(409).json({ error: 'Only draft desktop updates can be deleted.' });
+      }
+    }
+
+    if (!deleteFiles) {
+      const moveReq = await getRequest();
+      moveReq.input('folderId', sql.UniqueIdentifier, folderId);
+      moveReq.input('ownerId', sql.UniqueIdentifier, ownerId);
+      await moveReq.query(
+        `;WITH folder_tree AS (
+           SELECT id FROM file_folders WHERE id=@folderId AND owner_user_id=@ownerId
+           UNION ALL
+           SELECT ff.id
+           FROM file_folders ff
+           INNER JOIN folder_tree ft ON ff.parent_folder_id=ft.id
+           WHERE ff.owner_user_id=@ownerId
+         )
+         UPDATE files
+         SET folder_id=NULL
+         WHERE owner_user_id=@ownerId AND folder_id IN (SELECT id FROM folder_tree) OPTION (MAXRECURSION 100)`
+      );
+    } else {
+      const filesReq = await getRequest();
+      filesReq.input('folderId', sql.UniqueIdentifier, folderId);
+      filesReq.input('ownerId', sql.UniqueIdentifier, ownerId);
+      const folderFiles = await filesReq.query<{id:string;stored_path:string;size_bytes:number;status:string}>(
+        `;WITH folder_tree AS (
+           SELECT id FROM file_folders WHERE id=@folderId AND owner_user_id=@ownerId
+           UNION ALL
+           SELECT ff.id
+           FROM file_folders ff
+           INNER JOIN folder_tree ft ON ff.parent_folder_id=ft.id
+           WHERE ff.owner_user_id=@ownerId
+         )
+         SELECT id, stored_path, size_bytes, status
+         FROM files
+         WHERE owner_user_id=@ownerId AND folder_id IN (SELECT id FROM folder_tree) OPTION (MAXRECURSION 100)`
+      );
+
+      for (const file of folderFiles.recordset) {
+        const vaultPath = path.join(FILE_VAULT, file.stored_path);
+        try { if (fs.existsSync(vaultPath)) fs.unlinkSync(vaultPath); } catch {}
+      }
+
+      const storageToRemove = folderFiles.recordset
+        .filter((file) => file.status === 'Available')
+        .reduce((total, file) => total + Number(file.size_bytes || 0), 0);
+
+      const deleteReq = await getRequest();
+      deleteReq.input('folderId', sql.UniqueIdentifier, folderId);
+      deleteReq.input('ownerId', sql.UniqueIdentifier, ownerId);
+      await deleteReq.query(
+        `;WITH folder_tree AS (
+           SELECT id FROM file_folders WHERE id=@folderId AND owner_user_id=@ownerId
+           UNION ALL
+           SELECT ff.id
+           FROM file_folders ff
+           INNER JOIN folder_tree ft ON ff.parent_folder_id=ft.id
+           WHERE ff.owner_user_id=@ownerId
+         )
+         DELETE FROM files
+         WHERE owner_user_id=@ownerId AND folder_id IN (SELECT id FROM folder_tree) OPTION (MAXRECURSION 100)`
+      );
+
+      if (storageToRemove > 0) {
+        const storageReq = await getRequest();
+        storageReq.input('sz', sql.BigInt, storageToRemove);
+        storageReq.input('ownerId', sql.UniqueIdentifier, ownerId);
+        await storageReq.query('UPDATE users SET storage_used_bytes=CASE WHEN storage_used_bytes-@sz<0 THEN 0 ELSE storage_used_bytes-@sz END WHERE id=@ownerId');
+      }
+    }
+
+    const deleteFolderReq = await getRequest();
+    deleteFolderReq.input('id', sql.UniqueIdentifier, folderId);
+    deleteFolderReq.input('ownerId', sql.UniqueIdentifier, ownerId);
+    await deleteFolderReq.query(
+      `;WITH folder_tree AS (
+         SELECT id FROM file_folders WHERE id=@id AND owner_user_id=@ownerId
+         UNION ALL
+         SELECT ff.id
+         FROM file_folders ff
+         INNER JOIN folder_tree ft ON ff.parent_folder_id=ft.id
+         WHERE ff.owner_user_id=@ownerId
+       )
+       DELETE ff
+       FROM file_folders ff
+       INNER JOIN folder_tree ft ON ff.id=ft.id OPTION (MAXRECURSION 100)`
+    );
+
+    await logSystemEvent(
+      req.userId!,
+      req.user!.username,
+      'Delete',
+      'Folder',
+      folderId,
+      req,
+      deleteFiles
+        ? `Admin deleted folder tree "${folder.name}" and its files.`
+        : `Admin deleted folder tree "${folder.name}" and moved files to owner root.`,
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[POST /api/admin/file-folders/:id/delete]', err);
+    res.status(500).json({ error: 'Failed to delete folder.' });
+  }
 });
 
 app.post('/api/admin/files/:id/block', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, async (req: AuthenticatedRequest, res) => {

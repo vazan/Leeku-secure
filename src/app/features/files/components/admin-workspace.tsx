@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
-import { Activity, Database, Plus, Server, ShieldAlert, Terminal, Users, AlertTriangle } from "lucide-react";
+import { Activity, Database, Folder, FolderOpen, Plus, Server, ShieldAlert, Terminal, Users, AlertTriangle } from "lucide-react";
 import { toast } from "sonner";
 import { MaintenanceModeControl } from "@/app/shared/components/maintenance-mode-control";
-import type { FileMetadata, Quota, SystemLog, SystemStats, User } from "@/app/shared/types";
+import type { AdminFileFolder, FileMetadata, Quota, SystemLog, SystemStats, User } from "@/app/shared/types";
 
 type AdminTab = "overview" | "users" | "files" | "quotas" | "logs" | "security" | "health" | "maintenance";
 
@@ -44,6 +44,7 @@ function formatUptime(seconds = 0) {
 export default function AdminWorkspace({
   users,
   files,
+  folders,
   logs,
   stats,
   quotas,
@@ -51,6 +52,7 @@ export default function AdminWorkspace({
 }: {
   users: User[];
   files: FileMetadata[];
+  folders: AdminFileFolder[];
   logs: SystemLog[];
   stats: SystemStats | null;
   quotas: Quota[];
@@ -71,11 +73,49 @@ export default function AdminWorkspace({
   const [maintenanceStatus, setMaintenanceStatus] = useState(false);
   const [loadingMaintenance, setLoadingMaintenance] = useState(false);
   const [securityLogs, setSecurityLogs] = useState<SystemLog[]>([]);
+  const [activeFolderId, setActiveFolderId] = useState<string | null>(null);
   const [createDummyDraft, setCreateDummyDraft] = useState({
     username: "",
     password: "",
     quota_id: "guest",
   });
+
+  const folderById = useMemo(
+    () => new Map(folders.map((folder) => [folder.id, folder])),
+    [folders],
+  );
+
+  const folderPath = useMemo(() => {
+    if (!activeFolderId) return [] as AdminFileFolder[];
+    const chain: AdminFileFolder[] = [];
+    const seen = new Set<string>();
+    let currentId: string | null = activeFolderId;
+    while (currentId) {
+      if (seen.has(currentId)) break;
+      seen.add(currentId);
+      const current = folderById.get(currentId);
+      if (!current) break;
+      chain.unshift(current);
+      currentId = current.parent_folder_id || null;
+    }
+    return chain;
+  }, [activeFolderId, folderById]);
+
+  const visibleFolders = useMemo(
+    () => folders.filter((folder) => (folder.parent_folder_id || null) === activeFolderId),
+    [activeFolderId, folders],
+  );
+
+  const visibleFiles = useMemo(
+    () => files.filter((file) => (file.folder_id || null) === activeFolderId),
+    [activeFolderId, files],
+  );
+
+  useEffect(() => {
+    setActiveFolderId((current) =>
+      current && !folders.some((folder) => folder.id === current) ? null : current,
+    );
+  }, [folders]);
 
   useEffect(() => {
     // Load maintenance status on mount
@@ -236,6 +276,19 @@ export default function AdminWorkspace({
     }
   };
 
+  const deleteFolder = async (folder: AdminFileFolder) => {
+    if (!window.confirm(`Delete folder "${folder.name}" and its subfolders?`)) return;
+    const deleteFiles = window.confirm(
+      "Press OK to delete files inside the folder tree. Press Cancel to keep files and move them to the owner's root.",
+    );
+    await runAction(
+      () => post(`/api/admin/file-folders/${folder.id}/delete`, { delete_files: deleteFiles }),
+      deleteFiles
+        ? "Folder tree and files deleted."
+        : "Folder tree deleted and files moved to owner root.",
+    );
+  };
+
   return (
     <section className="space-y-6">
       <div>
@@ -356,12 +409,63 @@ export default function AdminWorkspace({
       )}
 
       {tab === "files" && (
-        <AdminPanel title="File management" meta={`${files.length} files`}>
+        <AdminPanel title="File management" meta={`${files.length} files | ${folders.length} folders`}>
+          <div className="mb-5 flex flex-wrap items-center gap-2 border border-[var(--border-subtle)] bg-[var(--admin-surface)] px-3 py-2 text-xs">
+            <button
+              type="button"
+              onClick={() => setActiveFolderId(null)}
+              className={`border px-2 py-1 ${activeFolderId ? "border-[var(--border-subtle)] text-[var(--text-muted)] hover:border-[var(--border-strong)] hover:text-[var(--text-primary)]" : "border-[var(--admin-border-info)] text-[var(--admin-info)]"}`}
+            >
+              All folders
+            </button>
+            {folderPath.map((folder) => (
+              <button
+                key={folder.id}
+                type="button"
+                onClick={() => setActiveFolderId(folder.id)}
+                className={`border px-2 py-1 ${folder.id === activeFolderId ? "border-[var(--admin-border-info)] text-[var(--admin-info)]" : "border-[var(--border-subtle)] text-[var(--text-muted)] hover:border-[var(--border-strong)] hover:text-[var(--text-primary)]"}`}
+              >
+                {folder.name}
+              </button>
+            ))}
+          </div>
+
+          <div className="mb-5 space-y-2">
+            <h3 className="text-xs font-semibold uppercase tracking-wide text-[var(--text-muted)]">Folders</h3>
+            {visibleFolders.length ? (
+              <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+                {visibleFolders.map((folder) => (
+                  <div key={folder.id} className="border border-[var(--border-subtle)] bg-[var(--admin-surface)] p-3 text-xs">
+                    <button
+                      type="button"
+                      onClick={() => setActiveFolderId(folder.id)}
+                      className="w-full text-left"
+                    >
+                      <span className="mb-2 inline-flex items-center gap-2 text-[var(--admin-info)]">
+                        {(folder.parent_folder_id || null) === activeFolderId ? <FolderOpen className="h-4 w-4" /> : <Folder className="h-4 w-4" />}
+                        <strong>{folder.name}</strong>
+                      </span>
+                      <span className="block text-[var(--text-muted)]">Owner: @{folder.username}</span>
+                      <span className="block text-[var(--text-muted)]">{folder.file_count} file(s)</span>
+                    </button>
+                    <div className="mt-3 flex justify-end">
+                      <AdminButton tone="pink" onClick={() => deleteFolder(folder)}>Delete folder</AdminButton>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="border border-dashed border-[var(--border-subtle)] px-3 py-2 text-[var(--text-muted)]">
+                No subfolders at this level.
+              </p>
+            )}
+          </div>
+
           <div className="overflow-x-auto">
             <table className="w-full min-w-[850px] text-left text-xs">
               <thead><tr>{["Filename", "Owner", "Size", "Status", "Actions"].map((label) => <th key={label} className="bg-[var(--admin-header)] px-4 py-3 text-[var(--text-muted)]">{label}</th>)}</tr></thead>
               <tbody className="divide-y divide-[var(--border-subtle)]">
-                {files.map((file) => (
+                {visibleFiles.map((file) => (
                   <tr key={file.id}>
                     <td className="max-w-xs px-4 py-3"><strong className="block truncate">{file.original_name}</strong><span className="text-[var(--text-muted)]">{file.mime_type}</span></td>
                     <td className="px-4 py-3 text-[var(--admin-info)]">@{file.username}</td>
@@ -381,6 +485,13 @@ export default function AdminWorkspace({
                     </td>
                   </tr>
                 ))}
+                {!visibleFiles.length && (
+                  <tr>
+                    <td colSpan={5} className="px-4 py-6 text-center text-[var(--text-muted)]">
+                      No files in this folder.
+                    </td>
+                  </tr>
+                )}
               </tbody>
             </table>
           </div>
