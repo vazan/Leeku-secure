@@ -412,9 +412,8 @@ function parseThreatsFromOutput(stdout: string, stderr: string = ''): string[] {
 // ──────────────────────────────────────────────────────────────
 
 const BLOCKED_EXTENSIONS = new Set([
-  '.exe', '.bat', '.cmd', '.com', '.msi', '.ps1',
-  '.vbs', '.js',  '.wsf', '.hta', '.scr', '.pif',
-  '.jar', '.sh',  '.py',  '.rb',  '.pl',
+  '.cmd', '.com',
+  '.vbs', '.wsf', '.hta', '.scr', '.pif'
 ]);
 
 /**
