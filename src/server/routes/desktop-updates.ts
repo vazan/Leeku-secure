@@ -2,8 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import express from 'express';
-import sql from 'mssql';
-import { getRequest } from '../db.js';
+import { getRequest, sql } from '../db.js';
 import { decryptColumn, decryptFileStream, unwrapKey } from '../utils/encryption.js';
 import { extractSingleFileZip, inspectSingleFileZip } from '../utils/single-file-zip.js';
 

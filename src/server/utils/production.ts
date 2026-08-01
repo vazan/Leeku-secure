@@ -1,7 +1,8 @@
 import fs from 'fs';
 import { isScannerAvailable } from './scanner.js';
 
-const PLACEHOLDER_PATTERN = /CHANGE_ME|GENERATE_WITH|localhost/i;
+const PLACEHOLDER_PATTERN = /CHANGE_ME|GENERATE_WITH/i;
+const PUBLIC_URL_KEYS = new Set(['APP_URL', 'ALLOWED_ORIGINS']);
 
 export function validateProductionConfig(): void {
   if (process.env.NODE_ENV !== 'production') return;
@@ -19,7 +20,9 @@ export function validateProductionConfig(): void {
   ];
   const missing = required.filter((key) => {
     const value = process.env[key];
-    return !value || PLACEHOLDER_PATTERN.test(value);
+    return !value
+      || PLACEHOLDER_PATTERN.test(value)
+      || (PUBLIC_URL_KEYS.has(key) && /localhost/i.test(value));
   });
   if (missing.length) {
     throw new Error(`[production] Missing or placeholder configuration: ${missing.join(', ')}`);

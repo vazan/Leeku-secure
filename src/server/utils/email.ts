@@ -120,19 +120,45 @@ export async function validateMxRecord(email: string): Promise<{ valid: boolean;
 
   try {
     const addresses = await dns.promises.resolveMx(domain);
-    if (!addresses || addresses.length === 0) {
-      return { valid: false, reason: `The domain "${domain}" has no mail (MX) records and cannot receive email.` };
+    if (addresses.some(({ exchange }) => exchange === '.')) {
+      return { valid: false, reason: `The domain "${domain}" does not accept email.` };
+    }
+    if (!addresses.length) {
+      return validateImplicitMailHost(domain);
     }
     return { valid: true, domain };
   } catch (err: any) {
-    // ENODATA / ENOTFOUND — no MX records at all
     if (err.code === 'ENODATA' || err.code === 'ENOTFOUND') {
-      return { valid: false, reason: `The domain "${domain}" has no mail (MX) records. Please use a valid email address.` };
+      return validateImplicitMailHost(domain);
     }
     // Temporary DNS failure — allow with warning
     console.warn(`[email] DNS MX lookup temporarily failed for "${domain}":`, err.message);
     return { valid: true, domain, reason: 'MX lookup temporarily unavailable — verification will be sent but may not arrive.' };
   }
+}
+
+async function validateImplicitMailHost(
+  domain: string,
+): Promise<{ valid: boolean; domain?: string; reason?: string }> {
+  const results = await Promise.allSettled([
+    dns.promises.resolve4(domain),
+    dns.promises.resolve6(domain),
+  ]);
+  if (results.some((result) => result.status === 'fulfilled' && result.value.length > 0)) {
+    return { valid: true, domain };
+  }
+
+  const temporaryFailure = results.some((result) => {
+    if (result.status === 'fulfilled') return false;
+    const code = (result.reason as NodeJS.ErrnoException)?.code;
+    return code !== 'ENODATA' && code !== 'ENOTFOUND';
+  });
+  if (temporaryFailure) {
+    console.warn(`[email] DNS address lookup temporarily failed for "${domain}".`);
+    return { valid: true, domain, reason: 'DNS lookup temporarily unavailable — verification will be sent but may not arrive.' };
+  }
+
+  return { valid: false, reason: `The domain "${domain}" has no mail server records. Please use a valid email address.` };
 }
 
 // ──────────────────────────────────────────────────────────────
