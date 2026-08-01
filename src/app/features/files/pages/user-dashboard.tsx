@@ -1776,14 +1776,6 @@ export default function UserDashboard({
                     <>
                       <button
                         type="button"
-                        onClick={() => openFolderShare(activeFolder)}
-                        className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--border-subtle)] px-3 py-2 text-xs font-medium text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]"
-                      >
-                        <Share2 className="h-3.5 w-3.5" />
-                        Share folder
-                      </button>
-                      <button
-                        type="button"
                         onClick={() => renameFolder(activeFolder)}
                         className="rounded-lg border border-[var(--border-subtle)] px-3 py-2 text-xs font-medium text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]"
                       >
@@ -1795,6 +1787,14 @@ export default function UserDashboard({
                         className="rounded-lg border border-[color-mix(in_srgb,var(--error-linear)_42%,transparent)] px-3 py-2 text-xs font-medium text-[var(--error-linear)] hover:bg-[color-mix(in_srgb,var(--error-linear)_12%,transparent)]"
                       >
                         Delete folder
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => openFolderShare(activeFolder)}
+                        className="inline-flex items-center gap-1.5 rounded-xl border border-[color-mix(in_srgb,var(--success-linear)_42%,transparent)] bg-[color-mix(in_srgb,var(--success-linear)_12%,transparent)] px-3 py-2 text-xs font-semibold text-[var(--success-linear)] hover:bg-[color-mix(in_srgb,var(--success-linear)_18%,transparent)]"
+                      >
+                        <Share2 className="h-3.5 w-3.5" />
+                        Share folder
                       </button>
                     </>
                   )}
