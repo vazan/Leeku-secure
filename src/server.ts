@@ -53,10 +53,11 @@ import {
 import { createSessionRouter } from './server/routes/sessions.js';
 import { createHealthRouter } from './server/routes/health.js';
 import { createPublicSharingRouter } from './server/routes/public-sharing.js';
+import { createPublicFolderSharingRouter } from './server/routes/public-folder-sharing.js';
 import { createMaintenanceModeRouter } from './server/routes/maintenance-mode.js';
 import { createDesktopUpdatesRouter, SYSTEM_UPDATE_FOLDER_NAME } from './server/routes/desktop-updates.js';
 import { validateProductionConfig } from './server/utils/production.js';
-import type { AdminFileFolder, Quota, User, FileMetadata, FileFolder, ShareLink, SystemLog, SystemStats } from './app/shared/types/index.js';
+import type { AdminFileFolder, Quota, User, FileMetadata, FileFolder, FolderShareLink, ShareLink, SystemLog, SystemStats } from './app/shared/types/index.js';
 
 const runtimeDir = (() => {
   const moduleUrl = (import.meta as ImportMeta | undefined)?.url;
@@ -810,6 +811,11 @@ interface ShareRow {
   id: string; file_id: string; public_token: string; password_hash: string | null;
   expires_at: Date | null; max_downloads: number | null; download_count: number;
   is_active: boolean; allow_external_preview: boolean; created_at: Date;
+}
+
+interface FolderShareRow {
+  id: string; folder_id: string; public_token: string; password_hash: string | null;
+  expires_at: Date | null; is_active: boolean; created_at: Date;
 }
 
 interface LogRow {
@@ -1935,6 +1941,17 @@ a{display:inline-block;color:#00F2FF;text-decoration:none;font-size:12px;margin-
   </form>
   <a href="/">Cancel and return</a>
 </div></body></html>`;
+}
+
+function mapFolderShareRow(row: FolderShareRow): FolderShareLink {
+  return {
+    id: row.id,
+    folder_id: row.folder_id,
+    public_token: row.public_token,
+    expires_at: row.expires_at ? row.expires_at.toISOString() : null,
+    is_active: row.is_active,
+    created_at: row.created_at.toISOString(),
+  };
 }
 
 /**
@@ -3477,11 +3494,29 @@ app.get('/api/sharing/links', authenticateUser as express.RequestHandler, async 
          )
        ORDER BY sl.created_at DESC`
     );
+    const folderRequest = await getRequest();
+    folderRequest.input('ownerId', sql.UniqueIdentifier, req.userId!);
+    folderRequest.input('systemFolderName', sql.NVarChar(120), SYSTEM_UPDATE_FOLDER_NAME);
+    const folderResult = await folderRequest.query<FolderShareRow>(
+      `SELECT fsl.id,fsl.folder_id,fsl.public_token,fsl.password_hash,fsl.expires_at,fsl.is_active,fsl.created_at
+       FROM folder_share_links fsl
+       INNER JOIN file_folders ff ON ff.id=fsl.folder_id
+       WHERE ff.owner_user_id=@ownerId
+         AND NOT EXISTS (
+           SELECT 1 FROM file_folders system_root
+           WHERE system_root.owner_user_id=@ownerId
+             AND system_root.parent_folder_id IS NULL
+             AND system_root.name=@systemFolderName
+             AND (system_root.id=ff.id OR system_root.id=ff.parent_folder_id)
+         )
+       ORDER BY fsl.created_at DESC`,
+    );
     res.json({
       links: result.recordset.map((row) => ({
         ...mapShareRow(row),
         is_available: fs.existsSync(path.join(FILE_VAULT, row.stored_path)),
       })),
+      folder_links: folderResult.recordset.map(mapFolderShareRow),
     });
   } catch (err) { console.error('[GET /api/sharing/links]', err); res.status(500).json({ error: 'Failed to load share links.' }); }
 });
@@ -3513,6 +3548,117 @@ const removeSharingLink = async (req: AuthenticatedRequest, res: express.Respons
 // Keep DELETE for API clients, and provide POST for IIS installations that filter DELETE verbs.
 app.delete('/api/sharing/links/:id', authenticateUser as express.RequestHandler, removeSharingLink);
 app.post('/api/sharing/links/:id/remove', authenticateUser as express.RequestHandler, removeSharingLink);
+
+app.post('/api/sharing/folder-links/:id/remove', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  try {
+    const request = await getRequest();
+    request.input('id', sql.UniqueIdentifier, req.params.id);
+    request.input('ownerId', sql.UniqueIdentifier, req.userId!);
+    const result = await request.query<{ folder_id: string }>(
+      `DELETE fsl
+       OUTPUT DELETED.folder_id
+       FROM folder_share_links fsl
+       INNER JOIN file_folders ff ON ff.id=fsl.folder_id
+       WHERE fsl.id=@id AND (ff.owner_user_id=@ownerId OR @ownerId IN (SELECT id FROM users WHERE role='Admin'))`,
+    );
+    if (!result.recordset.length) return res.status(404).json({ error: 'Folder share link not found.' });
+    await logSystemEvent(req.userId!, req.user!.username, 'Delete', 'FolderShareLink', req.params.id, req, `Removed share link for folder ${result.recordset[0].folder_id}.`);
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[POST /api/sharing/folder-links/:id/remove]', err);
+    res.status(500).json({ error: 'Failed to remove folder share link.' });
+  }
+});
+
+app.post('/api/file-folders/:id/share', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  const folderId = req.params.id;
+  if (!UUID_PATTERN.test(folderId)) return res.status(400).json({ error: 'Invalid folder id.' });
+  const { password, expires_at, is_active } = req.body || {};
+  try {
+    const folder = await getOwnedFolder(folderId, req.userId!);
+    if (!folder && req.user!.role !== 'Admin') return res.status(404).json({ error: 'Folder not found.' });
+    const folderRequest = await getRequest();
+    folderRequest.input('id', sql.UniqueIdentifier, folderId);
+    const folderResult = await folderRequest.query<FolderRow>(
+      'SELECT id,owner_user_id,parent_folder_id,name,created_at,updated_at FROM file_folders WHERE id=@id',
+    );
+    const targetFolder = folderResult.recordset[0];
+    if (!targetFolder) return res.status(404).json({ error: 'Folder not found.' });
+    if (targetFolder.owner_user_id !== req.userId && req.user!.role !== 'Admin') {
+      return res.status(403).json({ error: 'Only the folder owner can manage share links.' });
+    }
+
+    const systemRequest = await getRequest();
+    systemRequest.input('folderId', sql.UniqueIdentifier, folderId);
+    systemRequest.input('systemFolderName', sql.NVarChar(120), SYSTEM_UPDATE_FOLDER_NAME);
+    const systemResult = await systemRequest.query<{ is_system: number }>(
+      `;WITH ancestors AS (
+         SELECT id,parent_folder_id,name FROM file_folders WHERE id=@folderId
+         UNION ALL
+         SELECT ff.id,ff.parent_folder_id,ff.name FROM file_folders ff INNER JOIN ancestors a ON ff.id=a.parent_folder_id
+       )
+       SELECT COUNT(*) AS is_system FROM ancestors WHERE parent_folder_id IS NULL AND name=@systemFolderName OPTION (MAXRECURSION 100)`,
+    );
+    if (Number(systemResult.recordset[0]?.is_system || 0) > 0) {
+      return res.status(403).json({ error: 'Desktop update folders cannot be shared.' });
+    }
+
+    const existingRequest = await getRequest();
+    existingRequest.input('folderId', sql.UniqueIdentifier, folderId);
+    const existing = await existingRequest.query<FolderShareRow>(
+      'SELECT id,folder_id,public_token,password_hash,expires_at,is_active,created_at FROM folder_share_links WHERE folder_id=@folderId',
+    );
+    let shareRow: FolderShareRow;
+    if (!existing.recordset.length) {
+      const insertRequest = await getRequest();
+      insertRequest.input('folderId', sql.UniqueIdentifier, folderId);
+      insertRequest.input('token', sql.Char(32), generateSecureToken(16));
+      insertRequest.input('passwordHash', sql.NVarChar(256), password ? await hashSharePassword(password) : null);
+      insertRequest.input('expiresAt', sql.DateTimeOffset, expires_at || null);
+      insertRequest.input('active', sql.Bit, is_active === false ? 0 : 1);
+      const inserted = await insertRequest.query<FolderShareRow>(
+        `INSERT INTO folder_share_links (folder_id,public_token,password_hash,expires_at,is_active)
+         OUTPUT INSERTED.id,INSERTED.folder_id,INSERTED.public_token,INSERTED.password_hash,INSERTED.expires_at,INSERTED.is_active,INSERTED.created_at
+         VALUES (@folderId,@token,@passwordHash,@expiresAt,@active)`,
+      );
+      shareRow = inserted.recordset[0];
+    } else {
+      shareRow = existing.recordset[0];
+      const sets: string[] = [];
+      const updateRequest = await getRequest();
+      updateRequest.input('id', sql.UniqueIdentifier, shareRow.id);
+      if (is_active === true && !shareRow.is_active) {
+        updateRequest.input('token', sql.Char(32), generateSecureToken(16));
+        sets.push('public_token=@token');
+      }
+      if (password !== undefined) {
+        updateRequest.input('passwordHash', sql.NVarChar(256), password ? await hashSharePassword(password) : null);
+        sets.push('password_hash=@passwordHash');
+      }
+      if (expires_at !== undefined) {
+        updateRequest.input('expiresAt', sql.DateTimeOffset, expires_at || null);
+        sets.push('expires_at=@expiresAt');
+      }
+      if (is_active !== undefined) {
+        updateRequest.input('active', sql.Bit, is_active ? 1 : 0);
+        sets.push('is_active=@active');
+      }
+      if (sets.length) {
+        const updated = await updateRequest.query<FolderShareRow>(
+          `UPDATE folder_share_links SET ${sets.join(',')}
+           OUTPUT INSERTED.id,INSERTED.folder_id,INSERTED.public_token,INSERTED.password_hash,INSERTED.expires_at,INSERTED.is_active,INSERTED.created_at
+           WHERE id=@id`,
+        );
+        shareRow = updated.recordset[0];
+      }
+    }
+    await logSystemEvent(req.userId!, req.user!.username, 'Link', 'FolderShareLink', shareRow.id, req, `Configured share for folder ${folderId}.`);
+    res.json({ success: true, link: mapFolderShareRow(shareRow) });
+  } catch (err) {
+    console.error('[POST /api/file-folders/:id/share]', err);
+    res.status(500).json({ error: 'Failed to configure folder share link.' });
+  }
+});
 
 app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
   const fileId = req.params.id;
@@ -3623,6 +3769,13 @@ app.use('/api/public/share', createPublicSharingRouter({
   tempPath: UPLOAD_TEMP,
   logDownload: (req, fileId, originalName, token) =>
     logSystemEvent(null, 'Anonymous', 'Download', 'File', fileId, req, `Anonymous download of "${originalName}" via token ${token}.`),
+}));
+
+app.use('/api/public/folder', createPublicFolderSharingRouter({
+  vaultPath: FILE_VAULT,
+  tempPath: UPLOAD_TEMP,
+  logDownload: (req, fileId, originalName, token) =>
+    logSystemEvent(null, 'Anonymous', 'Download', 'File', fileId, req, `Anonymous folder-share download of "${originalName}" via token ${token}.`),
 }));
 
 app.use(createDesktopUpdatesRouter({

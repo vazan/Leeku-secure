@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import AuthPage from "@/app/features/auth/pages/auth-page";
 import LandingPage from "@/app/features/public/pages/landing-page";
 import PublicDownloadPage from "@/app/features/sharing/pages/public-download-page";
+import PublicFolderPage from "@/app/features/sharing/pages/public-folder-page";
 import UserDashboard from "@/app/features/files/pages/user-dashboard";
 import { Toaster } from "@/app/shared/components/ui/sonner";
 import type { Quota, User } from "@/app/shared/types";
@@ -11,7 +12,7 @@ export default function App() {
   const [token, setToken] = useState("");
   const [loading, setLoading] = useState(true);
   const [currentView, setCurrentView] = useState<
-    "landing" | "auth" | "dashboard" | "download"
+    "landing" | "auth" | "dashboard" | "download" | "folder"
   >("landing");
   const [authMode, setAuthMode] = useState<"login" | "register">("login");
   const [downloadToken, setDownloadToken] = useState<string | null>(null);
@@ -55,6 +56,14 @@ export default function App() {
         return;
       }
     }
+    if (hash.startsWith("#d/")) {
+      const parsedToken = hash.substring(3).trim();
+      if (parsedToken) {
+        setDownloadToken(parsedToken);
+        setCurrentView("folder");
+        return;
+      }
+    }
     if (hash === "#auth/login" || hash === "#auth/register") {
       setAuthMode(hash.endsWith("register") ? "register" : "login");
       setDownloadToken(null);
@@ -86,6 +95,7 @@ export default function App() {
           setToken("cookie");
           if (
             !window.location.hash.startsWith("#f/") &&
+            !window.location.hash.startsWith("#d/") &&
             !window.location.hash.startsWith("#auth/")
           )
             setCurrentView("dashboard");
@@ -95,6 +105,7 @@ export default function App() {
           if (
             refreshedUser &&
             !window.location.hash.startsWith("#f/") &&
+            !window.location.hash.startsWith("#d/") &&
             !window.location.hash.startsWith("#auth/")
           )
             setCurrentView("dashboard");
@@ -215,6 +226,17 @@ export default function App() {
         {currentView === "download" && downloadToken && (
           <div>
             <PublicDownloadPage
+              token={downloadToken}
+              onGoHome={() => {
+                window.location.hash = "";
+                setCurrentView(user ? "dashboard" : "landing");
+              }}
+            />
+          </div>
+        )}
+        {currentView === "folder" && downloadToken && (
+          <div>
+            <PublicFolderPage
               token={downloadToken}
               onGoHome={() => {
                 window.location.hash = "";

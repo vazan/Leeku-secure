@@ -33,6 +33,7 @@ import type {
   AdminFileFolder,
   FileFolder,
   FileMetadata,
+  FolderShareLink,
   Quota,
   ShareLink,
   SystemLog,
@@ -247,6 +248,7 @@ export default function UserDashboard({
   const [folders, setFolders] = useState<FileFolder[]>([]);
   const [activeFolderId, setActiveFolderId] = useState<string | null>(null);
   const [links, setLinks] = useState<ShareLink[]>([]);
+  const [folderLinks, setFolderLinks] = useState<FolderShareLink[]>([]);
   const [adminUsers, setAdminUsers] = useState<User[]>([]);
   const [adminFiles, setAdminFiles] = useState<FileMetadata[]>([]);
   const [adminFolders, setAdminFolders] = useState<AdminFileFolder[]>([]);
@@ -260,6 +262,7 @@ export default function UserDashboard({
   const [transfer, setTransfer] = useState<TransferState | null>(null);
   const [dragging, setDragging] = useState(false);
   const [shareFile, setShareFile] = useState<FileMetadata | null>(null);
+  const [shareFolder, setShareFolder] = useState<FileFolder | null>(null);
   const [videoFile, setVideoFile] = useState<FileMetadata | null>(null);
   const [sharePassword, setSharePassword] = useState("");
   const [shareExpires, setShareExpires] = useState("");
@@ -267,6 +270,9 @@ export default function UserDashboard({
   const [shareAllowExternalPreview, setShareAllowExternalPreview] =
     useState(false);
   const [shareUrl, setShareUrl] = useState("");
+  const [folderSharePassword, setFolderSharePassword] = useState("");
+  const [folderShareExpires, setFolderShareExpires] = useState("");
+  const [folderShareUrl, setFolderShareUrl] = useState("");
   const [profileUsername, setProfileUsername] = useState(user.username);
   const [profileEmail, setProfileEmail] = useState(user.email);
   const [profilePassword, setProfilePassword] = useState("");
@@ -389,7 +395,9 @@ export default function UserDashboard({
     }
 
     if (linksResponse.ok) {
-      setLinks((await linksResponse.json()).links || []);
+      const sharingPayload = await linksResponse.json();
+      setLinks(sharingPayload.links || []);
+      setFolderLinks(sharingPayload.folder_links || []);
     } else {
       let message = "Could not load sharing links.";
       try {
@@ -1288,6 +1296,58 @@ export default function UserDashboard({
     );
   };
 
+  const openFolderShare = (folder: FileFolder) => {
+    const existing = folderLinks.find((link) => link.folder_id === folder.id);
+    setShareFolder(folder);
+    setFolderSharePassword("");
+    setFolderShareExpires(existing?.expires_at?.substring(0, 16) || "");
+    setFolderShareUrl(existing ? `${window.location.origin}/#d/${existing.public_token}` : "");
+  };
+
+  const saveFolderShare = async () => {
+    if (!shareFolder) return;
+    const response = await fetch(`/api/file-folders/${shareFolder.id}/share`, {
+      method: "POST",
+      headers: { ...authHeaders(token), "Content-Type": "application/json" },
+      body: JSON.stringify({
+        password: folderSharePassword || undefined,
+        expires_at: folderShareExpires ? new Date(folderShareExpires).toISOString() : null,
+        is_active: true,
+      }),
+    });
+    const data = await response.json();
+    if (response.ok) {
+      setFolderShareUrl(`${window.location.origin}/#d/${data.link.public_token}`);
+      await loadFilesAndLinks();
+      notify("Folder share link ready.");
+    } else notifyError(data.error || "Could not create the folder share link.");
+  };
+
+  const revokeFolderShare = async (link: FolderShareLink, folderName: string) => {
+    if (!window.confirm(`Remove the shared link for "${folderName}"?`)) return false;
+    const response = await fetch(`/api/sharing/folder-links/${link.id}/remove`, {
+      method: "POST",
+      headers: authHeaders(token),
+    });
+    if (response.ok) {
+      setFolderLinks((current) => current.filter((item) => item.id !== link.id));
+      notify("Folder share link removed.");
+      return true;
+    }
+    notifyError((await response.json()).error || "Could not remove the folder share link.");
+    return false;
+  };
+
+  const removeFolderShare = async () => {
+    if (!shareFolder) return;
+    const existing = folderLinks.find((link) => link.folder_id === shareFolder.id);
+    if (!existing) return;
+    if (await revokeFolderShare(existing, shareFolder.name)) {
+      setFolderShareUrl("");
+      setShareFolder(null);
+    }
+  };
+
   const saveShare = async () => {
     if (!shareFile) return;
     const response = await fetch(`/api/files/${shareFile.id}/share`, {
@@ -1716,6 +1776,14 @@ export default function UserDashboard({
                     <>
                       <button
                         type="button"
+                        onClick={() => openFolderShare(activeFolder)}
+                        className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--border-subtle)] px-3 py-2 text-xs font-medium text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]"
+                      >
+                        <Share2 className="h-3.5 w-3.5" />
+                        Share folder
+                      </button>
+                      <button
+                        type="button"
                         onClick={() => renameFolder(activeFolder)}
                         className="rounded-lg border border-[var(--border-subtle)] px-3 py-2 text-xs font-medium text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]"
                       >
@@ -1952,17 +2020,17 @@ export default function UserDashboard({
                   Shared links
                 </h1>
                 <p className="mt-1 text-sm text-[var(--text-muted)]">
-                  Files currently available through shared links.
+                  Files and folders currently available through shared links.
                 </p>
               </div>
-              {links.length === 0 ? (
+              {links.length === 0 && folderLinks.length === 0 ? (
                 <div className="flex flex-col items-center py-16 text-center">
                   <div className="grid h-11 w-11 place-items-center rounded-xl bg-[var(--bg-hover)] text-[var(--text-muted)]">
                     <Link2 className="h-4 w-4" />
                   </div>
                   <p className="mt-4 text-sm font-medium">No shared links</p>
                   <p className="mt-1 text-xs text-[var(--text-muted)]">
-                    Share a file to create a link.
+                    Share a file or folder to create a link.
                   </p>
                 </div>
               ) : (
@@ -2018,6 +2086,53 @@ export default function UserDashboard({
                           <button
                             type="button"
                             onClick={() => removeSharedLink(link)}
+                            className="flex shrink-0 cursor-pointer items-center gap-1.5 whitespace-nowrap rounded-md px-2 py-2 text-xs font-medium tracking-normal text-[var(--error-linear)] hover:bg-[var(--bg-hover)] hover:text-[var(--error-linear)]"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                            Remove shared link
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                  {folderLinks.map((link) => {
+                    const folder = folders.find((item) => item.id === link.folder_id);
+                    const folderName = folder?.name || "Shared folder";
+                    return (
+                      <div
+                        key={link.id}
+                        className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] p-4 shadow-[var(--shadow-hairline)]"
+                      >
+                        <div className="flex items-start justify-between">
+                          <div className="grid h-9 w-9 place-items-center rounded-lg bg-[var(--bg-hover)]">
+                            <Folder className="h-4 w-4" />
+                          </div>
+                          <span className="text-xs text-[var(--text-muted)]">
+                            {link.is_active ? "Active" : "Paused"}
+                          </span>
+                        </div>
+                        <p className="mt-4 truncate text-sm font-medium" title={folderName}>
+                          {folderName}
+                        </p>
+                        <p className="mt-1 text-xs text-[var(--text-muted)]">
+                          Folder{link.expires_at ? ` · Expires ${new Date(link.expires_at).toLocaleDateString()}` : " · No expiration"}
+                        </p>
+                        <div className="mt-4 flex flex-nowrap items-center gap-1">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              navigator.clipboard
+                                .writeText(`${window.location.origin}/#d/${link.public_token}`)
+                                .then(() => notify("Link copied."))
+                            }
+                            className="flex shrink-0 cursor-pointer items-center gap-1.5 whitespace-nowrap rounded-md px-2 py-2 text-xs font-medium tracking-normal text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+                          >
+                            <Copy className="h-3.5 w-3.5" />
+                            Copy link
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void revokeFolderShare(link, folderName)}
                             className="flex shrink-0 cursor-pointer items-center gap-1.5 whitespace-nowrap rounded-md px-2 py-2 text-xs font-medium tracking-normal text-[var(--error-linear)] hover:bg-[var(--bg-hover)] hover:text-[var(--error-linear)]"
                           >
                             <Trash2 className="h-3.5 w-3.5" />
@@ -2196,6 +2311,21 @@ export default function UserDashboard({
               .writeText(shareUrl)
               .then(() => notify("Link copied."))
           }
+        />
+      )}
+      {shareFolder && (
+        <FolderShareDialog
+          folder={shareFolder}
+          password={folderSharePassword}
+          expires={folderShareExpires}
+          url={folderShareUrl}
+          canRemove={folderLinks.some((link) => link.folder_id === shareFolder.id)}
+          onPassword={setFolderSharePassword}
+          onExpires={setFolderShareExpires}
+          onSave={saveFolderShare}
+          onRemove={removeFolderShare}
+          onClose={() => setShareFolder(null)}
+          onCopy={() => navigator.clipboard.writeText(folderShareUrl).then(() => notify("Link copied."))}
         />
       )}
       {videoFile && (
@@ -2682,6 +2812,64 @@ function VideoPlayer({
         playsInline
         className="min-h-0 w-full flex-1 object-contain"
       />
+    </div>
+  );
+}
+
+function FolderShareDialog(props: {
+  folder: FileFolder;
+  password: string;
+  expires: string;
+  url: string;
+  canRemove: boolean;
+  onPassword: (value: string) => void;
+  onExpires: (value: string) => void;
+  onSave: () => void;
+  onRemove: () => void;
+  onClose: () => void;
+  onCopy: () => void;
+}) {
+  const selectedDate = parseLocalDateTimeValue(props.expires);
+  const selectedTime = selectedDate ? `${pad2(selectedDate.getHours())}:${pad2(selectedDate.getMinutes())}` : "23:59";
+  const [expirationOpen, setExpirationOpen] = useState(false);
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent) => { if (event.key === "Escape") props.onClose(); };
+    document.addEventListener("keydown", closeOnEscape);
+    return () => document.removeEventListener("keydown", closeOnEscape);
+  }, [props.onClose]);
+
+  return (
+    <div className="fixed inset-0 z-50 grid place-items-center bg-black/60 p-4 backdrop-blur-sm" onPointerDown={(event) => { if (event.target === event.currentTarget) props.onClose(); }}>
+      <div role="dialog" aria-modal="true" className="w-full max-w-lg rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-panel)] p-6 shadow-[var(--shadow-panel)]" onPointerDown={(event) => event.stopPropagation()}>
+        <div className="flex items-start justify-between gap-4">
+          <div><h2 className="text-lg font-semibold">Share {props.folder.name}</h2><p className="mt-1 text-sm text-[var(--text-muted)]">Sub-folders and their files are included.</p></div>
+          <button aria-label="Close" onClick={props.onClose} className="rounded-md p-2 hover:bg-[var(--bg-hover)]"><X className="h-4 w-4" /></button>
+        </div>
+        <div className="mt-6 grid gap-4 sm:grid-cols-2">
+          <Field label="Password" type="password" value={props.password} onChange={props.onPassword} placeholder="Optional" />
+          <div>
+            <span className="mb-2 block text-sm font-medium">Expires</span>
+            <Popover open={expirationOpen} onOpenChange={setExpirationOpen}>
+              <PopoverTrigger asChild><Button type="button" variant="outline" className="h-[42px] w-full justify-start px-3 font-normal"><CalendarDays className="mr-2 h-4 w-4" />{selectedDate ? selectedDate.toLocaleDateString() : "No expiration"}</Button></PopoverTrigger>
+              <PopoverContent align="start" className="z-[70] w-auto p-0">
+                <Calendar mode="single" selected={selectedDate} onSelect={(date) => props.onExpires(date ? combineDateAndTime(date, selectedTime) : "")} disabled={{ before: new Date() }} captionLayout="dropdown" />
+                <div className="border-t border-[var(--border-subtle)] p-3">
+                  <input aria-label="Expiration time" type="time" value={selectedTime} onChange={(event) => props.onExpires(combineDateAndTime(selectedDate || new Date(), event.target.value))} className="w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-elevated)] px-3 py-2 text-sm" />
+                  <div className="mt-3 flex items-center justify-between gap-3">
+                    <button type="button" onClick={() => { props.onExpires(""); setExpirationOpen(false); }} className="text-xs text-[var(--text-muted)] hover:text-[var(--text-primary)]">Clear expiration</button>
+                    <button type="button" onClick={() => setExpirationOpen(false)} className="rounded-md bg-[var(--accent-linear)] px-3 py-2 text-xs font-medium text-[var(--accent-contrast)]">Apply expiration</button>
+                  </div>
+                </div>
+              </PopoverContent>
+            </Popover>
+          </div>
+        </div>
+        {props.url && <div className="mt-5 flex gap-2"><input readOnly value={props.url} className="min-w-0 flex-1 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-muted)] px-3 py-2 text-sm" /><button type="button" title="Copy link" aria-label="Copy link" onClick={props.onCopy} className="grid h-10 w-10 place-items-center rounded-lg border border-[var(--border-subtle)]"><Copy className="h-4 w-4" /></button></div>}
+        <div className="mt-6 flex flex-wrap justify-between gap-2">
+          <div>{props.canRemove && <button type="button" onClick={props.onRemove} className="rounded-lg border border-[color-mix(in_srgb,var(--error-linear)_42%,transparent)] px-4 py-2 text-sm text-[var(--error-linear)]">Remove link</button>}</div>
+          <button type="button" onClick={props.onSave} className="rounded-lg bg-[var(--accent-linear)] px-4 py-2 text-sm font-medium text-[var(--accent-contrast)]">{props.url ? "Update link" : "Create link"}</button>
+        </div>
+      </div>
     </div>
   );
 }

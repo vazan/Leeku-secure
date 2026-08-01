@@ -317,6 +317,29 @@ CREATE TABLE [dbo].[share_links](
 ) ON [PRIMARY]
 GO
 
+-- Step 6b: folder_share_links (depends on file_folders)
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+CREATE TABLE [dbo].[folder_share_links](
+    [id] [uniqueidentifier] NOT NULL,
+    [folder_id] [uniqueidentifier] NOT NULL,
+    [public_token] [char](32) NOT NULL,
+    [password_hash] [nvarchar](256) NULL,
+    [expires_at] [datetimeoffset](7) NULL,
+    [is_active] [bit] NOT NULL,
+    [created_at] [datetimeoffset](7) NOT NULL,
+    CONSTRAINT [PK_folder_share_links] PRIMARY KEY CLUSTERED ([id] ASC),
+    CONSTRAINT [UQ_folder_share_links_folder] UNIQUE NONCLUSTERED ([folder_id] ASC),
+    CONSTRAINT [UQ_folder_share_links_token] UNIQUE NONCLUSTERED ([public_token] ASC)
+) ON [PRIMARY]
+GO
+CREATE NONCLUSTERED INDEX [IX_folder_share_links_active_expiry]
+ON [dbo].[folder_share_links] ([is_active] ASC, [expires_at] ASC)
+INCLUDE ([folder_id], [public_token])
+GO
+
 -- Step 7: refresh_tokens (depends on users)
 SET ANSI_NULLS ON
 GO
@@ -555,6 +578,14 @@ GO
 ALTER TABLE [dbo].[share_links] ADD CONSTRAINT [DF_share_links_allow_external_preview] DEFAULT ((0)) FOR [allow_external_preview]
 GO
 
+-- Folder share links defaults
+ALTER TABLE [dbo].[folder_share_links] ADD CONSTRAINT [DF_folder_share_links_id] DEFAULT (newsequentialid()) FOR [id]
+GO
+ALTER TABLE [dbo].[folder_share_links] ADD CONSTRAINT [DF_folder_share_links_is_active] DEFAULT ((1)) FOR [is_active]
+GO
+ALTER TABLE [dbo].[folder_share_links] ADD CONSTRAINT [DF_folder_share_links_created_at] DEFAULT (sysdatetimeoffset()) FOR [created_at]
+GO
+
 -- Refresh tokens defaults
 ALTER TABLE [dbo].[refresh_tokens] ADD DEFAULT (newsequentialid()) FOR [id]
 GO
@@ -631,6 +662,14 @@ REFERENCES [dbo].[files] ([id])
 ON DELETE CASCADE
 GO
 ALTER TABLE [dbo].[share_links] CHECK CONSTRAINT [FK_share_links_files]
+GO
+
+ALTER TABLE [dbo].[folder_share_links] WITH CHECK ADD CONSTRAINT [FK_folder_share_links_folders]
+FOREIGN KEY([folder_id])
+REFERENCES [dbo].[file_folders] ([id])
+ON DELETE CASCADE
+GO
+ALTER TABLE [dbo].[folder_share_links] CHECK CONSTRAINT [FK_folder_share_links_folders]
 GO
 
 ALTER TABLE [dbo].[users] WITH CHECK ADD CONSTRAINT [FK_users_quotas] 
