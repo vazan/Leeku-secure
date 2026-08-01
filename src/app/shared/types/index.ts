@@ -70,6 +70,15 @@ export interface ShareLink {
   created_at: string;
 }
 
+export interface FolderShareLink {
+  id: string;
+  folder_id: string;
+  public_token: string;
+  expires_at: string | null;
+  is_active: boolean;
+  created_at: string;
+}
+
 export interface ActiveSession {
   id: string;
   ip_address: string | null;

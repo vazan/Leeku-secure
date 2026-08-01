@@ -51,8 +51,7 @@ CREATE TABLE IF NOT EXISTS file_folders (
 	parent_folder_id UUID NULL REFERENCES file_folders(id) ON DELETE NO ACTION,
 	name VARCHAR(120) NOT NULL,
 	created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-	updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-	CONSTRAINT uq_file_folders_owner_parent_name UNIQUE (owner_user_id, parent_folder_id, name)
+	updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Compatibility fix for legacy schemas that still enforce UNIQUE(owner_user_id, name)
@@ -87,7 +86,6 @@ BEGIN
 		WHERE t.relname = 'file_folders'
 			AND n.nspname = current_schema()
 			AND c.contype = 'u'
-			AND c.conname <> 'uq_file_folders_owner_parent_name'
 			AND pg_get_constraintdef(c.oid) ILIKE 'UNIQUE (owner_user_id, name)%'
 	LOOP
 		EXECUTE format('ALTER TABLE %I.%I DROP CONSTRAINT %I', current_schema(), 'file_folders', legacy_constraint_name);
@@ -108,36 +106,55 @@ BEGIN
 			AND ns.nspname = current_schema()
 			AND i.indisunique
 			AND c.oid IS NULL
-			AND pg_get_indexdef(idx.oid) ILIKE '%(owner_user_id, name)%'
+			AND idx.relname NOT IN ('uq_file_folders_owner_root_name', 'uq_file_folders_owner_parent_name')
+			AND (
+				pg_get_indexdef(idx.oid) ILIKE '%(owner_user_id, name)%'
+				OR pg_get_indexdef(idx.oid) ILIKE '%(owner_user_id, parent_folder_id, name)%'
+			)
 	LOOP
 		EXECUTE format('DROP INDEX IF EXISTS %I.%I', current_schema(), legacy_unique_index_name);
 	END LOOP;
 END $$;
 
 DO $$
-DECLARE duplicate_group_count INTEGER;
+DECLARE root_duplicate_count INTEGER;
+DECLARE nested_duplicate_count INTEGER;
 BEGIN
-	SELECT COUNT(*) INTO duplicate_group_count
+	SELECT COUNT(*) INTO root_duplicate_count
+	FROM (
+		SELECT owner_user_id, name
+		FROM file_folders
+		WHERE parent_folder_id IS NULL
+		GROUP BY owner_user_id, name
+		HAVING COUNT(*) > 1
+	) roots;
+
+	SELECT COUNT(*) INTO nested_duplicate_count
 	FROM (
 		SELECT owner_user_id, parent_folder_id, name, COUNT(*) AS c
 		FROM file_folders
+		WHERE parent_folder_id IS NOT NULL
 		GROUP BY owner_user_id, parent_folder_id, name
 		HAVING COUNT(*) > 1
-	) d;
+	) nested;
 
-	IF duplicate_group_count > 0 THEN
+	IF root_duplicate_count > 0 OR nested_duplicate_count > 0 THEN
 		RAISE EXCEPTION
-			'Cannot enforce uq_file_folders_owner_parent_name: % duplicate group(s) already exist in (owner_user_id, parent_folder_id, name).',
-			duplicate_group_count;
+			'Cannot enforce folder name uniqueness: % root and % nested duplicate group(s) exist.',
+			root_duplicate_count, nested_duplicate_count;
 	END IF;
 END $$;
 
 ALTER TABLE file_folders
 	DROP CONSTRAINT IF EXISTS uq_file_folders_owner_parent_name;
 
-ALTER TABLE file_folders
-	ADD CONSTRAINT uq_file_folders_owner_parent_name
-	UNIQUE (owner_user_id, parent_folder_id, name);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_file_folders_owner_root_name
+	ON file_folders (owner_user_id, name)
+	WHERE parent_folder_id IS NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_file_folders_owner_parent_name
+	ON file_folders (owner_user_id, parent_folder_id, name)
+	WHERE parent_folder_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS files (
 	id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -186,6 +203,16 @@ CREATE TABLE IF NOT EXISTS share_links (
 	download_count INTEGER NOT NULL DEFAULT 0,
 	is_active BOOLEAN NOT NULL DEFAULT TRUE,
 	allow_external_preview BOOLEAN NOT NULL DEFAULT FALSE,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS folder_share_links (
+	id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+	folder_id UUID NOT NULL UNIQUE REFERENCES file_folders(id) ON DELETE CASCADE,
+	public_token CHAR(32) NOT NULL UNIQUE,
+	password_hash VARCHAR(256) NULL,
+	expires_at TIMESTAMPTZ NULL,
+	is_active BOOLEAN NOT NULL DEFAULT TRUE,
 	created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -245,6 +272,10 @@ CREATE INDEX IF NOT EXISTS ix_refresh_tokens_user_active
 
 CREATE INDEX IF NOT EXISTS ix_share_links_file_lookup
 	ON share_links (file_id, is_active, public_token);
+
+CREATE INDEX IF NOT EXISTS ix_folder_share_links_active_expiry
+	ON folder_share_links (is_active, expires_at)
+	INCLUDE (folder_id, public_token);
 
 CREATE INDEX IF NOT EXISTS ix_system_logs_created_at_desc
 	ON system_logs (created_at DESC);
