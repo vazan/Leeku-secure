@@ -159,16 +159,16 @@ export function createPublicFolderSharingRouter(options: {
     const countsRequest = await getRequest();
     countsRequest.input('folderId', sql.UniqueIdentifier, row.folder_id);
     const counts = await countsRequest.query<{ stored_path: string | null }>(
-      `;WITH folder_tree AS (
-         SELECT id FROM file_folders WHERE id=@folderId
+      `WITH RECURSIVE folder_tree AS (
+         SELECT id,0 AS depth FROM file_folders WHERE id=@folderId
          UNION ALL
-         SELECT ff.id FROM file_folders ff INNER JOIN folder_tree ft ON ff.parent_folder_id=ft.id
+         SELECT ff.id,ft.depth+1 FROM file_folders ff INNER JOIN folder_tree ft ON ff.parent_folder_id=ft.id
+         WHERE ft.depth<5
        )
       SELECT f.stored_path
        FROM files f WHERE f.folder_id IN (SELECT id FROM folder_tree)
          AND COALESCE(f.status,'Available')='Available'
-         AND (f.expires_at IS NULL OR f.expires_at>SYSDATETIMEOFFSET())
-       OPTION (MAXRECURSION 100)`,
+         AND (f.expires_at IS NULL OR f.expires_at>CURRENT_TIMESTAMP)`,
     );
 
     const fileCount = counts.recordset.filter(
