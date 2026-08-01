@@ -3,6 +3,46 @@ agent: DevEngineer | date: 2026-07-25 | model: GPT-5.3-Codex
 plan: /memories/session/dev-plan.md
 ---
 
+Intent
+Implemented social embed parity for folder share links so Discord, Meta/Facebook, and X can unfurl folder links with Open Graph/Twitter metadata, aligned with existing file-share behavior.
+
+Change class
+🟡 STANDARD
+
+Files changed
+- src/server/routes/public-folder-sharing.ts:
+  - Added folder OG metadata HTML builder and route: `GET /api/public/folder/:token/og`.
+  - Added crawler-aware response behavior: crawlers receive OG/Twitter HTML, non-crawlers auto-redirect to app hash route.
+  - Added title/description format:
+    - Title: `Folder name - Shared by username`
+    - Description: `Folder name · number of files · Shared by username`
+- src/server.ts:
+  - Added vanity route rewrite: `GET /d/:token` -> internal dispatch to folder OG endpoint.
+  - Updated `robots.txt` crawler allow-list to include `/d/` and `/api/public/folder/` alongside existing file-share paths.
+- src/app/features/files/pages/user-dashboard.tsx:
+  - Switched generated/copy folder share URLs from hash-only `/#d/:token` to crawler-friendly `/d/:token`.
+
+Public contracts impacted
+- Added API endpoint: `GET /api/public/folder/:token/og`
+- Added vanity route: `GET /d/:token`
+- Existing folder share/download APIs remain unchanged.
+
+Validation status
+- Build: PASSED (`pnpm build`)
+- Type diagnostics for edited files: PASSED
+
+Handoff notes
+- TestEngineer focus:
+  - Post a folder link using `/d/:token` in Discord, Meta Messenger/Facebook, and X; verify preview title/description now render.
+  - Verify preview title matches: folder name plus uploader.
+  - Verify preview description matches: folder name plus file count plus uploader.
+  - Verify opening the same link in a normal browser redirects to hash route and loads shared folder page.
+- QaEngineer focus:
+  - Confirm additive route compatibility (legacy `/#d/:token` continues to work in-app).
+  - Confirm no regression on file share embed route `/s/:token`.
+
+---
+
 ## Intention
 Corriger le cas "dossier existe" alors qu'il n'est pas visible dans My Leeku file, en rendant le conflit compréhensible et en éliminant les anciens uniques globaux hérités.
 

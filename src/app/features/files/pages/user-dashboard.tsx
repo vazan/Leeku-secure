@@ -1278,6 +1278,9 @@ export default function UserDashboard({
       ? `${window.location.origin}/api/public/share/${publicToken}/embed`
       : `${window.location.origin}/s/${publicToken}`;
 
+  const toFolderShareUrl = (publicToken: string) =>
+    `${window.location.origin}/d/${publicToken}`;
+
   const openShare = (file: FileMetadata) => {
     const existing = links.find((link) => link.file_id === file.id);
     const allowExternalPreview =
@@ -1301,7 +1304,7 @@ export default function UserDashboard({
     setShareFolder(folder);
     setFolderSharePassword("");
     setFolderShareExpires(existing?.expires_at?.substring(0, 16) || "");
-    setFolderShareUrl(existing ? `${window.location.origin}/#d/${existing.public_token}` : "");
+    setFolderShareUrl(existing ? toFolderShareUrl(existing.public_token) : "");
   };
 
   const saveFolderShare = async () => {
@@ -1317,7 +1320,7 @@ export default function UserDashboard({
     });
     const data = await response.json();
     if (response.ok) {
-      setFolderShareUrl(`${window.location.origin}/#d/${data.link.public_token}`);
+      setFolderShareUrl(toFolderShareUrl(data.link.public_token));
       await loadFilesAndLinks();
       notify("Folder share link ready.");
     } else notifyError(data.error || "Could not create the folder share link.");
@@ -2122,7 +2125,7 @@ export default function UserDashboard({
                             type="button"
                             onClick={() =>
                               navigator.clipboard
-                                .writeText(`${window.location.origin}/#d/${link.public_token}`)
+                                .writeText(toFolderShareUrl(link.public_token))
                                 .then(() => notify("Link copied."))
                             }
                             className="flex shrink-0 cursor-pointer items-center gap-1.5 whitespace-nowrap rounded-md px-2 py-2 text-xs font-medium tracking-normal text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
