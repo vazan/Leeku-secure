@@ -69,6 +69,7 @@ export function createPublicFolderSharingRouter(options: {
   logDownload: (req: express.Request, fileId: string, originalName: string, token: string) => Promise<void>;
 }): express.Router {
   const router = express.Router();
+  const FACEBOOK_APP_ID = String(process.env.FACEBOOK_APP_ID || process.env.FB_APP_ID || '').trim();
   const downloadSessions = new Map<string, FolderDownloadSession>();
 
   if (!fs.existsSync(options.tempPath)) fs.mkdirSync(options.tempPath, { recursive: true });
@@ -118,6 +119,145 @@ export function createPublicFolderSharingRouter(options: {
     if (!row.password_hash) return true;
     return typeof password === 'string' && !!password && verifySharePassword(password, row.password_hash);
   };
+
+  const resolveOgImageUrl = (baseUrl: string): string | null => {
+    try {
+      const assetsDir = path.join(process.cwd(), 'dist', 'assets');
+      const entries = fs.readdirSync(assetsDir, { withFileTypes: true });
+      const mascotAsset = entries.find(
+        (entry) => entry.isFile() && /^leeku_mascot-.*\.png$/i.test(entry.name),
+      );
+      if (!mascotAsset) return null;
+      return `${baseUrl}/assets/${encodeURIComponent(mascotAsset.name)}`;
+    } catch {
+      return null;
+    }
+  };
+
+  const ogErrorHtml = (label: string): string => `<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><title>${label}</title></head><body><p>${label}</p></body></html>`;
+
+  const buildFolderShareOgHtml = async (
+    req: express.Request,
+    res: express.Response,
+    token: string,
+    baseUrl: string,
+  ): Promise<void> => {
+    const row = await loadShare(token);
+    if (!row) {
+      res.status(404).type('html').send(ogErrorHtml('Not Found'));
+      return;
+    }
+    if (!row.is_active) {
+      res.status(404).type('html').send(ogErrorHtml('Not Found'));
+      return;
+    }
+    if (row.expires_at && new Date(row.expires_at) <= new Date()) {
+      res.status(410).type('html').send(ogErrorHtml('Expired'));
+      return;
+    }
+
+    const countsRequest = await getRequest();
+    countsRequest.input('folderId', sql.UniqueIdentifier, row.folder_id);
+    const counts = await countsRequest.query<{ stored_path: string | null }>(
+      `;WITH folder_tree AS (
+         SELECT id FROM file_folders WHERE id=@folderId
+         UNION ALL
+         SELECT ff.id FROM file_folders ff INNER JOIN folder_tree ft ON ff.parent_folder_id=ft.id
+       )
+      SELECT f.stored_path
+       FROM files f WHERE f.folder_id IN (SELECT id FROM folder_tree)
+         AND COALESCE(f.status,'Available')='Available'
+         AND (f.expires_at IS NULL OR f.expires_at>SYSDATETIMEOFFSET())
+       OPTION (MAXRECURSION 100)`,
+    );
+
+    const fileCount = counts.recordset.filter(
+      (file: { stored_path: string | null }) =>
+        file.stored_path && fs.existsSync(path.join(options.vaultPath, file.stored_path)),
+    ).length;
+    const uploader = decryptColumn(row.owner_username_encrypted, row.owner_username_iv, row.owner_username_auth_tag);
+    const appUrl = `${baseUrl}/#d/${token}`;
+    const previewUrl = `${baseUrl}/d/${token}`;
+
+    const esc = (s: string) => s
+      .replace(/&/g, '&amp;')
+      .replace(/"/g, '&quot;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/'/g, '&#39;');
+    const safeFolderName = esc(row.folder_name);
+    const safeUploader = esc(uploader);
+    const safeAppUrl = esc(appUrl);
+    const safePreviewUrl = esc(previewUrl);
+    const ogImageUrl = resolveOgImageUrl(baseUrl);
+    const safeOgImageUrl = ogImageUrl ? esc(ogImageUrl) : null;
+    const ogTitle = `${safeFolderName} - Shared by ${safeUploader}`;
+    const ogDescription = `${safeFolderName} · ${fileCount} file${fileCount === 1 ? '' : 's'} · Shared by ${safeUploader}`;
+
+    const ua = String(req.get('user-agent') || '').toLowerCase();
+    const isCrawlerUa =
+      ua.includes('facebookexternalhit') ||
+      ua.includes('facebot') ||
+      ua.includes('meta-externalagent') ||
+      ua.includes('meta-externalfetcher') ||
+      ua.includes('metaexternalagent') ||
+      ua.includes('metaexternalfetcher') ||
+      ua.includes('discordbot') ||
+      ua.includes('twitterbot') ||
+      ua.includes('slackbot') ||
+      ua.includes('linkedinbot') ||
+      ua.includes('whatsapp');
+
+    const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>${ogTitle}</title>
+<meta property="og:title" content="${ogTitle}" />
+<meta property="og:description" content="${ogDescription}" />
+<meta property="og:type" content="website" />
+<meta property="og:url" content="${safePreviewUrl}" />
+<meta property="og:site_name" content="Leeku Secure" />
+<meta property="og:locale" content="en_US" />
+${FACEBOOK_APP_ID ? `<meta property="fb:app_id" content="${esc(FACEBOOK_APP_ID)}" />` : ''}
+${safeOgImageUrl ? `<meta property="og:image" content="${safeOgImageUrl}" />` : ''}
+${safeOgImageUrl ? `<meta property="og:image:secure_url" content="${safeOgImageUrl}" />` : ''}
+${safeOgImageUrl ? '<meta property="og:image:type" content="image/png" />' : ''}
+${safeOgImageUrl ? '<meta property="og:image:width" content="380" />' : ''}
+${safeOgImageUrl ? '<meta property="og:image:height" content="380" />' : ''}
+<meta name="twitter:card" content="summary" />
+<meta name="twitter:title" content="${ogTitle}" />
+<meta name="twitter:description" content="${ogDescription}" />
+${safeOgImageUrl ? `<meta name="twitter:image" content="${safeOgImageUrl}" />` : ''}
+<link rel="canonical" href="${safePreviewUrl}" />
+${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)});</script>`}
+</head>
+<body>
+<p><a href="${safeAppUrl}">${safeFolderName}</a></p>
+<p>${fileCount} file${fileCount === 1 ? '' : 's'} · Shared by ${safeUploader}</p>
+</body>
+</html>`;
+
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-store, max-age=0');
+    res.send(html);
+  };
+
+  router.get('/:token/og', async (req, res) => {
+    const protocol = req.protocol || 'https';
+    const host = req.get('host') || 'leeks.miku.rip';
+    const baseUrl = `${protocol}://${host}`;
+    try {
+      await buildFolderShareOgHtml(req, res, req.params.token, baseUrl);
+    } catch (error) {
+      console.error('[GET /api/public/folder/:token/og]', error);
+      if (!res.headersSent) {
+        res.status(500).type('html').send(ogErrorHtml('Internal Error'));
+      }
+    }
+  });
 
   router.get('/:token', async (req, res) => {
     try {

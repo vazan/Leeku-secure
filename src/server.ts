@@ -4485,23 +4485,33 @@ async function bootstrap() {
       '',
       'User-agent: facebookexternalhit',
       'Allow: /s/',
+      'Allow: /d/',
       'Allow: /api/public/share/',
+      'Allow: /api/public/folder/',
       '',
       'User-agent: facebot',
       'Allow: /s/',
+      'Allow: /d/',
       'Allow: /api/public/share/',
+      'Allow: /api/public/folder/',
       '',
       'User-agent: meta-externalagent',
       'Allow: /s/',
+      'Allow: /d/',
       'Allow: /api/public/share/',
+      'Allow: /api/public/folder/',
       '',
       'User-agent: meta-externalfetcher',
       'Allow: /s/',
+      'Allow: /d/',
       'Allow: /api/public/share/',
+      'Allow: /api/public/folder/',
       '',
       'User-agent: discordbot',
       'Allow: /s/',
       'Allow: /api/public/share/',
+      'Allow: /d/',
+      'Allow: /api/public/folder/',
     ].join('\n'));
   });
 
@@ -4510,6 +4520,12 @@ async function bootstrap() {
   // Vanity path for share links — internally dispatch to OG HTML handler (no redirect hop for crawlers).
   app.get('/s/:token', (req, res, next) => {
     req.url = `/api/public/share/${req.params.token}/og`;
+    (app as unknown as { _router: { handle: express.RequestHandler } })._router.handle(req, res, next);
+  });
+
+  // Vanity path for folder share links — internally dispatch to folder OG HTML handler.
+  app.get('/d/:token', (req, res, next) => {
+    req.url = `/api/public/folder/${req.params.token}/og`;
     (app as unknown as { _router: { handle: express.RequestHandler } })._router.handle(req, res, next);
   });
 
