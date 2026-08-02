@@ -14,9 +14,11 @@ import {
   verifyFileSecret,
   verifySharePassword,
 } from '../utils/encryption.js';
+import { getPublicProfilePictureUrl } from '../utils/profile-picture.js';
 
 interface ShareRow {
   id: string;
+  owner_user_id: string;
   public_token: string;
   password_hash: string | null;
   expires_at: Date | null;
@@ -49,6 +51,7 @@ interface PublicDownloadSession {
 export function createPublicSharingRouter(options: {
   vaultPath: string;
   tempPath: string;
+  profilePictureRoot?: string;
   logDownload: (req: express.Request, fileId: string, originalName: string, token: string) => Promise<void>;
 }): express.Router {
   const router = express.Router();
@@ -274,7 +277,7 @@ const buildPromise = (async () => {
         original_name_encrypted: Buffer; original_name_iv: Buffer; original_name_auth_tag: Buffer;
         owner_username_encrypted: Buffer; owner_username_iv: Buffer; owner_username_auth_tag: Buffer;
       }>(
-        `SELECT sl.id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.allow_external_preview,
+        `SELECT sl.id,u.id AS owner_user_id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.allow_external_preview,
                 f.status AS file_status,f.leeku_vibe,f.mime_type,f.size_bytes,f.created_at AS file_created_at,f.stored_path,f.client_secret_hash,
                 f.original_name_encrypted,f.original_name_iv,f.original_name_auth_tag,
                 u.username_encrypted AS owner_username_encrypted,u.username_iv AS owner_username_iv,u.username_auth_tag AS owner_username_auth_tag
@@ -334,6 +337,11 @@ const buildPromise = (async () => {
     }
   };
 
+  const resolveProfilePictureOgImageUrl = (baseUrl: string, userId: string | null | undefined): string | null => {
+    if (!userId || !options.profilePictureRoot) return null;
+    return getPublicProfilePictureUrl(baseUrl, options.profilePictureRoot, userId);
+  };
+
   const ogErrorHtml = (label: string): string => `<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><title>${label}</title></head><body><p>${label}</p></body></html>`;
 
@@ -351,7 +359,7 @@ const buildPromise = (async () => {
       original_name_encrypted: Buffer; original_name_iv: Buffer; original_name_auth_tag: Buffer;
       owner_username_encrypted: Buffer; owner_username_iv: Buffer; owner_username_auth_tag: Buffer;
     }>(
-      `SELECT sl.id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.allow_external_preview,
+      `SELECT sl.id,u.id AS owner_user_id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.allow_external_preview,
               f.status AS file_status,f.mime_type,f.size_bytes,f.created_at AS file_created_at,f.stored_path,
               f.original_name_encrypted,f.original_name_iv,f.original_name_auth_tag,
               u.username_encrypted AS owner_username_encrypted,u.username_iv AS owner_username_iv,u.username_auth_tag AS owner_username_auth_tag
@@ -384,7 +392,8 @@ const buildPromise = (async () => {
     const safeUploader = esc(uploader);
     const safeAppUrl = esc(appUrl);
     const safePreviewUrl = esc(previewUrl);
-    const ogImageUrl = resolveOgImageUrl(baseUrl);
+    const profileImageUrl = resolveProfilePictureOgImageUrl(baseUrl, row.owner_user_id);
+    const ogImageUrl = profileImageUrl || resolveOgImageUrl(baseUrl);
     const safeOgImageUrl = ogImageUrl ? esc(ogImageUrl) : null;
     const ogTitle = `${safeFileName} - Shared by ${safeUploader}`;
     const ogDescription = `${safeFileName} · ${sizeLabel} · Shared by ${safeUploader}`;

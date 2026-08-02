@@ -35,6 +35,14 @@ import {
 } from './server/utils/encryption.js';
 import { scanFileBuffer, scanFilePath, heuristicPreScan } from './server/utils/scanner.js';
 import {
+  detectProfilePictureMime,
+  getLatestProfilePictureFile,
+  getProfilePictureDirectory,
+  getProfilePictureExtension,
+  getProfilePictureFiles,
+  resolveProfilePictureUserIdFromToken,
+} from './server/utils/profile-picture.js';
+import {
   startExpiryCleanup, stopExpiryCleanup,
   computeExpiresAt, isValidTtl,
   type ExpiredFileRecord,
@@ -501,31 +509,7 @@ if (!fs.existsSync(PROFILE_PICTURE_PATH)) {
   console.log(`[server] Created profile picture directory: ${PROFILE_PICTURE_PATH}`);
 }
 
-function detectProfilePictureMime(buffer: Buffer): 'image/jpeg' | 'image/png' | 'image/webp' | null {
-  if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return 'image/jpeg';
-  if (buffer.length >= 8 && buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return 'image/png';
-  if (buffer.length >= 12 && buffer.subarray(0, 4).toString('ascii') === 'RIFF' && buffer.subarray(8, 12).toString('ascii') === 'WEBP') return 'image/webp';
-  return null;
-}
-
-function getProfilePictureDirectory(userId: string): string {
-  return path.join(PROFILE_PICTURE_PATH, userId, 'avatars');
-}
-
-function getProfilePictureFiles(userId: string): string[] {
-  const directory = getProfilePictureDirectory(userId);
-  if (!fs.existsSync(directory)) return [];
-  return fs.readdirSync(directory)
-    .map((name) => path.join(directory, name))
-    .filter((filePath) => fs.statSync(filePath).isFile())
-    .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
-}
-
-function getProfilePictureExtension(mimeType: 'image/jpeg' | 'image/png' | 'image/webp'): string {
-  if (mimeType === 'image/jpeg') return 'jpg';
-  if (mimeType === 'image/png') return 'png';
-  return 'webp';
-}
+// Profile picture helpers are provided by the shared utility module.
 
 // ──────────────────────────────────────────────────────────────
 // Gemini AI (optional)
@@ -1692,9 +1676,27 @@ const profilePictureUpload = multer({
   limits: { files: 1, fileSize: 5 * 1024 * 1024 },
 });
 
+app.get('/api/public/users/:avatarToken/avatar', (req, res) => {
+  try {
+    const userId = resolveProfilePictureUserIdFromToken(PROFILE_PICTURE_PATH, req.params.avatarToken);
+    if (!userId) return res.status(404).end();
+    const avatarPath = getLatestProfilePictureFile(PROFILE_PICTURE_PATH, userId);
+    if (!avatarPath) return res.status(404).end();
+    const picture = fs.readFileSync(avatarPath);
+    const mimeType = detectProfilePictureMime(picture);
+    if (!mimeType) return res.status(404).end();
+    res.setHeader('Content-Type', mimeType);
+    res.setHeader('Cache-Control', 'public, max-age=3600, stale-while-revalidate=86400');
+    res.send(picture);
+  } catch (err) {
+    console.error('[GET /api/public/users/:avatarToken/avatar]', err);
+    res.status(500).json({ error: 'Could not load profile picture.' });
+  }
+});
+
 app.get('/api/users/me/avatar', authenticateUser as express.RequestHandler, (req: AuthenticatedRequest, res) => {
   try {
-    const avatarPath = getProfilePictureFiles(req.userId!)[0];
+    const avatarPath = getLatestProfilePictureFile(PROFILE_PICTURE_PATH, req.userId!);
     if (!avatarPath) return res.status(404).end();
     const picture = fs.readFileSync(avatarPath);
     const mimeType = detectProfilePictureMime(picture);
@@ -1714,13 +1716,13 @@ app.post('/api/users/me/avatar', authenticateUser as express.RequestHandler, pro
   if (!mimeType) return res.status(400).json({ error: 'Profile pictures must be PNG, JPEG, or WebP.' });
 
   try {
-    const directory = getProfilePictureDirectory(req.userId!);
+    const directory = getProfilePictureDirectory(PROFILE_PICTURE_PATH, req.userId!);
     fs.mkdirSync(directory, { recursive: true });
     const extension = getProfilePictureExtension(mimeType);
     const filename = `${Date.now()}-${generateSecureToken(8)}.${extension}`;
     fs.writeFileSync(path.join(directory, filename), req.file.buffer);
 
-    for (const oldPicture of getProfilePictureFiles(req.userId!).slice(10)) {
+    for (const oldPicture of getProfilePictureFiles(PROFILE_PICTURE_PATH, req.userId!).slice(10)) {
       fs.unlinkSync(oldPicture);
     }
 
@@ -1734,7 +1736,7 @@ app.post('/api/users/me/avatar', authenticateUser as express.RequestHandler, pro
 
 const removeProfilePicture = async (req: AuthenticatedRequest, res: express.Response) => {
   try {
-    const directory = getProfilePictureDirectory(req.userId!);
+    const directory = getProfilePictureDirectory(PROFILE_PICTURE_PATH, req.userId!);
     if (fs.existsSync(directory)) fs.rmSync(directory, { recursive: true, force: true });
     await logSystemEvent(req.userId!, req.user!.username, 'Auth', 'User', req.userId!, req, 'Removed profile picture.');
     res.json({ success: true });
@@ -3767,6 +3769,7 @@ app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, asy
 app.use('/api/public/share', createPublicSharingRouter({
   vaultPath: FILE_VAULT,
   tempPath: UPLOAD_TEMP,
+  profilePictureRoot: PROFILE_PICTURE_PATH,
   logDownload: (req, fileId, originalName, token) =>
     logSystemEvent(null, 'Anonymous', 'Download', 'File', fileId, req, `Anonymous download of "${originalName}" via token ${token}.`),
 }));
@@ -3774,6 +3777,7 @@ app.use('/api/public/share', createPublicSharingRouter({
 app.use('/api/public/folder', createPublicFolderSharingRouter({
   vaultPath: FILE_VAULT,
   tempPath: UPLOAD_TEMP,
+  profilePictureRoot: PROFILE_PICTURE_PATH,
   logDownload: (req, fileId, originalName, token) =>
     logSystemEvent(null, 'Anonymous', 'Download', 'File', fileId, req, `Anonymous folder-share download of "${originalName}" via token ${token}.`),
 }));
