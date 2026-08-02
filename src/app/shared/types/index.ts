@@ -39,6 +39,9 @@ export interface FileMetadata {
   leeku_vibe: string; // Funny approve comments
   is_encrypted: boolean;
   has_user_secret: boolean;
+  preview_kind: 'text' | 'csv' | null;
+  preview_available: boolean;
+  preview_max_bytes: number;
   created_at: string;
 }
 

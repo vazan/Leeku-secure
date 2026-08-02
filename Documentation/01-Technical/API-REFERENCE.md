@@ -83,7 +83,7 @@ Evidence:
 | GET | /api/files/upload | User | Upload state/check handler exists | Leeku-MSSQL/src/server.ts |
 | POST | /api/files/upload | User | File upload handler exists | Leeku-MSSQL/src/server.ts |
 | POST | /api/files/:id/delete | User | File delete handler exists | Leeku-MSSQL/src/server.ts |
-| GET | /api/files/:id/preview | User | File preview handler exists | Leeku-MSSQL/src/server.ts |
+| GET | /api/files/:id/preview | User | Streams image/MP4 previews or returns text/CSV content up to 5 MiB; user-secret text files require `X-File-Secret` | Leeku-MSSQL/src/server.ts |
 | GET | /api/files/:id/download | User | Direct/private download handler exists | Leeku-MSSQL/src/server.ts |
 | POST | /api/files/:id/download/prepare | User | Prepared download initiation exists | Leeku-MSSQL/src/server.ts |
 | GET | /api/files/:id/download/:downloadId/status | User | Prepared download status exists | Leeku-MSSQL/src/server.ts |
@@ -102,6 +102,7 @@ Mounted at /api/public/share.
 | GET | /api/public/share/:token | None | Returns share metadata | Leeku-MSSQL/src/server/routes/public-sharing.ts |
 | GET | /api/public/share/:token/og | None | OG metadata page route | Leeku-MSSQL/src/server/routes/public-sharing.ts |
 | GET | /api/public/share/s/:token | None | Short token route variant | Leeku-MSSQL/src/server/routes/public-sharing.ts |
+| POST | /api/public/share/:token/preview | Share password/secret when configured | Returns decrypted text or CSV content up to 5 MiB without consuming a download | Leeku-MSSQL/src/server/routes/public-sharing.ts |
 | POST | /api/public/share/:token/download | None | Public download initiation | Leeku-MSSQL/src/server/routes/public-sharing.ts |
 | GET | /api/public/share/:token/download/:downloadId/status | None | Public prepared download status | Leeku-MSSQL/src/server/routes/public-sharing.ts |
 | GET | /api/public/share/:token/download/:downloadId/file | None | Public prepared download fetch | Leeku-MSSQL/src/server/routes/public-sharing.ts |
