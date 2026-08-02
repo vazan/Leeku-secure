@@ -522,7 +522,7 @@ export default function PublicDownloadPage({
                 <h2 className="text-sm font-semibold">File preview</h2>
                 <span className="text-xs uppercase text-[var(--text-faint)]">{preview.kind}</span>
               </div>
-              <TextFilePreview preview={preview} />
+              <TextFilePreview preview={preview} fileName={meta.file_name} />
             </section>
           )}
         </div>
