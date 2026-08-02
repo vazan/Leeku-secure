@@ -8,6 +8,25 @@ interface AuthPageProps {
   onCancel: () => void;
 }
 
+const getCsrfToken = () =>
+  document.cookie
+    .split("; ")
+    .find((row) => row.startsWith("leeku_csrf="))
+    ?.split("=")[1] || "";
+
+async function ensureCsrfToken() {
+  const existing = getCsrfToken();
+  if (existing) return existing;
+
+  const response = await fetch("/api/auth/csrf");
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(data.error || "Could not prepare sign-in request.");
+  }
+
+  return data.csrfToken || getCsrfToken();
+}
+
 export default function AuthPage({
   initialMode,
   onAuthSuccess,
@@ -30,11 +49,15 @@ export default function AuthPage({
     setLoading(true);
     setMessage("");
     try {
+      const csrfToken = await ensureCsrfToken();
       const response = await fetch(
         mode === "login" ? "/api/auth/login" : "/api/auth/register",
         {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            ...(csrfToken ? { "X-CSRF-Token": csrfToken } : {}),
+          },
           body: JSON.stringify(
             mode === "login"
               ? { login: email, password }

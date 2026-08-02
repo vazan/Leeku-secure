@@ -7,6 +7,25 @@ import UserDashboard from "@/app/features/files/pages/user-dashboard";
 import { Toaster } from "@/app/shared/components/ui/sonner";
 import type { Quota, User } from "@/app/shared/types";
 
+const getCsrfToken = () =>
+  document.cookie
+    .split("; ")
+    .find((row) => row.startsWith("leeku_csrf="))
+    ?.split("=")[1] || "";
+
+async function ensureCsrfToken() {
+  const existing = getCsrfToken();
+  if (existing) return existing;
+
+  const response = await fetch("/api/auth/csrf");
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(data.error || "Could not refresh the session.");
+  }
+
+  return data.csrfToken || getCsrfToken();
+}
+
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [token, setToken] = useState("");
@@ -23,16 +42,11 @@ export default function App() {
     userRef.current = user;
   }, [user]);
 
-  const getCsrfToken = () =>
-    document.cookie
-      .split("; ")
-      .find((row) => row.startsWith("leeku_csrf="))
-      ?.split("=")[1] || "";
-
   const refreshSession = async () => {
+    const csrfToken = await ensureCsrfToken();
     const response = await fetch("/api/auth/refresh", {
       method: "POST",
-      headers: { "X-CSRF-Token": getCsrfToken() },
+      headers: { "X-CSRF-Token": csrfToken },
     });
     if (!response.ok) return null;
     const data = await response.json();
@@ -161,11 +175,12 @@ export default function App() {
 
   const handleLogout = async () => {
     try {
+      const csrfToken = await ensureCsrfToken();
       await fetch("/api/auth/logout", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "X-CSRF-Token": getCsrfToken(),
+          "X-CSRF-Token": csrfToken,
         },
       });
     } catch {
