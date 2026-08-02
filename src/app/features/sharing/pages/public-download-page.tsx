@@ -3,11 +3,15 @@ import {
   ArrowLeft,
   Check,
   Download,
+  Eye,
   Loader2,
   Lock,
 } from "lucide-react";
 import ErrorScreen from "@/app/shared/components/common/error-screen";
 import FileTypeIcon from "@/app/shared/components/common/file-type-icon";
+import TextFilePreview, {
+  type TextFilePreviewData,
+} from "@/app/shared/components/common/text-file-preview";
 import TransferProgress, {
   type TransferState,
 } from "@/app/shared/components/common/transfer-progress";
@@ -27,6 +31,9 @@ interface PublicFileMeta {
   uploader: string;
   downloads_current: number;
   downloads_max: number | null;
+  preview_kind: "text" | "csv" | null;
+  preview_available: boolean;
+  preview_max_bytes: number;
 }
 
 interface PreparedDownloadStartResponse {
@@ -129,8 +136,42 @@ export default function PublicDownloadPage({
   const [downloading, setDownloading] = useState(false);
   const [done, setDone] = useState(false);
   const [transfer, setTransfer] = useState<TransferState | null>(null);
+  const [preview, setPreview] = useState<TextFilePreviewData | null>(null);
+  const [previewing, setPreviewing] = useState(false);
   const doneTimerRef = useRef<number | null>(null);
   const downloadControllerRef = useRef<AbortController | null>(null);
+  const previewControllerRef = useRef<AbortController | null>(null);
+
+  const loadPreview = async (credentials?: { password?: string; secret_key?: string }) => {
+    previewControllerRef.current?.abort();
+    const controller = new AbortController();
+    previewControllerRef.current = controller;
+    setPreviewing(true);
+    setError("");
+
+    try {
+      const response = await fetch(`/api/public/share/${token}/preview`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(credentials || {}),
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        throw new Error(await readJsonError(response, "Preview unavailable."));
+      }
+      const data = (await response.json()) as TextFilePreviewData;
+      setPreview(data);
+    } catch (reason) {
+      if (!(reason instanceof DOMException && reason.name === "AbortError")) {
+        setError(reason instanceof Error ? reason.message : "Preview unavailable.");
+      }
+    } finally {
+      if (previewControllerRef.current === controller) {
+        previewControllerRef.current = null;
+        setPreviewing(false);
+      }
+    }
+  };
 
   useEffect(() => {
     fetch(`/api/public/share/${token}`)
@@ -139,6 +180,9 @@ export default function PublicDownloadPage({
       if (!response.ok)
         throw new Error(data.error || "This link is no longer available.");
       setMeta(data);
+      if (data.preview_available && !data.protected && !data.requires_secret_key) {
+        void loadPreview();
+      }
 
       // Update OG meta tags for JS-capable crawlers (e.g. newer Discord bots)
       const title = `${data.file_name} - Shared by ${data.uploader}`;
@@ -197,9 +241,18 @@ export default function PublicDownloadPage({
     () => () => {
       if (doneTimerRef.current) window.clearTimeout(doneTimerRef.current);
       downloadControllerRef.current?.abort();
+      previewControllerRef.current?.abort();
     },
     [],
   );
+
+  const requestPreview = () => {
+    if (!meta) return;
+    void loadPreview({
+      password: password || undefined,
+      secret_key: secretKey || undefined,
+    });
+  };
 
   const download = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -322,7 +375,7 @@ export default function PublicDownloadPage({
 
   return (
     <div className="min-h-screen bg-[var(--bg-primary)] px-5 py-6">
-      <div className="mx-auto max-w-xl">
+      <div className={`mx-auto ${preview || meta?.preview_available ? "max-w-6xl" : "max-w-xl"}`}>
         <button
           onClick={onGoHome}
           className="flex items-center gap-2 text-sm text-[var(--text-muted)]"
@@ -433,18 +486,45 @@ export default function PublicDownloadPage({
                 Your browser download has started.
               </p>
             )}
-            <button
-              disabled={downloading}
-              className="flex w-full items-center justify-center gap-2 rounded-lg bg-[var(--accent-linear)] px-4 py-3 text-sm font-medium text-[var(--accent-contrast)] hover:bg-[var(--accent-linear-bright)]"
-            >
-              {downloading ? (
-                <Loader2 className="h-4 w-4 animate-spin" />
-              ) : (
-                <Download className="h-4 w-4" />
+            <div className="flex flex-col gap-3 sm:flex-row">
+              {meta.preview_available && (
+                <button
+                  type="button"
+                  onClick={requestPreview}
+                  disabled={previewing || downloading}
+                  className="flex flex-1 items-center justify-center gap-2 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-elevated)] px-4 py-3 text-sm font-medium hover:bg-[var(--bg-hover)] disabled:opacity-60"
+                >
+                  {previewing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Eye className="h-4 w-4" />}
+                  {previewing ? "Loading preview" : preview ? "Refresh preview" : "Preview file"}
+                </button>
               )}
-              {downloading ? "Preparing download" : "Download file"}
-            </button>
+              <button
+                disabled={downloading || previewing}
+                className="flex flex-1 items-center justify-center gap-2 rounded-lg bg-[var(--accent-linear)] px-4 py-3 text-sm font-medium text-[var(--accent-contrast)] hover:bg-[var(--accent-linear-bright)] disabled:opacity-60"
+              >
+                {downloading ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <Download className="h-4 w-4" />
+                )}
+                {downloading ? "Preparing download" : "Download file"}
+              </button>
+            </div>
+            {meta.preview_kind && !meta.preview_available && (
+              <p className="text-xs text-[var(--text-faint)]">
+                Preview is unavailable because this file exceeds the {formatBytes(meta.preview_max_bytes)} limit.
+              </p>
+            )}
           </form>
+          {preview && (
+            <section className="mt-8 border-t border-[var(--border-subtle)] pt-6">
+              <div className="mb-4 flex items-center justify-between gap-3">
+                <h2 className="text-sm font-semibold">File preview</h2>
+                <span className="text-xs uppercase text-[var(--text-faint)]">{preview.kind}</span>
+              </div>
+              <TextFilePreview preview={preview} />
+            </section>
+          )}
         </div>
       </div>
     </div>

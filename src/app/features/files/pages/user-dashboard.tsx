@@ -4,10 +4,12 @@ import {
   Camera,
   CalendarDays,
   Copy,
+  Eye,
   Folder,
   FolderPlus,
   LayoutGrid,
   Link2,
+  Loader2,
   Lock,
   LogOut,
   MoreHorizontal,
@@ -53,6 +55,9 @@ import TransferProgress, {
 import FileTypeIcon, {
   getFileTypeBadge,
 } from "@/app/shared/components/common/file-type-icon";
+import TextFilePreview, {
+  type TextFilePreviewData,
+} from "@/app/shared/components/common/text-file-preview";
 import { downloadWithProgress } from "@/app/shared/utils/download-with-progress";
 
 interface UserDashboardProps {
@@ -264,6 +269,7 @@ export default function UserDashboard({
   const [shareFile, setShareFile] = useState<FileMetadata | null>(null);
   const [shareFolder, setShareFolder] = useState<FileFolder | null>(null);
   const [videoFile, setVideoFile] = useState<FileMetadata | null>(null);
+  const [textPreviewFile, setTextPreviewFile] = useState<FileMetadata | null>(null);
   const [sharePassword, setSharePassword] = useState("");
   const [shareExpires, setShareExpires] = useState("");
   const [shareMaxDownloads, setShareMaxDownloads] = useState("");
@@ -1895,6 +1901,14 @@ export default function UserDashboard({
                         </div>
                       </div>
                       <div className="mt-4 grid w-full min-w-0 gap-2 min-[380px]:grid-cols-2">
+                        {file.preview_available && (
+                          <FileActionButton
+                            label="Preview"
+                            onClick={() => setTextPreviewFile(file)}
+                          >
+                            <Eye className="h-3.5 w-3.5" />
+                          </FileActionButton>
+                        )}
                         <FileActionButton
                           label="Download"
                           onClick={() => downloadFile(file)}
@@ -1926,38 +1940,38 @@ export default function UserDashboard({
               )}
               {visibleFiles.length > 0 && (
               <div className="hidden overflow-hidden rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] shadow-[var(--shadow-hairline)] sm:block">
-                <table className="w-full text-left text-sm">
+                <table className="w-full table-fixed text-left text-sm">
                   <thead className="border-b border-[var(--border-subtle)] bg-[var(--bg-muted)] text-xs text-[var(--text-muted)]">
                     <tr>
                       <th className="px-4 py-3 font-medium">Name</th>
-                      <th className="hidden px-4 py-3 font-medium md:table-cell">
+                      <th className="hidden w-24 px-3 py-3 font-medium md:table-cell">
                         Type
                       </th>
-                      <th className="hidden px-4 py-3 font-medium sm:table-cell">
+                      <th className="hidden w-20 px-3 py-3 font-medium sm:table-cell">
                         Size
                       </th>
-                      <th className="hidden px-4 py-3 font-medium lg:table-cell">
+                      <th className="hidden w-24 px-3 py-3 font-medium lg:table-cell">
                         Added
                       </th>
-                      <th className="hidden px-4 py-3 font-medium md:table-cell">
+                      <th className="hidden w-40 px-3 py-3 font-medium md:table-cell">
                         Folder
                       </th>
-                      <th className="px-4 py-3" />
+                      <th className="w-40 px-2 py-3" />
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-[var(--border-subtle)]">
                     {visibleFiles.map((file) => (
                       <tr key={file.id} className="hover:bg-[var(--bg-muted)]">
-                        <td className="px-4 py-3">
-                          <div className="flex items-center gap-3">
+                        <td className="min-w-0 px-4 py-3">
+                          <div className="flex min-w-0 items-center gap-3">
                             <FileThumbnail
                               file={file}
                               token={token}
                               className="h-9 w-9 rounded-lg"
                               iconClassName="h-4 w-4"
                             />
-                            <div>
-                              <p className="flex max-w-xs items-center gap-1 truncate font-medium">
+                            <div className="min-w-0">
+                              <p className="flex min-w-0 items-center gap-1 font-medium">
                                 <span className="truncate">{file.original_name}</span>
                                 {file.has_user_secret && (
                                   <Lock className="h-3.5 w-3.5 shrink-0 text-[var(--text-faint)]" aria-label="Secret key required" />
@@ -1969,24 +1983,32 @@ export default function UserDashboard({
                             </div>
                           </div>
                         </td>
-                        <td className="hidden px-4 py-3 text-[var(--text-muted)] md:table-cell">
-                          {fileKind(file)}
+                        <td className="hidden w-24 px-3 py-3 text-[var(--text-muted)] md:table-cell">
+                          <span className="block truncate">{fileKind(file)}</span>
                         </td>
-                        <td className="hidden px-4 py-3 text-[var(--text-muted)] sm:table-cell">
+                        <td className="hidden w-20 px-3 py-3 text-[var(--text-muted)] sm:table-cell">
                           {formatBytes(file.size)}
                         </td>
-                        <td className="hidden px-4 py-3 text-[var(--text-muted)] lg:table-cell">
+                        <td className="hidden w-24 px-3 py-3 text-[var(--text-muted)] lg:table-cell">
                           {new Date(file.created_at).toLocaleDateString()}
                         </td>
-                        <td className="hidden px-4 py-3 md:table-cell">
+                        <td className="hidden w-40 px-3 py-3 md:table-cell">
                           <MoveFileSelect
                             file={file}
                             folders={folders}
                             onMove={moveFileToFolder}
                           />
                         </td>
-                        <td className="px-4 py-3">
-                          <div className="flex justify-end gap-1">
+                        <td className="w-40 px-2 py-3">
+                          <div className="flex w-36 justify-end gap-1">
+                            {file.preview_available && (
+                              <IconButton
+                                label="Preview"
+                                onClick={() => setTextPreviewFile(file)}
+                              >
+                                <Eye className="h-4 w-4" />
+                              </IconButton>
+                            )}
                             <IconButton
                               label="Download"
                               onClick={() => downloadFile(file)}
@@ -2334,6 +2356,13 @@ export default function UserDashboard({
       {videoFile && (
         <VideoPlayer file={videoFile} onClose={() => setVideoFile(null)} />
       )}
+      {textPreviewFile && (
+        <TextPreviewDialog
+          file={textPreviewFile}
+          token={token}
+          onClose={() => setTextPreviewFile(null)}
+        />
+      )}
     </div>
   );
 }
@@ -2427,7 +2456,7 @@ function MoveFileSelect({
       <select
         value={file.folder_id || ""}
         onChange={(event) => onMove(file, event.target.value || null)}
-        className="h-9 w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-elevated)] px-2 text-xs text-[var(--text-secondary)] outline-none focus:border-[var(--accent-linear)] md:w-40"
+        className="h-9 w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-elevated)] px-2 text-xs text-[var(--text-secondary)] outline-none focus:border-[var(--accent-linear)]"
       >
         <option value="">/</option>
         {folderOptions.map((folder) => (
@@ -2815,6 +2844,145 @@ function VideoPlayer({
         playsInline
         className="min-h-0 w-full flex-1 object-contain"
       />
+    </div>
+  );
+}
+
+function TextPreviewDialog({
+  file,
+  token,
+  onClose,
+}: {
+  file: FileMetadata;
+  token: string;
+  onClose: () => void;
+}) {
+  const [preview, setPreview] = useState<TextFilePreviewData | null>(null);
+  const [secretKey, setSecretKey] = useState("");
+  const [loading, setLoading] = useState(!file.has_user_secret);
+  const [error, setError] = useState("");
+  const requestRef = React.useRef<AbortController | null>(null);
+
+  const loadPreview = async (providedSecret = "") => {
+    requestRef.current?.abort();
+    const controller = new AbortController();
+    requestRef.current = controller;
+    setLoading(true);
+    setError("");
+
+    try {
+      const response = await fetch(`/api/files/${file.id}/preview`, {
+        headers: {
+          ...authHeaders(token),
+          ...(providedSecret ? { "X-File-Secret": providedSecret } : {}),
+        },
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        throw new Error(await readJsonError(response, "Preview unavailable."));
+      }
+      setPreview((await response.json()) as TextFilePreviewData);
+    } catch (reason) {
+      if (!(reason instanceof DOMException && reason.name === "AbortError")) {
+        setError(reason instanceof Error ? reason.message : "Preview unavailable.");
+      }
+    } finally {
+      if (requestRef.current === controller) {
+        requestRef.current = null;
+        setLoading(false);
+      }
+    }
+  };
+
+  useEffect(() => {
+    if (!file.has_user_secret) void loadPreview();
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      requestRef.current?.abort();
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [file.id, file.has_user_secret, onClose]);
+
+  return (
+    <div
+      className="fixed inset-0 z-[60] grid place-items-center bg-black/70 p-3 backdrop-blur-sm sm:p-6"
+      onPointerDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-label={`Preview ${file.original_name}`}
+        className="flex max-h-[92vh] w-full max-w-6xl flex-col overflow-hidden rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-panel)] shadow-[var(--shadow-panel)]"
+        onPointerDown={(event) => event.stopPropagation()}
+      >
+        <div className="flex items-center justify-between gap-4 border-b border-[var(--border-subtle)] px-4 py-3 sm:px-5">
+          <div className="min-w-0">
+            <h2 className="truncate text-sm font-semibold">{file.original_name}</h2>
+            <p className="mt-0.5 text-xs text-[var(--text-faint)]">
+              {formatBytes(file.size)} · {file.preview_kind?.toUpperCase()}
+            </p>
+          </div>
+          <button
+            type="button"
+            aria-label="Close preview"
+            onClick={onClose}
+            className="grid h-9 w-9 shrink-0 place-items-center rounded-md hover:bg-[var(--bg-hover)]"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        <div className="min-h-0 flex-1 overflow-auto p-4 sm:p-5">
+          {file.has_user_secret && !preview && (
+            <form
+              className="mx-auto max-w-md space-y-4 py-8"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void loadPreview(secretKey.trim());
+              }}
+            >
+              <label className="block">
+                <span className="mb-2 flex items-center gap-2 text-sm font-medium">
+                  <Lock className="h-4 w-4" />
+                  Secret key
+                </span>
+                <input
+                  required
+                  type="password"
+                  value={secretKey}
+                  onChange={(event) => setSecretKey(event.target.value)}
+                  className="w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-elevated)] px-3 py-3 text-sm outline-none focus:border-[var(--accent-linear)]"
+                  autoFocus
+                />
+              </label>
+              <button
+                disabled={loading}
+                className="flex w-full items-center justify-center gap-2 rounded-lg bg-[var(--accent-linear)] px-4 py-3 text-sm font-medium text-[var(--accent-contrast)] disabled:opacity-60"
+              >
+                {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Eye className="h-4 w-4" />}
+                {loading ? "Loading preview" : "Open preview"}
+              </button>
+            </form>
+          )}
+
+          {loading && !file.has_user_secret && (
+            <div className="grid min-h-48 place-items-center">
+              <Loader2 className="h-5 w-5 animate-spin text-[var(--text-muted)]" />
+            </div>
+          )}
+          {error && (
+            <p className="mx-auto my-4 max-w-md rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-muted)] p-3 text-sm text-[var(--text-muted)]">
+              {error}
+            </p>
+          )}
+          {preview && <TextFilePreview preview={preview} />}
+        </div>
+      </div>
     </div>
   );
 }

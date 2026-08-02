@@ -15,6 +15,7 @@ import {
   verifySharePassword,
 } from '../utils/encryption.js';
 import { getPublicProfilePictureUrl } from '../utils/profile-picture.js';
+import { getTextPreviewKind, TEXT_PREVIEW_MAX_BYTES } from '../utils/text-preview.js';
 
 interface ShareRow {
   id: string;
@@ -293,9 +294,11 @@ const buildPromise = (async () => {
       if (row.expires_at && new Date(row.expires_at) < new Date()) return res.status(410).json({ error: 'Share link has expired.' });
       if (row.max_downloads && row.download_count >= row.max_downloads) return res.status(410).json({ error: 'Download limit reached.' });
       if (!fs.existsSync(path.join(options.vaultPath, row.stored_path))) return res.status(410).json({ error: 'The shared file is no longer available.' });
+      const fileName = decryptColumn(row.original_name_encrypted, row.original_name_iv, row.original_name_auth_tag);
+      const previewKind = getTextPreviewKind(fileName, row.mime_type || '');
       res.json({
         token: row.public_token,
-        file_name: decryptColumn(row.original_name_encrypted, row.original_name_iv, row.original_name_auth_tag),
+        file_name: fileName,
         mime_type: row.mime_type,
         size: row.size_bytes,
         created_at: row.file_created_at?.toISOString(),
@@ -306,10 +309,106 @@ const buildPromise = (async () => {
         leeku_vibe: row.leeku_vibe || '',
         downloads_current: row.download_count,
         downloads_max: row.max_downloads,
+        preview_kind: previewKind,
+        preview_available: !!previewKind && row.size_bytes <= TEXT_PREVIEW_MAX_BYTES,
+        preview_max_bytes: TEXT_PREVIEW_MAX_BYTES,
       });
     } catch (error) {
       console.error('[GET /api/public/share/:token]', error);
       res.status(500).json({ error: 'Failed to load share info.' });
+    }
+  });
+
+  router.post('/:token/preview', rateLimit({
+    windowMs: 15 * 60_000,
+    max: parseInt(process.env.PUBLIC_SHARE_PREVIEW_ATTEMPTS_PER_15_MIN || '30', 10),
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Too many preview or password attempts. Please wait before trying again.' },
+  }), async (req, res) => {
+    const token = req.params.token;
+    const { password, secret_key } = req.body;
+    let tempFile = '';
+
+    try {
+      const request = await getRequest();
+      request.input('tok', sql.Char(32), token);
+      const result = await request.query<ShareRow & {
+        file_status: string; stored_path: string; mime_type: string; size_bytes: number;
+        client_secret_hash: string | null; client_crypto_salt: Buffer | null; client_crypto_iv: Buffer | null; client_crypto_iterations: number | null;
+        original_name_encrypted: Buffer; original_name_iv: Buffer; original_name_auth_tag: Buffer;
+        checksum_sha256: string; file_id_join: string;
+        encrypted_key: Buffer; key_iv: Buffer; key_auth_tag: Buffer; file_iv: Buffer; file_auth_tag: Buffer;
+      }>(
+        `SELECT sl.id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.allow_external_preview,
+                f.id AS file_id_join,f.status AS file_status,f.stored_path,f.mime_type,f.size_bytes,f.checksum_sha256,
+                f.client_secret_hash,f.client_crypto_salt,f.client_crypto_iv,f.client_crypto_iterations,
+                f.original_name_encrypted,f.original_name_iv,f.original_name_auth_tag,
+                k.encrypted_key,k.key_iv,k.key_auth_tag,k.file_iv,k.file_auth_tag
+         FROM share_links sl
+         INNER JOIN files f ON sl.file_id=f.id
+         INNER JOIN file_encryption_keys k ON f.id=k.file_id
+         WHERE sl.public_token=@tok`,
+      );
+      const row = result.recordset[0];
+      if (!row) return res.status(404).json({ error: 'Share link not found.' });
+      if (!row.is_active) return res.status(404).json({ error: 'Share link inactive.' });
+      if (row.file_status === 'Blocked') return res.status(410).json({ error: 'File has been blocked.' });
+      if (row.expires_at && new Date(row.expires_at) < new Date()) return res.status(410).json({ error: 'Link expired.' });
+      if (row.max_downloads && row.download_count >= row.max_downloads) return res.status(410).json({ error: 'Download limit reached.' });
+
+      const originalName = decryptColumn(row.original_name_encrypted, row.original_name_iv, row.original_name_auth_tag);
+      const previewKind = getTextPreviewKind(originalName, row.mime_type || '');
+      if (!previewKind) return res.status(415).json({ error: 'Preview is only available for text and CSV files.' });
+      if (Number(row.size_bytes || 0) > TEXT_PREVIEW_MAX_BYTES) {
+        return res.status(413).json({ error: 'This file is larger than the 5 MB preview limit.' });
+      }
+      if (row.password_hash && (!password || !(await verifySharePassword(password, row.password_hash)))) {
+        return res.status(403).json({ error: password ? 'Incorrect vault password.' : 'Password required.' });
+      }
+      const providedSecret = typeof secret_key === 'string' ? secret_key.trim() : '';
+      if (row.client_secret_hash) {
+        if (!providedSecret) return res.status(403).json({ error: 'Secret key required.' });
+        if (!(await verifyFileSecret(providedSecret, row.client_secret_hash))) {
+          return res.status(403).json({ error: 'Incorrect secret key.' });
+        }
+      }
+
+      const vaultFile = path.join(options.vaultPath, row.stored_path);
+      if (!fs.existsSync(vaultFile)) return res.status(410).json({ error: 'Vault file not found.' });
+      tempFile = buildUniqueTempFilePath('leeku-preview', token);
+      const fileKey = unwrapKey(row.encrypted_key, row.key_iv, row.key_auth_tag);
+      const hash = crypto.createHash('sha256');
+      await decryptFileStream(vaultFile, tempFile, fileKey, row.file_iv, row.file_auth_tag, undefined, hash);
+      if (hash.digest('hex') !== row.checksum_sha256) throw new Error('File integrity check failed.');
+
+      if (row.client_secret_hash) {
+        if (!row.client_crypto_salt || !row.client_crypto_iv || !row.client_crypto_iterations) {
+          throw new Error('Secret-key metadata is missing for this file.');
+        }
+        await decryptClientProtectedFileInPlace(
+          tempFile,
+          providedSecret,
+          row.client_crypto_salt,
+          row.client_crypto_iv,
+          row.client_crypto_iterations,
+        );
+      }
+
+      const previewSize = fs.statSync(tempFile).size;
+      if (previewSize > TEXT_PREVIEW_MAX_BYTES) {
+        return res.status(413).json({ error: 'This file is larger than the 5 MB preview limit.' });
+      }
+      const content = await fs.promises.readFile(tempFile, 'utf8');
+      res.setHeader('Cache-Control', 'no-store, max-age=0');
+      return res.json({ kind: previewKind, content });
+    } catch (error) {
+      console.error('[POST /api/public/share/:token/preview]', error);
+      return res.status(500).json({ error: 'Preview failed.' });
+    } finally {
+      if (tempFile) {
+        try { await fs.promises.unlink(tempFile); } catch {}
+      }
     }
   });
 

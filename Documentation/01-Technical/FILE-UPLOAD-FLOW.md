@@ -223,6 +223,8 @@ flowchart TD
 **Supported preview types:**
 - `image/*` — all image MIME types
 - `video/mp4` — MP4 video only (not WebM, AVI, etc.)
+- Text-compatible files — logs, Markdown, structured data, configuration, source, scripts, and similar recognized text formats up to 5 MiB
+- `text/csv`, `application/csv`, and `.csv` — rendered as a color-banded table up to 5 MiB
 
 **Evidence:**  
 - Server preview eligibility check: [server.ts#L2820](../../src/server.ts#L2820)  
@@ -251,12 +253,11 @@ sequenceDiagram
         API->>Server: Authenticate user
         Server->>Server: Check file ownership
         Server->>Server: Check file status (not Blocked)
-        Server->>Server: Check secret key (no encryption)
         Server->>Server: Validate previewable type
         alt Validation fails
-            Server-->>API: HTTP 403/410/415 error
+            Server-->>API: HTTP 403/410/413/415 error
             API-->>Component: Catch error, set failed=true
-        else Validation passes
+        else Image or MP4
             Server->>Vault: Stream file from vault
             Vault-->>Server: File binary stream
             Server-->>API: HTTP 200 + binary data
@@ -264,6 +265,12 @@ sequenceDiagram
             Component->>Component: URL.createObjectURL(blob)
             Component->>Component: setPreviewUrl(objectUrl)
             Component->>Component: Render <img> or <video>
+        else Text or CSV
+            Server->>Server: Verify optional X-File-Secret
+            Server->>Vault: Decrypt and verify file into temporary storage
+            Server-->>API: HTTP 200 + JSON content
+            API->>Component: Render plain text or color-banded CSV table
+            Server->>Server: Remove temporary plaintext
         end
     end
 ```

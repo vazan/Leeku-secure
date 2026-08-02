@@ -65,6 +65,7 @@ import { createPublicFolderSharingRouter } from './server/routes/public-folder-s
 import { createMaintenanceModeRouter } from './server/routes/maintenance-mode.js';
 import { createDesktopUpdatesRouter, SYSTEM_UPDATE_FOLDER_NAME } from './server/routes/desktop-updates.js';
 import { validateProductionConfig } from './server/utils/production.js';
+import { getTextPreviewKind, TEXT_PREVIEW_MAX_BYTES } from './server/utils/text-preview.js';
 import type { AdminFileFolder, Quota, User, FileMetadata, FileFolder, FolderShareLink, ShareLink, SystemLog, SystemStats } from './app/shared/types/index.js';
 
 const runtimeDir = (() => {
@@ -826,13 +827,15 @@ function mapUserRow(row: UserRow): User {
 }
 
 function mapFileRow(row: FileRow, ownerUsername: string): FileMetadata {
+  const originalName = decryptColumn(row.original_name_encrypted, row.original_name_iv, row.original_name_auth_tag);
+  const previewKind = getTextPreviewKind(originalName, row.mime_type || '');
   return {
     id:             row.id,
     owner_user_id:  row.owner_user_id,
     username:       ownerUsername,
     folder_id:      row.folder_id || null,
     folder_name:    row.folder_name || null,
-    original_name:  decryptColumn(row.original_name_encrypted, row.original_name_iv, row.original_name_auth_tag),
+    original_name:  originalName,
     stored_name:    row.stored_path,
     mime_type:      row.mime_type,
     size:           Number(row.size_bytes),
@@ -842,6 +845,9 @@ function mapFileRow(row: FileRow, ownerUsername: string): FileMetadata {
     checksum:       row.checksum_sha256,
     leeku_vibe:     row.leeku_vibe || '',
     is_encrypted:   row.is_encrypted,
+    preview_kind:   previewKind,
+    preview_available: !!previewKind && row.status !== 'Blocked' && Number(row.size_bytes) <= TEXT_PREVIEW_MAX_BYTES,
+    preview_max_bytes: TEXT_PREVIEW_MAX_BYTES,
     created_at:     row.created_at.toISOString(),
   };
 }
@@ -3053,13 +3059,24 @@ app.post('/api/files/:id/delete', authenticateUser as express.RequestHandler, as
 
 app.get('/api/files/:id/preview', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
   const fileId = req.params.id;
+  let textPreviewPath: string | null = null;
+
+  const cleanupTextPreview = () => {
+    if (!textPreviewPath) return;
+    unregisterTempFile(textPreviewPath);
+    try { if (fs.existsSync(textPreviewPath)) fs.unlinkSync(textPreviewPath); } catch {}
+    textPreviewPath = null;
+  };
+
   try {
     const fileReq = await getRequest();
     fileReq.input('id', sql.UniqueIdentifier, fileId);
     const fileResult = await fileReq.query<FileRow>(
       `SELECT id,owner_user_id,original_name_encrypted,original_name_iv,original_name_auth_tag,
               stored_path,size_bytes,status,mime_type,encrypted_size_bytes,checksum_sha256,
-              scan_result,scan_message,is_encrypted,leeku_vibe,ttl_hours,expires_at,created_at
+              scan_result,scan_message,is_encrypted,leeku_vibe,ttl_hours,
+              client_secret_hash,client_crypto_salt,client_crypto_iv,client_crypto_iterations,
+              expires_at,created_at
        FROM files WHERE id=@id`
     );
     if (!fileResult.recordset.length) return res.status(404).json({ error: 'File not found.' });
@@ -3070,11 +3087,27 @@ app.get('/api/files/:id/preview', authenticateUser as express.RequestHandler, as
       return res.status(403).json({ error: 'Administrator access is required for desktop update artifacts.' });
     if (file.status === 'Blocked')
       return res.status(410).json({ error: 'Blocked files cannot be previewed.' });
-    if (file.client_secret_hash)
+
+    const originalName = decryptColumn(file.original_name_encrypted, file.original_name_iv, file.original_name_auth_tag);
+    const textPreviewKind = getTextPreviewKind(originalName, file.mime_type || '');
+    const mediaPreviewable = file.mime_type.startsWith('image/') || file.mime_type === 'video/mp4';
+    if (!textPreviewKind && !mediaPreviewable)
+      return res.status(415).json({ error: 'Preview is not available for this file type.' });
+    if (textPreviewKind && Number(file.size_bytes || 0) > TEXT_PREVIEW_MAX_BYTES)
+      return res.status(413).json({ error: 'This file is larger than the 5 MB preview limit.' });
+    if (file.client_secret_hash && !textPreviewKind)
       return res.status(403).json({ error: 'This file requires its secret key and cannot be previewed inline.' });
-    const previewable = file.mime_type.startsWith('image/') || file.mime_type === 'video/mp4';
-    if (!previewable)
-      return res.status(415).json({ error: 'Preview is only available for images and MP4 videos.' });
+
+    const secretHeaderRaw = req.headers['x-file-secret'];
+    const providedSecret = Array.isArray(secretHeaderRaw)
+      ? String(secretHeaderRaw[0] || '').trim()
+      : String(secretHeaderRaw || '').trim();
+    if (file.client_secret_hash) {
+      if (!providedSecret)
+        return res.status(403).json({ error: 'This file requires its secret key to preview.' });
+      if (!(await verifyFileSecret(providedSecret, file.client_secret_hash)))
+        return res.status(403).json({ error: 'Incorrect secret key.' });
+    }
 
     const vaultPath = path.join(FILE_VAULT, file.stored_path);
     if (!fs.existsSync(vaultPath)) return res.status(410).json({ error: 'Vault file not found.' });
@@ -3088,7 +3121,38 @@ app.get('/api/files/:id/preview', authenticateUser as express.RequestHandler, as
 
     const keyRow = keyRes.recordset[0];
     const fileKey = unwrapKey(keyRow.encrypted_key, keyRow.key_iv, keyRow.key_auth_tag);
-    const originalName = decryptColumn(file.original_name_encrypted, file.original_name_iv, file.original_name_auth_tag);
+
+    if (textPreviewKind) {
+      textPreviewPath = buildUniqueTempFilePath(UPLOAD_TEMP, 'leeku-text-preview', fileId);
+      registerTempFile(textPreviewPath);
+      const hash = crypto.createHash('sha256');
+      await decryptFileStream(vaultPath, textPreviewPath, fileKey, keyRow.file_iv, keyRow.file_auth_tag, undefined, hash);
+      if (hash.digest('hex') !== file.checksum_sha256)
+        return res.status(500).json({ error: 'File integrity check failed.' });
+
+      if (file.client_secret_hash) {
+        if (!file.client_crypto_salt || !file.client_crypto_iv || !file.client_crypto_iterations)
+          return res.status(500).json({ error: 'Secret-key metadata is missing for this file.' });
+        try {
+          await decryptClientProtectedFileInPlace(
+            textPreviewPath,
+            providedSecret,
+            file.client_crypto_salt,
+            file.client_crypto_iv,
+            file.client_crypto_iterations,
+          );
+        } catch {
+          return res.status(403).json({ error: 'Incorrect secret key.' });
+        }
+      }
+
+      if (fs.statSync(textPreviewPath).size > TEXT_PREVIEW_MAX_BYTES)
+        return res.status(413).json({ error: 'This file is larger than the 5 MB preview limit.' });
+      const content = await fs.promises.readFile(textPreviewPath, 'utf8');
+      res.setHeader('Cache-Control', 'no-store, max-age=0');
+      return res.json({ kind: textPreviewKind, content });
+    }
+
     const safeName = originalName.replace(/"/g, '\\"');
 
     res.setHeader('Content-Type', file.mime_type);
@@ -3117,7 +3181,12 @@ app.get('/api/files/:id/preview', authenticateUser as express.RequestHandler, as
     });
 
     encryptedStream.pipe(decipher).pipe(res);
-  } catch (err) { console.error('[GET /api/files/:id/preview]', err); res.status(500).json({ error: 'Preview failed.' }); }
+  } catch (err) {
+    console.error('[GET /api/files/:id/preview]', err);
+    if (!res.headersSent) res.status(500).json({ error: 'Preview failed.' });
+  } finally {
+    cleanupTextPreview();
+  }
 });
 
 app.get('/api/files/:id/download', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
