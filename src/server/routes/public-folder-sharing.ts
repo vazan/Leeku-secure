@@ -12,9 +12,11 @@ import {
   verifyFileSecret,
   verifySharePassword,
 } from '../utils/encryption.js';
+import { getPublicProfilePictureUrl } from '../utils/profile-picture.js';
 
 interface FolderShareRow {
   id: string;
+  owner_user_id: string;
   folder_id: string;
   public_token: string;
   password_hash: string | null;
@@ -65,6 +67,7 @@ const DOWNLOAD_SESSION_TTL_MS = 10 * 60_000;
 export function createPublicFolderSharingRouter(options: {
   vaultPath: string;
   tempPath: string;
+  profilePictureRoot?: string;
   logDownload: (req: express.Request, fileId: string, originalName: string, token: string) => Promise<void>;
 }): express.Router {
   const router = express.Router();
@@ -91,7 +94,7 @@ export function createPublicFolderSharingRouter(options: {
     const request = await getRequest();
     request.input('token', sql.Char(32), token);
     const result = await request.query<FolderShareRow>(
-      `SELECT fsl.id,fsl.folder_id,fsl.public_token,fsl.password_hash,fsl.expires_at,fsl.is_active,
+      `SELECT fsl.id,u.id AS owner_user_id,fsl.folder_id,fsl.public_token,fsl.password_hash,fsl.expires_at,fsl.is_active,
               ff.name AS folder_name,
               u.username_encrypted AS owner_username_encrypted,u.username_iv AS owner_username_iv,u.username_auth_tag AS owner_username_auth_tag
        FROM folder_share_links fsl
@@ -131,6 +134,11 @@ export function createPublicFolderSharingRouter(options: {
     } catch {
       return null;
     }
+  };
+
+  const resolveProfilePictureOgImageUrl = (baseUrl: string, userId: string | null | undefined): string | null => {
+    if (!userId || !options.profilePictureRoot) return null;
+    return getPublicProfilePictureUrl(baseUrl, options.profilePictureRoot, userId);
   };
 
   const ogErrorHtml = (label: string): string => `<!DOCTYPE html>
@@ -189,7 +197,8 @@ export function createPublicFolderSharingRouter(options: {
     const safeUploader = esc(uploader);
     const safeAppUrl = esc(appUrl);
     const safePreviewUrl = esc(previewUrl);
-    const ogImageUrl = resolveOgImageUrl(baseUrl);
+    const profileImageUrl = resolveProfilePictureOgImageUrl(baseUrl, row.owner_user_id);
+    const ogImageUrl = profileImageUrl || resolveOgImageUrl(baseUrl);
     const safeOgImageUrl = ogImageUrl ? esc(ogImageUrl) : null;
     const ogTitle = `${safeFolderName} - Shared by ${safeUploader}`;
     const ogDescription = `${safeFolderName} · ${fileCount} file${fileCount === 1 ? '' : 's'} · Shared by ${safeUploader}`;
