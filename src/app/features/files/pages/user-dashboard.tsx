@@ -1723,7 +1723,7 @@ export default function UserDashboard({
                     See all
                   </button>
                 </div>
-                <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+                <div className="grid gap-3 sm:grid-cols-2 sm:gap-4 xl:grid-cols-4">
                   {files.slice(0, 4).map((file) => (
                     <FileCard
                       key={file.id}
@@ -2680,28 +2680,28 @@ function FileCard({
   }, [menuOpen]);
 
   return (
-    <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] p-4 shadow-[var(--shadow-hairline)]">
+    <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] p-3 shadow-[var(--shadow-hairline)] sm:p-4">
       <div className="relative">
         <FileThumbnail
           file={file}
           token={token}
-          className="h-32 w-full rounded-lg"
+          className="h-24 w-full rounded-lg sm:h-32"
           iconClassName="h-8 w-8"
           onOpenVideo={onOpenVideo}
           interactiveVideo
           showTypeBadge={false}
         />
-        <span className="pointer-events-none absolute left-2 top-2 flex h-8 min-w-8 items-center justify-center rounded-md border border-[var(--border-subtle)] bg-[color-mix(in_srgb,var(--bg-elevated)_78%,transparent)] px-2 text-[10px] font-semibold leading-none text-[var(--text-secondary)] shadow-[var(--shadow-hairline)] backdrop-blur-sm">
+        <span className="pointer-events-none absolute left-1.5 top-1.5 flex h-7 min-w-7 items-center justify-center rounded-md border border-[var(--border-subtle)] bg-[color-mix(in_srgb,var(--bg-elevated)_78%,transparent)] px-1.5 text-[9px] font-semibold leading-none text-[var(--text-secondary)] shadow-[var(--shadow-hairline)] backdrop-blur-sm sm:left-2 sm:top-2 sm:h-8 sm:min-w-8 sm:px-2 sm:text-[10px]">
           {getFileTypeBadge(file.original_name)}
         </span>
-        <div ref={menuRef} className="absolute right-2 top-2">
+        <div ref={menuRef} className="absolute right-1.5 top-1.5 sm:right-2 sm:top-2">
           <button
             aria-label="File options"
             aria-expanded={menuOpen}
             onClick={() => setMenuOpen((open) => !open)}
-            className="rounded-md bg-[var(--bg-elevated)] p-2 text-[var(--text-secondary)] shadow-[var(--shadow-hairline)] hover:bg-[var(--bg-elevated)] hover:text-[var(--text-primary)]"
+            className="rounded-md bg-[var(--bg-elevated)] p-1.5 text-[var(--text-secondary)] shadow-[var(--shadow-hairline)] hover:bg-[var(--bg-elevated)] hover:text-[var(--text-primary)] sm:p-2"
           >
-            <MoreHorizontal className="h-4 w-4" />
+            <MoreHorizontal className="h-3.5 w-3.5 sm:h-4 sm:w-4" />
           </button>
           {menuOpen && (
             <div className="absolute right-0 z-20 mt-1 w-36 overflow-hidden rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-panel)] py-1 text-sm shadow-[var(--shadow-panel)]">
@@ -2729,8 +2729,8 @@ function FileCard({
           )}
         </div>
       </div>
-      <div className="mt-3 flex items-center gap-2">
-        <p className="min-w-0 flex flex-1 items-center gap-1 truncate text-sm font-medium">
+      <div className="mt-2.5 flex items-center gap-2 sm:mt-3">
+        <p className="min-w-0 flex flex-1 items-center gap-1 truncate text-xs font-medium sm:text-sm">
           <span className="truncate">{file.original_name}</span>
           {file.has_user_secret && (
             <Lock className="h-3.5 w-3.5 shrink-0 text-[var(--text-faint)]" aria-label="Secret key required" />
@@ -2740,7 +2740,7 @@ function FileCard({
           <ArrowDownToLine className="h-4 w-4" />
         </IconButton>
       </div>
-      <p className="mt-1 text-xs text-[var(--text-muted)]">
+      <p className="mt-1 text-[11px] text-[var(--text-muted)] sm:text-xs">
         {formatBytes(file.size)} ·{" "}
         {new Date(file.created_at).toLocaleDateString()}
       </p>
