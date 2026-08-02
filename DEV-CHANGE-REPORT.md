@@ -1,6 +1,46 @@
 ---
 
 Intent
+Reduced oversized Home "Recent files" tiles on phone screens by applying compact mobile-first sizing while preserving the existing desktop layout.
+
+Change class
+🟡 STANDARD
+
+Files changed
+- src/app/features/files/pages/user-dashboard.tsx:
+  - Reduced mobile Recent files grid gap.
+  - Switched FileCard to compact mobile spacing/padding.
+  - Reduced mobile thumbnail height and corner overlay/control footprint.
+  - Slightly reduced mobile filename/meta typography for denser cards.
+  - Kept previous dimensions from `sm` and above.
+
+Public contracts impacted
+- None. No API, shared type, or route changes.
+
+Validation status
+- Edited file diagnostics: PASSED.
+- Build: PASSED (`pnpm run build`).
+- Workspace lint/type-check: FAILED only on existing unrelated baseline JSX namespace errors in maintenance components:
+  - `src/app/shared/components/maintenance-mode-banner.tsx`
+  - `src/app/shared/components/maintenance-mode-control.tsx`
+
+Handoff notes
+- TestEngineer focus:
+  - Verify Home > Recent files on narrow Android/iOS widths displays smaller, denser tiles with no clipping.
+  - Verify tile controls (menu, download) remain tappable and functional.
+  - Verify desktop/tablet tile sizing remains unchanged.
+- QaEngineer focus:
+  - Validate no visual regression in non-Home file surfaces.
+  - Confirm change is style-only and does not affect navigation/actions.
+
+Approval trail
+- Not required (STANDARD change).
+
+---
+
+---
+
+Intent
 Implemented social embed parity for folder share links so Discord, Meta/Facebook, and X can unfurl folder links with Open Graph/Twitter metadata, aligned with existing file-share behavior.
 
 Change class
