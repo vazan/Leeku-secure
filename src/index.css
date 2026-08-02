@@ -35,6 +35,13 @@
   --success-linear: #27a644;
   --error-linear: #eb5757;
   --warning-linear: #f7bf8b;
+  --syntax-comment: #8b949e;
+  --syntax-keyword: #ff7b72;
+  --syntax-string: #a5d6ff;
+  --syntax-number: #79c0ff;
+  --syntax-title: #d2a8ff;
+  --syntax-name: #7ee787;
+  --syntax-built-in: #ffa657;
   --admin-surface: #0a0b0c;
   --admin-header: #08090a;
   --admin-info: #7c86e8;
@@ -109,6 +116,59 @@ body {
   text-rendering: geometricPrecision;
 }
 
+.syntax-preview .hljs-comment,
+.syntax-preview .hljs-quote {
+  color: var(--syntax-comment);
+  font-style: italic;
+}
+
+.syntax-preview .hljs-keyword,
+.syntax-preview .hljs-selector-tag,
+.syntax-preview .hljs-doctag {
+  color: var(--syntax-keyword);
+}
+
+.syntax-preview .hljs-string,
+.syntax-preview .hljs-regexp,
+.syntax-preview .hljs-addition,
+.syntax-preview .hljs-attribute {
+  color: var(--syntax-string);
+}
+
+.syntax-preview .hljs-number,
+.syntax-preview .hljs-literal,
+.syntax-preview .hljs-variable,
+.syntax-preview .hljs-template-variable,
+.syntax-preview .hljs-meta {
+  color: var(--syntax-number);
+}
+
+.syntax-preview .hljs-title,
+.syntax-preview .hljs-title.class_,
+.syntax-preview .hljs-title.function_,
+.syntax-preview .hljs-type {
+  color: var(--syntax-title);
+}
+
+.syntax-preview .hljs-name,
+.syntax-preview .hljs-selector-id,
+.syntax-preview .hljs-selector-class,
+.syntax-preview .hljs-section {
+  color: var(--syntax-name);
+}
+
+.syntax-preview .hljs-built_in,
+.syntax-preview .hljs-symbol,
+.syntax-preview .hljs-bullet,
+.syntax-preview .hljs-params,
+.syntax-preview .hljs-link {
+  color: var(--syntax-built-in);
+}
+
+.syntax-preview .hljs-deletion {
+  color: var(--error-linear);
+}
+
 button,
 a {
   -webkit-tap-highlight-color: transparent;
@@ -179,6 +239,13 @@ a {
   --success-linear: #15803d;
   --error-linear: #c0264c;
   --warning-linear: #b45309;
+  --syntax-comment: #6e7781;
+  --syntax-keyword: #cf222e;
+  --syntax-string: #0a3069;
+  --syntax-number: #0550ae;
+  --syntax-title: #8250df;
+  --syntax-name: #116329;
+  --syntax-built-in: #953800;
   --admin-surface: #ffffff;
   --admin-header: #eef0f3;
   --admin-info: #4338ca;

@@ -1,4 +1,42 @@
 ---
+agent: DevEngineer | date: 2026-08-02 | model: GitHub Copilot
+plan: /memories/session/dev-plan.md
+---
+
+Intent
+Ported theme-aware syntax highlighting for code-file previews to the PostgreSQL branch, preserving plain-text and CSV behavior.
+
+Change class
+STANDARD
+
+Files changed
+- `src/app/shared/components/common/text-file-preview.tsx`: added explicit Highlight.js grammars, filename-based language detection, escaped highlighted output, and a 512 KiB highlighting guard.
+- `src/app/features/files/pages/user-dashboard.tsx`: passes private preview filenames to the shared renderer.
+- `src/app/features/sharing/pages/public-download-page.tsx`: passes public preview filenames to the shared renderer.
+- `src/index.css`: added dark/light theme syntax token colors.
+- `package.json`, `pnpm-lock.yaml`: added Highlight.js and synchronized the pnpm dependency lock.
+- `tests/syntax-preview.test.ts`: covers language mapping and escaped HTML rendering.
+
+Public contracts impacted
+- `TextFilePreview` requires a `fileName` prop; no HTTP API or database contract changed.
+
+Validation status
+- Focused preview tests: PASSED (7/7).
+- Production build: PASSED.
+- Touched-file diagnostics: PASSED.
+- Existing build warnings remain: large Vite chunk and CommonJS `import.meta` warning.
+- The legacy `package-lock.json` was already MSSQL-based and out of sync with the PostgreSQL manifest before this task. It remains unchanged; pnpm is the repository's validated package manager and `pnpm install --frozen-lockfile` passed.
+
+Handoff TestEngineer
+- Verify HTML, CSS/SCSS, JavaScript/TypeScript, JSON/YAML, SQL, and shell previews in public and authenticated views.
+- Verify `.txt` and `.log` remain plain, CSV retains column colors, and code is displayed rather than executed.
+
+Handoff QaEngineer
+- Confirm theme contrast in dark, light, and Leeku themes and check a preview larger than 512 KiB falls back to responsive plain rendering.
+
+---
+
+---
 agent: DevEngineer | date: 2026-07-25 | model: GPT-5.3-Codex
 plan: /memories/session/dev-plan.md
 ---

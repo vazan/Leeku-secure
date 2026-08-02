@@ -2980,7 +2980,9 @@ function TextPreviewDialog({
               {error}
             </p>
           )}
-          {preview && <TextFilePreview preview={preview} />}
+          {preview && (
+            <TextFilePreview preview={preview} fileName={file.original_name} />
+          )}
         </div>
       </div>
     </div>
