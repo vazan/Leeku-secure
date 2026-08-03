@@ -8,11 +8,12 @@
 
 import express from 'express';
 import { getMaintenanceStatus, setMaintenanceStatus } from '../middleware/maintenance-mode.js';
+import type { SystemLog } from '../../app/shared/types/index.js';
 
 export function createMaintenanceModeRouter(options: {
   authenticateUser: express.RequestHandler;
   verifyAdmin: express.RequestHandler;
-  logSystemEvent: (userId: string, username: string, event: string, target: string, targetId: string, req: express.Request, msg: string) => Promise<void>;
+  logSystemEvent: (userId: string, username: string, event: SystemLog['event_type'], target: string, targetId: string, req: express.Request, msg: string) => Promise<void>;
 }): express.Router {
   const router = express.Router();
 

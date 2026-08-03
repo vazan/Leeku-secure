@@ -63,6 +63,11 @@ interface FolderManifestRow {
   stored_path: string | null;
 }
 
+function getSingleParam(value: string | string[] | undefined): string {
+  if (Array.isArray(value)) return value[0] ?? '';
+  return value ?? '';
+}
+
 const DOWNLOAD_SESSION_TTL_MS = 10 * 60_000;
 
 export function createPublicFolderSharingRouter(options: {
@@ -259,7 +264,7 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
     const host = req.get('host') || 'leeks.miku.rip';
     const baseUrl = `${protocol}://${host}`;
     try {
-      await buildFolderShareOgHtml(req, res, req.params.token, baseUrl);
+      await buildFolderShareOgHtml(req, res, getSingleParam(req.params.token), baseUrl);
     } catch (error) {
       console.error('[GET /api/public/folder/:token/og]', error);
       if (!res.headersSent) {
@@ -270,7 +275,7 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
 
   router.get('/:token', async (req, res) => {
     try {
-      const row = await loadShare(req.params.token);
+      const row = await loadShare(getSingleParam(req.params.token));
       if (!validateShare(row, res)) return;
       const folderCountRequest = await getRequest();
       folderCountRequest.input('folderId', sql.UniqueIdentifier, row.folder_id);
@@ -322,7 +327,7 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
     message: { error: 'Too many password attempts. Please wait before trying again.' },
   }), async (req, res) => {
     try {
-      const row = await loadShare(req.params.token);
+      const row = await loadShare(getSingleParam(req.params.token));
       if (!validateShare(row, res)) return;
       if (!(await verifyPassword(row, req.body?.password))) {
         return res.status(403).json({ error: req.body?.password ? 'Incorrect folder password.' : 'Password required.' });
@@ -382,7 +387,7 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
   }), async (req, res) => {
     sweepSessions();
     try {
-      const row = await loadShare(req.params.token);
+      const row = await loadShare(getSingleParam(req.params.token));
       if (!validateShare(row, res)) return;
       if (!(await verifyPassword(row, req.body?.password))) {
         return res.status(403).json({ error: req.body?.password ? 'Incorrect folder password.' : 'Password required.' });
@@ -390,7 +395,7 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
 
       const request = await getRequest();
       request.input('folderId', sql.UniqueIdentifier, row.folder_id);
-      request.input('fileId', sql.UniqueIdentifier, req.params.fileId);
+      request.input('fileId', sql.UniqueIdentifier, getSingleParam(req.params.fileId));
       const result = await request.query<{
         id: string; stored_path: string; mime_type: string; size_bytes: number; encrypted_size_bytes: number | null;
         checksum_sha256: string; client_secret_hash: string | null; client_crypto_salt: Buffer | null;
@@ -428,7 +433,7 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
       const tempFile = path.join(options.tempPath, `leeku-folder-share-${sessionId}-${crypto.randomBytes(6).toString('hex')}.tmp`);
       const encryptedSize = Number(file.encrypted_size_bytes || 0) || fs.statSync(vaultFile).size;
       const session: FolderDownloadSession = {
-        id: sessionId, accessToken, token: req.params.token, shareId: row.id, fileId: file.id, originalName,
+        id: sessionId, accessToken, token: getSingleParam(req.params.token), shareId: row.id, fileId: file.id, originalName,
         mimeType: file.mime_type || 'application/octet-stream', tempFile, sizeBytes: Number(file.size_bytes || 0),
         status: 'preparing', phase: 'decrypting', loaded: 0, total: encryptedSize,
         expiresAt: Date.now() + DOWNLOAD_SESSION_TTL_MS, claimed: false,
@@ -478,8 +483,8 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
 
       res.status(202).json({
         download_id: sessionId,
-        status_url: `/api/public/folder/${req.params.token}/download/${sessionId}/status?access_token=${encodeURIComponent(accessToken)}`,
-        file_url: `/api/public/folder/${req.params.token}/download/${sessionId}/file?access_token=${encodeURIComponent(accessToken)}`,
+        status_url: `/api/public/folder/${getSingleParam(req.params.token)}/download/${sessionId}/status?access_token=${encodeURIComponent(accessToken)}`,
+        file_url: `/api/public/folder/${getSingleParam(req.params.token)}/download/${sessionId}/file?access_token=${encodeURIComponent(accessToken)}`,
       });
     } catch (error) {
       console.error('[POST /api/public/folder/:token/files/:fileId/download]', error);
@@ -489,8 +494,8 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
 
   router.get('/:token/download/:downloadId/status', (req, res) => {
     sweepSessions();
-    const session = downloadSessions.get(req.params.downloadId);
-    if (!session || session.token !== req.params.token || req.query.access_token !== session.accessToken) {
+    const session = downloadSessions.get(getSingleParam(req.params.downloadId));
+    if (!session || session.token !== getSingleParam(req.params.token) || req.query.access_token !== session.accessToken) {
       return res.status(404).json({ error: 'Download session not found.' });
     }
     res.json({
@@ -504,8 +509,8 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
 
   router.get('/:token/download/:downloadId/file', async (req, res) => {
     sweepSessions();
-    const session = downloadSessions.get(req.params.downloadId);
-    if (!session || session.token !== req.params.token || req.query.access_token !== session.accessToken) {
+    const session = downloadSessions.get(getSingleParam(req.params.downloadId));
+    if (!session || session.token !== getSingleParam(req.params.token) || req.query.access_token !== session.accessToken) {
       return res.status(404).json({ error: 'Download session not found.' });
     }
     if (session.status === 'error') {

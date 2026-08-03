@@ -231,6 +231,25 @@ Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for:
 | **Documentation** | ✅ Comprehensive | 16+ technical guides, API reference, runbooks |
 | **Test Framework** | ⚠️ Planned | Gap identified in CONTRIBUTING.md; discussion needed |
 
+## Release Notes
+
+### 2026-08-03 - Dependency Upgrade + Express 5 Compatibility
+
+- Upgraded major dependencies:
+	- `express` 4 -> 5 and `@types/express` 4 -> 5
+	- `vite` 6 -> 8 and `@vitejs/plugin-react` 5 -> 6
+	- `typescript` 5 -> 7
+	- `esbuild` 0.25 -> 0.28
+	- `lucide-react` 0.x -> 1.x
+- Updated Express 5 route compatibility:
+	- SPA fallback route migrated from `*` to `/{*path}`.
+	- Vanity share route internal dispatch migrated from private `app._router.handle` to public `app.handle`.
+- Type-safety compatibility updates applied for stricter TS 7 behavior in streaming/download and crypto helper code paths.
+- Post-upgrade validation:
+	- `pnpm lint` passed
+	- `pnpm build` passed
+	- Existing targeted test suite passed
+
 ## License and AI Disclosure
 
 This project is licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for the full license text.

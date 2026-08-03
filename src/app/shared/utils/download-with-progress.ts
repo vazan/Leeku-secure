@@ -60,7 +60,7 @@ export async function downloadWithProgress(
       return;
     }
 
-    const chunks: Uint8Array[] = [];
+    const chunks: BlobPart[] = [];
     let loaded = 0;
 
     while (true) {
@@ -68,8 +68,11 @@ export async function downloadWithProgress(
       if (done) break;
       if (!value) continue;
 
-      chunks.push(value);
-      loaded += value.byteLength;
+      const normalizedChunk = new Uint8Array(value.byteLength);
+      normalizedChunk.set(value);
+
+      chunks.push(normalizedChunk.buffer);
+      loaded += normalizedChunk.byteLength;
       options.onProgress({ loaded, total });
     }
 
