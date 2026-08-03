@@ -41,7 +41,7 @@ const IV_LENGTH   = 12;  // 96 bits — recommended for AES-GCM
 const TAG_LENGTH  = 16;  // 128 bits — maximum GCM auth tag
 
 /** Argon2id parameters (OWASP recommended minimum for 2024) */
-const ARGON2_OPTIONS: argon2.Options = {
+const ARGON2_OPTIONS: argon2.HashOptions = {
   type:        argon2.argon2id,
   memoryCost:  65536,   // 64 MiB
   timeCost:    3,       // 3 iterations
@@ -49,7 +49,7 @@ const ARGON2_OPTIONS: argon2.Options = {
 };
 
 /** Argon2i parameters dedicated to optional per-file secret keys. */
-const ARGON2_FILE_SECRET_OPTIONS: argon2.Options = {
+const ARGON2_FILE_SECRET_OPTIONS: argon2.HashOptions = {
   type:        argon2.argon2i,
   memoryCost:  65536,
   timeCost:    3,

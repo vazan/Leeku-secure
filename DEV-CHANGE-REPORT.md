@@ -39,6 +39,43 @@ Approval trail
 ---
 
 Intent
+Executed a low-risk dependency safe pass on `mssql` by updating `argon2` to the latest compatible release and applying the minimum TypeScript compatibility fix required by upstream type export changes.
+
+Change class
+🟡 STANDARD
+
+Files changed
+- package.json:
+  - Updated `argon2` from `^0.44.0` to `^0.45.1`.
+- pnpm-lock.yaml:
+  - Refreshed lockfile for updated dependency graph.
+- src/server/utils/encryption.ts:
+  - Switched argon2 option typings from `argon2.Options` to `argon2.HashOptions` to align with `argon2@0.45.x` type exports.
+
+Public contracts impacted
+- None. No API endpoint, payload, or shared DTO changes.
+
+Validation status
+- Type-check: PASSED (`pnpm run lint`).
+- Build: PASSED (`pnpm run build`).
+- Tests: PASSED (`pnpm exec tsx --test tests/*.test.ts`) — 11 passed, 0 failed.
+
+Deferred updates (higher risk)
+- `express` 4 -> 5
+- `@vitejs/plugin-react` 5 -> 6
+- `vite` 6 -> 8
+- `typescript` 5 -> 7
+- `lucide-react` 0.x -> 1.x
+- `esbuild` 0.25 -> 0.28 (0.x line; treat as migration)
+- `@types/node` 22 -> 26
+- `@types/express` 4 -> 5
+
+Approval trail
+- Not required (STANDARD change).
+
+---
+
+Intent
 Aligned account email-change UX with security behavior by forcing immediate sign-out when re-verification is required.
 
 Change class
