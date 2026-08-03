@@ -48,6 +48,11 @@ interface PublicDownloadSession {
   error?: string;
 }
 
+function getSingleParam(value: string | string[] | undefined): string {
+  if (Array.isArray(value)) return value[0] ?? '';
+  return value ?? '';
+}
+
 export function createPublicSharingRouter(options: {
   vaultPath: string;
   tempPath: string;
@@ -269,7 +274,7 @@ const buildPromise = (async () => {
 
   router.get('/:token', async (req, res) => {
     try {
-      const request = await getRequest(); request.input('tok', sql.Char(32), req.params.token);
+      const request = await getRequest(); request.input('tok', sql.Char(32), getSingleParam(req.params.token));
       const result = await request.query<ShareRow & {
         file_status: string; leeku_vibe: string|null; mime_type: string;
         size_bytes: number; file_created_at: Date; stored_path: string;
@@ -325,7 +330,7 @@ const buildPromise = (async () => {
     legacyHeaders: false,
     message: { error: 'Too many preview or password attempts. Please wait before trying again.' },
   }), async (req, res) => {
-    const token = req.params.token;
+    const token = getSingleParam(req.params.token);
     const { password, secret_key } = req.body;
     let tempFile = '';
 
@@ -551,7 +556,7 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
     const host = req.get('host') || 'leeks.miku.rip';
     const baseUrl = `${protocol}://${host}`;
     try {
-      await buildShareOgHtml(req, res, req.params.token, baseUrl);
+      await buildShareOgHtml(req, res, getSingleParam(req.params.token), baseUrl);
     } catch (error) {
       console.error('[GET /:token/og]', error);
       if (!res.headersSent) {
@@ -566,7 +571,7 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
     const host = req.get('host') || 'leeks.miku.rip';
     const baseUrl = `${protocol}://${host}`;
     try {
-      await buildShareOgHtml(req, res, req.params.token, baseUrl);
+      await buildShareOgHtml(req, res, getSingleParam(req.params.token), baseUrl);
     } catch (error) {
       console.error('[GET /s/:token]', error);
       if (!res.headersSent) {
@@ -582,7 +587,7 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
     message: { error: 'Too many download or password attempts. Please wait before trying again.' },
   }), async (req, res) => {
     sweepDownloadSessions();
-    const token = req.params.token;
+    const token = getSingleParam(req.params.token);
     const { password, secret_key } = req.body;
     try {
       const request = await getRequest(); request.input('tok', sql.Char(32), token);
@@ -818,7 +823,7 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
   });
 
   router.get('/:token/embed', async (req, res) => {
-    const token = req.params.token;
+    const token = getSingleParam(req.params.token);
     try {
       const request = await getRequest();
       request.input('tok', sql.Char(32), token);
