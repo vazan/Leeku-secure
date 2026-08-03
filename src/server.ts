@@ -132,6 +132,11 @@ function parseNonNegativeIntEnv(name: string, fallback: number): number {
   return fallback;
 }
 
+function getSingleParam(value: string | string[] | undefined): string {
+  if (Array.isArray(value)) return value[0] ?? '';
+  return value ?? '';
+}
+
 function buildUniqueTempFilePath(baseDir: string, prefix: string, id: string): string {
   const unique = crypto.randomBytes(8).toString('hex');
   return path.join(baseDir, `${prefix}-${id}-${Date.now()}-${unique}.tmp`);
@@ -1089,6 +1094,17 @@ interface AuthenticatedRequest extends express.Request {
   user?: User;
   userId?: string;
   authToken?: string;
+  file?: {
+    fieldname: string;
+    originalname: string;
+    encoding: string;
+    mimetype: string;
+    destination?: string;
+    filename?: string;
+    path: string;
+    size: number;
+    buffer?: Buffer;
+  };
 }
 
 async function authenticateUser(
@@ -1515,7 +1531,7 @@ app.post('/api/auth/logout', async (req, res) => {
 
 const sessionRouteOptions = {
   authenticate: authenticateUser as express.RequestHandler,
-  getCurrentRefreshTokenHash: (req) => {
+  getCurrentRefreshTokenHash: (req: express.Request) => {
     const token = getCookieValue(req, REFRESH_COOKIE_NAME);
     return token ? hashRefreshToken(token) : null;
   },
@@ -1722,7 +1738,7 @@ const profilePictureUpload = multer({
 
 app.get('/api/public/users/:avatarToken/avatar', (req, res) => {
   try {
-    const userId = resolveProfilePictureUserIdFromToken(PROFILE_PICTURE_PATH, req.params.avatarToken);
+    const userId = resolveProfilePictureUserIdFromToken(PROFILE_PICTURE_PATH, getSingleParam(req.params.avatarToken));
     if (!userId) return res.status(404).end();
     const avatarPath = getLatestProfilePictureFile(PROFILE_PICTURE_PATH, userId);
     if (!avatarPath) return res.status(404).end();
@@ -1756,6 +1772,7 @@ app.get('/api/users/me/avatar', authenticateUser as express.RequestHandler, (req
 
 app.post('/api/users/me/avatar', authenticateUser as express.RequestHandler, profilePictureUpload.single('avatar'), async (req: AuthenticatedRequest, res) => {
   if (!req.file) return res.status(400).json({ error: 'Choose a profile picture to upload.' });
+  if (!req.file.buffer) return res.status(400).json({ error: 'Invalid profile picture payload.' });
   const mimeType = detectProfilePictureMime(req.file.buffer);
   if (!mimeType) return res.status(400).json({ error: 'Profile pictures must be PNG, JPEG, or WebP.' });
 
@@ -2173,7 +2190,7 @@ app.post('/api/file-folders', authenticateUser as express.RequestHandler, async 
 });
 
 app.post('/api/file-folders/:id/rename', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
-  const folderId = req.params.id;
+  const folderId = getSingleParam(req.params.id);
   if (!UUID_PATTERN.test(folderId)) return res.status(400).json({ error: 'Invalid folder id.' });
   const name = validateFolderName(req.body?.name);
   if (!name) return res.status(400).json({ error: 'Folder name must be between 1 and 120 characters.' });
@@ -2206,7 +2223,7 @@ app.post('/api/file-folders/:id/rename', authenticateUser as express.RequestHand
 });
 
 app.post('/api/file-folders/:id/delete', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
-  const folderId = req.params.id;
+  const folderId = getSingleParam(req.params.id);
   if (!UUID_PATTERN.test(folderId)) return res.status(400).json({ error: 'Invalid folder id.' });
   const deleteFiles = !!req.body?.delete_files;
   try {
@@ -2315,7 +2332,7 @@ app.post('/api/file-folders/:id/delete', authenticateUser as express.RequestHand
 });
 
 app.post('/api/files/:id/folder', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
-  const fileId = req.params.id;
+  const fileId = getSingleParam(req.params.id);
   if (!UUID_PATTERN.test(fileId)) return res.status(400).json({ error: 'Invalid file id.' });
   const folderId = normalizeNullableFolderId(req.body?.folder_id);
   if (folderId === undefined) return res.status(400).json({ error: 'Invalid folder id.' });
@@ -2654,7 +2671,7 @@ app.post(
         filename: `merged_${identifier}`,
         path: mergedPath,
         size: mergedStat.size,
-      } as Express.Multer.File;
+      } as AuthenticatedRequest['file'];
 
       // Inject body parameters so the downstream code treats it like a regular upload
       req.body = req.body || {};
@@ -3055,7 +3072,7 @@ function cleanupAndRespond(
 // ──────────────────────────────────────────────────────────────
 
 app.post('/api/files/:id/delete', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
-  const fileId = req.params.id;
+  const fileId = getSingleParam(req.params.id);
   
   // Check maintenance mode before proceeding
   if (await checkMaintenanceMode('delete', req, res)) return;
@@ -3096,7 +3113,7 @@ app.post('/api/files/:id/delete', authenticateUser as express.RequestHandler, as
 });
 
 app.get('/api/files/:id/preview', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
-  const fileId = req.params.id;
+  const fileId = getSingleParam(req.params.id);
   let textPreviewPath: string | null = null;
 
   const cleanupTextPreview = () => {
@@ -3228,7 +3245,7 @@ app.get('/api/files/:id/preview', authenticateUser as express.RequestHandler, as
 });
 
 app.get('/api/files/:id/download', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
-  const fileId = req.params.id;
+  const fileId = getSingleParam(req.params.id);
   let tempPath: string | null = null;
   let tempFileCleaned = false;
 
@@ -3345,7 +3362,7 @@ app.post('/api/files/:id/download/prepare', authenticateUser as express.RequestH
   // Check maintenance mode before proceeding
   if (await checkMaintenanceMode('download', req, res)) return;
   
-  const fileId = req.params.id;
+  const fileId = getSingleParam(req.params.id);
   try {
     const fileReq = await getRequest();
     fileReq.input('id', sql.UniqueIdentifier, fileId);
@@ -3510,7 +3527,8 @@ app.post('/api/files/:id/download/prepare', authenticateUser as express.RequestH
 
 app.get('/api/files/:id/download/:downloadId/status', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
   sweepPrivateDownloadSessions();
-  const { id: fileId, downloadId } = req.params;
+  const fileId = getSingleParam(req.params.id);
+  const downloadId = getSingleParam(req.params.downloadId);
   const session = privateDownloadSessions.get(downloadId);
   if (!session || session.fileId !== fileId || session.userId !== req.userId) {
     return res.status(404).json({ error: 'Download session not found. Wait a few seconds.' });
@@ -3531,7 +3549,8 @@ app.get('/api/files/:id/download/:downloadId/status', authenticateUser as expres
 
 app.get('/api/files/:id/download/:downloadId/file', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
   sweepPrivateDownloadSessions();
-  const { id: fileId, downloadId } = req.params;
+  const fileId = getSingleParam(req.params.id);
+  const downloadId = getSingleParam(req.params.downloadId);
   const session = privateDownloadSessions.get(downloadId);
   if (!session || session.fileId !== fileId || session.userId !== req.userId) {
     return res.status(404).json({ error: 'Download session not found. Wait a few seconds.' });
@@ -3631,7 +3650,7 @@ app.get('/api/sharing/links', authenticateUser as express.RequestHandler, async 
 });
 
 const removeSharingLink = async (req: AuthenticatedRequest, res: express.Response) => {
-  const linkId = req.params.id;
+  const linkId = getSingleParam(req.params.id);
   try {
     const findRequest = await getRequest();
     findRequest.input('id', sql.UniqueIdentifier, linkId);
@@ -3661,7 +3680,8 @@ app.post('/api/sharing/links/:id/remove', authenticateUser as express.RequestHan
 app.post('/api/sharing/folder-links/:id/remove', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
   try {
     const request = await getRequest();
-    request.input('id', sql.UniqueIdentifier, req.params.id);
+    const linkId = getSingleParam(req.params.id);
+    request.input('id', sql.UniqueIdentifier, linkId);
     request.input('ownerId', sql.UniqueIdentifier, req.userId!);
     const result = await request.query<{ folder_id: string }>(
       `DELETE fsl
@@ -3671,7 +3691,7 @@ app.post('/api/sharing/folder-links/:id/remove', authenticateUser as express.Req
        WHERE fsl.id=@id AND (ff.owner_user_id=@ownerId OR @ownerId IN (SELECT id FROM users WHERE role='Admin'))`,
     );
     if (!result.recordset.length) return res.status(404).json({ error: 'Folder share link not found.' });
-    await logSystemEvent(req.userId!, req.user!.username, 'Delete', 'FolderShareLink', req.params.id, req, `Removed share link for folder ${result.recordset[0].folder_id}.`);
+    await logSystemEvent(req.userId!, req.user!.username, 'Delete', 'FolderShareLink', linkId, req, `Removed share link for folder ${result.recordset[0].folder_id}.`);
     res.json({ success: true });
   } catch (err) {
     console.error('[POST /api/sharing/folder-links/:id/remove]', err);
@@ -3680,7 +3700,7 @@ app.post('/api/sharing/folder-links/:id/remove', authenticateUser as express.Req
 });
 
 app.post('/api/file-folders/:id/share', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
-  const folderId = req.params.id;
+  const folderId = getSingleParam(req.params.id);
   if (!UUID_PATTERN.test(folderId)) return res.status(400).json({ error: 'Invalid folder id.' });
   const { password, expires_at, is_active } = req.body || {};
   try {
@@ -3770,7 +3790,7 @@ app.post('/api/file-folders/:id/share', authenticateUser as express.RequestHandl
 });
 
 app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
-  const fileId = req.params.id;
+  const fileId = getSingleParam(req.params.id);
   const { password, expires_at, max_downloads, is_active, allow_external_preview } = req.body;
   try {
     const fReq = await getRequest(); fReq.input('id', sql.UniqueIdentifier, fileId);
@@ -4002,7 +4022,7 @@ app.post('/api/admin/users/create-dummy', authenticateUser as express.RequestHan
 });
 
 app.post('/api/admin/users/:id/reset-password', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
-  const userId = req.params.id;
+  const userId = getSingleParam(req.params.id);
   const newPassword = String(req.body?.password || '').trim();
   if (!newPassword || newPassword.length < 8 || newPassword.length > 128) {
     return res.status(400).json({ error: 'Password must be between 8 and 128 characters.' });
@@ -4054,7 +4074,7 @@ app.post('/api/admin/users/:id/reset-password', authenticateUser as express.Requ
 });
 
 app.post('/api/admin/users/:id/suspend', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
-  const userId = req.params.id;
+  const userId = getSingleParam(req.params.id);
   try {
     const uReq = await getRequest(); uReq.input('id', sql.UniqueIdentifier, userId);
     const uRes = await uReq.query<UserRow>(
@@ -4081,7 +4101,7 @@ app.post('/api/admin/users/:id/suspend', authenticateUser as express.RequestHand
 });
 
 app.post('/api/admin/users/:id/quota', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
-  const { quota_id } = req.body; const userId = req.params.id;
+  const { quota_id } = req.body; const userId = getSingleParam(req.params.id);
   try {
     const qC = await getRequest(); qC.input('qid', sql.NVarChar(50), quota_id);
     const qR = await qC.query<{c:number}>('SELECT COUNT(*) AS c FROM quotas WHERE id=@qid');
@@ -4103,7 +4123,7 @@ app.post('/api/admin/users/:id/quota', authenticateUser as express.RequestHandle
 });
 
 app.post('/api/admin/users/:id/edit', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
-  const userId = req.params.id; const { username, email, role, status, password } = req.body;
+  const userId = getSingleParam(req.params.id); const { username, email, role, status, password } = req.body;
   try {
     const sets: string[] = []; const upReq = await getRequest(); upReq.input('id', sql.UniqueIdentifier, userId);
     if (username !== undefined) {
@@ -4188,7 +4208,7 @@ app.get('/api/admin/file-folders', authenticateUser as express.RequestHandler, v
 });
 
 app.post('/api/admin/file-folders/:id/delete', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
-  const folderId = req.params.id;
+  const folderId = getSingleParam(req.params.id);
   if (!UUID_PATTERN.test(folderId)) return res.status(400).json({ error: 'Invalid folder id.' });
   const deleteFiles = !!req.body?.delete_files;
 
@@ -4323,7 +4343,7 @@ app.post('/api/admin/file-folders/:id/delete', authenticateUser as express.Reque
 });
 
 app.post('/api/admin/files/:id/block', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
-  const fileId = req.params.id;
+  const fileId = getSingleParam(req.params.id);
   try {
     const fReq = await getRequest(); fReq.input('id', sql.UniqueIdentifier, fileId);
     const fRes = await fReq.query<{status:string;size_bytes:number;owner_user_id:string}>('SELECT status,size_bytes,owner_user_id FROM files WHERE id=@id');
@@ -4400,7 +4420,7 @@ app.post('/api/admin/quotas', authenticateUser as express.RequestHandler, verify
 });
 
 app.post('/api/admin/quotas/:id/delete', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
-  const quotaId = req.params.id; const { migrate_to_quota_id } = req.body;
+  const quotaId = getSingleParam(req.params.id); const { migrate_to_quota_id } = req.body;
   try {
     const qC = await getRequest(); qC.input('id', sql.NVarChar(50), quotaId);
     const qR = await qC.query<{c:number}>('SELECT COUNT(*) AS c FROM quotas WHERE id=@id');
@@ -4630,17 +4650,17 @@ async function bootstrap() {
 
   // Vanity path for share links — internally dispatch to OG HTML handler (no redirect hop for crawlers).
   app.get('/s/:token', (req, res, next) => {
-    req.url = `/api/public/share/${req.params.token}/og`;
-    (app as unknown as { _router: { handle: express.RequestHandler } })._router.handle(req, res, next);
+    req.url = `/api/public/share/${getSingleParam(req.params.token)}/og`;
+    (app as unknown as { handle: express.RequestHandler }).handle(req, res, next);
   });
 
   // Vanity path for folder share links — internally dispatch to folder OG HTML handler.
   app.get('/d/:token', (req, res, next) => {
-    req.url = `/api/public/folder/${req.params.token}/og`;
-    (app as unknown as { _router: { handle: express.RequestHandler } })._router.handle(req, res, next);
+    req.url = `/api/public/folder/${getSingleParam(req.params.token)}/og`;
+    (app as unknown as { handle: express.RequestHandler }).handle(req, res, next);
   });
 
-  app.get('*', (req, res) => res.sendFile(path.join(distPath, 'index.html')));
+  app.get('/{*path}', (req, res) => res.sendFile(path.join(distPath, 'index.html')));
   
   // 8. HTTP or HTTPS
   const sslEnabled = process.env.SSL_ENABLED === 'true';
