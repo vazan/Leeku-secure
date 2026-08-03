@@ -3,6 +3,71 @@ agent: DevEngineer | date: 2026-08-02 | model: GitHub Copilot
 plan: /memories/session/dev-plan.md
 ---
 
+---
+agent: DevEngineer | date: 2026-08-03 | model: GPT-5.3-Codex
+plan: /memories/session/dev-plan.md
+---
+
+Intent
+Executed the requested dependency upgrade set (Express, Vite toolchain, TypeScript, esbuild, lucide-react) on branch chore/dependency-major-upgrades with minimal compatibility fixes and full validation.
+
+Change class
+STANDARD
+
+Files changed
+- package.json, pnpm-lock.yaml:
+  - express: 4 -> 5
+  - @types/express: 4 -> 5
+  - vite: 6 -> 8
+  - @vitejs/plugin-react: 5 -> 6
+  - typescript: 5 -> 7
+  - esbuild: 0.25 -> 0.28
+  - lucide-react: 0.x -> 1.x
+  - removed @types/multer (replaced by local shim to avoid Express 4/5 type conflict)
+- src/server.ts:
+  - Added route-param normalization helper for Express 5 typings.
+  - Added explicit req.file typing on AuthenticatedRequest.
+  - Normalized id/downloadId/token path param uses.
+  - Updated SPA fallback route from * to /{*path} for Express 5 compatibility.
+- src/server/routes/public-sharing.ts:
+  - Added route-param normalization helper.
+  - Normalized token/fileId/downloadId param uses.
+- src/server/routes/public-folder-sharing.ts:
+  - Added route-param normalization helper.
+  - Normalized token/fileId/downloadId param uses.
+- src/app/shared/utils/client-file-secret.ts:
+  - Normalized PBKDF2 salt buffer for TypeScript 7 DOM typings.
+- src/app/shared/utils/download-with-progress.ts:
+  - Normalized stream chunks for TypeScript 7 BlobPart typing compatibility.
+- src/server/routes/maintenance-mode.ts:
+  - Tightened log event type to shared SystemLog union.
+- src/types/multer.d.ts:
+  - Added local module shim for multer import typing.
+
+Public contracts impacted
+- No intentional API contract changes.
+- Internal Express 5 path syntax change on SPA fallback route only (behavior preserved).
+
+Validation status
+- Type-check: PASSED (`pnpm lint`)
+- Build: PASSED (`pnpm build`)
+- Tests: PASSED (`pnpm exec tsx --test tests/desktop-updates-path.test.ts tests/profile-picture.test.ts tests/syntax-preview.test.ts tests/text-preview.test.ts`)
+- Existing non-blocking warnings remain:
+  - Vite native config warning about __dirname in vite.config.ts.
+  - esbuild warning for import.meta in CJS output.
+  - bundle chunk size advisory.
+
+Handoff TestEngineer
+- Focus regression checks on:
+  - Express 5 route behavior for public share endpoints and vanity URLs.
+  - Private download prepare/status/file flows using downloadId path params.
+  - Profile picture upload flow (multer path + buffer handling).
+
+Handoff QaEngineer
+- Upgrade set is complete and validated at lint/build/test level; runtime smoke on deployed environment should confirm auth/csrf/session cookie flows and reverse-proxy behavior.
+
+---
+
 Intent
 Ported theme-aware syntax highlighting for code-file previews to the PostgreSQL branch, preserving plain-text and CSV behavior.
 

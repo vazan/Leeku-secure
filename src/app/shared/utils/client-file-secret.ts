@@ -31,11 +31,15 @@ async function deriveClientSecretKey(
     ['deriveKey'],
   );
 
+  // Copy into a fresh ArrayBuffer-backed view for stricter TS DOM typings.
+  const normalizedSalt = new Uint8Array(salt.byteLength);
+  normalizedSalt.set(salt);
+
   return crypto.subtle.deriveKey(
     {
       name: 'PBKDF2',
       hash: 'SHA-256',
-      salt,
+      salt: normalizedSalt,
       iterations,
     },
     material,
