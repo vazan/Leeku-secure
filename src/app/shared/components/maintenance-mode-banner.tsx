@@ -6,7 +6,7 @@
  * Displays a prominent banner when the system is in maintenance mode
  */
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type JSX } from 'react';
 
 interface MaintenanceStatusResponse {
   maintenance_mode: boolean;

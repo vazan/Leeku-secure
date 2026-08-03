@@ -1530,6 +1530,9 @@ app.post('/api/users/me/update', authenticateUser as express.RequestHandler, asy
   const userId = req.userId!;
   try {
     const sets: string[] = [];
+    let verificationToken: string | null = null;
+    let updatedEmailForVerification: string | null = null;
+    let requiresReauth = false;
     const upReq = await getRequest();
     upReq.input('id', sql.UniqueIdentifier, userId);
 
@@ -1548,14 +1551,35 @@ app.post('/api/users/me/update', authenticateUser as express.RequestHandler, asy
     if (email !== undefined) {
       const te = email.toLowerCase().trim();
       if (!te) return res.status(400).json({ error: 'Email cannot be blank.' });
-      const h = hashColumnForLookup(te);
-      const d = await getRequest(); d.input('h', sql.Char(64), h); d.input('id', sql.UniqueIdentifier, userId);
-      const dr = await d.query<{c:number}>('SELECT COUNT(*) AS c FROM users WHERE email_hash=@h AND id!=@id');
-      if (dr.recordset[0].c) return res.status(400).json({ error: 'Email already in use.' });
-      const enc = encryptColumn(te);
-      upReq.input('eEnc', sql.VarBinary(512), enc.ciphertext); upReq.input('eIv', sql.VarBinary(16), enc.iv);
-      upReq.input('eTag', sql.VarBinary(16), enc.authTag);     upReq.input('eHash', sql.Char(64), h);
-      sets.push('email_encrypted=@eEnc,email_iv=@eIv,email_auth_tag=@eTag,email_hash=@eHash');
+      const currentEmail = String(req.user?.email || '').toLowerCase().trim();
+      if (te !== currentEmail) {
+        const mxCheck = await validateMxRecord(te);
+        if (!mxCheck.valid) {
+          return res.status(400).json({ error: mxCheck.reason || 'Invalid email domain.' });
+        }
+
+        const h = hashColumnForLookup(te);
+        const d = await getRequest(); d.input('h', sql.Char(64), h); d.input('id', sql.UniqueIdentifier, userId);
+        const dr = await d.query<{c:number}>('SELECT COUNT(*) AS c FROM users WHERE email_hash=@h AND id!=@id');
+        if (dr.recordset[0].c) return res.status(400).json({ error: 'Email already in use.' });
+
+        const enc = encryptColumn(te);
+        upReq.input('eEnc', sql.VarBinary(512), enc.ciphertext); upReq.input('eIv', sql.VarBinary(16), enc.iv);
+        upReq.input('eTag', sql.VarBinary(16), enc.authTag);     upReq.input('eHash', sql.Char(64), h);
+
+        if (SMTP_ENABLED) {
+          verificationToken = generateSecureToken(32);
+          const verificationExpires = new Date(Date.now() + 24 * 60 * 60 * 1000);
+          upReq.input('vOk', sql.Bit, 0);
+          upReq.input('vTok', sql.Char(64), verificationToken);
+          upReq.input('vExp', sql.DateTimeOffset, verificationExpires);
+          sets.push('email_encrypted=@eEnc,email_iv=@eIv,email_auth_tag=@eTag,email_hash=@eHash,email_verified=@vOk,email_verification_token=@vTok,email_verification_expires=@vExp');
+          updatedEmailForVerification = te;
+          requiresReauth = true;
+        } else {
+          sets.push('email_encrypted=@eEnc,email_iv=@eIv,email_auth_tag=@eTag,email_hash=@eHash');
+        }
+      }
     }
     if (password?.trim()) {
       const h = await hashPassword(password.trim());
@@ -1572,6 +1596,20 @@ app.post('/api/users/me/update', authenticateUser as express.RequestHandler, asy
       WHERE id=@id`
     );
     const user = mapUserRow(updated.recordset[0]);
+    if (SMTP_ENABLED && verificationToken && updatedEmailForVerification) {
+      sendVerificationEmail(updatedEmailForVerification, user.username, verificationToken)
+        .catch(e => console.error('[email] Failed to send verification after email change:', e.message));
+    }
+    if (requiresReauth) {
+      await revokeAllRefreshSessions(userId);
+      clearAuthCookie(res);
+      await logSystemEvent(userId, user.username, 'Auth', 'User', userId, req, 'Updated email address and invalidated active session pending re-verification.');
+      return res.json({
+        success: true,
+        requires_reauth: true,
+        message: 'Email updated. Please verify your new address and sign in again.',
+      });
+    }
     if (password?.trim()) {
       await revokeAllRefreshSessions(userId);
       await issueRefreshSession(userId, req, res);

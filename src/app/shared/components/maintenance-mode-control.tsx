@@ -6,7 +6,7 @@
  * Allows admins to enable/disable maintenance mode
  */
 
-import { useState } from 'react';
+import { useState, type JSX } from 'react';
 import { AlertCircle, Check, AlertTriangle } from 'lucide-react';
 
 interface MaintenanceModeControlProps {

@@ -38,6 +38,116 @@ Approval trail
 
 ---
 
+Intent
+Aligned account email-change UX with security behavior by forcing immediate sign-out when re-verification is required.
+
+Change class
+🟡 STANDARD
+
+Files changed
+- src/server.ts:
+  - For POST /api/users/me/update, when SMTP-enabled email change occurs and verification is reset, now revokes all refresh sessions, clears auth cookies, and returns `requires_reauth: true` with a user-facing message.
+- src/app/features/files/pages/user-dashboard.tsx:
+  - Updated profile-save handler to parse response payload.
+  - If `requires_reauth` is true, show message and immediately run logout flow instead of showing generic “Profile updated.”
+
+Public contracts impacted
+- Response payload for successful `/api/users/me/update` now may include:
+  - `requires_reauth: true`
+  - `message: string`
+
+Validation status
+- Type-check: PASSED (`pnpm run lint`).
+- Build: PASSED (`pnpm run build`).
+- Tests: PASSED (`pnpm exec tsx --test tests/*.test.ts`) — 11 passed, 0 failed.
+
+Handoff notes
+- TestEngineer focus:
+  - Change email in settings with SMTP enabled; verify success message and immediate logout.
+  - Verify old session is invalidated and user must verify new email before login.
+  - Verify username-only or password-only updates do not force logout unexpectedly.
+
+Approval trail
+- Not required (STANDARD change).
+
+---
+
+Intent
+Fixed account settings email updates so changing a user email now triggers the confirmation workflow and sends a verification email.
+
+Change class
+🟡 STANDARD
+
+Files changed
+- src/server.ts:
+  - Updated POST /api/users/me/update email branch to detect actual email changes.
+  - Added MX validation for changed emails.
+  - When SMTP is enabled, now regenerates verification token/expiry, marks email as unverified, and stores verification state.
+  - Added async verification email send after successful update (non-blocking response path).
+
+Public contracts impacted
+- No route shape changes.
+- Behavioral change: changing account email now requires re-verification when SMTP is enabled.
+
+Validation status
+- Type-check: PASSED (pnpm run lint).
+- Build: PASSED (pnpm run build).
+- Tests: PASSED (pnpm exec tsx --test tests/*.test.ts) — 11 passed, 0 failed.
+
+Handoff notes
+- TestEngineer focus:
+  - Change email in Account Settings to a valid domain and confirm verification email is received.
+  - Open verification link and confirm account can log in afterward.
+  - Try invalid/no-MX domains and confirm update is rejected with clear error.
+  - Confirm unchanged email submissions do not trigger a new verification cycle.
+- QaEngineer focus:
+  - Confirm no regression in username/password-only account updates.
+  - Confirm SMTP-disabled environments keep existing behavior (no verification requirement).
+
+Approval trail
+- Not required (STANDARD change).
+
+---
+
+Intent
+Patched the high-severity Nodemailer advisory by upgrading to a non-vulnerable version and re-validating the full project.
+
+Change class
+🟡 STANDARD
+
+Files changed
+- package.json:
+  - Upgraded `nodemailer` from `^8.0.11` to `^9.0.3`.
+- pnpm-lock.yaml:
+  - Refreshed lockfile to resolve `nodemailer@9.0.3`.
+
+Security advisory addressed
+- GHSA-p6gq-j5cr-w38f
+- Issue: message-level raw option bypass could allow arbitrary file-read and SSRF in delivered message construction.
+- Vulnerable range: `<=9.0.0`
+- Patched range: `>=9.0.1`
+
+Public contracts impacted
+- None. Existing email utility and API endpoint contracts remain unchanged.
+
+Validation status
+- Security audit: PASSED (`pnpm audit --json`) with zero vulnerabilities.
+- Build: PASSED (`pnpm run build`).
+- Type-check: PASSED (`pnpm run lint`).
+- Tests: PASSED (`pnpm exec tsx --test tests/*.test.ts`) — 11 passed, 0 failed.
+- Note: existing non-blocking build warning remains about `import.meta` in CJS output.
+
+Handoff notes
+- TestEngineer focus:
+  - Smoke-check verification email, quota-change notification email, and account deletion confirmation email flows against staging SMTP.
+- QaEngineer focus:
+  - Confirm vulnerability closure evidence from audit output and dependency lock update.
+
+Approval trail
+- Not required (STANDARD change).
+
+---
+
 ---
 
 Intent
@@ -257,6 +367,55 @@ Validation status
 
 Approval trail
 - User explicitly approved CRITICAL contract change with `GO` on 2026-07-18.
+
+---
+
+Intent
+Updated project dependencies to current safe versions (patch/minor within existing major ranges), removed unused packages, and validated build/type-check/test stability.
+
+Change class
+🟡 STANDARD
+
+Files changed
+- package.json:
+  - Removed unused dependencies: `date-fns`, `autoprefixer`.
+  - Removed duplicate runtime `vite` entry from dependencies (kept in devDependencies).
+  - Updated multiple dependency ranges to current releases within the same major.
+- pnpm-lock.yaml:
+  - Refreshed lockfile after dependency update and removals.
+- src/app/shared/components/maintenance-mode-banner.tsx:
+  - Added `type JSX` import from React to preserve JSX return typing compatibility with updated React type packages.
+- src/app/shared/components/maintenance-mode-control.tsx:
+  - Added `type JSX` import from React to preserve JSX return typing compatibility with updated React type packages.
+
+Public contracts impacted
+- None. No API route shape, request/response schema, or shared DTO contract changes.
+
+Deferred updates (intentional)
+- Left major-version upgrades for a dedicated migration pass due higher regression risk:
+  - `express` 4 -> 5
+  - `@vitejs/plugin-react` 5 -> 6
+  - `vite` 6 -> 8
+  - `typescript` 5 -> 7
+  - `nodemailer` 8 -> 9
+  - `lucide-react` 0.x -> 1.x
+
+Validation status
+- Build: PASSED (`pnpm run build`).
+- Type-check: PASSED (`pnpm run lint`).
+- Tests: PASSED (`pnpm exec tsx --test tests/*.test.ts`) — 11 passed, 0 failed.
+- Note: existing non-blocking build warning remains about `import.meta` in CJS bundle output.
+
+Handoff notes
+- TestEngineer focus:
+  - Run full app smoke checks on auth, file operations, sharing, admin maintenance controls, and email flows due dependency drift on core packages.
+  - Confirm no runtime issue around updated `mssql`, `multer`, `express-rate-limit`, and `@google/genai` integrations.
+- QaEngineer focus:
+  - Validate release risk remains low because only non-major updates were applied and all current automated checks pass.
+  - Track deferred major upgrades as a separate migration workstream.
+
+Approval trail
+- Not required (STANDARD change).
 
 ---
 

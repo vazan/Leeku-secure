@@ -1411,12 +1411,26 @@ export default function UserDashboard({
         password: profilePassword || undefined,
       }),
     });
+    const payload = await response.json().catch(() => ({} as Record<string, unknown>));
     if (response.ok) {
       setProfilePassword("");
+      if (payload.requires_reauth) {
+        toast.success(
+          (typeof payload.message === "string" && payload.message) ||
+            "Email updated. Please verify your new address and sign in again.",
+        );
+        await onLogout();
+        return;
+      }
       onTriggerRefreshUser();
-      toast.success("Profile updated.");
+      toast.success(
+        (typeof payload.message === "string" && payload.message) || "Profile updated.",
+      );
     } else
-      notifyError((await response.json()).error || "Could not update profile.");
+      notifyError(
+        (typeof payload.error === "string" && payload.error) ||
+          "Could not update profile.",
+      );
   };
 
   useEffect(() => {
