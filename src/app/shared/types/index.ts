@@ -19,6 +19,7 @@ export interface User {
   role: 'User' | 'Admin';
   quota_id: string;
   storage_used: number;
+  files_used?: number;
   status: 'Active' | 'Suspended';
   created_at: string;
 }

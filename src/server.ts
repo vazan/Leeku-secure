@@ -763,6 +763,7 @@ interface UserRow {
   id: string; email_encrypted: Buffer; email_iv: Buffer; email_auth_tag: Buffer;
   username_encrypted: Buffer; username_iv: Buffer; username_auth_tag: Buffer;
   role: string; quota_id: string; storage_used_bytes: number; status: string;
+  files_used?: number;
   created_at: Date; failed_login_count: number; locked_until: Date | null;
   password_hash?: string;
   email_verified?: boolean;
@@ -826,6 +827,7 @@ function mapUserRow(row: UserRow): User {
     role:         row.role as 'User' | 'Admin',
     quota_id:     row.quota_id,
     storage_used: Number(row.storage_used_bytes),
+    files_used:   Number(row.files_used ?? 0),
     status:       row.status as 'Active' | 'Suspended',
     created_at:   row.created_at.toISOString(),
   };
@@ -1144,6 +1146,7 @@ async function authenticateUser(
       `SELECT id, email_encrypted, email_iv, email_auth_tag,
               username_encrypted, username_iv, username_auth_tag,
               role, quota_id, storage_used_bytes, status, created_at,
+              (SELECT COUNT(*) FROM files WHERE owner_user_id = users.id AND status = 'Available') AS files_used,
               failed_login_count, locked_until
        FROM users WHERE id = @id AND status = 'Active'`
     );
