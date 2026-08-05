@@ -251,6 +251,8 @@ export default function UserDashboard({
   );
   const [files, setFiles] = useState<FileMetadata[]>([]);
   const [folders, setFolders] = useState<FileFolder[]>([]);
+  const [foldersLoaded, setFoldersLoaded] = useState(false);
+  const [foldersLoading, setFoldersLoading] = useState(false);
   const [activeFolderId, setActiveFolderId] = useState<string | null>(null);
   const [links, setLinks] = useState<ShareLink[]>([]);
   const [folderLinks, setFolderLinks] = useState<FolderShareLink[]>([]);
@@ -270,6 +272,9 @@ export default function UserDashboard({
   const [shareFolder, setShareFolder] = useState<FileFolder | null>(null);
   const [videoFile, setVideoFile] = useState<FileMetadata | null>(null);
   const [textPreviewFile, setTextPreviewFile] = useState<FileMetadata | null>(null);
+  const [moveFile, setMoveFile] = useState<FileMetadata | null>(null);
+  const [moveTargetFolderId, setMoveTargetFolderId] = useState("");
+  const [moveSubmitting, setMoveSubmitting] = useState(false);
   const [sharePassword, setSharePassword] = useState("");
   const [shareExpires, setShareExpires] = useState("");
   const [shareMaxDownloads, setShareMaxDownloads] = useState("");
@@ -381,11 +386,44 @@ export default function UserDashboard({
     }
   };
 
+  const loadFolders = async (force = false) => {
+    if (foldersLoading) return;
+    if (foldersLoaded && !force) return;
+
+    setFoldersLoading(true);
+    try {
+      const foldersResponse = await fetch("/api/file-folders", {
+        headers: authHeaders(token),
+      });
+      if (foldersResponse.ok) {
+        const nextFolders = ((await foldersResponse.json()).folders || []) as FileFolder[];
+        setFolders(nextFolders);
+        setFoldersLoaded(true);
+        setActiveFolderId((current) =>
+          current && !nextFolders.some((folder) => folder.id === current) ? null : current,
+        );
+        setUploadTargetFolderId((current) =>
+          current && !nextFolders.some((folder) => folder.id === current) ? null : current,
+        );
+      } else {
+        let message = "Could not load folders.";
+        try {
+          const payload = await foldersResponse.json();
+          message = payload?.error || message;
+        } catch {
+          // Keep generic message when response is not JSON.
+        }
+        notifyError(message);
+      }
+    } finally {
+      setFoldersLoading(false);
+    }
+  };
+
   const loadFilesAndLinks = async () => {
-    const [filesResponse, linksResponse, foldersResponse] = await Promise.all([
+    const [filesResponse, linksResponse] = await Promise.all([
       fetch("/api/files", { headers: authHeaders(token) }),
       fetch("/api/sharing/links", { headers: authHeaders(token) }),
-      fetch("/api/file-folders", { headers: authHeaders(token) }),
     ]);
     if (filesResponse.ok) {
       setFiles((await filesResponse.json()).files || []);
@@ -408,26 +446,6 @@ export default function UserDashboard({
       let message = "Could not load sharing links.";
       try {
         const payload = await linksResponse.json();
-        message = payload?.error || message;
-      } catch {
-        // Keep generic message when response is not JSON.
-      }
-      notifyError(message);
-    }
-
-    if (foldersResponse.ok) {
-      const nextFolders = ((await foldersResponse.json()).folders || []) as FileFolder[];
-      setFolders(nextFolders);
-      setActiveFolderId((current) =>
-        current && !nextFolders.some((folder) => folder.id === current) ? null : current,
-      );
-      setUploadTargetFolderId((current) =>
-        current && !nextFolders.some((folder) => folder.id === current) ? null : current,
-      );
-    } else {
-      let message = "Could not load folders.";
-      try {
-        const payload = await foldersResponse.json();
         message = payload?.error || message;
       } catch {
         // Keep generic message when response is not JSON.
@@ -1267,16 +1285,34 @@ export default function UserDashboard({
     const data = await response.json();
     if (response.ok) {
       setFiles((current) => current.map((item) => (item.id === file.id ? data.file : item)));
-      setFolders((current) =>
-        current.map((folder) => ({
-          ...folder,
-          file_count: files
-            .map((item) => (item.id === file.id ? data.file : item))
-            .filter((item) => item.folder_id === folder.id).length,
-        })),
-      );
+      if (foldersLoaded) {
+        void loadFolders(true);
+      }
       notify(folderId ? "File moved to folder." : "File moved to All Files.");
-    } else notifyError(data.error || "Could not move file.");
+      return true;
+    }
+
+    notifyError(data.error || "Could not move file.");
+    return false;
+  };
+
+  const openMoveDialog = (file: FileMetadata) => {
+    setMoveFile(file);
+    setMoveTargetFolderId(file.folder_id || "");
+    void loadFolders();
+  };
+
+  const submitMoveDialog = async () => {
+    if (!moveFile) return;
+    setMoveSubmitting(true);
+    try {
+      const moved = await moveFileToFolder(moveFile, moveTargetFolderId || null);
+      if (moved) {
+        setMoveFile(null);
+      }
+    } finally {
+      setMoveSubmitting(false);
+    }
   };
 
   const toShareUrl = (publicToken: string, allowExternalPreview: boolean) =>
@@ -1713,6 +1749,9 @@ export default function UserDashboard({
                     onChange={(event) =>
                       setUploadTargetFolderId(event.target.value || null)
                     }
+                    onFocus={() => {
+                      if (!foldersLoaded) void loadFolders();
+                    }}
                     disabled={uploading}
                     className="h-10 w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-muted)] px-3 text-sm text-[var(--text-secondary)] outline-none focus:border-[var(--accent-linear)] disabled:cursor-not-allowed disabled:opacity-70"
                   >
@@ -1795,6 +1834,16 @@ export default function UserDashboard({
                     <FolderPlus className="h-3.5 w-3.5" />
                     {activeFolder ? "New sub-folder" : "New folder"}
                   </button>
+                  {!foldersLoaded && (
+                    <button
+                      type="button"
+                      onClick={() => void loadFolders()}
+                      disabled={foldersLoading}
+                      className="rounded-lg border border-[var(--border-subtle)] px-3 py-2 text-xs font-medium text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] disabled:opacity-60"
+                    >
+                      {foldersLoading ? "Loading folders..." : "Browse folders"}
+                    </button>
+                  )}
                   {activeFolder && (
                     <>
                       <button
@@ -1944,9 +1993,7 @@ export default function UserDashboard({
                         </FileActionButton>
                       </div>
                       <MoveFileSelect
-                        file={file}
-                        folders={folders}
-                        onMove={moveFileToFolder}
+                        onMove={() => openMoveDialog(file)}
                       />
                     </div>
                   ))}
@@ -1964,13 +2011,12 @@ export default function UserDashboard({
                       <th className="hidden w-20 px-3 py-3 font-medium sm:table-cell">
                         Size
                       </th>
-                      <th className="hidden w-24 px-3 py-3 font-medium lg:table-cell">
+                      <th className="hidden w-28 px-3 py-3 font-medium lg:table-cell">
                         Added
                       </th>
-                      <th className="hidden w-40 px-3 py-3 font-medium md:table-cell">
-                        Folder
+                      <th className="hidden w-48 px-3 py-3 font-medium lg:table-cell">
+                        Actions
                       </th>
-                      <th className="w-40 px-2 py-3" />
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-[var(--border-subtle)]">
@@ -2003,18 +2049,11 @@ export default function UserDashboard({
                         <td className="hidden w-20 px-3 py-3 text-[var(--text-muted)] sm:table-cell">
                           {formatBytes(file.size)}
                         </td>
-                        <td className="hidden w-24 px-3 py-3 text-[var(--text-muted)] lg:table-cell">
+                        <td className="hidden w-28 px-3 py-3 text-[var(--text-muted)] lg:table-cell">
                           {new Date(file.created_at).toLocaleDateString()}
                         </td>
-                        <td className="hidden w-40 px-3 py-3 md:table-cell">
-                          <MoveFileSelect
-                            file={file}
-                            folders={folders}
-                            onMove={moveFileToFolder}
-                          />
-                        </td>
-                        <td className="w-40 px-2 py-3">
-                          <div className="flex w-36 justify-end gap-1">
+                        <td className="w-48 px-2 py-3">
+                          <div className="flex w-44 justify-end gap-1">
                             {file.preview_available && (
                               <IconButton
                                 label="Preview"
@@ -2034,6 +2073,12 @@ export default function UserDashboard({
                               onClick={() => openShare(file)}
                             >
                               <Share2 className="h-4 w-4" />
+                            </IconButton>
+                            <IconButton
+                              label="Move to folder"
+                              onClick={() => openMoveDialog(file)}
+                            >
+                              <Folder className="h-4 w-4" />
                             </IconButton>
                             <IconButton
                               label="Delete"
@@ -2377,6 +2422,20 @@ export default function UserDashboard({
           onClose={() => setTextPreviewFile(null)}
         />
       )}
+      {moveFile && (
+        <MoveFileDialog
+          file={moveFile}
+          folders={folders}
+          loadingFolders={foldersLoading}
+          submitting={moveSubmitting}
+          value={moveTargetFolderId}
+          onChange={setMoveTargetFolderId}
+          onClose={() => {
+            if (!moveSubmitting) setMoveFile(null);
+          }}
+          onConfirm={submitMoveDialog}
+        />
+      )}
     </div>
   );
 }
@@ -2430,13 +2489,39 @@ function FileActionButton({
 }
 
 function MoveFileSelect({
+  onMove,
+}: {
+  onMove: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onMove}
+      className="mt-3 h-9 w-full rounded-lg border border-[var(--border-subtle)] px-2 text-xs font-medium text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] sm:mt-0"
+    >
+      Move to folder
+    </button>
+  );
+}
+
+function MoveFileDialog({
   file,
   folders,
-  onMove,
+  loadingFolders,
+  submitting,
+  value,
+  onChange,
+  onClose,
+  onConfirm,
 }: {
   file: FileMetadata;
   folders: FileFolder[];
-  onMove: (file: FileMetadata, folderId: string | null) => void;
+  loadingFolders: boolean;
+  submitting: boolean;
+  value: string;
+  onChange: (value: string) => void;
+  onClose: () => void;
+  onConfirm: () => void;
 }) {
   const folderById = useMemo(
     () => new Map(folders.map((folder) => [folder.id, folder] as const)),
@@ -2464,22 +2549,86 @@ function MoveFileSelect({
       .sort((a, b) => a.label.localeCompare(b.label));
   }, [folderById, folders]);
 
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", closeOnEscape);
+    return () => document.removeEventListener("keydown", closeOnEscape);
+  }, [onClose]);
+
   return (
-    <label className="mt-3 block text-xs text-[var(--text-muted)] sm:mt-0">
-      <span className="sr-only">Move {file.original_name}</span>
-      <select
-        value={file.folder_id || ""}
-        onChange={(event) => onMove(file, event.target.value || null)}
-        className="h-9 w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-elevated)] px-2 text-xs text-[var(--text-secondary)] outline-none focus:border-[var(--accent-linear)]"
+    <div
+      className="fixed inset-0 z-50 grid place-items-center bg-black/60 p-4 backdrop-blur-sm"
+      onPointerDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        className="w-full max-w-md rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] p-5 shadow-[var(--shadow-panel)]"
+        onPointerDown={(event) => event.stopPropagation()}
       >
-        <option value="">/</option>
-        {folderOptions.map((folder) => (
-          <option key={folder.id} value={folder.id}>
-            /{folder.label}
-          </option>
-        ))}
-      </select>
-    </label>
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <h2 className="text-base font-semibold">Move file to folder</h2>
+            <p className="mt-1 line-clamp-2 text-xs text-[var(--text-muted)]">
+              {file.original_name}
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={submitting}
+            className="rounded-md p-2 hover:bg-[var(--bg-hover)] disabled:opacity-60"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        <label className="mt-4 block text-sm font-medium">
+          Destination
+          <select
+            value={value}
+            onChange={(event) => onChange(event.target.value)}
+            disabled={loadingFolders || submitting}
+            className="mt-2 h-10 w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-elevated)] px-3 text-sm text-[var(--text-secondary)] outline-none focus:border-[var(--accent-linear)] disabled:cursor-not-allowed disabled:opacity-70"
+          >
+            <option value="">/</option>
+            {folderOptions.map((folder) => (
+              <option key={folder.id} value={folder.id}>
+                /{folder.label}
+              </option>
+            ))}
+          </select>
+        </label>
+        {!loadingFolders && folderOptions.length === 0 && (
+          <p className="mt-2 text-xs text-[var(--text-muted)]">
+            No folders found. Create one first or move the file to root.
+          </p>
+        )}
+
+        <div className="mt-5 flex justify-end gap-2">
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={submitting}
+            className="rounded-lg border border-[var(--border-subtle)] px-3 py-2 text-sm text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] disabled:opacity-60"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={onConfirm}
+            disabled={loadingFolders || submitting}
+            className="rounded-lg bg-[var(--accent-linear)] px-3 py-2 text-sm font-medium text-[var(--accent-contrast)] disabled:opacity-60"
+          >
+            {submitting ? "Moving..." : "Move file"}
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 

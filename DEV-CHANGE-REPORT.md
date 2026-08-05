@@ -1,6 +1,39 @@
 ---
 
 ---
+agent: DevEngineer | date: 2026-08-05 | model: GPT-5.3-Codex
+plan: /memories/session/dev-plan.md
+---
+
+Intent
+Ported the validated All Files performance and move-flow changes to the `mssql` branch, including the explicit `Actions` header layout used in the PostgreSQL branch after the final UI adjustment.
+
+Change class
+STANDARD
+
+Files changed
+- src/app/features/files/pages/user-dashboard.tsx:
+  - Removed eager `/api/file-folders` loading from the initial dashboard refresh.
+  - Added lazy folder loading with loading/loaded guards.
+  - Replaced inline move dropdowns with a `Move to folder` button and modal dialog.
+  - Added explicit `Browse folders` action in All Files and lazy load on upload-folder focus.
+  - Removed the desktop Folder column and added the final explicit `Actions` header/width layout to prevent overlap with Added.
+
+Public contracts impacted
+- No API contract changes.
+
+Validation status
+- Type-check: PASSED (`pnpm run lint`)
+
+Handoff TestEngineer
+- Verify initial All Files load does not request folders until Browse folders, Move to folder, or upload-folder focus.
+- Verify mobile and desktop move-to-folder flows.
+- Verify desktop table header alignment and no overlap between Added and Actions.
+
+Handoff QaEngineer
+- Confirm improved initial load behavior on large folder datasets in the MSSQL environment.
+
+---
 agent: DevEngineer | date: 2026-08-03 | model: GPT-5.3-Codex
 plan: /memories/session/dev-plan.md
 ---
