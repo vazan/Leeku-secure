@@ -4,6 +4,45 @@ plan: /memories/session/dev-plan.md
 ---
 
 ---
+agent: DevEngineer | date: 2026-08-05 | model: GPT-5.3-Codex
+plan: /memories/session/dev-plan.md
+---
+
+Intent
+Reduced All Files latency for large folder sets by removing eager folder loading at initial dashboard refresh and introducing an explicit move-to-folder dialog that lazy-loads folders only when needed.
+
+Change class
+STANDARD
+
+Files changed
+- src/app/features/files/pages/user-dashboard.tsx:
+  - Split initial refresh to load files + share links only (no eager `/api/file-folders` call).
+  - Added lazy folder loader with loaded/loading guards.
+  - Replaced per-row folder select controls with a `Move to folder` button and modal dialog.
+  - Move dialog now fetches folder options on open and uses existing `POST /api/files/:id/folder` contract.
+  - Added explicit `Browse folders` button in All Files controls when folder list has not yet been loaded.
+  - Kept desktop folder column readable via `file.folder_name` text without requiring folder list preload.
+  - Upload-folder select now lazy-loads folders on first focus.
+
+Public contracts impacted
+- No API contract changes.
+- Existing endpoint `POST /api/files/:id/folder` remains unchanged.
+
+Validation status
+- Build: PASSED (`pnpm run build`)
+- Lint: PASSED (`pnpm run lint`)
+- Type-check: PASSED (`pnpm exec tsc --noEmit`)
+
+Handoff TestEngineer
+- Verify initial dashboard/All Files load no longer triggers `/api/file-folders` until user opens Move dialog, clicks Browse folders, or focuses upload-folder select.
+- Verify mobile and desktop move-to-folder flows (open modal, choose destination, move to root and nested folders).
+- Verify existing folder operations after lazy load: browse folders, create folder, folder breadcrumbs, and share folder.
+
+Handoff QaEngineer
+- Validate performance improvement on accounts with large imported folder trees.
+- Confirm UX is clear for first-time folder interactions (explicit Browse folders and modal loading states).
+
+---
 agent: DevEngineer | date: 2026-08-03 | model: GPT-5.3-Codex
 plan: /memories/session/dev-plan.md
 ---
