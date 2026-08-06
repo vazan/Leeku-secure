@@ -102,10 +102,8 @@ Intent
 Reduced oversized Home "Recent files" tiles on phone screens by applying compact mobile-first sizing while preserving the existing desktop layout.
 
 Change class
-🟡 STANDARD
 
 Files changed
-- src/app/features/files/pages/user-dashboard.tsx:
   - Reduced mobile Recent files grid gap.
   - Switched FileCard to compact mobile spacing/padding.
   - Reduced mobile thumbnail height and corner overlay/control footprint.
@@ -114,7 +112,6 @@ Files changed
 
 Public contracts impacted
 - None. No API, shared type, or route changes.
-
 Validation status
 - Edited file diagnostics: PASSED.
 - Build: PASSED (`pnpm run build`).
@@ -122,21 +119,63 @@ Validation status
   - `src/app/shared/components/maintenance-mode-banner.tsx`
   - `src/app/shared/components/maintenance-mode-control.tsx`
 
-Handoff notes
 - TestEngineer focus:
   - Verify Home > Recent files on narrow Android/iOS widths displays smaller, denser tiles with no clipping.
-  - Verify tile controls (menu, download) remain tappable and functional.
   - Verify desktop/tablet tile sizing remains unchanged.
 - QaEngineer focus:
-  - Validate no visual regression in non-Home file surfaces.
-  - Confirm change is style-only and does not affect navigation/actions.
-
 Approval trail
 - Not required (STANDARD change).
-
+---
+agent: DevEngineer | date: 2026-08-06 | model: GPT-5.3-Codex
+plan: /memories/session/dev-plan.md
 ---
 
 Intent
+Addressed PageSpeed findings for unused JavaScript and render-blocking CSS by reducing initial payload and deferring heavy preview assets to on-demand chunks.
+
+Change class
+STANDARD
+
+Files changed
+- src/app/app.tsx:
+  - Replaced eager view imports with `React.lazy` for landing/auth/dashboard/public download/public folder pages.
+  - Wrapped each view render path with `Suspense` fallback spinner to preserve UX while chunks load.
+- src/app/features/files/pages/user-dashboard.tsx:
+  - Converted `TextFilePreview` import to lazy-loaded component.
+  - Added `Suspense` fallback around preview dialog rendering.
+- src/app/features/sharing/pages/public-download-page.tsx:
+  - Converted `TextFilePreview` import to lazy-loaded component.
+  - Added `Suspense` fallback around preview section rendering.
+- src/app/shared/components/common/text-file-preview.tsx:
+  - Added component-scoped CSS import for syntax highlight styles.
+- src/app/shared/components/common/text-file-preview.css:
+  - New file containing syntax-preview hljs theme rules previously in global CSS.
+- src/index.css:
+  - Removed global `.syntax-preview` highlight style block so it is no longer render-blocking on first paint.
+- vite.config.ts:
+  - Added conservative `rollupOptions.output.manualChunks` grouping (react, preview libs, ui libs, motion, vendor).
+
+Public contracts impacted
+- None. No API surface, route contract, or shared DTO shape changes.
+
+Validation status
+- Build: PASSED (`pnpm run build`)
+- Type-check: PASSED (`pnpm run lint` / `tsc --noEmit`)
+- Bundle evidence (before -> after):
+  - Initial monolithic JS: `dist/assets/index-*.js` ~877.31 kB (gzip ~267.83 kB) -> entry `dist/assets/index-*.js` ~8.51 kB (gzip ~3.13 kB), with deferred chunks for feature/vendor code.
+  - Preview-specific CSS split out: new `dist/assets/text-file-preview-*.css` ~1.09 kB (gzip ~0.28 kB), removed from global critical CSS path.
+
+Handoff TestEngineer
+- Verify first-load navigation for landing/auth/dashboard/download/folder still renders correctly under slow network (chunk-loading paths).
+- Verify text/csv preview still works in dashboard and public share pages, including spinner fallback during first preview open.
+- Verify no regressions in hash-route transitions (`#auth/*`, `#dashboard`, `#f/*`, `#d/*`).
+
+Handoff QaEngineer
+- Re-run PageSpeed on representative landing and public-download URLs and compare:
+  - Reduce unused JavaScript opportunity.
+  - Render-blocking CSS transfer/latency impact.
+- Confirm no user-visible regressions during initial navigation and preview open.
+
 Executed a low-risk dependency safe pass on `mssql` by updating `argon2` to the latest compatible release and applying the minimum TypeScript compatibility fix required by upstream type export changes.
 
 Change class

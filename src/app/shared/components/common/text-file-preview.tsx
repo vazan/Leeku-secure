@@ -31,6 +31,7 @@ import typescript from "highlight.js/lib/languages/typescript";
 import xml from "highlight.js/lib/languages/xml";
 import yaml from "highlight.js/lib/languages/yaml";
 import Papa from "papaparse";
+import "./text-file-preview.css";
 
 export interface TextFilePreviewData {
   kind: "text" | "csv";

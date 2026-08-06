@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { Suspense, useEffect, useRef, useState } from "react";
 import {
   ArrowLeft,
   Check,
@@ -9,12 +9,14 @@ import {
 } from "lucide-react";
 import ErrorScreen from "@/app/shared/components/common/error-screen";
 import FileTypeIcon from "@/app/shared/components/common/file-type-icon";
-import TextFilePreview, {
-  type TextFilePreviewData,
-} from "@/app/shared/components/common/text-file-preview";
+import type { TextFilePreviewData } from "@/app/shared/components/common/text-file-preview";
 import TransferProgress, {
   type TransferState,
 } from "@/app/shared/components/common/transfer-progress";
+
+const TextFilePreview = React.lazy(
+  () => import("@/app/shared/components/common/text-file-preview"),
+);
 
 interface PublicDownloadPageProps {
   token: string;
@@ -522,7 +524,15 @@ export default function PublicDownloadPage({
                 <h2 className="text-sm font-semibold">File preview</h2>
                 <span className="text-xs uppercase text-[var(--text-faint)]">{preview.kind}</span>
               </div>
-              <TextFilePreview preview={preview} fileName={meta.file_name} />
+              <Suspense
+                fallback={(
+                  <div className="grid min-h-48 place-items-center">
+                    <Loader2 className="h-5 w-5 animate-spin text-[var(--text-muted)]" />
+                  </div>
+                )}
+              >
+                <TextFilePreview preview={preview} fileName={meta.file_name} />
+              </Suspense>
             </section>
           )}
         </div>

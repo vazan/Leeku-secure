@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { Suspense, useEffect, useMemo, useState } from "react";
 import {
   ArrowDownToLine,
   Camera,
@@ -55,10 +55,12 @@ import TransferProgress, {
 import FileTypeIcon, {
   getFileTypeBadge,
 } from "@/app/shared/components/common/file-type-icon";
-import TextFilePreview, {
-  type TextFilePreviewData,
-} from "@/app/shared/components/common/text-file-preview";
+import type { TextFilePreviewData } from "@/app/shared/components/common/text-file-preview";
 import { downloadWithProgress } from "@/app/shared/utils/download-with-progress";
+
+const TextFilePreview = React.lazy(
+  () => import("@/app/shared/components/common/text-file-preview"),
+);
 
 interface UserDashboardProps {
   user: User;
@@ -3144,7 +3146,15 @@ function TextPreviewDialog({
             </p>
           )}
           {preview && (
-            <TextFilePreview preview={preview} fileName={file.original_name} />
+            <Suspense
+              fallback={(
+                <div className="grid min-h-48 place-items-center">
+                  <Loader2 className="h-5 w-5 animate-spin text-[var(--text-muted)]" />
+                </div>
+              )}
+            >
+              <TextFilePreview preview={preview} fileName={file.original_name} />
+            </Suspense>
           )}
         </div>
       </div>
