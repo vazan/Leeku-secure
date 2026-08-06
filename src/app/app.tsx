@@ -1,11 +1,12 @@
-import { useEffect, useRef, useState } from "react";
-import AuthPage from "@/app/features/auth/pages/auth-page";
-import LandingPage from "@/app/features/public/pages/landing-page";
-import PublicDownloadPage from "@/app/features/sharing/pages/public-download-page";
-import PublicFolderPage from "@/app/features/sharing/pages/public-folder-page";
-import UserDashboard from "@/app/features/files/pages/user-dashboard";
+import { Suspense, lazy, useEffect, useRef, useState } from "react";
 import { Toaster } from "@/app/shared/components/ui/sonner";
 import type { Quota, User } from "@/app/shared/types";
+
+const AuthPage = lazy(() => import("@/app/features/auth/pages/auth-page"));
+const LandingPage = lazy(() => import("@/app/features/public/pages/landing-page"));
+const PublicDownloadPage = lazy(() => import("@/app/features/sharing/pages/public-download-page"));
+const PublicFolderPage = lazy(() => import("@/app/features/sharing/pages/public-folder-page"));
+const UserDashboard = lazy(() => import("@/app/features/files/pages/user-dashboard"));
 
 const getCsrfToken = () =>
   document.cookie
@@ -201,64 +202,80 @@ export default function App() {
     );
   }
 
+  const viewFallback = (
+    <div className="grid min-h-[60vh] place-items-center">
+      <div className="h-5 w-5 animate-spin rounded-full border border-[var(--border-subtle)] border-t-[var(--accent-linear)]" />
+    </div>
+  );
+
   return (
     <div className="min-h-screen bg-[var(--bg-primary)] text-[var(--text-primary)] selection:bg-[var(--accent-linear)] selection:text-[var(--accent-contrast)]">
       <Toaster />
       <main>
         {currentView === "landing" && (
-          <div>
-            <LandingPage
-              quotas={quotas}
-              onGoToAuth={(mode) => {
-                window.location.hash = `auth/${mode}`;
-              }}
-            />
-          </div>
+          <Suspense fallback={viewFallback}>
+            <div>
+              <LandingPage
+                quotas={quotas}
+                onGoToAuth={(mode) => {
+                  window.location.hash = `auth/${mode}`;
+                }}
+              />
+            </div>
+          </Suspense>
         )}
         {currentView === "auth" && (
-          <div>
-            <AuthPage
-              initialMode={authMode}
-              onAuthSuccess={handleAuthSuccess}
-              onCancel={() => {
-                window.history.replaceState(null, "", window.location.pathname);
-                setCurrentView(user ? "dashboard" : "landing");
-              }}
-            />
-          </div>
+          <Suspense fallback={viewFallback}>
+            <div>
+              <AuthPage
+                initialMode={authMode}
+                onAuthSuccess={handleAuthSuccess}
+                onCancel={() => {
+                  window.history.replaceState(null, "", window.location.pathname);
+                  setCurrentView(user ? "dashboard" : "landing");
+                }}
+              />
+            </div>
+          </Suspense>
         )}
         {currentView === "dashboard" && user && (
-          <div>
-            <UserDashboard
-              user={user}
-              token={token}
-              quotas={quotas}
-              onLogout={handleLogout}
-              onTriggerRefreshUser={handleRefreshUser}
-            />
-          </div>
+          <Suspense fallback={viewFallback}>
+            <div>
+              <UserDashboard
+                user={user}
+                token={token}
+                quotas={quotas}
+                onLogout={handleLogout}
+                onTriggerRefreshUser={handleRefreshUser}
+              />
+            </div>
+          </Suspense>
         )}
         {currentView === "download" && downloadToken && (
-          <div>
-            <PublicDownloadPage
-              token={downloadToken}
-              onGoHome={() => {
-                window.location.hash = "";
-                setCurrentView(user ? "dashboard" : "landing");
-              }}
-            />
-          </div>
+          <Suspense fallback={viewFallback}>
+            <div>
+              <PublicDownloadPage
+                token={downloadToken}
+                onGoHome={() => {
+                  window.location.hash = "";
+                  setCurrentView(user ? "dashboard" : "landing");
+                }}
+              />
+            </div>
+          </Suspense>
         )}
         {currentView === "folder" && downloadToken && (
-          <div>
-            <PublicFolderPage
-              token={downloadToken}
-              onGoHome={() => {
-                window.location.hash = "";
-                setCurrentView(user ? "dashboard" : "landing");
-              }}
-            />
-          </div>
+          <Suspense fallback={viewFallback}>
+            <div>
+              <PublicFolderPage
+                token={downloadToken}
+                onGoHome={() => {
+                  window.location.hash = "";
+                  setCurrentView(user ? "dashboard" : "landing");
+                }}
+              />
+            </div>
+          </Suspense>
         )}
       </main>
     </div>

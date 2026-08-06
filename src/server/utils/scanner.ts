@@ -433,7 +433,7 @@ const BLOCKED_FILENAME_PATTERNS: { pattern: RegExp; label: string }[] = [
   { pattern: /_?nulled/i,                             label: 'Nulled script' },
   { pattern: /warez/i,                                label: 'Warez' },
   { pattern: /torrent/i,                              label: 'Torrent' },
-  { pattern: /_?hack/i,                               label: 'Hack tool' },
+  { pattern: /\bhack(?:tool)?\b/i,                    label: 'Hack tool' },
   { pattern: /_?cheat/i,                              label: 'Cheat tool' },
   { pattern: /_?loader\.(exe|dll|bin)/i,              label: 'Malicious loader' },
   { pattern: /password[_\-.]?(stealer|grabber)/i,     label: 'Credential stealer' },
