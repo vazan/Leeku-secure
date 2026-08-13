@@ -1,9 +1,45 @@
 ---
 
 ---
-agent: DevEngineer | date: 2026-08-05 | model: GPT-5.3-Codex
+agent: DevEngineer | date: 2026-08-13 | model: GPT-5.3-Codex
 plan: /memories/session/dev-plan.md
 ---
+
+Intent
+Implemented direct video playback under All files by enabling watch actions in list/table views and broadening private preview support from MP4-only to all video MIME types.
+
+Change class
+STANDARD
+
+Files changed
+- src/server.ts:
+  - Updated `GET /api/files/:id/preview` media gate from `video/mp4` to `video/*` while keeping existing blocked-file and secret-key restrictions intact.
+- src/app/features/files/pages/user-dashboard.tsx:
+  - Added `isVideoFile` helper and replaced MP4-only thumbnail interaction checks with generic `video/*` checks.
+  - Updated All files mobile and desktop action controls to show a dynamic `Watch` action for video files and keep `Preview` for text-previewable files.
+  - Reused existing full-screen `VideoPlayer` modal for newly supported video MIME types.
+
+Public contracts impacted
+- No route shape changes.
+- Behavioral update on existing endpoint `GET /api/files/:id/preview`: private inline media preview now accepts `video/*` instead of only `video/mp4`.
+
+Validation status
+- Type-check: PASSED (`pnpm lint`)
+- Build: PASSED (`pnpm build`)
+- Existing non-blocking baseline warnings remain unchanged:
+  - Vite native config warning about `__dirname` in `vite.config.ts`.
+  - esbuild warning for `import.meta` in CJS output.
+
+Handoff TestEngineer
+- Verify All files mobile cards display `Watch` for video MIME files and open in-page player.
+- Verify All files desktop action column shows `Watch` for video MIME files and opens player.
+- Verify non-video previewable text/csv files still open text preview dialog.
+- Verify unsupported/binary non-video files still do not expose preview/watch actions.
+- Verify secret-key-protected video files remain blocked from inline playback per current policy.
+
+Handoff QaEngineer
+- Confirm end-to-end user journey: upload video (mp4 + at least one non-mp4 codec/container), navigate to All files, play directly, close modal, and continue browsing without page navigation.
+- Confirm no regressions for image thumbnails and text preview flow.
 
 Intent
 Ported the validated All Files performance and move-flow changes to the `mssql` branch, including the explicit `Actions` header layout used in the PostgreSQL branch after the final UI adjustment.

@@ -3148,7 +3148,7 @@ app.get('/api/files/:id/preview', authenticateUser as express.RequestHandler, as
 
     const originalName = decryptColumn(file.original_name_encrypted, file.original_name_iv, file.original_name_auth_tag);
     const textPreviewKind = getTextPreviewKind(originalName, file.mime_type || '');
-    const mediaPreviewable = file.mime_type.startsWith('image/') || file.mime_type === 'video/mp4';
+    const mediaPreviewable = file.mime_type.startsWith('image/') || file.mime_type.startsWith('video/');
     if (!textPreviewKind && !mediaPreviewable)
       return res.status(415).json({ error: 'Preview is not available for this file type.' });
     if (textPreviewKind && Number(file.size_bytes || 0) > TEXT_PREVIEW_MAX_BYTES)

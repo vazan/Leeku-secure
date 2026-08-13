@@ -220,6 +220,10 @@ function supportsExternalPreview(file: FileMetadata) {
   );
 }
 
+function isVideoFile(file: FileMetadata) {
+  return file.mime_type.startsWith("video/");
+}
+
 function pad2(value: number) {
   return String(value).padStart(2, "0");
 }
@@ -1966,12 +1970,22 @@ export default function UserDashboard({
                         </div>
                       </div>
                       <div className="mt-4 grid w-full min-w-0 gap-2 min-[380px]:grid-cols-2">
-                        {file.preview_available && (
+                        {(file.preview_available || isVideoFile(file)) && (
                           <FileActionButton
-                            label="Preview"
-                            onClick={() => setTextPreviewFile(file)}
+                            label={isVideoFile(file) ? "Watch" : "Preview"}
+                            onClick={() => {
+                              if (isVideoFile(file)) {
+                                setVideoFile(file);
+                                return;
+                              }
+                              setTextPreviewFile(file);
+                            }}
                           >
-                            <Eye className="h-3.5 w-3.5" />
+                            {isVideoFile(file) ? (
+                              <Play className="h-3.5 w-3.5" />
+                            ) : (
+                              <Eye className="h-3.5 w-3.5" />
+                            )}
                           </FileActionButton>
                         )}
                         <FileActionButton
@@ -2056,12 +2070,22 @@ export default function UserDashboard({
                         </td>
                         <td className="w-48 px-2 py-3">
                           <div className="flex w-44 justify-end gap-1">
-                            {file.preview_available && (
+                            {(file.preview_available || isVideoFile(file)) && (
                               <IconButton
-                                label="Preview"
-                                onClick={() => setTextPreviewFile(file)}
+                                label={isVideoFile(file) ? "Watch" : "Preview"}
+                                onClick={() => {
+                                  if (isVideoFile(file)) {
+                                    setVideoFile(file);
+                                    return;
+                                  }
+                                  setTextPreviewFile(file);
+                                }}
                               >
-                                <Eye className="h-4 w-4" />
+                                {isVideoFile(file) ? (
+                                  <Play className="h-4 w-4" />
+                                ) : (
+                                  <Eye className="h-4 w-4" />
+                                )}
                               </IconButton>
                             )}
                             <IconButton
@@ -2687,8 +2711,8 @@ function FileThumbnail({
   const [hovering, setHovering] = useState(false);
   const videoRef = React.useRef<HTMLVideoElement>(null);
   const isImage = file.mime_type.startsWith("image/");
-  const isMp4 = file.mime_type === "video/mp4";
-  const isPreviewable = isImage || isMp4;
+  const isVideo = file.mime_type.startsWith("video/");
+  const isPreviewable = isImage || isVideo;
 
   useEffect(() => {
     setPreviewUrl(null);
@@ -2754,13 +2778,13 @@ function FileThumbnail({
 
   return (
     <div
-      role={isMp4 && interactiveVideo && onOpenVideo ? "button" : undefined}
-      tabIndex={isMp4 && interactiveVideo && onOpenVideo ? 0 : undefined}
-      aria-label={isMp4 && interactiveVideo && onOpenVideo ? `Play ${file.original_name}` : undefined}
-      className={`group/preview relative grid shrink-0 place-items-center overflow-hidden bg-[var(--bg-hover)] text-[var(--text-muted)] ${isMp4 && interactiveVideo && onOpenVideo ? "cursor-pointer" : ""} ${className}`}
-      onClick={isMp4 && interactiveVideo ? onOpenVideo : undefined}
+      role={isVideo && interactiveVideo && onOpenVideo ? "button" : undefined}
+      tabIndex={isVideo && interactiveVideo && onOpenVideo ? 0 : undefined}
+      aria-label={isVideo && interactiveVideo && onOpenVideo ? `Play ${file.original_name}` : undefined}
+      className={`group/preview relative grid shrink-0 place-items-center overflow-hidden bg-[var(--bg-hover)] text-[var(--text-muted)] ${isVideo && interactiveVideo && onOpenVideo ? "cursor-pointer" : ""} ${className}`}
+      onClick={isVideo && interactiveVideo ? onOpenVideo : undefined}
       onKeyDown={
-        isMp4 && interactiveVideo && onOpenVideo
+        isVideo && interactiveVideo && onOpenVideo
           ? (event) => {
               if (event.key === "Enter" || event.key === " ") {
                 event.preventDefault();
@@ -2770,7 +2794,7 @@ function FileThumbnail({
           : undefined
       }
       onPointerEnter={
-        isMp4 && interactiveVideo
+        isVideo && interactiveVideo
           ? () => {
               setHovering(true);
               void playVideo();
@@ -2778,7 +2802,7 @@ function FileThumbnail({
           : undefined
       }
       onPointerLeave={
-        isMp4 && interactiveVideo
+        isVideo && interactiveVideo
           ? () => {
               setHovering(false);
               stopVideo();
@@ -2793,7 +2817,7 @@ function FileThumbnail({
           className="h-full w-full object-cover"
           onError={() => setFailed(true)}
         />
-      ) : isMp4 && previewUrl && !failed ? (
+      ) : isVideo && previewUrl && !failed ? (
         <>
           <video
             ref={videoRef}
