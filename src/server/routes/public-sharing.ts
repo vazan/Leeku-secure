@@ -53,6 +53,53 @@ function getSingleParam(value: string | string[] | undefined): string {
   return value ?? '';
 }
 
+function parseSingleByteRange(rangeHeader: string, fileSize: number): { start: number; end: number } | null {
+  const normalized = rangeHeader.trim();
+  if (!normalized.toLowerCase().startsWith('bytes=')) return null;
+
+  const spec = normalized.slice(6).trim();
+  if (!spec || spec.includes(',')) return null;
+
+  const [rawStart = '', rawEnd = ''] = spec.split('-', 2);
+  const startPart = rawStart.trim();
+  const endPart = rawEnd.trim();
+
+  if (!startPart && !endPart) return null;
+  if (!Number.isInteger(fileSize) || fileSize <= 0) return null;
+
+  let start = 0;
+  let end = fileSize - 1;
+
+  if (!startPart) {
+    const suffixLength = Number(endPart);
+    if (!Number.isInteger(suffixLength) || suffixLength <= 0) return null;
+    const clampedLength = Math.min(suffixLength, fileSize);
+    start = fileSize - clampedLength;
+    end = fileSize - 1;
+    return { start, end };
+  }
+
+  start = Number(startPart);
+  if (!Number.isInteger(start) || start < 0 || start >= fileSize) return null;
+
+  if (endPart) {
+    end = Number(endPart);
+    if (!Number.isInteger(end) || end < start) return null;
+    if (end >= fileSize) end = fileSize - 1;
+  }
+
+  return { start, end };
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 export function createPublicSharingRouter(options: {
   vaultPath: string;
   tempPath: string;
@@ -853,7 +900,8 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
       if (row.file_status === 'Blocked') return res.status(410).json({ error: 'File has been blocked.' });
       if (row.expires_at && new Date(row.expires_at) < new Date()) return res.status(410).json({ error: 'Link expired.' });
       if (row.max_downloads && row.download_count >= row.max_downloads) return res.status(410).json({ error: 'Download limit reached.' });
-      if (!row.mime_type.startsWith('image/') && !row.mime_type.startsWith('video/')) {
+      const normalizedMimeType = String(row.mime_type || '').trim().toLowerCase();
+      if (!normalizedMimeType.startsWith('image/') && !normalizedMimeType.startsWith('video/')) {
         return res.status(400).json({ error: 'Only image and video files support external preview.' });
       }
       if (row.password_hash) {
@@ -861,6 +909,50 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
       }
       if (row.client_secret_hash) {
         return res.status(403).json({ error: 'Secret-key-protected files cannot be used for external preview.' });
+      }
+
+      const rangeHeader = typeof req.headers.range === 'string' ? req.headers.range.trim() : '';
+      const fetchDest = String(req.headers['sec-fetch-dest'] || '').trim().toLowerCase();
+      const acceptHeader = String(req.headers.accept || '').toLowerCase();
+      const rawMode = String(req.query.raw || '').trim() === '1';
+      const compatMode = String(req.query.compat || '').trim() === '1';
+      const streamMimeType = compatMode && normalizedMimeType === 'video/quicktime'
+        ? 'video/mp4'
+        : (normalizedMimeType || 'application/octet-stream');
+      const isDocumentNavigation = fetchDest === 'document' || (fetchDest === '' && !rangeHeader && acceptHeader.includes('text/html'));
+
+      if (!rawMode && isDocumentNavigation) {
+        const playerSrc = `${req.originalUrl}${req.originalUrl.includes('?') ? '&' : '?'}raw=1${normalizedMimeType === 'video/quicktime' ? '&compat=1' : ''}`;
+        const safeName = escapeHtml(decryptColumn(row.original_name_encrypted, row.original_name_iv, row.original_name_auth_tag));
+        const safeType = escapeHtml(normalizedMimeType || 'application/octet-stream');
+        const safeStreamType = escapeHtml(streamMimeType);
+
+        res.setHeader('Cache-Control', 'no-store, max-age=0');
+        return res.status(200).type('html').send(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>${safeName}</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #090b10; color: #eef2ff; font-family: system-ui, -apple-system, Segoe UI, sans-serif; }
+    main { width: min(96vw, 1100px); display: grid; gap: 12px; }
+    h1 { margin: 0; font-size: 14px; font-weight: 600; color: #c9d3ff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    p { margin: 0; font-size: 12px; color: #9ba7c7; }
+    video { width: 100%; max-height: calc(100vh - 96px); background: black; border-radius: 10px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>${safeName}</h1>
+    <p>MIME: ${safeType}${safeType !== safeStreamType ? ` (compat stream: ${safeStreamType})` : ''}</p>
+    <video controls playsinline preload="metadata" src="${escapeHtml(playerSrc)}">
+      Your browser could not play this video format directly.
+    </video>
+  </main>
+</body>
+</html>`);
       }
 
       const vaultFile = path.join(options.vaultPath, row.stored_path);
@@ -915,26 +1007,24 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
         return;
       }
 
-      const rangeHeader = typeof req.headers.range === 'string' ? req.headers.range.trim() : '';
-
-      res.setHeader('Content-Type', row.mime_type || 'application/octet-stream');
+      res.setHeader('Content-Type', streamMimeType);
       res.setHeader('Content-Disposition', `inline; filename="${originalName.replace(/"/g, '\\"')}"`);
       res.setHeader('Accept-Ranges', 'bytes');
 
       // ------------------------------------------
       // CASE 1: Handle HTTP Range Requests (Seeking/Buffering)
       // ------------------------------------------
-      if (rangeHeader.startsWith('bytes=')) {
-        const [startRaw, endRaw] = rangeHeader.slice(6).split('-');
-        const start = Number(startRaw);
-        const end = endRaw ? Number(endRaw) : fileSize - 1;
+      if (rangeHeader.toLowerCase().startsWith('bytes=')) {
+        const parsedRange = parseSingleByteRange(rangeHeader, fileSize);
 
-        if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end < start || end >= fileSize) {
+        if (!parsedRange) {
           await fileHandle.close().catch(() => {});
           res.status(416);
           res.setHeader('Content-Range', `bytes */${fileSize}`);
           return res.json({ error: 'Requested range is not satisfiable.' });
         }
+
+        const { start, end } = parsedRange;
 
         res.status(206);
         res.setHeader('Content-Range', `bytes ${start}-${end}/${fileSize}`);

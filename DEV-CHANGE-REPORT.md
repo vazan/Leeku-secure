@@ -4,6 +4,83 @@ plan: /memories/session/dev-plan.md
 ---
 
 Intent
+Addressed Chrome behavior where direct navigation to public `.mov` embed URLs triggers download instead of playback by serving a lightweight HTML player page for document navigations, while preserving raw media streaming for real video/embed fetches.
+
+Change class
+STANDARD
+
+Files changed
+- src/server/routes/public-sharing.ts:
+  - Added an HTML escape helper for safe player-page rendering.
+  - Added document-navigation detection (`sec-fetch-dest` / `accept`) and `raw=1` override.
+  - For document navigations, returns an inline HTML `<video>` player that points to the same embed endpoint with `?raw=1`.
+  - Preserved binary stream behavior for range/media requests used by `<video src>` and external embeds.
+
+Public contracts impacted
+- No route shape changes.
+- Behavioral enhancement on `GET /api/public/share/:token/embed`:
+  - Browser-navigation requests can return HTML player content.
+  - Media fetch requests continue returning binary bytes with range support.
+
+Validation status
+- Type-check: PASSED (`pnpm lint`)
+- Build: PASSED (`pnpm build`)
+
+Handoff TestEngineer
+- In Chrome, open the public embed URL directly and verify it renders player UI instead of immediate download.
+- Confirm playback attempts via player (`?raw=1` source) and seek/range behavior still works.
+- Confirm Firefox and external `<video src>` embeds remain unchanged.
+
+Handoff QaEngineer
+- Validate direct-link UX parity between Firefox and Chrome for public `.mov` embeds.
+
+---
+agent: DevEngineer | date: 2026-08-13 | model: GPT-5.3-Codex
+plan: /memories/session/dev-plan.md
+---
+
+Intent
+Fixed public external video embed playback failures for .mov files by implementing RFC-compliant single-range parsing, including suffix ranges (`bytes=-N`) commonly used during media probing.
+
+Change class
+STANDARD
+
+Files changed
+- src/server/routes/public-sharing.ts:
+  - Added `parseSingleByteRange` helper supporting `bytes=N-`, `bytes=N-M`, and `bytes=-S` formats.
+  - Updated embed route range handling to use the helper and return 416 only for invalid/unsatisfiable ranges.
+  - Normalized MIME checks (`trim().toLowerCase()`) before external preview media eligibility checks.
+  - Reused normalized MIME for `Content-Type` response header.
+
+Public contracts impacted
+- No route shape changes.
+- Behavioral correction on `GET /api/public/share/:token/embed`: now accepts valid suffix range requests that were previously rejected.
+
+Validation status
+- Type-check: PASSED (`pnpm lint`)
+- Build: PASSED (`pnpm build`)
+- Existing non-blocking baseline warnings remain unchanged:
+  - Vite native config warning about `__dirname` in `vite.config.ts`.
+  - esbuild warning for `import.meta` in CJS output.
+
+Handoff TestEngineer
+- Verify `.mov` playback over public embed URL now initializes and seeks correctly.
+- Verify range request cases:
+  - `Range: bytes=0-1023` => 206
+  - `Range: bytes=1024-` => 206
+  - `Range: bytes=-2048` => 206
+  - malformed/multi-range => 416
+- Verify existing image/video embeds still work and non-media files remain blocked.
+
+Handoff QaEngineer
+- Validate playback and seeking for the provided public `.mov` embed URL across target browsers/devices.
+
+---
+agent: DevEngineer | date: 2026-08-13 | model: GPT-5.3-Codex
+plan: /memories/session/dev-plan.md
+---
+
+Intent
 Implemented direct video playback under All files by enabling watch actions in list/table views and broadening private preview support from MP4-only to all video MIME types.
 
 Change class
