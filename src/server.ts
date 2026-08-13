@@ -97,6 +97,7 @@ const APP_URL            = process.env.APP_URL || `http://localhost:${PORT}`;
 const NODE_ENV           = process.env.NODE_ENV || 'development';
 const FILE_VAULT         = process.env.FILE_STORAGE_UNC_PATH || path.join(process.cwd(), 'vault');
 const UPLOAD_TEMP        = process.env.UPLOAD_TEMP_PATH || path.join(os.tmpdir(), 'leeku-uploads');
+const PUBLIC_SHARE_DECRYPTED_PREVIEW_PATH = String(process.env.PUBLIC_SHARE_DECRYPTED_PREVIEW_PATH || '').trim() || null;
 const PROFILE_PICTURE_PATH = process.env.PROFILE_PICTURE_PATH || path.join(FILE_VAULT, 'users');
 const MAX_LOG_ENTRIES    = parseInt(process.env.MAX_LOG_ENTRIES || '500', 10);
 const MAX_LOGIN_ATTEMPTS = parseInt(process.env.MAX_LOGIN_ATTEMPTS || '5', 10);
@@ -801,7 +802,7 @@ interface AdminFolderRow extends FolderRow {
 interface ShareRow {
   id: string; file_id: string; public_token: string; password_hash: string | null;
   expires_at: Date | null; max_downloads: number | null; download_count: number;
-  is_active: boolean; allow_external_preview: boolean; created_at: Date;
+  is_active: boolean; allow_external_preview: boolean; allow_decrypted_external_preview: boolean; created_at: Date;
 }
 
 interface FolderShareRow {
@@ -1069,6 +1070,7 @@ function mapShareRow(row: ShareRow): ShareLink {
     file_id:        row.file_id,
     public_token:   row.public_token,
     allow_external_preview: !!row.allow_external_preview,
+    allow_decrypted_external_preview: !!row.allow_decrypted_external_preview,
     password:       row.password_hash ? '[protected]' : undefined,
     expires_at:     row.expires_at ? row.expires_at.toISOString() : null,
     max_downloads:  row.max_downloads,
@@ -3618,7 +3620,7 @@ app.get('/api/sharing/links', authenticateUser as express.RequestHandler, async 
     request.input('ownerId', sql.UniqueIdentifier, req.userId!);
     request.input('systemFolderName', sql.NVarChar(120), SYSTEM_UPDATE_FOLDER_NAME);
     const result = await request.query<ShareRow & { stored_path: string }>(
-      `SELECT sl.id,sl.file_id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.allow_external_preview,sl.created_at,f.stored_path
+      `SELECT sl.id,sl.file_id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.allow_external_preview,sl.allow_decrypted_external_preview,sl.created_at,f.stored_path
        FROM share_links sl
        INNER JOIN files f ON sl.file_id=f.id
        WHERE f.owner_user_id=@ownerId
@@ -3806,7 +3808,7 @@ app.post('/api/file-folders/:id/share', authenticateUser as express.RequestHandl
 
 app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
   const fileId = getSingleParam(req.params.id);
-  const { password, expires_at, max_downloads, is_active, allow_external_preview } = req.body;
+  const { password, expires_at, max_downloads, is_active, allow_external_preview, allow_decrypted_external_preview } = req.body;
   try {
     const fReq = await getRequest(); fReq.input('id', sql.UniqueIdentifier, fileId);
     const fRes = await fReq.query<{owner_user_id:string;status:string;stored_path:string;mime_type:string;client_secret_hash:string|null}>(
@@ -3824,12 +3826,16 @@ app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, asy
 
     const exReq = await getRequest(); exReq.input('fid', sql.UniqueIdentifier, fileId);
     const existing = await exReq.query<ShareRow>(
-      'SELECT id,file_id,public_token,password_hash,expires_at,max_downloads,download_count,is_active,allow_external_preview,created_at FROM share_links WHERE file_id=@fid'
+      'SELECT id,file_id,public_token,password_hash,expires_at,max_downloads,download_count,is_active,allow_external_preview,allow_decrypted_external_preview,created_at FROM share_links WHERE file_id=@fid'
     );
 
     let shareRow: ShareRow;
     if (!existing.recordset.length) {
       const allowExternalPreview = !!allow_external_preview;
+      const allowDecryptedExternalPreview = !!allow_decrypted_external_preview;
+      if (allowDecryptedExternalPreview && !allowExternalPreview) {
+        return res.status(400).json({ error: 'Decrypted external preview requires external preview to be enabled.' });
+      }
       if (allowExternalPreview) {
         if (!file.mime_type.startsWith('image/') && !file.mime_type.startsWith('video/'))
           return res.status(400).json({ error: 'External preview is only supported for image and video files.' });
@@ -3838,6 +3844,8 @@ app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, asy
         if (file.client_secret_hash)
           return res.status(400).json({ error: 'Files protected with a secret key cannot use external preview.' });
       }
+      if (allowDecryptedExternalPreview && !PUBLIC_SHARE_DECRYPTED_PREVIEW_PATH)
+        return res.status(400).json({ error: 'Decrypted external preview is not configured on this host.' });
       const token = generateSecureToken(16);
       const pwH   = password ? await hashSharePassword(password) : null;
       const insReq = await getRequest();
@@ -3848,10 +3856,11 @@ app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, asy
       insReq.input('md',    sql.Int,              max_downloads ? Number(max_downloads) : null);
       insReq.input('act',   sql.Bit,              is_active !== undefined ? (is_active ? 1 : 0) : 1);
       insReq.input('allowExternalPreview', sql.Bit, allowExternalPreview ? 1 : 0);
+      insReq.input('allowDecryptedExternalPreview', sql.Bit, allowDecryptedExternalPreview ? 1 : 0);
       const insRes = await insReq.query<ShareRow>(
-        `INSERT INTO share_links (file_id,public_token,password_hash,expires_at,max_downloads,is_active,allow_external_preview)
-        VALUES (@fid,@tok,@pwH,@exp,@md,@act,@allowExternalPreview)
-        RETURNING id,file_id,public_token,password_hash,expires_at,max_downloads,download_count,is_active,allow_external_preview,created_at`
+        `INSERT INTO share_links (file_id,public_token,password_hash,expires_at,max_downloads,is_active,allow_external_preview,allow_decrypted_external_preview)
+        VALUES (@fid,@tok,@pwH,@exp,@md,@act,@allowExternalPreview,@allowDecryptedExternalPreview)
+        RETURNING id,file_id,public_token,password_hash,expires_at,max_downloads,download_count,is_active,allow_external_preview,allow_decrypted_external_preview,created_at`
       );
       shareRow = insRes.recordset[0];
     } else {
@@ -3864,10 +3873,16 @@ app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, asy
         allow_external_preview !== undefined
           ? !!allow_external_preview
           : !!shareRow.allow_external_preview;
+      const nextAllowDecryptedExternalPreview =
+        allow_decrypted_external_preview !== undefined
+          ? !!allow_decrypted_external_preview
+          : !!shareRow.allow_decrypted_external_preview;
       const nextMaxDownloads =
         max_downloads !== undefined
           ? (max_downloads ? Number(max_downloads) : null)
           : shareRow.max_downloads;
+      if (nextAllowDecryptedExternalPreview && !nextAllowExternalPreview)
+        return res.status(400).json({ error: 'Decrypted external preview requires external preview to be enabled.' });
       if (nextAllowExternalPreview) {
         if (!file.mime_type.startsWith('image/') && !file.mime_type.startsWith('video/'))
           return res.status(400).json({ error: 'External preview is only supported for image and video files.' });
@@ -3876,6 +3891,8 @@ app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, asy
         if (file.client_secret_hash)
           return res.status(400).json({ error: 'Files protected with a secret key cannot use external preview.' });
       }
+      if (nextAllowDecryptedExternalPreview && !PUBLIC_SHARE_DECRYPTED_PREVIEW_PATH)
+        return res.status(400).json({ error: 'Decrypted external preview is not configured on this host.' });
       if (
         (is_active === true && !shareRow.is_active) ||
         (max_downloads !== undefined && nextMaxDownloads !== shareRow.max_downloads)
@@ -3891,11 +3908,15 @@ app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, asy
         upReq.input('allowExternalPreview', sql.Bit, allow_external_preview ? 1 : 0);
         sets.push('allow_external_preview=@allowExternalPreview');
       }
+      if (allow_decrypted_external_preview !== undefined) {
+        upReq.input('allowDecryptedExternalPreview', sql.Bit, allow_decrypted_external_preview ? 1 : 0);
+        sets.push('allow_decrypted_external_preview=@allowDecryptedExternalPreview');
+      }
       if (sets.length) {
         const upRes = await upReq.query<ShareRow>(
           `UPDATE share_links SET ${sets.join(',')}
             WHERE id=@id
-            RETURNING id,file_id,public_token,password_hash,expires_at,max_downloads,download_count,is_active,allow_external_preview,created_at`
+            RETURNING id,file_id,public_token,password_hash,expires_at,max_downloads,download_count,is_active,allow_external_preview,allow_decrypted_external_preview,created_at`
         );
         shareRow = upRes.recordset[0];
       }
@@ -3909,6 +3930,7 @@ app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, asy
 app.use('/api/public/share', createPublicSharingRouter({
   vaultPath: FILE_VAULT,
   tempPath: UPLOAD_TEMP,
+  decryptedPreviewPath: PUBLIC_SHARE_DECRYPTED_PREVIEW_PATH || undefined,
   profilePictureRoot: PROFILE_PICTURE_PATH,
   logDownload: (req, fileId, originalName, token) =>
     logSystemEvent(null, 'Anonymous', 'Download', 'File', fileId, req, `Anonymous download of "${originalName}" via token ${token}.`),
@@ -4525,6 +4547,9 @@ async function ensureOptionalShareLinkColumns(): Promise<void> {
   const request = await getRequest();
   await request.query(
     'ALTER TABLE share_links ADD COLUMN IF NOT EXISTS allow_external_preview BOOLEAN NOT NULL DEFAULT FALSE'
+  );
+  await request.query(
+    'ALTER TABLE share_links ADD COLUMN IF NOT EXISTS allow_decrypted_external_preview BOOLEAN NOT NULL DEFAULT FALSE'
   );
 }
 

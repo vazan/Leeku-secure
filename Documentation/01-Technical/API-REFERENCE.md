@@ -107,6 +107,7 @@ Mounted at /api/public/share.
 | GET | /api/public/share/:token/download/:downloadId/status | None | Public prepared download status | Leeku-MSSQL/src/server/routes/public-sharing.ts |
 | GET | /api/public/share/:token/download/:downloadId/file | None | Public prepared download fetch | Leeku-MSSQL/src/server/routes/public-sharing.ts |
 | GET | /api/public/share/:token/embed | None | Embed/public preview endpoint | Leeku-MSSQL/src/server/routes/public-sharing.ts |
+| GET | /api/public/share/:token/dec_embed | None | Decrypted embed/public preview endpoint | Leeku-MSSQL/src/server/routes/public-sharing.ts |
 
 ### 3.6 Admin and Maintenance
 

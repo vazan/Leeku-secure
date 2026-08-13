@@ -22,6 +22,7 @@ psql -U leeku_app -d LeekuSecure -f Documentation/SQL/postgresql_schema.sql
 - The schema is idempotent where possible (`CREATE TABLE IF NOT EXISTS`, `ON CONFLICT DO NOTHING`).
 - Includes seed data needed by the app (for example quota tiers and system configuration defaults).
 - Use this file as the single source of truth for database changes on this branch.
+- Incremental migrations are also stored here, including [2026-08-13-postgresql-share-links-decrypted-preview.sql](2026-08-13-postgresql-share-links-decrypted-preview.sql) for decrypted external preview flags on `share_links`.
 
 ## Related Docs
 

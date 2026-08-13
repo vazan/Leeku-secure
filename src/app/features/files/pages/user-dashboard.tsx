@@ -286,6 +286,8 @@ export default function UserDashboard({
   const [shareMaxDownloads, setShareMaxDownloads] = useState("");
   const [shareAllowExternalPreview, setShareAllowExternalPreview] =
     useState(false);
+  const [shareAllowDecryptedExternalPreview, setShareAllowDecryptedExternalPreview] =
+    useState(false);
   const [shareUrl, setShareUrl] = useState("");
   const [folderSharePassword, setFolderSharePassword] = useState("");
   const [folderShareExpires, setFolderShareExpires] = useState("");
@@ -1322,9 +1324,13 @@ export default function UserDashboard({
     }
   };
 
-  const toShareUrl = (publicToken: string, allowExternalPreview: boolean) =>
+  const toShareUrl = (
+    publicToken: string,
+    allowExternalPreview: boolean,
+    allowDecryptedExternalPreview = false,
+  ) =>
     allowExternalPreview
-      ? `${window.location.origin}/api/public/share/${publicToken}/embed`
+      ? `${window.location.origin}/api/public/share/${publicToken}/${allowDecryptedExternalPreview ? "dec_embed" : "embed"}`
       : `${window.location.origin}/s/${publicToken}`;
 
   const toFolderShareUrl = (publicToken: string) =>
@@ -1334,6 +1340,8 @@ export default function UserDashboard({
     const existing = links.find((link) => link.file_id === file.id);
     const allowExternalPreview =
       !!existing?.allow_external_preview && supportsExternalPreview(file);
+    const allowDecryptedExternalPreview =
+      allowExternalPreview && !!existing?.allow_decrypted_external_preview;
     setShareFile(file);
     setSharePassword("");
     setShareExpires(existing?.expires_at?.substring(0, 16) || "");
@@ -1341,9 +1349,14 @@ export default function UserDashboard({
       existing?.max_downloads ? String(existing.max_downloads) : "",
     );
     setShareAllowExternalPreview(allowExternalPreview);
+    setShareAllowDecryptedExternalPreview(allowDecryptedExternalPreview);
     setShareUrl(
       existing
-        ? toShareUrl(existing.public_token, allowExternalPreview)
+        ? toShareUrl(
+            existing.public_token,
+            allowExternalPreview,
+            allowDecryptedExternalPreview,
+          )
         : "",
     );
   };
@@ -1410,12 +1423,19 @@ export default function UserDashboard({
         expires_at: shareExpires ? new Date(shareExpires).toISOString() : null,
         max_downloads: shareMaxDownloads ? Number(shareMaxDownloads) : null,
         allow_external_preview: shareAllowExternalPreview,
+        allow_decrypted_external_preview: shareAllowDecryptedExternalPreview,
         is_active: true,
       }),
     });
     const data = await response.json();
     if (response.ok) {
-      setShareUrl(toShareUrl(data.link.public_token, shareAllowExternalPreview));
+      setShareUrl(
+        toShareUrl(
+          data.link.public_token,
+          shareAllowExternalPreview,
+          shareAllowDecryptedExternalPreview,
+        ),
+      );
       await loadFilesAndLinks();
       notify("Share link ready.");
     } else notifyError(data.error || "Could not create the share link.");
@@ -2185,6 +2205,7 @@ export default function UserDashboard({
                                   toShareUrl(
                                     link.public_token,
                                     !!link.allow_external_preview,
+                                    !!link.allow_decrypted_external_preview,
                                   ),
                                 )
                                 .then(() => notify("Link copied."))
@@ -2410,11 +2431,16 @@ export default function UserDashboard({
           expires={shareExpires}
           maxDownloads={shareMaxDownloads}
           allowExternalPreview={shareAllowExternalPreview}
+          allowDecryptedExternalPreview={shareAllowDecryptedExternalPreview}
           url={shareUrl}
           onPassword={setSharePassword}
           onExpires={setShareExpires}
           onMaxDownloads={setShareMaxDownloads}
-          onAllowExternalPreview={setShareAllowExternalPreview}
+          onAllowExternalPreview={(value) => {
+            setShareAllowExternalPreview(value);
+            if (!value) setShareAllowDecryptedExternalPreview(false);
+          }}
+          onAllowDecryptedExternalPreview={setShareAllowDecryptedExternalPreview}
           onSave={saveShare}
           onClose={() => setShareFile(null)}
           onCopy={() =>
@@ -3251,11 +3277,13 @@ function ShareDialog(props: {
   expires: string;
   maxDownloads: string;
   allowExternalPreview: boolean;
+  allowDecryptedExternalPreview: boolean;
   url: string;
   onPassword: (value: string) => void;
   onExpires: (value: string) => void;
   onMaxDownloads: (value: string) => void;
   onAllowExternalPreview: (value: boolean) => void;
+  onAllowDecryptedExternalPreview: (value: boolean) => void;
   onSave: () => void;
   onClose: () => void;
   onCopy: () => void;
@@ -3374,24 +3402,45 @@ function ShareDialog(props: {
           />
         </div>
         {supportsExternalPreview(props.file) && (
-          <label className="mt-4 flex cursor-pointer items-start gap-3 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-muted)] p-3 text-sm">
-            <input
-              type="checkbox"
-              checked={props.allowExternalPreview}
-              onChange={(event) =>
-                props.onAllowExternalPreview(event.target.checked)
-              }
-              className="mt-0.5 h-4 w-4 rounded border-[var(--border-subtle)]"
-            />
-            <span>
-              <span className="block font-medium text-[var(--text-primary)]">
-                Allow external preview
+          <>
+            <label className="mt-4 flex cursor-pointer items-start gap-3 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-muted)] p-3 text-sm">
+              <input
+                type="checkbox"
+                checked={props.allowExternalPreview}
+                onChange={(event) =>
+                  props.onAllowExternalPreview(event.target.checked)
+                }
+                className="mt-0.5 h-4 w-4 rounded border-[var(--border-subtle)]"
+              />
+              <span>
+                <span className="block font-medium text-[var(--text-primary)]">
+                  Allow external preview
+                </span>
+                <span className="mt-1 block text-xs text-[var(--text-muted)]">
+                  Generates a media embed link for image/video playback outside Leeku.
+                </span>
               </span>
-              <span className="mt-1 block text-xs text-[var(--text-muted)]">
-                Generates a media embed link for image/video playback outside Leeku.
+            </label>
+            <label className={`mt-3 flex items-start gap-3 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-muted)] p-3 text-sm ${props.allowExternalPreview ? "cursor-pointer" : "cursor-not-allowed opacity-60"}`}>
+              <input
+                type="checkbox"
+                checked={props.allowDecryptedExternalPreview}
+                disabled={!props.allowExternalPreview}
+                onChange={(event) =>
+                  props.onAllowDecryptedExternalPreview(event.target.checked)
+                }
+                className="mt-0.5 h-4 w-4 rounded border-[var(--border-subtle)]"
+              />
+              <span>
+                <span className="block font-medium text-[var(--text-primary)]">
+                  Allow decrypted external preview
+                </span>
+                <span className="mt-1 block text-xs text-[var(--text-muted)]">
+                  Stores a decrypted media cache on the host-configured SMB path for faster embed playback.
+                </span>
               </span>
-            </span>
-          </label>
+            </label>
+          </>
         )}
         {props.url && (
           <div className="mt-5 flex gap-2">

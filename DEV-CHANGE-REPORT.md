@@ -4,6 +4,65 @@ plan: /memories/session/dev-plan.md
 ---
 
 Intent
+Added an opt-in `allow_decrypted_external_preview` share-link capability so owners can keep standard external previews while enabling a second mode that stores decrypted media cache files on a host-configured SMB path for faster embed playback.
+
+Change class
+STANDARD
+
+Files changed
+- src/app/shared/types/index.ts:
+  - Added `allow_decrypted_external_preview?: boolean` to `ShareLink`.
+- src/app/features/files/pages/user-dashboard.tsx:
+  - Added share-dialog state for decrypted external preview.
+  - Added a new checkbox in Share dialog: "Allow decrypted external preview".
+  - Enforced UI coupling so decrypted mode is automatically turned off when external preview is disabled.
+  - Sent `allow_decrypted_external_preview` in share-link save payloads.
+- src/server.ts:
+  - Added `PUBLIC_SHARE_DECRYPTED_PREVIEW_PATH` env wiring.
+  - Extended PostgreSQL share schema bootstrap with `share_links.allow_decrypted_external_preview` (`BOOLEAN NOT NULL DEFAULT FALSE`).
+  - Extended `ShareRow` + `mapShareRow` and listing query to include the new flag.
+  - Extended `POST /api/files/:id/share` create/update logic to validate and persist the new flag.
+  - Added guardrails:
+    - decrypted preview requires external preview enabled.
+    - decrypted preview requires server path configuration.
+  - Passed `decryptedPreviewPath` into the public sharing router.
+- Documentation/SQL/2026-08-13-postgresql-share-links-decrypted-preview.sql:
+  - Added a PostgreSQL-native migration for `share_links.allow_decrypted_external_preview` and `share_links.allow_external_preview` defaults/backfill.
+- Documentation/SQL/postgresql_schema.sql:
+  - Added `allow_decrypted_external_preview BOOLEAN NOT NULL DEFAULT FALSE` to the canonical `share_links` schema.
+- src/server/routes/public-sharing.ts:
+  - Added router option `decryptedPreviewPath`.
+  - Added embed-route handling for `allow_decrypted_external_preview`:
+    - Uses SMB-backed decrypted cache path when enabled.
+    - Keeps existing temp-cache behavior when disabled.
+    - Returns 503 if link requests decrypted mode but host path is not configured.
+
+Public contracts impacted
+- Existing endpoint `POST /api/files/:id/share` now accepts `allow_decrypted_external_preview`.
+- Existing share-link responses now include `allow_decrypted_external_preview`.
+- Existing embed route behavior is unchanged unless the new flag is enabled.
+
+Validation status
+- Type-check: PASSED (`pnpm lint`)
+- Build: PASSED (`pnpm build`)
+- Existing non-blocking baseline warnings remain unchanged:
+  - Vite native config warning about `__dirname` in `vite.config.ts`.
+  - esbuild warning for `import.meta` in CJS output.
+
+- Verify Share dialog behavior:
+  - second checkbox only functions when external preview is enabled.
+- Verify API create/update persists the new flag and returns it in links payload.
+- Verify embed with decrypted flag enabled writes/uses cache under configured SMB path.
+- Verify embed with decrypted flag disabled keeps existing temp-cache path behavior.
+- Verify misconfigured host (no `PUBLIC_SHARE_DECRYPTED_PREVIEW_PATH`) returns explicit error when decrypted mode is enabled.
+
+Handoff QaEngineer
+- Validate first-play latency improvement for large video embeds with decrypted mode enabled.
+
+agent: DevEngineer | date: 2026-08-13 | model: GPT-5.3-Codex
+plan: /memories/session/dev-plan.md
+---
+
 Addressed Chrome behavior where direct navigation to public `.mov` embed URLs triggers download instead of playback by serving a lightweight HTML player page for document navigations, while preserving raw media streaming for real video/embed fetches.
 
 Change class
@@ -12,7 +71,6 @@ STANDARD
 Files changed
 - src/server/routes/public-sharing.ts:
   - Added an HTML escape helper for safe player-page rendering.
-  - Added document-navigation detection (`sec-fetch-dest` / `accept`) and `raw=1` override.
   - For document navigations, returns an inline HTML `<video>` player that points to the same embed endpoint with `?raw=1`.
   - Preserved binary stream behavior for range/media requests used by `<video src>` and external embeds.
 
@@ -20,31 +78,17 @@ Public contracts impacted
 - No route shape changes.
 - Behavioral enhancement on `GET /api/public/share/:token/embed`:
   - Browser-navigation requests can return HTML player content.
-  - Media fetch requests continue returning binary bytes with range support.
-
-Validation status
 - Type-check: PASSED (`pnpm lint`)
 - Build: PASSED (`pnpm build`)
-
-Handoff TestEngineer
 - In Chrome, open the public embed URL directly and verify it renders player UI instead of immediate download.
 - Confirm playback attempts via player (`?raw=1` source) and seek/range behavior still works.
-- Confirm Firefox and external `<video src>` embeds remain unchanged.
 
 Handoff QaEngineer
-- Validate direct-link UX parity between Firefox and Chrome for public `.mov` embeds.
-
----
-agent: DevEngineer | date: 2026-08-13 | model: GPT-5.3-Codex
 plan: /memories/session/dev-plan.md
 ---
-
-Intent
 Fixed public external video embed playback failures for .mov files by implementing RFC-compliant single-range parsing, including suffix ranges (`bytes=-N`) commonly used during media probing.
-
 Change class
 STANDARD
-
 Files changed
 - src/server/routes/public-sharing.ts:
   - Added `parseSingleByteRange` helper supporting `bytes=N-`, `bytes=N-M`, and `bytes=-S` formats.
