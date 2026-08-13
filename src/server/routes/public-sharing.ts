@@ -27,6 +27,7 @@ interface ShareRow {
   download_count: number;
   is_active: boolean;
   allow_external_preview: boolean;
+  allow_decrypted_external_preview: boolean;
 }
 
 type DownloadPreparationPhase = 'decrypting' | 'verifying' | 'finalizing' | 'ready' | 'error';
@@ -104,12 +105,14 @@ function escapeHtml(value: string): string {
 export function createPublicSharingRouter(options: {
   vaultPath: string;
   tempPath: string;
+  decryptedPreviewPath?: string;
   profilePictureRoot?: string;
   logDownload: (req: express.Request, fileId: string, originalName: string, token: string) => Promise<void>;
 }): express.Router {
   const router = express.Router();
   const FACEBOOK_APP_ID = String(process.env.FACEBOOK_APP_ID || process.env.FB_APP_ID || '').trim();
   const EMBED_CACHE_PREFIX = 'leeku-embed-cache';
+  const DECRYPTED_EMBED_CACHE_PREFIX = 'leeku-external-decrypted';
   const EMBED_CACHE_TTL_MS = (() => {
     const fallback = 30 * 60_000;
     const raw = process.env.PUBLIC_SHARE_EMBED_CACHE_TTL_MS;
@@ -124,9 +127,14 @@ export function createPublicSharingRouter(options: {
   const embedCacheInflight = new Map<string, Promise<string>>();
   const downloadSessions = new Map<string, PublicDownloadSession>();
   let lastEmbedCacheSweep = 0;
+  const decryptedPreviewPath = options.decryptedPreviewPath ? path.resolve(options.decryptedPreviewPath) : null;
 
   if (!fs.existsSync(options.tempPath)) {
     fs.mkdirSync(options.tempPath, { recursive: true });
+  }
+
+  if (decryptedPreviewPath && !fs.existsSync(decryptedPreviewPath)) {
+    fs.mkdirSync(decryptedPreviewPath, { recursive: true });
   }
 
   const buildUniqueTempFilePath = (prefix: string, id: string): string => {
@@ -137,6 +145,13 @@ export function createPublicSharingRouter(options: {
   const getEmbedCachePath = (token: string, fileId: string): string => {
     const key = crypto.createHash('sha256').update(`${token}:${fileId}`).digest('hex').slice(0, 24);
     return path.join(options.tempPath, `${EMBED_CACHE_PREFIX}-${key}.tmp`);
+  };
+
+  const getDecryptedEmbedCachePath = (token: string, fileId: string, originalName: string): string => {
+    const key = crypto.createHash('sha256').update(`${token}:${fileId}`).digest('hex').slice(0, 24);
+    const extension = path.extname(originalName || '').slice(0, 12);
+    const suffix = extension ? extension.toLowerCase() : '.bin';
+    return path.join(decryptedPreviewPath || options.tempPath, `${DECRYPTED_EMBED_CACHE_PREFIX}-${key}${suffix}`);
   };
 
   const sweepEmbedCache = () => {
@@ -195,10 +210,15 @@ export function createPublicSharingRouter(options: {
     expectedSize: number,
     expectedChecksum: string,
   ): Promise<string> => {
+    const normalizedExpectedSize = Number(expectedSize);
     if (fs.existsSync(cachePath)) {
       try {
         const stat = fs.statSync(cachePath);
-        if (stat.size === expectedSize) return cachePath;
+        if (Number.isFinite(normalizedExpectedSize) && normalizedExpectedSize > 0) {
+          if (stat.size === normalizedExpectedSize) return cachePath;
+        } else if (stat.size > 0) {
+          return cachePath;
+        }
       } catch {
         // continue and regenerate
       }
@@ -330,7 +350,7 @@ const buildPromise = (async () => {
         original_name_encrypted: Buffer; original_name_iv: Buffer; original_name_auth_tag: Buffer;
         owner_username_encrypted: Buffer; owner_username_iv: Buffer; owner_username_auth_tag: Buffer;
       }>(
-        `SELECT sl.id,u.id AS owner_user_id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.allow_external_preview,
+        `SELECT sl.id,u.id AS owner_user_id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.allow_external_preview,sl.allow_decrypted_external_preview,
                 f.status AS file_status,f.leeku_vibe,f.mime_type,f.size_bytes,f.created_at AS file_created_at,f.stored_path,f.client_secret_hash,
                 f.original_name_encrypted,f.original_name_iv,f.original_name_auth_tag,
                 u.username_encrypted AS owner_username_encrypted,u.username_iv AS owner_username_iv,u.username_auth_tag AS owner_username_auth_tag
@@ -357,6 +377,7 @@ const buildPromise = (async () => {
         protected: !!row.password_hash,
         requires_secret_key: !!row.client_secret_hash,
         allow_external_preview: !!row.allow_external_preview,
+        allow_decrypted_external_preview: !!row.allow_decrypted_external_preview,
         uploader: decryptColumn(row.owner_username_encrypted, row.owner_username_iv, row.owner_username_auth_tag),
         leeku_vibe: row.leeku_vibe || '',
         downloads_current: row.download_count,
@@ -870,7 +891,11 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
     }
   });
 
-  router.get('/:token/embed', async (req, res) => {
+  const handleEmbedRoute = async (
+    req: express.Request,
+    res: express.Response,
+    forceDecryptedFromPath = false,
+  ) => {
     const token = getSingleParam(req.params.token);
     try {
       const request = await getRequest();
@@ -882,7 +907,7 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
         mime_type: string; size_bytes: number; checksum_sha256: string; file_id_join: string;
         encrypted_key: Buffer; key_iv: Buffer; key_auth_tag: Buffer; file_iv: Buffer; file_auth_tag: Buffer;
       }>(
-        `SELECT sl.id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.allow_external_preview,
+        `SELECT sl.id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.allow_external_preview,sl.allow_decrypted_external_preview,
                 f.id AS file_id_join,f.status AS file_status,f.stored_path,f.mime_type,f.size_bytes,f.checksum_sha256,
                 f.client_secret_hash,
                 f.original_name_encrypted,f.original_name_iv,f.original_name_auth_tag,
@@ -915,16 +940,38 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
       const rangeHeader = typeof req.headers.range === 'string' ? req.headers.range.trim() : '';
       const fetchDest = String(req.headers['sec-fetch-dest'] || '').trim().toLowerCase();
       const acceptHeader = String(req.headers.accept || '').toLowerCase();
+      const userAgent = String(req.get('user-agent') || '').toLowerCase();
+      const isCrawlerUa =
+        userAgent.includes('discordbot') ||
+        userAgent.includes('facebookexternalhit') ||
+        userAgent.includes('facebot') ||
+        userAgent.includes('meta-externalagent') ||
+        userAgent.includes('meta-externalfetcher') ||
+        userAgent.includes('metaexternalagent') ||
+        userAgent.includes('metaexternalfetcher') ||
+        userAgent.includes('twitterbot') ||
+        userAgent.includes('slackbot') ||
+        userAgent.includes('linkedinbot') ||
+        userAgent.includes('whatsapp');
       const rawMode = String(req.query.raw || '').trim() === '1';
+      const forceDecryptedMode = String(req.query.decrypted || '').trim() === '1';
       const compatMode = String(req.query.compat || '').trim() === '1';
       const streamMimeType = compatMode && normalizedMimeType === 'video/quicktime'
         ? 'video/mp4'
         : (normalizedMimeType || 'application/octet-stream');
       const isDocumentNavigation = fetchDest === 'document' || (fetchDest === '' && !rangeHeader && acceptHeader.includes('text/html'));
+      const originalName = decryptColumn(row.original_name_encrypted, row.original_name_iv, row.original_name_auth_tag);
+      const useDecryptedExternalPreview =
+        !!row.allow_decrypted_external_preview ||
+        forceDecryptedFromPath ||
+        forceDecryptedMode;
+      if (useDecryptedExternalPreview && !decryptedPreviewPath) {
+        return res.status(503).json({ error: 'Decrypted external preview is not configured on this host.' });
+      }
 
-      if (!rawMode && isDocumentNavigation) {
+      if (!rawMode && isDocumentNavigation && !isCrawlerUa) {
         const playerSrc = `${req.originalUrl}${req.originalUrl.includes('?') ? '&' : '?'}raw=1${normalizedMimeType === 'video/quicktime' ? '&compat=1' : ''}`;
-        const safeName = escapeHtml(decryptColumn(row.original_name_encrypted, row.original_name_iv, row.original_name_auth_tag));
+        const safeName = escapeHtml(originalName);
         const safeType = escapeHtml(normalizedMimeType || 'application/octet-stream');
         const safeStreamType = escapeHtml(streamMimeType);
 
@@ -968,11 +1015,14 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
       if (!reservation.rowsAffected[0]) return res.status(410).json({ error: 'Download limit reached or link expired.' });
 
       const fileKey = unwrapKey(row.encrypted_key, row.key_iv, row.key_auth_tag);
-      const originalName = decryptColumn(row.original_name_encrypted, row.original_name_iv, row.original_name_auth_tag);
       await options.logDownload(req, row.file_id_join, originalName, token);
 
-      sweepEmbedCache();
-      const cachePath = getEmbedCachePath(token, row.file_id_join);
+      const cachePath = useDecryptedExternalPreview
+        ? getDecryptedEmbedCachePath(token, row.file_id_join, originalName)
+        : getEmbedCachePath(token, row.file_id_join);
+      if (!useDecryptedExternalPreview) {
+        sweepEmbedCache();
+      }
       const cacheKey = `${token}:${row.file_id_join}`;
       
       await ensureEmbedCacheFile(
@@ -1011,6 +1061,7 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
       res.setHeader('Content-Type', streamMimeType);
       res.setHeader('Content-Disposition', `inline; filename="${originalName.replace(/"/g, '\\"')}"`);
       res.setHeader('Accept-Ranges', 'bytes');
+      res.setHeader('X-Leeku-External-Preview-Mode', useDecryptedExternalPreview ? 'decrypted' : 'standard');
 
       // ------------------------------------------
       // CASE 1: Handle HTTP Range Requests (Seeking/Buffering)
@@ -1073,7 +1124,14 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
         res.status(500).json({ error: 'External preview failed.' });
       }
     }
+  };
 
+  router.get('/:token/embed', async (req, res) => {
+    await handleEmbedRoute(req, res, false);
+  });
+
+  router.get('/:token/dec_embed', async (req, res) => {
+    await handleEmbedRoute(req, res, true);
   });
 
   return router;
