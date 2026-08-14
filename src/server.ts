@@ -60,7 +60,7 @@ import {
 } from './server/middleware/maintenance-mode.js';
 import { createSessionRouter } from './server/routes/sessions.js';
 import { createHealthRouter } from './server/routes/health.js';
-import { createPublicSharingRouter } from './server/routes/public-sharing.js';
+import { cleanupPublicShareDecryptedPreviewFiles, createPublicSharingRouter } from './server/routes/public-sharing.js';
 import { createPublicFolderSharingRouter } from './server/routes/public-folder-sharing.js';
 import { createMaintenanceModeRouter } from './server/routes/maintenance-mode.js';
 import { createDesktopUpdatesRouter, SYSTEM_UPDATE_FOLDER_NAME } from './server/routes/desktop-updates.js';
@@ -3666,8 +3666,8 @@ const removeSharingLink = async (req: AuthenticatedRequest, res: express.Respons
   try {
     const findRequest = await getRequest();
     findRequest.input('id', sql.UniqueIdentifier, linkId);
-    const result = await findRequest.query<{file_id:string;owner_user_id:string}>(
-      `SELECT sl.file_id,f.owner_user_id
+    const result = await findRequest.query<{file_id:string;public_token:string;owner_user_id:string}>(
+      `SELECT sl.file_id,sl.public_token,f.owner_user_id
        FROM share_links sl INNER JOIN files f ON sl.file_id=f.id
        WHERE sl.id=@id`
     );
@@ -3679,6 +3679,10 @@ const removeSharingLink = async (req: AuthenticatedRequest, res: express.Respons
     const deleteRequest = await getRequest();
     deleteRequest.input('id', sql.UniqueIdentifier, linkId);
     await deleteRequest.query('DELETE FROM share_links WHERE id=@id');
+
+    if (PUBLIC_SHARE_DECRYPTED_PREVIEW_PATH) {
+      cleanupPublicShareDecryptedPreviewFiles(PUBLIC_SHARE_DECRYPTED_PREVIEW_PATH, link.public_token, link.file_id);
+    }
 
     await logSystemEvent(req.userId!, req.user!.username, 'Delete', 'ShareLink', linkId, req, `Removed share link for file ${link.file_id}.`);
     res.json({ success: true });

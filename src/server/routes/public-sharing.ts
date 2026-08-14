@@ -101,6 +101,35 @@ function escapeHtml(value: string): string {
     .replace(/'/g, '&#39;');
 }
 
+export function cleanupPublicShareDecryptedPreviewFiles(rootPath: string, token: string, fileId: string): number {
+  if (!rootPath || !token || !fileId) return 0;
+
+  const normalizedRoot = path.resolve(rootPath);
+  try {
+    const entries = fs.readdirSync(normalizedRoot, { withFileTypes: true });
+    const key = crypto.createHash('sha256').update(`${token}:${fileId}`).digest('hex').slice(0, 24);
+    const prefix = `leeku-external-decrypted-${key}`;
+    let removed = 0;
+
+    for (const entry of entries) {
+      if (!entry.isFile()) continue;
+      if (!entry.name.startsWith(prefix)) continue;
+
+      const fullPath = path.join(normalizedRoot, entry.name);
+      try {
+        fs.unlinkSync(fullPath);
+        removed += 1;
+      } catch {
+        // best-effort cleanup only
+      }
+    }
+
+    return removed;
+  } catch {
+    return 0;
+  }
+}
+
 export function createPublicSharingRouter(options: {
   vaultPath: string;
   tempPath: string;
