@@ -1040,6 +1040,7 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
         const sizeLabel = ogFormatBytes(Number(row.size_bytes || 0));
         const previewUrl = `${req.protocol}://${req.get('host') || 'leeks.miku.rip'}${req.originalUrl}`;
         const directUrl = `${req.protocol}://${req.get('host') || 'leeks.miku.rip'}${req.originalUrl}`;
+        const playerUrl = `${directUrl}${directUrl.includes('?') ? '&' : '?'}raw=1${normalizedMimeType === 'video/quicktime' ? '&compat=1' : ''}`;
         const profileImageUrl = resolveProfilePictureOgImageUrl(req.protocol + '://' + (req.get('host') || 'leeks.miku.rip'), row.owner_user_id);
         const ogImageUrl = profileImageUrl || resolveOgImageUrl(req.protocol + '://' + (req.get('host') || 'leeks.miku.rip'));
         const safeName = escapeHtml(originalName);
@@ -1048,6 +1049,7 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
         const safeDescription = escapeHtml(`${safeFileType} · ${sizeLabel} · Shared by ${uploader}`);
         const safePreviewUrl = escapeHtml(previewUrl);
         const safeDirectUrl = escapeHtml(directUrl);
+        const safePlayerUrl = escapeHtml(playerUrl);
         const safeOgImageUrl = ogImageUrl ? escapeHtml(ogImageUrl) : null;
         const ogTitle = `${safeName} - Shared by ${safeUploader}`;
 
@@ -1060,19 +1062,30 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
 <title>${ogTitle}</title>
 <meta property="og:title" content="${ogTitle}" />
 <meta property="og:description" content="${safeDescription}" />
-<meta property="og:type" content="website" />
+<meta property="og:type" content="video.other" />
 <meta property="og:url" content="${safePreviewUrl}" />
 <meta property="og:site_name" content="Leeku Secure" />
 <meta property="og:locale" content="en_US" />
+<meta property="og:video" content="${safePlayerUrl}" />
+<meta property="og:video:url" content="${safePlayerUrl}" />
+<meta property="og:video:secure_url" content="${safePlayerUrl}" />
+<meta property="og:video:type" content="${safeFileType}" />
+<meta property="og:video:width" content="1280" />
+<meta property="og:video:height" content="720" />
 ${safeOgImageUrl ? `<meta property="og:image" content="${safeOgImageUrl}" />` : ''}
 ${safeOgImageUrl ? `<meta property="og:image:secure_url" content="${safeOgImageUrl}" />` : ''}
 ${safeOgImageUrl ? '<meta property="og:image:type" content="image/png" />' : ''}
 ${safeOgImageUrl ? '<meta property="og:image:width" content="380" />' : ''}
 ${safeOgImageUrl ? '<meta property="og:image:height" content="380" />' : ''}
-<meta name="twitter:card" content="summary" />
+<meta name="twitter:card" content="player" />
 <meta name="twitter:title" content="${ogTitle}" />
 <meta name="twitter:description" content="${safeDescription}" />
 ${safeOgImageUrl ? `<meta name="twitter:image" content="${safeOgImageUrl}" />` : ''}
+<meta name="twitter:player" content="${safePlayerUrl}" />
+<meta name="twitter:player:stream" content="${safePlayerUrl}" />
+<meta name="twitter:player:stream:content_type" content="${safeFileType}" />
+<meta name="twitter:player:width" content="1280" />
+<meta name="twitter:player:height" content="720" />
 <link rel="canonical" href="${safePreviewUrl}" />
 </head>
 <body>
