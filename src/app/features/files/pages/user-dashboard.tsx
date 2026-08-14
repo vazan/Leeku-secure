@@ -57,6 +57,10 @@ import FileTypeIcon, {
 } from "@/app/shared/components/common/file-type-icon";
 import type { TextFilePreviewData } from "@/app/shared/components/common/text-file-preview";
 import { downloadWithProgress } from "@/app/shared/utils/download-with-progress";
+import {
+  getVideoEmbedWarningMessage,
+  shouldShowVideoEmbedWarning,
+} from "@/app/shared/utils/video-embed-warning";
 
 const TextFilePreview = React.lazy(
   () => import("@/app/shared/components/common/text-file-preview"),
@@ -3296,6 +3300,13 @@ function ShareDialog(props: {
   const [isReadOnly, setIsReadOnly] = useState(true);
   const [password, setPassword] = useState('');
 
+  const showVideoEmbedWarning = shouldShowVideoEmbedWarning({
+    mime_type: props.file.mime_type,
+    size: props.file.size,
+    allowExternalPreview: props.allowExternalPreview,
+    allowDecryptedExternalPreview: props.allowDecryptedExternalPreview,
+  });
+
   useEffect(() => {
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key === "Escape") props.onClose();
@@ -3440,6 +3451,11 @@ function ShareDialog(props: {
                 </span>
               </span>
             </label>
+            {showVideoEmbedWarning && (
+              <div className="mt-3 rounded-lg border border-yellow-400/60 bg-yellow-500/10 px-3 py-2 text-sm text-yellow-100">
+                {getVideoEmbedWarningMessage()}
+              </div>
+            )}
           </>
         )}
         {props.url && (
