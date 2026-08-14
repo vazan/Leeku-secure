@@ -1018,6 +1018,10 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
         : (normalizedMimeType || 'application/octet-stream');
       const isDocumentNavigation = fetchDest === 'document' || (fetchDest === '' && !rangeHeader && acceptHeader.includes('text/html'));
       const originalName = decryptColumn(row.original_name_encrypted, row.original_name_iv, row.original_name_auth_tag);
+      const requestedDecryptedPreview = forceDecryptedFromPath || forceDecryptedMode;
+      if (requestedDecryptedPreview && !row.allow_decrypted_external_preview) {
+        return res.status(403).json({ error: 'Decrypted external preview is not enabled for this share link.' });
+      }
       const useDecryptedExternalPreview =
         !!row.allow_decrypted_external_preview ||
         forceDecryptedFromPath ||
