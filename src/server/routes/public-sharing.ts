@@ -102,6 +102,29 @@ function escapeHtml(value: string): string {
     .replace(/'/g, '&#39;');
 }
 
+export const DISCORD_INLINE_VIDEO_LIMIT_BYTES = 50 * 1024 * 1024;
+
+export function shouldServeLargeVideoHtmlFallback(input: {
+  mimeType: string;
+  sizeBytes: number;
+  userAgent: string;
+  acceptHeader: string;
+  fetchDest: string;
+  rangeHeader: string;
+  rawMode: boolean;
+}): boolean {
+  if (input.rawMode || input.rangeHeader) return false;
+  if (!input.mimeType || !input.mimeType.toLowerCase().startsWith('video/')) return false;
+
+  const sizeBytes = Number(input.sizeBytes ?? 0);
+  if (!Number.isFinite(sizeBytes) || sizeBytes <= DISCORD_INLINE_VIDEO_LIMIT_BYTES) return false;
+
+  const userAgent = input.userAgent.toLowerCase();
+  const isCrawlerUa = /discordbot|facebookexternalhit|facebot|meta-externalagent|meta-externalfetcher|twitterbot|slackbot|linkedinbot|whatsapp/.test(userAgent);
+
+  return isCrawlerUa;
+}
+
 export function cleanupPublicShareDecryptedPreviewFiles(rootPath: string, token: string, fileId: string): number {
   if (!rootPath || !token || !fileId) return 0;
 
@@ -933,16 +956,21 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
         file_status: string; stored_path: string;
         client_secret_hash: string | null;
         original_name_encrypted: Buffer; original_name_iv: Buffer; original_name_auth_tag: Buffer;
+        owner_username_encrypted: Buffer; owner_username_iv: Buffer; owner_username_auth_tag: Buffer;
+        owner_user_id: string;
         mime_type: string; size_bytes: number; checksum_sha256: string; file_id_join: string;
         encrypted_key: Buffer; key_iv: Buffer; key_auth_tag: Buffer; file_iv: Buffer; file_auth_tag: Buffer;
       }>(
         `SELECT sl.id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.allow_external_preview,sl.allow_decrypted_external_preview,
+                u.id AS owner_user_id,
                 f.id AS file_id_join,f.status AS file_status,f.stored_path,f.mime_type,f.size_bytes,f.checksum_sha256,
                 f.client_secret_hash,
                 f.original_name_encrypted,f.original_name_iv,f.original_name_auth_tag,
+                u.username_encrypted AS owner_username_encrypted,u.username_iv AS owner_username_iv,u.username_auth_tag AS owner_username_auth_tag,
                 k.encrypted_key,k.key_iv,k.key_auth_tag,k.file_iv,k.file_auth_tag
          FROM share_links sl
          INNER JOIN files f ON sl.file_id=f.id
+         INNER JOIN users u ON f.owner_user_id=u.id
          INNER JOIN file_encryption_keys k ON f.id=k.file_id
          WHERE sl.public_token=@tok`
       );
@@ -996,6 +1024,63 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
         forceDecryptedMode;
       if (useDecryptedExternalPreview && !decryptedPreviewPath) {
         return res.status(503).json({ error: 'Decrypted external preview is not configured on this host.' });
+      }
+
+      const shouldUseLargeVideoHtmlFallback = shouldServeLargeVideoHtmlFallback({
+        mimeType: normalizedMimeType,
+        sizeBytes: Number(row.size_bytes || 0),
+        userAgent,
+        acceptHeader,
+        fetchDest,
+        rangeHeader,
+        rawMode,
+      });
+
+      if (!rawMode && shouldUseLargeVideoHtmlFallback) {
+        const uploader = decryptColumn(row.owner_username_encrypted, row.owner_username_iv, row.owner_username_auth_tag);
+        const sizeLabel = ogFormatBytes(Number(row.size_bytes || 0));
+        const previewUrl = `${req.protocol}://${req.get('host') || 'leeks.miku.rip'}${req.originalUrl}`;
+        const directUrl = `${req.protocol}://${req.get('host') || 'leeks.miku.rip'}${req.originalUrl}`;
+        const profileImageUrl = resolveProfilePictureOgImageUrl(req.protocol + '://' + (req.get('host') || 'leeks.miku.rip'), row.owner_user_id);
+        const ogImageUrl = profileImageUrl || resolveOgImageUrl(req.protocol + '://' + (req.get('host') || 'leeks.miku.rip'));
+        const safeName = escapeHtml(originalName);
+        const safeUploader = escapeHtml(uploader);
+        const safeFileType = escapeHtml(normalizedMimeType || 'video/mp4');
+        const safeDescription = escapeHtml(`${safeFileType} · ${sizeLabel} · Shared by ${uploader}`);
+        const safePreviewUrl = escapeHtml(previewUrl);
+        const safeDirectUrl = escapeHtml(directUrl);
+        const safeOgImageUrl = ogImageUrl ? escapeHtml(ogImageUrl) : null;
+        const ogTitle = `${safeName} - Shared by ${safeUploader}`;
+
+        res.setHeader('Cache-Control', 'no-store, max-age=0');
+        return res.status(200).type('html').send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>${ogTitle}</title>
+<meta property="og:title" content="${ogTitle}" />
+<meta property="og:description" content="${safeDescription}" />
+<meta property="og:type" content="website" />
+<meta property="og:url" content="${safePreviewUrl}" />
+<meta property="og:site_name" content="Leeku Secure" />
+<meta property="og:locale" content="en_US" />
+${safeOgImageUrl ? `<meta property="og:image" content="${safeOgImageUrl}" />` : ''}
+${safeOgImageUrl ? `<meta property="og:image:secure_url" content="${safeOgImageUrl}" />` : ''}
+${safeOgImageUrl ? '<meta property="og:image:type" content="image/png" />' : ''}
+${safeOgImageUrl ? '<meta property="og:image:width" content="380" />' : ''}
+${safeOgImageUrl ? '<meta property="og:image:height" content="380" />' : ''}
+<meta name="twitter:card" content="summary" />
+<meta name="twitter:title" content="${ogTitle}" />
+<meta name="twitter:description" content="${safeDescription}" />
+${safeOgImageUrl ? `<meta name="twitter:image" content="${safeOgImageUrl}" />` : ''}
+<link rel="canonical" href="${safePreviewUrl}" />
+</head>
+<body>
+<p><a href="${safeDirectUrl}">${safeName}</a></p>
+<p>Shared by ${safeUploader} · ${sizeLabel}</p>
+</body>
+</html>`);
       }
 
       if (!rawMode && isDocumentNavigation && !isCrawlerUa) {
