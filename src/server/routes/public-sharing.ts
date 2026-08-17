@@ -101,6 +101,30 @@ function escapeHtml(value: string): string {
     .replace(/'/g, '&#39;');
 }
 
+function encodeContentDispositionFilename(name: string): string {
+  const normalized = String(name || '')
+    .replace(/[\r\n]/g, ' ')
+    .replace(/[\\/]/g, '_')
+    .replace(/[\x00-\x1F\x7F]/g, '')
+    .trim();
+
+  const safeName = normalized || 'download';
+  const asciiFallback = safeName
+    .replace(/[^\x20-\x7E]/g, '_')
+    .replace(/["\\;]/g, '_')
+    .trim() || 'download';
+
+  const encodedUtf8 = encodeURIComponent(safeName)
+    .replace(/['()*]/g, (ch) => `%${ch.charCodeAt(0).toString(16).toUpperCase()}`)
+    .replace(/%(7C|60|5E)/g, (segment) => segment.toLowerCase());
+
+  return `filename="${asciiFallback}"; filename*=UTF-8''${encodedUtf8}`;
+}
+
+function buildContentDisposition(dispositionType: 'attachment' | 'inline', name: string): string {
+  return `${dispositionType}; ${encodeContentDispositionFilename(name)}`;
+}
+
 export const DISCORD_INLINE_VIDEO_LIMIT_BYTES = 50 * 1024 * 1024;
 
 export function shouldServeLargeVideoHtmlFallback(input: {
@@ -918,7 +942,7 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
       }
 
       res.setHeader('Content-Type', session.mimeType);
-      res.setHeader('Content-Disposition', `attachment; filename="${session.originalName.replace(/"/g, '\\"')}"`);
+      res.setHeader('Content-Disposition', buildContentDisposition('attachment', session.originalName));
       res.setHeader('Content-Length', fileSize);
 
       const stream = fs.createReadStream(session.tempFile);
@@ -1189,7 +1213,7 @@ ${safeOgImageUrl ? `<meta name="twitter:image" content="${safeOgImageUrl}" />` :
       }
 
       res.setHeader('Content-Type', streamMimeType);
-      res.setHeader('Content-Disposition', `inline; filename="${originalName.replace(/"/g, '\\"')}"`);
+      res.setHeader('Content-Disposition', buildContentDisposition('inline', originalName));
       res.setHeader('Accept-Ranges', 'bytes');
       res.setHeader('X-Leeku-External-Preview-Mode', useDecryptedExternalPreview ? 'decrypted' : 'standard');
 
