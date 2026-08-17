@@ -1,4 +1,48 @@
 ---
+agent: DevEngineer | date: 2026-08-17 | model: GPT-5.3-Codex
+plan: /memories/session/dev-plan.md
+---
+
+Intent
+Fixed public-share download failures for files with Japanese/non-ASCII names by making `Content-Disposition` header generation RFC-compliant and header-safe.
+
+Change class
+STANDARD
+
+Files changed
+- src/server/routes/public-sharing.ts:
+  - Added `encodeContentDispositionFilename` helper that:
+    - strips CR/LF/control chars and path separators,
+    - emits an ASCII-safe `filename="..."` fallback,
+    - emits UTF-8 `filename*=` (RFC 5987) for full Unicode names.
+  - Added `buildContentDisposition` helper.
+  - Replaced direct header construction in:
+    - `GET /api/public/share/:token/download/:downloadId/file` (`attachment`)
+    - `GET /api/public/share/:token/embed` (`inline`)
+
+Public contracts impacted
+- No route shape changes.
+- Behavioral fix: Unicode filenames are now served without `ERR_INVALID_CHAR` header failures.
+
+Validation status
+- Build: PASSED (`pnpm run build`)
+- Type-check: PASSED (`pnpm run lint && pnpm exec tsc --noEmit`)
+- Existing non-blocking baseline warnings unchanged:
+  - Vite config native warning about `__dirname`.
+  - esbuild CJS warning for `import.meta`.
+
+Handoff TestEngineer
+- Verify downloads succeed for filenames containing:
+  - Japanese scripts (e.g. `レポート2026年8月.pdf`)
+  - mixed ASCII + Unicode + spaces
+  - emoji and punctuation edge cases
+- Verify browser save dialog shows correct Unicode name while fallback remains safe.
+- Verify embed inline path still streams media with `Content-Disposition: inline`.
+
+Handoff QaEngineer
+- Validate end-to-end public share download and embed behavior across target browsers with Unicode filenames.
+
+---
 
 ---
 agent: DevEngineer | date: 2026-08-13 | model: GPT-5.3-Codex
