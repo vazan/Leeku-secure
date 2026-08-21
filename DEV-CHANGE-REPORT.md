@@ -1,4 +1,262 @@
 ---
+agent: DevEngineer | date: 2026-08-21 | model: GPT-5.3-Codex
+plan: /memories/session/dev-plan.md
+---
+
+Intent
+Added share-dialog readiness feedback for decrypted external preview video links by introducing server warmup mode and a UI progress bar while cache preparation completes.
+
+Change class
+STANDARD
+
+Files changed
+- src/server/routes/public-sharing.ts:
+  - Added `warmup=1` mode for `*_embed_media` handling.
+  - Warmup mode prepares cache via `ensureEmbedCacheFile` and returns JSON readiness without consuming download counts or streaming media.
+- src/app/features/files/pages/user-dashboard.tsx:
+  - Added `shareSubmitting` and `shareWarmupProgress` state.
+  - After share creation (when decrypted external preview + video), calls `/api/public/share/:token/dec_embed_media?warmup=1` and shows progress bar until completion.
+  - Disabled Create/Cancel actions while submission/warmup is in progress and updated button labels.
+
+Public contracts impacted
+- Existing route shapes preserved.
+- Additive behavior: `GET /api/public/share/:token/dec_embed_media?warmup=1` returns readiness JSON.
+
+Validation status
+- Type-check: PASSED (`pnpm -s tsc --noEmit`)
+- Targeted tests: PASSED (`pnpm -s tsx --test tests/public-share-embed-crawler.test.ts tests/public-share-cache-cleanup.test.ts tests/share-video-warning.test.ts`)
+
+Handoff TestEngineer
+- Verify share dialog shows progress bar after Create Link for decrypted external preview video links.
+- Verify success path transitions to “Share link ready.” once warmup completes.
+
+Handoff QaEngineer
+- Validate first Discord play attempt without manual link open while using the new readiness flow.
+
+---
+
+---
+agent: DevEngineer | date: 2026-08-21 | model: GPT-5.3-Codex
+plan: /memories/session/dev-plan.md
+---
+
+Intent
+Addressed Discord first-play failures by warming embed cache files in the background when crawler metadata HTML is served.
+
+Change class
+STANDARD
+
+Files changed
+- src/server/routes/public-sharing.ts:
+  - Added `warmEmbedCacheInBackground` in embed handler.
+  - On crawler HTML fallback responses, starts asynchronous cache preparation (`ensureEmbedCacheFile`) for the media stream target.
+  - Keeps existing response shape and legacy routes unchanged.
+
+Public contracts impacted
+- No route shape changes.
+- Behavioral improvement: cache file can be prepared during crawler unfurl phase, reducing dependency on first human click.
+
+Validation status
+- Type-check: PASSED (`pnpm -s tsc --noEmit`)
+- Targeted tests: PASSED (`pnpm -s tsx --test tests/public-share-embed-crawler.test.ts tests/public-share-cache-cleanup.test.ts tests/share-video-warning.test.ts`)
+
+Handoff TestEngineer
+- Verify first Discord play attempt succeeds without opening the link in browser first.
+
+Handoff QaEngineer
+- Confirm no regressions in non-crawler embed streaming paths.
+
+---
+
+---
+agent: DevEngineer | date: 2026-08-21 | model: GPT-5.3-Codex
+plan: /memories/session/dev-plan.md
+---
+
+Intent
+Resolved Discord player-click no-op behavior by removing dependency on `?raw=1` query parsing for embed playback and introducing explicit media-stream routes.
+
+Change class
+STANDARD
+
+Files changed
+- src/server/routes/public-sharing.ts:
+  - Extended embed handler with `forceRawFromPath` mode.
+  - Added dedicated always-stream routes:
+    - `/api/public/share/:token/embed_media`
+    - `/api/public/share/:token/dec_embed_media`
+  - Updated crawler metadata tags (`og:video`, `twitter:player`, `twitter:player:stream`) to target the new media routes.
+  - Updated direct browser HTML player source to use new media routes.
+
+Public contracts impacted
+- Existing `/embed` and `/dec_embed` routes preserved.
+- New additive stream endpoints provide deterministic media behavior for third-party player contexts.
+
+Validation status
+- Type-check: PASSED (`pnpm -s tsc --noEmit`)
+- Targeted tests: PASSED (`pnpm -s tsx --test tests/public-share-embed-crawler.test.ts tests/public-share-cache-cleanup.test.ts tests/share-video-warning.test.ts`)
+
+Handoff TestEngineer
+- Verify Discord embed card metadata points to `/dec_embed_media`.
+- Verify Discord play button starts playback without click-through fallback.
+
+Handoff QaEngineer
+- Validate social embed playback stability with both old and newly generated share tokens.
+
+---
+
+---
+agent: DevEngineer | date: 2026-08-21 | model: GPT-5.3-Codex
+plan: /memories/session/dev-plan.md
+---
+
+Intent
+Addressed remaining Discord unfurl misses by allowing crawler video metadata fallback even when crawler requests include a `Range` header.
+
+Change class
+STANDARD
+
+Files changed
+- src/server/routes/public-sharing.ts:
+  - Updated `shouldServeLargeVideoHtmlFallback` to ignore `rangeHeader` for crawler user-agents.
+  - Crawler unfurl requests now consistently receive metadata HTML unless `raw=1` is explicitly requested.
+- tests/public-share-embed-crawler.test.ts:
+  - Updated crawler range-case assertion to expect metadata HTML fallback.
+
+Public contracts impacted
+- No route shape changes.
+- Behavioral fix: Discord crawler probe patterns with `Range` still receive OG/Twitter metadata HTML.
+
+Validation status
+- Type-check: PASSED (`pnpm -s tsc --noEmit`)
+- Targeted tests: PASSED (`pnpm -s tsx --test tests/public-share-embed-crawler.test.ts tests/public-share-cache-cleanup.test.ts tests/share-video-warning.test.ts`)
+
+Handoff TestEngineer
+- Verify Discord unfurl appears when crawler sends `Range` and when it does not.
+
+Handoff QaEngineer
+- Confirm stability of social unfurl behavior on `/dec_embed` across repeated reposts.
+
+---
+
+---
+agent: DevEngineer | date: 2026-08-21 | model: GPT-5.3-Codex
+plan: /memories/session/dev-plan.md
+---
+
+Intent
+Restored Discord/social video unfurls after the cross-site navigation fix by ensuring crawler requests always receive metadata HTML for video embed URLs.
+
+Change class
+STANDARD
+
+Files changed
+- src/server/routes/public-sharing.ts:
+  - Updated `shouldServeLargeVideoHtmlFallback` to always return HTML card mode for crawler user-agents on non-raw, non-range video requests, regardless of file size.
+  - Preserves raw/range streaming behavior for actual player fetches.
+- tests/public-share-embed-crawler.test.ts:
+  - Updated expectations to assert crawler HTML-card behavior for small videos.
+
+Public contracts impacted
+- No route shape changes.
+- Behavioral fix: Discord/social crawlers can again discover `twitter:player`/`og:video` metadata for video links.
+
+Validation status
+- Type-check: PASSED (`pnpm -s tsc --noEmit`)
+- Targeted tests: PASSED (`pnpm -s tsx --test tests/public-share-embed-crawler.test.ts tests/public-share-cache-cleanup.test.ts tests/share-video-warning.test.ts`)
+
+Handoff TestEngineer
+- Verify Discord unfurl appears for both small and large video files.
+- Verify inline playback still requests media stream endpoints (`raw=1`/range) and starts without click-through.
+
+Handoff QaEngineer
+- Re-run social embed compatibility matrix for Discord/Facebook/Twitter on `/dec_embed` links.
+
+---
+
+---
+agent: DevEngineer | date: 2026-08-21 | model: GPT-5.3-Codex
+plan: /memories/session/dev-plan.md
+---
+
+Intent
+Fixed Discord inline player stalls for public `/dec_embed` links by preventing cross-site navigations from receiving the HTML player shell.
+
+Change class
+STANDARD
+
+Files changed
+- src/server/routes/public-sharing.ts:
+  - Added `sec-fetch-site` awareness in embed request classification.
+  - Tightened document-navigation heuristic fallback (`fetchDest === ''`) to only first-party style navigations (`sec-fetch-site: none`).
+  - Skipped HTML player shell response for cross-site navigations so embedded contexts receive raw media streams.
+
+Public contracts impacted
+- No route shape changes.
+- Existing `/api/public/share/:token/embed` and `/api/public/share/:token/dec_embed` handlers remain unchanged.
+- Behavioral fix: cross-site embedded players now get stream responses instead of HTML shell responses.
+
+Validation status
+- Type-check: PASSED (`pnpm -s tsc --noEmit`)
+- Build: PASSED (`pnpm -s build`)
+- Targeted tests: PASSED (`pnpm -s tsx --test tests/public-share-embed-crawler.test.ts tests/public-share-cache-cleanup.test.ts tests/share-video-warning.test.ts`)
+
+Handoff TestEngineer
+- Validate Discord inline playback on `/dec_embed` without requiring user click-through.
+- Confirm direct browser navigation to embed URLs still renders HTML player shell for non-crawler first-party requests.
+
+Handoff QaEngineer
+- Re-run social embed smoke tests (Discord/Facebook/Twitter cards) for video links and confirm no regressions.
+
+---
+
+---
+agent: DevEngineer | date: 2026-08-21 | model: GPT-5.3-Codex
+plan: /memories/session/dev-plan.md
+---
+
+Intent
+Changed media share-link configuration so image/video external preview requests are normalized to decrypted external preview only, while preserving legacy `/embed` routing code for potential rollback.
+
+Change class
+STANDARD
+
+Files changed
+- src/server.ts:
+  - In `POST /api/files/:id/share` create/update flow, added media-aware normalization:
+    - when external preview is requested for image/video, both `allow_external_preview` and `allow_decrypted_external_preview` are forced to `true`.
+  - Update flow now persists normalized flags even if only one flag was sent by older clients.
+- src/app/features/files/pages/user-dashboard.tsx:
+  - Share dialog for image/video now exposes only one preview option: `Allow decrypted external preview`.
+  - Save payload now mirrors that single option into both API flags.
+  - URL generation continues to support old `/embed` links where stored flags still require it.
+
+Public contracts impacted
+- No route shape changes.
+- Existing `/api/public/share/:token/embed` and `/api/public/share/:token/dec_embed` handlers remain in place.
+- Behavioral change: new/updated image/video external preview shares are persisted in decrypted-preview mode.
+
+Validation status
+- Build: PASSED (`pnpm -s build`)
+- Lint: PASSED (`pnpm -s lint`)
+- Type-check: PASSED (`pnpm -s tsc --noEmit`)
+- Targeted tests: PASSED (`pnpm -s tsx --test tests/public-share-embed-crawler.test.ts tests/public-share-cache-cleanup.test.ts tests/share-video-warning.test.ts`)
+- Existing non-blocking baseline warnings unchanged:
+  - Vite config native warning about `__dirname`.
+  - esbuild CJS warning for `import.meta`.
+
+Handoff TestEngineer
+- Verify share dialog for image/video presents only decrypted external preview toggle.
+- Verify enabling it creates a link that resolves to `/dec_embed`.
+- Verify disabling it yields standard `/s/:token` share link behavior.
+- Verify legacy links already in `/embed` mode remain functional until explicitly updated.
+
+Handoff QaEngineer
+- Validate end-to-end image/video sharing UX and confirm no regression for non-media share flows.
+
+---
+
+---
 agent: DevEngineer | date: 2026-08-17 | model: GPT-5.3-Codex
 plan: /memories/session/dev-plan.md
 ---

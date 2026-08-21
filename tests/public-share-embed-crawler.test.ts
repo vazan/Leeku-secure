@@ -17,7 +17,7 @@ test('returns the HTML fallback for large Discord inline video previews', () => 
   );
 });
 
-test('keeps direct small-video streams and raw requests as media streams', () => {
+test('serves metadata HTML to crawlers and keeps raw/non-crawler requests as media streams', () => {
   assert.equal(
     shouldServeLargeVideoHtmlFallback({
       mimeType: 'video/mp4',
@@ -28,7 +28,7 @@ test('keeps direct small-video streams and raw requests as media streams', () =>
       rangeHeader: '',
       rawMode: false,
     }),
-    false,
+    true,
   );
 
   assert.equal(
@@ -41,7 +41,7 @@ test('keeps direct small-video streams and raw requests as media streams', () =>
       rangeHeader: 'bytes=0-1023',
       rawMode: false,
     }),
-    false,
+    true,
   );
 
   assert.equal(
