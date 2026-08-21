@@ -1173,7 +1173,10 @@ ${safeOgImageUrl ? `<meta name="twitter:image" content="${safeOgImageUrl}" />` :
 </html>`);
       }
 
-      if (!rawMode && isDocumentNavigation && !isCrawlerUa && !isCrossSiteNavigation) {
+      // Only videos need the HTML player shell; images stream inline and render natively.
+      const isVideoMimeType = normalizedMimeType.startsWith('video/');
+
+      if (!rawMode && isVideoMimeType && isDocumentNavigation && !isCrawlerUa && !isCrossSiteNavigation) {
         const playerSrc = `${mediaStreamPath}${normalizedMimeType === 'video/quicktime' ? '?compat=1' : ''}`;
         const safeName = escapeHtml(originalName);
         const safeType = escapeHtml(normalizedMimeType || 'application/octet-stream');
