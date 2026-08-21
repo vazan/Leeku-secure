@@ -117,6 +117,7 @@ const HTTP_HEADERS_TIMEOUT_MS = parseNonNegativeIntEnv('HTTP_HEADERS_TIMEOUT_MS'
 const HTTP_KEEP_ALIVE_TIMEOUT_MS = parseNonNegativeIntEnv('HTTP_KEEP_ALIVE_TIMEOUT_MS', 5_000);
 const HTTP_SOCKET_TIMEOUT_MS = parseNonNegativeIntEnv('HTTP_SOCKET_TIMEOUT_MS', 0);
 const UNC_SHARE_HEALTHCHECK_INTERVAL_MS = parseNonNegativeIntEnv('UNC_SHARE_HEALTHCHECK_INTERVAL_MS', 5 * 60_000);
+const VIDEO_EMBED_MAX_SIZE_BYTES = 950 * 1024 * 1024;
 const ALLOW_UNSCANNED_UPLOADS_IN_DEVELOPMENT =
   NODE_ENV === 'development' && process.env.ALLOW_UNSCANNED_UPLOADS_IN_DEVELOPMENT !== 'false';
 
@@ -3815,8 +3816,8 @@ app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, asy
   const { password, expires_at, max_downloads, is_active, allow_external_preview, allow_decrypted_external_preview } = req.body;
   try {
     const fReq = await getRequest(); fReq.input('id', sql.UniqueIdentifier, fileId);
-    const fRes = await fReq.query<{owner_user_id:string;status:string;stored_path:string;mime_type:string;client_secret_hash:string|null}>(
-      'SELECT owner_user_id,status,stored_path,mime_type,client_secret_hash FROM files WHERE id=@id'
+    const fRes = await fReq.query<{owner_user_id:string;status:string;stored_path:string;mime_type:string;size:number;client_secret_hash:string|null}>(
+      'SELECT owner_user_id,status,stored_path,mime_type,size_bytes AS size,client_secret_hash FROM files WHERE id=@id'
     );
     if (!fRes.recordset.length) return res.status(404).json({ error: 'File not found.' });
     const file = fRes.recordset[0];
@@ -3827,6 +3828,8 @@ app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, asy
     if (file.status === 'Blocked') return res.status(400).json({ error: 'Blocked files cannot be shared.' });
     if (!fs.existsSync(path.join(FILE_VAULT, file.stored_path)))
       return res.status(410).json({ error: 'This file is no longer available in the vault.' });
+    const exceedsVideoEmbedSizeLimit =
+      file.mime_type.startsWith('video/') && file.size > VIDEO_EMBED_MAX_SIZE_BYTES;
 
     const exReq = await getRequest(); exReq.input('fid', sql.UniqueIdentifier, fileId);
     const existing = await exReq.query<ShareRow>(
@@ -3839,6 +3842,10 @@ app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, asy
         file.mime_type.startsWith('image/') || file.mime_type.startsWith('video/');
       let allowExternalPreview = !!allow_external_preview;
       let allowDecryptedExternalPreview = !!allow_decrypted_external_preview;
+      if (exceedsVideoEmbedSizeLimit) {
+        allowExternalPreview = false;
+        allowDecryptedExternalPreview = false;
+      }
       if (supportsExternalPreview && (allowExternalPreview || allowDecryptedExternalPreview)) {
         allowExternalPreview = true;
         allowDecryptedExternalPreview = true;
@@ -3889,6 +3896,10 @@ app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, asy
         allow_decrypted_external_preview !== undefined
           ? !!allow_decrypted_external_preview
           : !!shareRow.allow_decrypted_external_preview;
+      if (exceedsVideoEmbedSizeLimit) {
+        nextAllowExternalPreview = false;
+        nextAllowDecryptedExternalPreview = false;
+      }
       if (supportsExternalPreview && (nextAllowExternalPreview || nextAllowDecryptedExternalPreview)) {
         nextAllowExternalPreview = true;
         nextAllowDecryptedExternalPreview = true;

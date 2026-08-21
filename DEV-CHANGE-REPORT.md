@@ -4,6 +4,80 @@ plan: /memories/session/dev-plan.md
 ---
 
 Intent
+Repair smaller-video embed creation after the 950 MiB preview limit was introduced.
+
+Change class
+STANDARD
+
+Root cause
+- `POST /api/files/:id/share` selected a nonexistent `files.size` column.
+- The MSSQL schema uses `files.size_bytes`, so SQL Server returned an error before the share configuration logic ran.
+
+Files changed
+- src/server.ts:
+  - Aliased `size_bytes AS size` in the share-link file lookup, preserving the existing limit comparison shape.
+
+Public contracts impacted
+- No API contract changes.
+- Videos below 950 MiB can again create decrypted external preview links.
+
+Validation status
+- Type-check: PASSED (`pnpm lint`)
+- Build: PASSED (`pnpm build`)
+
+Handoff TestEngineer
+- Exercise decrypted external preview creation for a video below 950 MiB against MSSQL.
+
+Handoff QaEngineer
+- Confirm a 300 MB video creates a decrypted embed and a video above 950 MiB does not.
+
+---
+
+agent: DevEngineer | date: 2026-08-21 | model: GPT-5.3-Codex
+plan: /memories/session/dev-plan.md
+---
+
+Intent
+Prevent users from creating decrypted external video embeds above the 950 MiB third-party platform limit.
+
+Change class
+STANDARD
+
+Files changed
+- src/app/shared/utils/video-embed-warning.ts:
+  - Added video embed size eligibility and the 950 MB warning message.
+- src/app/features/files/pages/user-dashboard.tsx:
+  - Disables and dims "Allow decrypted external preview" for videos larger than 950 MiB.
+  - Shows a yellow warning that only files under 950 MB can be used for embeds.
+  - Prevents stale UI state from submitting the preview flags.
+- src/server.ts:
+  - Loads plaintext file size when configuring a share link.
+  - Forces both external-preview flags off for videos above 950 MiB during create and update flows.
+
+Public contracts impacted
+- No route shapes or response fields changed.
+- Behavioral change: `POST /api/files/:id/share` persists both external-preview flags as `false` for video files larger than 950 MiB.
+
+Validation status
+- Type-check: PASSED (`pnpm lint`)
+- Build: PASSED (`pnpm build`)
+- Targeted tests: PASSED (`pnpm exec tsx --test tests/share-video-warning.test.ts`)
+- Patch whitespace: PASSED (`git diff --check`)
+
+Handoff TestEngineer
+- Cover 950 MiB (eligible) and 950 MiB + 1 byte (ineligible) boundaries in the client helper and UI.
+- Verify a crafted share request cannot persist either preview flag for an oversized video.
+
+Handoff QaEngineer
+- Confirm an oversized video share remains a standard download link and never exposes a decrypted embed URL.
+
+---
+
+agent: DevEngineer | date: 2026-08-21 | model: GPT-5.3-Codex
+plan: /memories/session/dev-plan.md
+---
+
+Intent
 Added share-dialog readiness feedback for decrypted external preview video links by introducing server warmup mode and a UI progress bar while cache preparation completes.
 
 Change class
