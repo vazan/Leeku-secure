@@ -58,6 +58,8 @@ import FileTypeIcon, {
 import type { TextFilePreviewData } from "@/app/shared/components/common/text-file-preview";
 import { downloadWithProgress } from "@/app/shared/utils/download-with-progress";
 import {
+  exceedsVideoEmbedSizeLimit,
+  getVideoEmbedSizeLimitMessage,
   getVideoEmbedWarningMessage,
   shouldShowVideoEmbedWarning,
 } from "@/app/shared/utils/video-embed-warning";
@@ -1360,7 +1362,8 @@ export default function UserDashboard({
     const allowDecryptedExternalPreview =
       !!existing?.allow_external_preview &&
       !!existing?.allow_decrypted_external_preview &&
-      supportsExternalPreview(file);
+      supportsExternalPreview(file) &&
+      !exceedsVideoEmbedSizeLimit(file);
     const allowExternalPreview = allowDecryptedExternalPreview;
     setShareFile(file);
     setSharePassword("");
@@ -1441,7 +1444,9 @@ export default function UserDashboard({
     setShareSubmitting(true);
     setShareWarmupProgress(null);
     const enableDecryptedExternalPreview =
-      supportsExternalPreview(shareFile) && shareAllowDecryptedExternalPreview;
+      supportsExternalPreview(shareFile) &&
+      !exceedsVideoEmbedSizeLimit(shareFile) &&
+      shareAllowDecryptedExternalPreview;
     try {
       const response = await fetch(`/api/files/${shareFile.id}/share`, {
         method: "POST",
@@ -3390,6 +3395,7 @@ function ShareDialog(props: {
     allowExternalPreview: props.allowExternalPreview,
     allowDecryptedExternalPreview: props.allowDecryptedExternalPreview,
   });
+  const exceedsEmbedSizeLimit = exceedsVideoEmbedSizeLimit(props.file);
 
   useEffect(() => {
     const closeOnEscape = (event: KeyboardEvent) => {
@@ -3498,10 +3504,11 @@ function ShareDialog(props: {
         </div>
         {supportsExternalPreview(props.file) && (
           <>
-            <label className="mt-4 flex cursor-pointer items-start gap-3 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-muted)] p-3 text-sm">
+            <label className={`mt-4 flex items-start gap-3 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-muted)] p-3 text-sm ${exceedsEmbedSizeLimit ? "cursor-not-allowed opacity-60" : "cursor-pointer"}`}>
               <input
                 type="checkbox"
                 checked={props.allowDecryptedExternalPreview}
+                disabled={exceedsEmbedSizeLimit}
                 onChange={(event) =>
                   props.onAllowDecryptedExternalPreview(event.target.checked)
                 }
@@ -3519,6 +3526,11 @@ function ShareDialog(props: {
             {showVideoEmbedWarning && (
               <div className="mt-3 rounded-lg border border-yellow-400/60 bg-yellow-500/10 px-3 py-2 text-sm text-yellow-100">
                 {getVideoEmbedWarningMessage()}
+              </div>
+            )}
+            {exceedsEmbedSizeLimit && (
+              <div className="mt-3 rounded-lg border border-yellow-400/60 bg-yellow-500/10 px-3 py-2 text-sm text-yellow-100">
+                {getVideoEmbedSizeLimitMessage()}
               </div>
             )}
           </>
