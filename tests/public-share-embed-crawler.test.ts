@@ -1,45 +1,59 @@
-import test from 'node:test';
 import assert from 'node:assert/strict';
+import test from 'node:test';
 import { shouldServeLargeVideoHtmlFallback, DISCORD_INLINE_VIDEO_LIMIT_BYTES } from '../src/server/routes/public-sharing.js';
 
-test('Discord crawler gets HTML fallback for large inline videos', () => {
-  const result = shouldServeLargeVideoHtmlFallback({
-    mimeType: 'video/mp4',
-    sizeBytes: DISCORD_INLINE_VIDEO_LIMIT_BYTES + 1,
-    userAgent: 'DiscordBot/2.0',
-    acceptHeader: 'text/html',
-    fetchDest: 'document',
-    rangeHeader: '',
-    rawMode: false,
-  });
-
-  assert.equal(result, true);
+test('returns the HTML fallback for large Discord inline video previews', () => {
+  assert.equal(
+    shouldServeLargeVideoHtmlFallback({
+      mimeType: 'video/mp4',
+      sizeBytes: DISCORD_INLINE_VIDEO_LIMIT_BYTES + 1,
+      userAgent: 'Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)',
+      acceptHeader: 'text/html,application/xhtml+xml',
+      fetchDest: 'document',
+      rangeHeader: '',
+      rawMode: false,
+    }),
+    true,
+  );
 });
 
-test('Browser navigation keeps direct video streaming for large files', () => {
-  const result = shouldServeLargeVideoHtmlFallback({
-    mimeType: 'video/mp4',
-    sizeBytes: DISCORD_INLINE_VIDEO_LIMIT_BYTES + 1,
-    userAgent: 'Mozilla/5.0 (Linux; Android 10)',
-    acceptHeader: 'text/html',
-    fetchDest: 'document',
-    rangeHeader: '',
-    rawMode: false,
-  });
+test('serves metadata HTML to crawlers and keeps raw/non-crawler requests as media streams', () => {
+  assert.equal(
+    shouldServeLargeVideoHtmlFallback({
+      mimeType: 'video/mp4',
+      sizeBytes: DISCORD_INLINE_VIDEO_LIMIT_BYTES - 1,
+      userAgent: 'Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)',
+      acceptHeader: 'text/html,application/xhtml+xml',
+      fetchDest: 'document',
+      rangeHeader: '',
+      rawMode: false,
+    }),
+    true,
+  );
 
-  assert.equal(result, false);
-});
+  assert.equal(
+    shouldServeLargeVideoHtmlFallback({
+      mimeType: 'video/mp4',
+      sizeBytes: DISCORD_INLINE_VIDEO_LIMIT_BYTES + 1,
+      userAgent: 'Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)',
+      acceptHeader: 'text/html,application/xhtml+xml',
+      fetchDest: 'document',
+      rangeHeader: 'bytes=0-1023',
+      rawMode: false,
+    }),
+    true,
+  );
 
-test('Small videos are not forced into HTML fallback', () => {
-  const result = shouldServeLargeVideoHtmlFallback({
-    mimeType: 'video/mp4',
-    sizeBytes: DISCORD_INLINE_VIDEO_LIMIT_BYTES - 1,
-    userAgent: 'DiscordBot/2.0',
-    acceptHeader: 'text/html',
-    fetchDest: 'document',
-    rangeHeader: '',
-    rawMode: false,
-  });
-
-  assert.equal(result, false);
+  assert.equal(
+    shouldServeLargeVideoHtmlFallback({
+      mimeType: 'video/mp4',
+      sizeBytes: DISCORD_INLINE_VIDEO_LIMIT_BYTES + 1,
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+      acceptHeader: 'text/html,application/xhtml+xml',
+      fetchDest: 'document',
+      rangeHeader: '',
+      rawMode: false,
+    }),
+    false,
+  );
 });

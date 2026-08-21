@@ -3835,8 +3835,14 @@ app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, asy
 
     let shareRow: ShareRow;
     if (!existing.recordset.length) {
-      const allowExternalPreview = !!allow_external_preview;
-      const allowDecryptedExternalPreview = !!allow_decrypted_external_preview;
+      const supportsExternalPreview =
+        file.mime_type.startsWith('image/') || file.mime_type.startsWith('video/');
+      let allowExternalPreview = !!allow_external_preview;
+      let allowDecryptedExternalPreview = !!allow_decrypted_external_preview;
+      if (supportsExternalPreview && (allowExternalPreview || allowDecryptedExternalPreview)) {
+        allowExternalPreview = true;
+        allowDecryptedExternalPreview = true;
+      }
       if (allowDecryptedExternalPreview && !allowExternalPreview) {
         return res.status(400).json({ error: 'Decrypted external preview requires external preview to be enabled.' });
       }
@@ -3873,14 +3879,20 @@ app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, asy
       const upReq = await getRequest(); upReq.input('id', sql.UniqueIdentifier, shareRow.id);
       const nextPasswordProtected =
         password !== undefined ? !!password : !!shareRow.password_hash;
-      const nextAllowExternalPreview =
+      const supportsExternalPreview =
+        file.mime_type.startsWith('image/') || file.mime_type.startsWith('video/');
+      let nextAllowExternalPreview =
         allow_external_preview !== undefined
           ? !!allow_external_preview
           : !!shareRow.allow_external_preview;
-      const nextAllowDecryptedExternalPreview =
+      let nextAllowDecryptedExternalPreview =
         allow_decrypted_external_preview !== undefined
           ? !!allow_decrypted_external_preview
           : !!shareRow.allow_decrypted_external_preview;
+      if (supportsExternalPreview && (nextAllowExternalPreview || nextAllowDecryptedExternalPreview)) {
+        nextAllowExternalPreview = true;
+        nextAllowDecryptedExternalPreview = true;
+      }
       const nextMaxDownloads =
         max_downloads !== undefined
           ? (max_downloads ? Number(max_downloads) : null)
@@ -3908,12 +3920,18 @@ app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, asy
       if (expires_at !== undefined) { upReq.input('exp', sql.DateTimeOffset, expires_at||null); sets.push('expires_at=@exp'); }
       if (max_downloads !== undefined) { upReq.input('md', sql.Int, nextMaxDownloads); sets.push('max_downloads=@md'); }
       if (is_active !== undefined) { upReq.input('act', sql.Bit, is_active ? 1 : 0); sets.push('is_active=@act'); }
-      if (allow_external_preview !== undefined) {
-        upReq.input('allowExternalPreview', sql.Bit, allow_external_preview ? 1 : 0);
+      const shouldUpdateAllowExternalPreview =
+        allow_external_preview !== undefined ||
+        nextAllowExternalPreview !== !!shareRow.allow_external_preview;
+      if (shouldUpdateAllowExternalPreview) {
+        upReq.input('allowExternalPreview', sql.Bit, nextAllowExternalPreview ? 1 : 0);
         sets.push('allow_external_preview=@allowExternalPreview');
       }
-      if (allow_decrypted_external_preview !== undefined) {
-        upReq.input('allowDecryptedExternalPreview', sql.Bit, allow_decrypted_external_preview ? 1 : 0);
+      const shouldUpdateAllowDecryptedExternalPreview =
+        allow_decrypted_external_preview !== undefined ||
+        nextAllowDecryptedExternalPreview !== !!shareRow.allow_decrypted_external_preview;
+      if (shouldUpdateAllowDecryptedExternalPreview) {
+        upReq.input('allowDecryptedExternalPreview', sql.Bit, nextAllowDecryptedExternalPreview ? 1 : 0);
         sets.push('allow_decrypted_external_preview=@allowDecryptedExternalPreview');
       }
       if (sets.length) {

@@ -292,6 +292,10 @@ export default function UserDashboard({
     useState(false);
   const [shareAllowDecryptedExternalPreview, setShareAllowDecryptedExternalPreview] =
     useState(false);
+  const [shareSubmitting, setShareSubmitting] = useState(false);
+  const [shareWarmupProgress, setShareWarmupProgress] = useState<number | null>(
+    null,
+  );
   const [shareUrl, setShareUrl] = useState("");
   const [folderSharePassword, setFolderSharePassword] = useState("");
   const [folderShareExpires, setFolderShareExpires] = useState("");
@@ -1328,24 +1332,37 @@ export default function UserDashboard({
     }
   };
 
+  const toEmbedVersion = (publicToken: string, createdAt?: string): string => {
+    const parsedCreatedAt = createdAt ? Date.parse(createdAt) : NaN;
+    if (Number.isFinite(parsedCreatedAt)) return String(parsedCreatedAt);
+    return publicToken.slice(0, 10);
+  };
+
   const toShareUrl = (
     publicToken: string,
     allowExternalPreview: boolean,
     allowDecryptedExternalPreview = false,
-  ) =>
-    allowExternalPreview
-      ? `${window.location.origin}/api/public/share/${publicToken}/${allowDecryptedExternalPreview ? "dec_embed" : "embed"}`
-      : `${window.location.origin}/s/${publicToken}`;
+    createdAt?: string,
+  ) => {
+    if (!allowExternalPreview) {
+      return `${window.location.origin}/s/${publicToken}`;
+    }
+
+    const embedVersion = toEmbedVersion(publicToken, createdAt);
+
+    return `${window.location.origin}/api/public/share/${publicToken}/${allowDecryptedExternalPreview ? "dec_embed" : "embed"}?v=${encodeURIComponent(embedVersion)}`;
+  };
 
   const toFolderShareUrl = (publicToken: string) =>
     `${window.location.origin}/d/${publicToken}`;
 
   const openShare = (file: FileMetadata) => {
     const existing = links.find((link) => link.file_id === file.id);
-    const allowExternalPreview =
-      !!existing?.allow_external_preview && supportsExternalPreview(file);
     const allowDecryptedExternalPreview =
-      allowExternalPreview && !!existing?.allow_decrypted_external_preview;
+      !!existing?.allow_external_preview &&
+      !!existing?.allow_decrypted_external_preview &&
+      supportsExternalPreview(file);
+    const allowExternalPreview = allowDecryptedExternalPreview;
     setShareFile(file);
     setSharePassword("");
     setShareExpires(existing?.expires_at?.substring(0, 16) || "");
@@ -1354,12 +1371,15 @@ export default function UserDashboard({
     );
     setShareAllowExternalPreview(allowExternalPreview);
     setShareAllowDecryptedExternalPreview(allowDecryptedExternalPreview);
+    setShareSubmitting(false);
+    setShareWarmupProgress(null);
     setShareUrl(
       existing
         ? toShareUrl(
             existing.public_token,
             allowExternalPreview,
             allowDecryptedExternalPreview,
+            existing.created_at,
           )
         : "",
     );
@@ -1418,31 +1438,93 @@ export default function UserDashboard({
   };
 
   const saveShare = async () => {
-    if (!shareFile) return;
-    const response = await fetch(`/api/files/${shareFile.id}/share`, {
-      method: "POST",
-      headers: { ...authHeaders(token), "Content-Type": "application/json" },
-      body: JSON.stringify({
-        password: sharePassword || undefined,
-        expires_at: shareExpires ? new Date(shareExpires).toISOString() : null,
-        max_downloads: shareMaxDownloads ? Number(shareMaxDownloads) : null,
-        allow_external_preview: shareAllowExternalPreview,
-        allow_decrypted_external_preview: shareAllowDecryptedExternalPreview,
-        is_active: true,
-      }),
-    });
-    const data = await response.json();
-    if (response.ok) {
-      setShareUrl(
-        toShareUrl(
-          data.link.public_token,
-          shareAllowExternalPreview,
-          shareAllowDecryptedExternalPreview,
-        ),
+    if (!shareFile || shareSubmitting) return;
+    setShareSubmitting(true);
+    setShareWarmupProgress(null);
+    const enableDecryptedExternalPreview =
+      supportsExternalPreview(shareFile) && shareAllowDecryptedExternalPreview;
+    try {
+      const response = await fetch(`/api/files/${shareFile.id}/share`, {
+        method: "POST",
+        headers: { ...authHeaders(token), "Content-Type": "application/json" },
+        body: JSON.stringify({
+          password: sharePassword || undefined,
+          expires_at: shareExpires ? new Date(shareExpires).toISOString() : null,
+          max_downloads: shareMaxDownloads ? Number(shareMaxDownloads) : null,
+          allow_external_preview: enableDecryptedExternalPreview,
+          allow_decrypted_external_preview: enableDecryptedExternalPreview,
+          is_active: true,
+        }),
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        notifyError(data.error || "Could not create the share link.");
+        return;
+      }
+
+      const publicToken = String(data.link.public_token || "");
+      const createdAt = String(data.link.created_at || "");
+      const nextShareUrl = toShareUrl(
+        publicToken,
+        enableDecryptedExternalPreview,
+        enableDecryptedExternalPreview,
+        createdAt,
       );
-      await loadFilesAndLinks();
-      notify("Share link ready.");
-    } else notifyError(data.error || "Could not create the share link.");
+
+      const shouldWarmupDecryptedPreview =
+        enableDecryptedExternalPreview &&
+        String(shareFile.mime_type || "").toLowerCase().startsWith("video/");
+
+      if (!shouldWarmupDecryptedPreview) {
+        setShareUrl(nextShareUrl);
+        await loadFilesAndLinks();
+        notify("Share link ready.");
+        return;
+      }
+
+      setShareUrl("");
+      notify("Share link created. Preparing server preview cache...");
+      setShareWarmupProgress(8);
+
+      let progress = 8;
+      const progressTimer = window.setInterval(() => {
+        progress = Math.min(progress + 4, 92);
+        setShareWarmupProgress(progress);
+      }, 300);
+
+      try {
+        const warmupVersion = toEmbedVersion(publicToken, createdAt);
+        const warmupResponse = await fetch(
+          `/api/public/share/${publicToken}/dec_embed_media?warmup=1&v=${encodeURIComponent(warmupVersion)}`,
+        );
+        if (!warmupResponse.ok) {
+          const warmupPayload = await warmupResponse
+            .json()
+            .catch(() => ({} as Record<string, unknown>));
+          const warmupError =
+            typeof warmupPayload.error === "string"
+              ? warmupPayload.error
+              : "Could not prepare the decrypted external preview cache.";
+          throw new Error(warmupError);
+        }
+
+        setShareWarmupProgress(100);
+        setShareUrl(nextShareUrl);
+        await loadFilesAndLinks();
+        notify("Share link ready.");
+      } catch (error) {
+        const message =
+          error instanceof Error
+            ? error.message
+            : "Share link created, but server preview cache is not ready yet.";
+        notifyError(message);
+      } finally {
+        window.clearInterval(progressTimer);
+        window.setTimeout(() => setShareWarmupProgress(null), 700);
+      }
+    } finally {
+      setShareSubmitting(false);
+    }
   };
 
   const removeSharedLink = async (link: ShareLink) => {
@@ -2210,6 +2292,7 @@ export default function UserDashboard({
                                     link.public_token,
                                     !!link.allow_external_preview,
                                     !!link.allow_decrypted_external_preview,
+                                    link.created_at,
                                   ),
                                 )
                                 .then(() => notify("Link copied."))
@@ -2440,11 +2523,12 @@ export default function UserDashboard({
           onPassword={setSharePassword}
           onExpires={setShareExpires}
           onMaxDownloads={setShareMaxDownloads}
-          onAllowExternalPreview={(value) => {
+          onAllowDecryptedExternalPreview={(value) => {
             setShareAllowExternalPreview(value);
-            if (!value) setShareAllowDecryptedExternalPreview(false);
+            setShareAllowDecryptedExternalPreview(value);
           }}
-          onAllowDecryptedExternalPreview={setShareAllowDecryptedExternalPreview}
+          submitting={shareSubmitting}
+          warmupProgress={shareWarmupProgress}
           onSave={saveShare}
           onClose={() => setShareFile(null)}
           onCopy={() =>
@@ -3282,11 +3366,12 @@ function ShareDialog(props: {
   maxDownloads: string;
   allowExternalPreview: boolean;
   allowDecryptedExternalPreview: boolean;
+  submitting: boolean;
+  warmupProgress: number | null;
   url: string;
   onPassword: (value: string) => void;
   onExpires: (value: string) => void;
   onMaxDownloads: (value: string) => void;
-  onAllowExternalPreview: (value: boolean) => void;
   onAllowDecryptedExternalPreview: (value: boolean) => void;
   onSave: () => void;
   onClose: () => void;
@@ -3417,26 +3502,7 @@ function ShareDialog(props: {
             <label className="mt-4 flex cursor-pointer items-start gap-3 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-muted)] p-3 text-sm">
               <input
                 type="checkbox"
-                checked={props.allowExternalPreview}
-                onChange={(event) =>
-                  props.onAllowExternalPreview(event.target.checked)
-                }
-                className="mt-0.5 h-4 w-4 rounded border-[var(--border-subtle)]"
-              />
-              <span>
-                <span className="block font-medium text-[var(--text-primary)]">
-                  Allow external preview
-                </span>
-                <span className="mt-1 block text-xs text-[var(--text-muted)]">
-                  Generates a media embed link for image/video playback outside Leeku.
-                </span>
-              </span>
-            </label>
-            <label className={`mt-3 flex items-start gap-3 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-muted)] p-3 text-sm ${props.allowExternalPreview ? "cursor-pointer" : "cursor-not-allowed opacity-60"}`}>
-              <input
-                type="checkbox"
                 checked={props.allowDecryptedExternalPreview}
-                disabled={!props.allowExternalPreview}
                 onChange={(event) =>
                   props.onAllowDecryptedExternalPreview(event.target.checked)
                 }
@@ -3447,7 +3513,7 @@ function ShareDialog(props: {
                   Allow decrypted external preview
                 </span>
                 <span className="mt-1 block text-xs text-[var(--text-muted)]">
-                  Stores a decrypted media cache on the host-configured SMB path for faster embed playback.
+                  Generates a media embed link and stores decrypted media cache on the host-configured SMB path for playback.
                 </span>
               </span>
             </label>
@@ -3473,18 +3539,39 @@ function ShareDialog(props: {
             </button>
           </div>
         )}
+        {props.warmupProgress !== null && (
+          <div className="mt-3 space-y-2">
+            <p className="text-xs text-[var(--text-muted)]">
+              Preparing decrypted preview cache on server ({Math.round(props.warmupProgress)}%)
+            </p>
+            <div className="h-2 w-full overflow-hidden rounded-full border border-[var(--border-subtle)] bg-[var(--bg-elevated)]">
+              <div
+                className="h-full bg-[var(--accent-linear)] transition-all duration-300"
+                style={{ width: `${Math.max(0, Math.min(100, props.warmupProgress))}%` }}
+              />
+            </div>
+          </div>
+        )}
         <div className="mt-6 flex justify-end gap-2">
           <button
+            type="button"
             onClick={props.onClose}
+            disabled={props.submitting}
             className="rounded-lg px-4 py-2.5 text-sm text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
           >
             Cancel
           </button>
           <button
+            type="button"
             onClick={props.onSave}
+            disabled={props.submitting}
             className="rounded-lg bg-[var(--accent-linear)] px-4 py-2.5 text-sm font-medium text-[var(--accent-contrast)] hover:bg-[var(--accent-linear-bright)]"
           >
-            Create link
+            {props.submitting
+              ? props.warmupProgress !== null
+                ? "Preparing link..."
+                : "Creating link..."
+              : "Create link"}
           </button>
         </div>
       </div>

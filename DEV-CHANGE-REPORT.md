@@ -1,4 +1,308 @@
 ---
+agent: DevEngineer | date: 2026-08-21 | model: GPT-5.3-Codex
+plan: /memories/session/dev-plan.md
+---
+
+Intent
+Added share-dialog readiness feedback for decrypted external preview video links by introducing server warmup mode and a UI progress bar while cache preparation completes.
+
+Change class
+STANDARD
+
+Files changed
+- src/server/routes/public-sharing.ts:
+  - Added `warmup=1` mode for `*_embed_media` handling.
+  - Warmup mode prepares cache via `ensureEmbedCacheFile` and returns JSON readiness without consuming download counts or streaming media.
+- src/app/features/files/pages/user-dashboard.tsx:
+  - Added `shareSubmitting` and `shareWarmupProgress` state.
+  - After share creation (when decrypted external preview + video), calls `/api/public/share/:token/dec_embed_media?warmup=1` and shows progress bar until completion.
+  - Disabled Create/Cancel actions while submission/warmup is in progress and updated button labels.
+
+Public contracts impacted
+- Existing route shapes preserved.
+- Additive behavior: `GET /api/public/share/:token/dec_embed_media?warmup=1` returns readiness JSON.
+
+Validation status
+- Type-check: PASSED (`pnpm -s tsc --noEmit`)
+- Targeted tests: PASSED (`pnpm -s tsx --test tests/public-share-embed-crawler.test.ts tests/public-share-cache-cleanup.test.ts tests/share-video-warning.test.ts`)
+
+Handoff TestEngineer
+- Verify share dialog shows progress bar after Create Link for decrypted external preview video links.
+- Verify success path transitions to “Share link ready.” once warmup completes.
+
+Handoff QaEngineer
+- Validate first Discord play attempt without manual link open while using the new readiness flow.
+
+---
+
+---
+agent: DevEngineer | date: 2026-08-21 | model: GPT-5.3-Codex
+plan: /memories/session/dev-plan.md
+---
+
+Intent
+Addressed Discord first-play failures by warming embed cache files in the background when crawler metadata HTML is served.
+
+Change class
+STANDARD
+
+Files changed
+- src/server/routes/public-sharing.ts:
+  - Added `warmEmbedCacheInBackground` in embed handler.
+  - On crawler HTML fallback responses, starts asynchronous cache preparation (`ensureEmbedCacheFile`) for the media stream target.
+  - Keeps existing response shape and legacy routes unchanged.
+
+Public contracts impacted
+- No route shape changes.
+- Behavioral improvement: cache file can be prepared during crawler unfurl phase, reducing dependency on first human click.
+
+Validation status
+- Type-check: PASSED (`pnpm -s tsc --noEmit`)
+- Targeted tests: PASSED (`pnpm -s tsx --test tests/public-share-embed-crawler.test.ts tests/public-share-cache-cleanup.test.ts tests/share-video-warning.test.ts`)
+
+Handoff TestEngineer
+- Verify first Discord play attempt succeeds without opening the link in browser first.
+
+Handoff QaEngineer
+- Confirm no regressions in non-crawler embed streaming paths.
+
+---
+
+---
+agent: DevEngineer | date: 2026-08-21 | model: GPT-5.3-Codex
+plan: /memories/session/dev-plan.md
+---
+
+Intent
+Resolved Discord player-click no-op behavior by removing dependency on `?raw=1` query parsing for embed playback and introducing explicit media-stream routes.
+
+Change class
+STANDARD
+
+Files changed
+- src/server/routes/public-sharing.ts:
+  - Extended embed handler with `forceRawFromPath` mode.
+  - Added dedicated always-stream routes:
+    - `/api/public/share/:token/embed_media`
+    - `/api/public/share/:token/dec_embed_media`
+  - Updated crawler metadata tags (`og:video`, `twitter:player`, `twitter:player:stream`) to target the new media routes.
+  - Updated direct browser HTML player source to use new media routes.
+
+Public contracts impacted
+- Existing `/embed` and `/dec_embed` routes preserved.
+- New additive stream endpoints provide deterministic media behavior for third-party player contexts.
+
+Validation status
+- Type-check: PASSED (`pnpm -s tsc --noEmit`)
+- Targeted tests: PASSED (`pnpm -s tsx --test tests/public-share-embed-crawler.test.ts tests/public-share-cache-cleanup.test.ts tests/share-video-warning.test.ts`)
+
+Handoff TestEngineer
+- Verify Discord embed card metadata points to `/dec_embed_media`.
+- Verify Discord play button starts playback without click-through fallback.
+
+Handoff QaEngineer
+- Validate social embed playback stability with both old and newly generated share tokens.
+
+---
+
+---
+agent: DevEngineer | date: 2026-08-21 | model: GPT-5.3-Codex
+plan: /memories/session/dev-plan.md
+---
+
+Intent
+Addressed remaining Discord unfurl misses by allowing crawler video metadata fallback even when crawler requests include a `Range` header.
+
+Change class
+STANDARD
+
+Files changed
+- src/server/routes/public-sharing.ts:
+  - Updated `shouldServeLargeVideoHtmlFallback` to ignore `rangeHeader` for crawler user-agents.
+  - Crawler unfurl requests now consistently receive metadata HTML unless `raw=1` is explicitly requested.
+- tests/public-share-embed-crawler.test.ts:
+  - Updated crawler range-case assertion to expect metadata HTML fallback.
+
+Public contracts impacted
+- No route shape changes.
+- Behavioral fix: Discord crawler probe patterns with `Range` still receive OG/Twitter metadata HTML.
+
+Validation status
+- Type-check: PASSED (`pnpm -s tsc --noEmit`)
+- Targeted tests: PASSED (`pnpm -s tsx --test tests/public-share-embed-crawler.test.ts tests/public-share-cache-cleanup.test.ts tests/share-video-warning.test.ts`)
+
+Handoff TestEngineer
+- Verify Discord unfurl appears when crawler sends `Range` and when it does not.
+
+Handoff QaEngineer
+- Confirm stability of social unfurl behavior on `/dec_embed` across repeated reposts.
+
+---
+
+---
+agent: DevEngineer | date: 2026-08-21 | model: GPT-5.3-Codex
+plan: /memories/session/dev-plan.md
+---
+
+Intent
+Restored Discord/social video unfurls after the cross-site navigation fix by ensuring crawler requests always receive metadata HTML for video embed URLs.
+
+Change class
+STANDARD
+
+Files changed
+- src/server/routes/public-sharing.ts:
+  - Updated `shouldServeLargeVideoHtmlFallback` to always return HTML card mode for crawler user-agents on non-raw, non-range video requests, regardless of file size.
+  - Preserves raw/range streaming behavior for actual player fetches.
+- tests/public-share-embed-crawler.test.ts:
+  - Updated expectations to assert crawler HTML-card behavior for small videos.
+
+Public contracts impacted
+- No route shape changes.
+- Behavioral fix: Discord/social crawlers can again discover `twitter:player`/`og:video` metadata for video links.
+
+Validation status
+- Type-check: PASSED (`pnpm -s tsc --noEmit`)
+- Targeted tests: PASSED (`pnpm -s tsx --test tests/public-share-embed-crawler.test.ts tests/public-share-cache-cleanup.test.ts tests/share-video-warning.test.ts`)
+
+Handoff TestEngineer
+- Verify Discord unfurl appears for both small and large video files.
+- Verify inline playback still requests media stream endpoints (`raw=1`/range) and starts without click-through.
+
+Handoff QaEngineer
+- Re-run social embed compatibility matrix for Discord/Facebook/Twitter on `/dec_embed` links.
+
+---
+
+---
+agent: DevEngineer | date: 2026-08-21 | model: GPT-5.3-Codex
+plan: /memories/session/dev-plan.md
+---
+
+Intent
+Fixed Discord inline player stalls for public `/dec_embed` links by preventing cross-site navigations from receiving the HTML player shell.
+
+Change class
+STANDARD
+
+Files changed
+- src/server/routes/public-sharing.ts:
+  - Added `sec-fetch-site` awareness in embed request classification.
+  - Tightened document-navigation heuristic fallback (`fetchDest === ''`) to only first-party style navigations (`sec-fetch-site: none`).
+  - Skipped HTML player shell response for cross-site navigations so embedded contexts receive raw media streams.
+
+Public contracts impacted
+- No route shape changes.
+- Existing `/api/public/share/:token/embed` and `/api/public/share/:token/dec_embed` handlers remain unchanged.
+- Behavioral fix: cross-site embedded players now get stream responses instead of HTML shell responses.
+
+Validation status
+- Type-check: PASSED (`pnpm -s tsc --noEmit`)
+- Build: PASSED (`pnpm -s build`)
+- Targeted tests: PASSED (`pnpm -s tsx --test tests/public-share-embed-crawler.test.ts tests/public-share-cache-cleanup.test.ts tests/share-video-warning.test.ts`)
+
+Handoff TestEngineer
+- Validate Discord inline playback on `/dec_embed` without requiring user click-through.
+- Confirm direct browser navigation to embed URLs still renders HTML player shell for non-crawler first-party requests.
+
+Handoff QaEngineer
+- Re-run social embed smoke tests (Discord/Facebook/Twitter cards) for video links and confirm no regressions.
+
+---
+
+---
+agent: DevEngineer | date: 2026-08-21 | model: GPT-5.3-Codex
+plan: /memories/session/dev-plan.md
+---
+
+Intent
+Changed media share-link configuration so image/video external preview requests are normalized to decrypted external preview only, while preserving legacy `/embed` routing code for potential rollback.
+
+Change class
+STANDARD
+
+Files changed
+- src/server.ts:
+  - In `POST /api/files/:id/share` create/update flow, added media-aware normalization:
+    - when external preview is requested for image/video, both `allow_external_preview` and `allow_decrypted_external_preview` are forced to `true`.
+  - Update flow now persists normalized flags even if only one flag was sent by older clients.
+- src/app/features/files/pages/user-dashboard.tsx:
+  - Share dialog for image/video now exposes only one preview option: `Allow decrypted external preview`.
+  - Save payload now mirrors that single option into both API flags.
+  - URL generation continues to support old `/embed` links where stored flags still require it.
+
+Public contracts impacted
+- No route shape changes.
+- Existing `/api/public/share/:token/embed` and `/api/public/share/:token/dec_embed` handlers remain in place.
+- Behavioral change: new/updated image/video external preview shares are persisted in decrypted-preview mode.
+
+Validation status
+- Build: PASSED (`pnpm -s build`)
+- Lint: PASSED (`pnpm -s lint`)
+- Type-check: PASSED (`pnpm -s tsc --noEmit`)
+- Targeted tests: PASSED (`pnpm -s tsx --test tests/public-share-embed-crawler.test.ts tests/public-share-cache-cleanup.test.ts tests/share-video-warning.test.ts`)
+- Existing non-blocking baseline warnings unchanged:
+  - Vite config native warning about `__dirname`.
+  - esbuild CJS warning for `import.meta`.
+
+Handoff TestEngineer
+- Verify share dialog for image/video presents only decrypted external preview toggle.
+- Verify enabling it creates a link that resolves to `/dec_embed`.
+- Verify disabling it yields standard `/s/:token` share link behavior.
+- Verify legacy links already in `/embed` mode remain functional until explicitly updated.
+
+Handoff QaEngineer
+- Validate end-to-end image/video sharing UX and confirm no regression for non-media share flows.
+
+---
+
+---
+agent: DevEngineer | date: 2026-08-17 | model: GPT-5.3-Codex
+plan: /memories/session/dev-plan.md
+---
+
+Intent
+Fixed public-share download failures for files with Japanese/non-ASCII names by making `Content-Disposition` header generation RFC-compliant and header-safe.
+
+Change class
+STANDARD
+
+Files changed
+- src/server/routes/public-sharing.ts:
+  - Added `encodeContentDispositionFilename` helper that:
+    - strips CR/LF/control chars and path separators,
+    - emits an ASCII-safe `filename="..."` fallback,
+    - emits UTF-8 `filename*=` (RFC 5987) for full Unicode names.
+  - Added `buildContentDisposition` helper.
+  - Replaced direct header construction in:
+    - `GET /api/public/share/:token/download/:downloadId/file` (`attachment`)
+    - `GET /api/public/share/:token/embed` (`inline`)
+
+Public contracts impacted
+- No route shape changes.
+- Behavioral fix: Unicode filenames are now served without `ERR_INVALID_CHAR` header failures.
+
+Validation status
+- Build: PASSED (`pnpm run build`)
+- Type-check: PASSED (`pnpm run lint && pnpm exec tsc --noEmit`)
+- Existing non-blocking baseline warnings unchanged:
+  - Vite config native warning about `__dirname`.
+  - esbuild CJS warning for `import.meta`.
+
+Handoff TestEngineer
+- Verify downloads succeed for filenames containing:
+  - Japanese scripts (e.g. `レポート2026年8月.pdf`)
+  - mixed ASCII + Unicode + spaces
+  - emoji and punctuation edge cases
+- Verify browser save dialog shows correct Unicode name while fallback remains safe.
+- Verify embed inline path still streams media with `Content-Disposition: inline`.
+
+Handoff QaEngineer
+- Validate end-to-end public share download and embed behavior across target browsers with Unicode filenames.
+
+---
+
+---
 agent: DevEngineer | date: 2026-08-13 | model: GPT-5.3-Codex
 plan: /memories/session/dev-plan.md
 ---
@@ -19,17 +323,13 @@ Files changed
   - Sent `allow_decrypted_external_preview` in share-link save payloads.
 - src/server.ts:
   - Added `PUBLIC_SHARE_DECRYPTED_PREVIEW_PATH` env wiring.
-  - Extended PostgreSQL share schema bootstrap with `share_links.allow_decrypted_external_preview` (`BOOLEAN NOT NULL DEFAULT FALSE`).
+  - Extended share schema bootstrap with `share_links.allow_decrypted_external_preview` (`BIT NOT NULL DEFAULT(0)`).
   - Extended `ShareRow` + `mapShareRow` and listing query to include the new flag.
   - Extended `POST /api/files/:id/share` create/update logic to validate and persist the new flag.
   - Added guardrails:
     - decrypted preview requires external preview enabled.
     - decrypted preview requires server path configuration.
   - Passed `decryptedPreviewPath` into the public sharing router.
-- Documentation/SQL/2026-08-13-postgresql-share-links-decrypted-preview.sql:
-  - Added a PostgreSQL-native migration for `share_links.allow_decrypted_external_preview` and `share_links.allow_external_preview` defaults/backfill.
-- Documentation/SQL/postgresql_schema.sql:
-  - Added `allow_decrypted_external_preview BOOLEAN NOT NULL DEFAULT FALSE` to the canonical `share_links` schema.
 - src/server/routes/public-sharing.ts:
   - Added router option `decryptedPreviewPath`.
   - Added embed-route handling for `allow_decrypted_external_preview`:
@@ -160,44 +460,33 @@ Handoff QaEngineer
 - Confirm end-to-end user journey: upload video (mp4 + at least one non-mp4 codec/container), navigate to All files, play directly, close modal, and continue browsing without page navigation.
 - Confirm no regressions for image thumbnails and text preview flow.
 
----
-agent: DevEngineer | date: 2026-08-02 | model: GitHub Copilot
-plan: /memories/session/dev-plan.md
----
-
 Intent
-Reduced All Files latency for large folder sets by removing eager folder loading at initial dashboard refresh and introducing an explicit move-to-folder dialog that lazy-loads folders only when needed.
+Ported the validated All Files performance and move-flow changes to the `mssql` branch, including the explicit `Actions` header layout used in the PostgreSQL branch after the final UI adjustment.
 
 Change class
 STANDARD
 
 Files changed
 - src/app/features/files/pages/user-dashboard.tsx:
-  - Split initial refresh to load files + share links only (no eager `/api/file-folders` call).
-  - Added lazy folder loader with loaded/loading guards.
-  - Replaced per-row folder select controls with a `Move to folder` button and modal dialog.
-  - Move dialog now fetches folder options on open and uses existing `POST /api/files/:id/folder` contract.
-  - Added explicit `Browse folders` button in All Files controls when folder list has not yet been loaded.
-  - Kept desktop folder column readable via `file.folder_name` text without requiring folder list preload.
-  - Upload-folder select now lazy-loads folders on first focus.
+  - Removed eager `/api/file-folders` loading from the initial dashboard refresh.
+  - Added lazy folder loading with loading/loaded guards.
+  - Replaced inline move dropdowns with a `Move to folder` button and modal dialog.
+  - Added explicit `Browse folders` action in All Files and lazy load on upload-folder focus.
+  - Removed the desktop Folder column and added the final explicit `Actions` header/width layout to prevent overlap with Added.
 
 Public contracts impacted
 - No API contract changes.
-- Existing endpoint `POST /api/files/:id/folder` remains unchanged.
 
 Validation status
-- Build: PASSED (`pnpm run build`)
-- Lint: PASSED (`pnpm run lint`)
-- Type-check: PASSED (`pnpm exec tsc --noEmit`)
+- Type-check: PASSED (`pnpm run lint`)
 
 Handoff TestEngineer
-- Verify initial dashboard/All Files load no longer triggers `/api/file-folders` until user opens Move dialog, clicks Browse folders, or focuses upload-folder select.
-- Verify mobile and desktop move-to-folder flows (open modal, choose destination, move to root and nested folders).
-- Verify existing folder operations after lazy load: browse folders, create folder, folder breadcrumbs, and share folder.
+- Verify initial All Files load does not request folders until Browse folders, Move to folder, or upload-folder focus.
+- Verify mobile and desktop move-to-folder flows.
+- Verify desktop table header alignment and no overlap between Added and Actions.
 
 Handoff QaEngineer
-- Validate performance improvement on accounts with large imported folder trees.
-- Confirm UX is clear for first-time folder interactions (explicit Browse folders and modal loading states).
+- Confirm improved initial load behavior on large folder datasets in the MSSQL environment.
 
 ---
 agent: DevEngineer | date: 2026-08-03 | model: GPT-5.3-Codex
@@ -265,41 +554,229 @@ Handoff QaEngineer
 ---
 
 Intent
-Ported theme-aware syntax highlighting for code-file previews to the PostgreSQL branch, preserving plain-text and CSV behavior.
+Reduced oversized Home "Recent files" tiles on phone screens by applying compact mobile-first sizing while preserving the existing desktop layout.
+
+Change class
+
+Files changed
+  - Reduced mobile Recent files grid gap.
+  - Switched FileCard to compact mobile spacing/padding.
+  - Reduced mobile thumbnail height and corner overlay/control footprint.
+  - Slightly reduced mobile filename/meta typography for denser cards.
+  - Kept previous dimensions from `sm` and above.
+
+Public contracts impacted
+- None. No API, shared type, or route changes.
+Validation status
+- Edited file diagnostics: PASSED.
+- Build: PASSED (`pnpm run build`).
+- Workspace lint/type-check: FAILED only on existing unrelated baseline JSX namespace errors in maintenance components:
+  - `src/app/shared/components/maintenance-mode-banner.tsx`
+  - `src/app/shared/components/maintenance-mode-control.tsx`
+
+- TestEngineer focus:
+  - Verify Home > Recent files on narrow Android/iOS widths displays smaller, denser tiles with no clipping.
+  - Verify desktop/tablet tile sizing remains unchanged.
+- QaEngineer focus:
+Approval trail
+- Not required (STANDARD change).
+---
+agent: DevEngineer | date: 2026-08-06 | model: GPT-5.3-Codex
+plan: /memories/session/dev-plan.md
+---
+
+Intent
+Addressed PageSpeed findings for unused JavaScript and render-blocking CSS by reducing initial payload and deferring heavy preview assets to on-demand chunks.
 
 Change class
 STANDARD
 
 Files changed
-- `src/app/shared/components/common/text-file-preview.tsx`: added explicit Highlight.js grammars, filename-based language detection, escaped highlighted output, and a 512 KiB highlighting guard.
-- `src/app/features/files/pages/user-dashboard.tsx`: passes private preview filenames to the shared renderer.
-- `src/app/features/sharing/pages/public-download-page.tsx`: passes public preview filenames to the shared renderer.
-- `src/index.css`: added dark/light theme syntax token colors.
-- `package.json`, `pnpm-lock.yaml`: added Highlight.js and synchronized the pnpm dependency lock.
-- `tests/syntax-preview.test.ts`: covers language mapping and escaped HTML rendering.
+- src/app/app.tsx:
+  - Replaced eager view imports with `React.lazy` for landing/auth/dashboard/public download/public folder pages.
+  - Wrapped each view render path with `Suspense` fallback spinner to preserve UX while chunks load.
+- src/app/features/files/pages/user-dashboard.tsx:
+  - Converted `TextFilePreview` import to lazy-loaded component.
+  - Added `Suspense` fallback around preview dialog rendering.
+- src/app/features/sharing/pages/public-download-page.tsx:
+  - Converted `TextFilePreview` import to lazy-loaded component.
+  - Added `Suspense` fallback around preview section rendering.
+- src/app/shared/components/common/text-file-preview.tsx:
+  - Added component-scoped CSS import for syntax highlight styles.
+- src/app/shared/components/common/text-file-preview.css:
+  - New file containing syntax-preview hljs theme rules previously in global CSS.
+- src/index.css:
+  - Removed global `.syntax-preview` highlight style block so it is no longer render-blocking on first paint.
+- vite.config.ts:
+  - Added conservative `rollupOptions.output.manualChunks` grouping (react, preview libs, ui libs, motion, vendor).
 
 Public contracts impacted
-- `TextFilePreview` requires a `fileName` prop; no HTTP API or database contract changed.
+- None. No API surface, route contract, or shared DTO shape changes.
 
 Validation status
-- Focused preview tests: PASSED (7/7).
-- Production build: PASSED.
-- Touched-file diagnostics: PASSED.
-- Existing build warnings remain: large Vite chunk and CommonJS `import.meta` warning.
-- The legacy `package-lock.json` was already MSSQL-based and out of sync with the PostgreSQL manifest before this task. It remains unchanged; pnpm is the repository's validated package manager and `pnpm install --frozen-lockfile` passed.
+- Build: PASSED (`pnpm run build`)
+- Type-check: PASSED (`pnpm run lint` / `tsc --noEmit`)
+- Bundle evidence (before -> after):
+  - Initial monolithic JS: `dist/assets/index-*.js` ~877.31 kB (gzip ~267.83 kB) -> entry `dist/assets/index-*.js` ~8.51 kB (gzip ~3.13 kB), with deferred chunks for feature/vendor code.
+  - Preview-specific CSS split out: new `dist/assets/text-file-preview-*.css` ~1.09 kB (gzip ~0.28 kB), removed from global critical CSS path.
 
 Handoff TestEngineer
-- Verify HTML, CSS/SCSS, JavaScript/TypeScript, JSON/YAML, SQL, and shell previews in public and authenticated views.
-- Verify `.txt` and `.log` remain plain, CSV retains column colors, and code is displayed rather than executed.
+- Verify first-load navigation for landing/auth/dashboard/download/folder still renders correctly under slow network (chunk-loading paths).
+- Verify text/csv preview still works in dashboard and public share pages, including spinner fallback during first preview open.
+- Verify no regressions in hash-route transitions (`#auth/*`, `#dashboard`, `#f/*`, `#d/*`).
 
 Handoff QaEngineer
-- Confirm theme contrast in dark, light, and Leeku themes and check a preview larger than 512 KiB falls back to responsive plain rendering.
+- Re-run PageSpeed on representative landing and public-download URLs and compare:
+  - Reduce unused JavaScript opportunity.
+  - Render-blocking CSS transfer/latency impact.
+- Confirm no user-visible regressions during initial navigation and preview open.
+
+Executed a low-risk dependency safe pass on `mssql` by updating `argon2` to the latest compatible release and applying the minimum TypeScript compatibility fix required by upstream type export changes.
+
+Change class
+🟡 STANDARD
+
+Files changed
+- package.json:
+  - Updated `argon2` from `^0.44.0` to `^0.45.1`.
+- pnpm-lock.yaml:
+  - Refreshed lockfile for updated dependency graph.
+- src/server/utils/encryption.ts:
+  - Switched argon2 option typings from `argon2.Options` to `argon2.HashOptions` to align with `argon2@0.45.x` type exports.
+
+Public contracts impacted
+- None. No API endpoint, payload, or shared DTO changes.
+
+Validation status
+- Type-check: PASSED (`pnpm run lint`).
+- Build: PASSED (`pnpm run build`).
+- Tests: PASSED (`pnpm exec tsx --test tests/*.test.ts`) — 11 passed, 0 failed.
+
+Deferred updates (higher risk)
+- `express` 4 -> 5
+- `@vitejs/plugin-react` 5 -> 6
+- `vite` 6 -> 8
+- `typescript` 5 -> 7
+- `lucide-react` 0.x -> 1.x
+- `esbuild` 0.25 -> 0.28 (0.x line; treat as migration)
+- `@types/node` 22 -> 26
+- `@types/express` 4 -> 5
+
+Approval trail
+- Not required (STANDARD change).
 
 ---
 
+Intent
+Aligned account email-change UX with security behavior by forcing immediate sign-out when re-verification is required.
+
+Change class
+🟡 STANDARD
+
+Files changed
+- src/server.ts:
+  - For POST /api/users/me/update, when SMTP-enabled email change occurs and verification is reset, now revokes all refresh sessions, clears auth cookies, and returns `requires_reauth: true` with a user-facing message.
+- src/app/features/files/pages/user-dashboard.tsx:
+  - Updated profile-save handler to parse response payload.
+  - If `requires_reauth` is true, show message and immediately run logout flow instead of showing generic “Profile updated.”
+
+Public contracts impacted
+- Response payload for successful `/api/users/me/update` now may include:
+  - `requires_reauth: true`
+  - `message: string`
+
+Validation status
+- Type-check: PASSED (`pnpm run lint`).
+- Build: PASSED (`pnpm run build`).
+- Tests: PASSED (`pnpm exec tsx --test tests/*.test.ts`) — 11 passed, 0 failed.
+
+Handoff notes
+- TestEngineer focus:
+  - Change email in settings with SMTP enabled; verify success message and immediate logout.
+  - Verify old session is invalidated and user must verify new email before login.
+  - Verify username-only or password-only updates do not force logout unexpectedly.
+
+Approval trail
+- Not required (STANDARD change).
+
 ---
-agent: DevEngineer | date: 2026-07-25 | model: GPT-5.3-Codex
-plan: /memories/session/dev-plan.md
+
+Intent
+Fixed account settings email updates so changing a user email now triggers the confirmation workflow and sends a verification email.
+
+Change class
+🟡 STANDARD
+
+Files changed
+- src/server.ts:
+  - Updated POST /api/users/me/update email branch to detect actual email changes.
+  - Added MX validation for changed emails.
+  - When SMTP is enabled, now regenerates verification token/expiry, marks email as unverified, and stores verification state.
+  - Added async verification email send after successful update (non-blocking response path).
+
+Public contracts impacted
+- No route shape changes.
+- Behavioral change: changing account email now requires re-verification when SMTP is enabled.
+
+Validation status
+- Type-check: PASSED (pnpm run lint).
+- Build: PASSED (pnpm run build).
+- Tests: PASSED (pnpm exec tsx --test tests/*.test.ts) — 11 passed, 0 failed.
+
+Handoff notes
+- TestEngineer focus:
+  - Change email in Account Settings to a valid domain and confirm verification email is received.
+  - Open verification link and confirm account can log in afterward.
+  - Try invalid/no-MX domains and confirm update is rejected with clear error.
+  - Confirm unchanged email submissions do not trigger a new verification cycle.
+- QaEngineer focus:
+  - Confirm no regression in username/password-only account updates.
+  - Confirm SMTP-disabled environments keep existing behavior (no verification requirement).
+
+Approval trail
+- Not required (STANDARD change).
+
+---
+
+Intent
+Patched the high-severity Nodemailer advisory by upgrading to a non-vulnerable version and re-validating the full project.
+
+Change class
+🟡 STANDARD
+
+Files changed
+- package.json:
+  - Upgraded `nodemailer` from `^8.0.11` to `^9.0.3`.
+- pnpm-lock.yaml:
+  - Refreshed lockfile to resolve `nodemailer@9.0.3`.
+
+Security advisory addressed
+- GHSA-p6gq-j5cr-w38f
+- Issue: message-level raw option bypass could allow arbitrary file-read and SSRF in delivered message construction.
+- Vulnerable range: `<=9.0.0`
+- Patched range: `>=9.0.1`
+
+Public contracts impacted
+- None. Existing email utility and API endpoint contracts remain unchanged.
+
+Validation status
+- Security audit: PASSED (`pnpm audit --json`) with zero vulnerabilities.
+- Build: PASSED (`pnpm run build`).
+- Type-check: PASSED (`pnpm run lint`).
+- Tests: PASSED (`pnpm exec tsx --test tests/*.test.ts`) — 11 passed, 0 failed.
+- Note: existing non-blocking build warning remains about `import.meta` in CJS output.
+
+Handoff notes
+- TestEngineer focus:
+  - Smoke-check verification email, quota-change notification email, and account deletion confirmation email flows against staging SMTP.
+- QaEngineer focus:
+  - Confirm vulnerability closure evidence from audit output and dependency lock update.
+
+Approval trail
+- Not required (STANDARD change).
+
+---
+
 ---
 
 Intent
@@ -342,50 +819,95 @@ Handoff notes
 
 ---
 
-## Intention
-Corriger le cas "dossier existe" alors qu'il n'est pas visible dans My Leeku file, en rendant le conflit compréhensible et en éliminant les anciens uniques globaux hérités.
+---
 
-## Changement
-Classe : STANDARD — 2 fichiers modifiés, correction ciblée, pas de refactor opportuniste.
+Intent
+Added admin-side folder navigation in the Admin Files panel so admins can browse root folders, open subfolders by clicking, and delete folders/subtrees.
 
-## Fichiers
-| Fichier | Raison |
-|---|---|
-| src/server.ts | Gestion fiable des conflits d'unicité PostgreSQL + enrichissement de la réponse 409 + migration de nettoyage des contraintes/index uniques legacy (owner_user_id, name) |
-| src/app/features/files/pages/user-dashboard.tsx | En cas de 409 à la création: refresh dossiers, navigation vers le parent existant, message explicite (chemin réel ou zone système cachée) |
+Change class
+🟡 STANDARD
 
-## Contrats publics impactés
-OUI (additif, rétrocompatible): `POST /api/file-folders` conserve `error` et ajoute éventuellement `existing_folder`, `existing_folder_path`, `existing_folder_hidden_by_system_filter` lors d'un 409.
+Files changed
+- src/app/shared/types/index.ts:
+  - Added `AdminFileFolder` shared type (`FileFolder` + owner username).
+- src/server.ts:
+  - Added `GET /api/admin/file-folders` to return folder tree metadata for all owners with decrypted owner usernames.
+  - Added `POST /api/admin/file-folders/:id/delete` for admin folder-tree deletion with `delete_files` option.
+- src/app/features/files/pages/user-dashboard.tsx:
+  - Added admin folder data loading in `loadAdmin` and passed folders to AdminWorkspace.
+- src/app/features/files/components/admin-workspace.tsx:
+  - Added folder breadcrumb navigation state in Admin Files tab.
+  - Added current-level folder cards with click-to-open behavior.
+  - Added folder delete action with choice: delete contained files or move them to owner root.
+  - Scoped file table to active folder context.
 
-## Risques
-Perf/Sécu/Régression/Compat : Faible / Faible / Faible / Faible.
+Public contracts impacted
+- Added API endpoint: GET /api/admin/file-folders
+- Added API endpoint: POST /api/admin/file-folders/:id/delete
 
-## Dette observée
-MINOR — Base de code avec quelques blocs SQL Server historiques encore présents dans branche PostgreSQL.
+Validation status
+- Type diagnostics for edited files: PASSED.
+- Workspace type-check: FAILED only on existing unrelated baseline JSX namespace issues in maintenance components.
 
-## Validation
-Build: ✅  Lint: ❌  Type-check: ❌  Smoke: ⚠️SKIPPED
-
-Détail validation:
-- `pnpm build` : PASS
-- `pnpm lint` (`tsc --noEmit`) : FAIL sur erreur préexistante non liée dans `src/server/routes/desktop-updates.ts` (incompatibilité de type `ISqlTypeWithLength`)
-
-## Approbation CRITICAL
-N/A
-
-## Handoff TestEngineer
-Surfaces à tester:
-- Création dossier déjà existant même parent: vérifier message + absence de faux "disparus".
-- Création dossier en conflit avec ancien unique global: vérifier message chemin et navigation parent.
-- Conflit dans arborescence système cachée: vérifier message explicite.
-
-## Handoff QaEngineer
-Correction STANDARD livrée avec preuve build PASS, et échec type-check global préexistant documenté hors surface modifiée.
+Handoff notes
+- Verify Admin > Files root shows only root-level folders.
+- Verify opening folders reveals only direct subfolders and files in that folder.
+- Verify deleting folder with files removal updates owner storage usage.
+- Verify deleting folder without files moves files to the owner's root.
 
 ---
 
 Intent
-Ported the validated Android All Files view rendering fix to the PostgreSQL branch, preventing the files area from overflowing the phone viewport or appearing tiny/left-aligned.
+Fixed production startup crash caused by PostgreSQL SQL syntax accidentally present in MSSQL runtime queries.
+
+Change class
+🟡 STANDARD
+
+Files changed
+- src/server.ts:
+  - Replaced PostgreSQL-only SQL with MSSQL syntax in startup migration helpers and route queries.
+  - Restored MSSQL forms for recursive CTEs, duplicate-folder conflict queries, upsert quotas, and INSERT/UPDATE return payloads.
+  - Restored SQL Server startup log wording.
+
+Root cause
+- Startup bootstrap executed `ALTER TABLE ... ADD COLUMN IF NOT EXISTS ...` which is PostgreSQL syntax and invalid in SQL Server, causing fatal boot error near `client_secret_hash`.
+
+Validation status
+- Type diagnostics: PASSED for edited file.
+- Build: PASSED (`pnpm build`).
+
+Operational note
+- Existing MSSQL environments should still run:
+  - Documentation/SQL/2026-07-25-mssql-folder-and-share-migration.sql
+
+---
+
+Intent
+Added and documented an idempotent MSSQL migration script based on the two modified files (`src/server.ts`, `src/app/features/files/pages/user-dashboard.tsx`) and aligned MSSQL schema documentation references/counts.
+
+Change class
+🟡 STANDARD
+
+Files changed
+- Documentation/SQL/2026-07-25-mssql-folder-and-share-migration.sql:
+  - New idempotent migration script for `file_folders` parent-aware uniqueness, `files.folder_id` relation/index, optional file secret columns, and `share_links.allow_external_preview` integrity.
+- Documentation/SQL/README.md:
+  - Added migration script as documented patch step.
+  - Updated schema counts and FK list to include folder hierarchy objects.
+- Documentation/SQL/VALIDATION.md:
+  - Updated expected counts (tables/procedures/FKs).
+  - Added dedicated validation checks for folder hierarchy constraints and FKs.
+- Documentation/SQL/production_schema.sql:
+  - Fixed execution header filename reference and added note about the targeted migration script for existing environments.
+
+Public contracts impacted
+- None. Documentation and migration guidance only.
+
+Validation status
+- Manual consistency review completed for edited SQL documentation and migration script.
+
+Intent
+Fixed the Android All Files view rendering issue where the files area could overflow the phone viewport and appear tiny, left-aligned, or horizontally stretched.
 
 Change class
 🟡 STANDARD
@@ -416,50 +938,15 @@ Test coverage status + handoff hint for test-engineer
 Validation status
 - file diagnostics: PASSED for `src/app/features/files/pages/user-dashboard.tsx`
 - build: PASSED (`pnpm run build`)
-- lint/type-check: PASSED (`pnpm run lint`)
+- lint/type-check: FAILED only on existing unrelated JSX namespace baseline issues in maintenance components.
 
 Approval trail
-- Not required (STANDARD change). User validated the MSSQL branch fix and requested the same changes on PostgreSQL on 2026-07-19.
+- Not required (STANDARD change).
 
 ---
 
 Intent
-Extended folder organization on the PostgreSQL branch to support nested sub-folders with a maximum depth of 5 (Google Drive-like hierarchy).
-
-Change class
-🔴 CRITICAL
-
-Files changed
-- src/app/shared/types/index.ts:
-  - Added `parent_folder_id` to `FileFolder`.
-- src/server.ts:
-  - Added parent-aware folder model and depth validation (`MAX_FOLDER_DEPTH = 5`).
-  - Updated folder list/create/rename APIs to include `parent_folder_id`.
-  - Updated folder delete behavior to include descendants using recursive queries.
-  - Updated PostgreSQL runtime schema migration to support parent folders, parent-scoped uniqueness, and parent-aware indexes.
-- src/app/features/files/pages/user-dashboard.tsx:
-  - Added nested navigation with breadcrumbs.
-  - Added create-subfolder behavior in current context.
-  - Added hierarchical folder path labels in file move selector.
-- Documentation/SQL/postgresql_schema.sql:
-  - Added `parent_folder_id` and parent-scoped uniqueness/index definitions for canonical PostgreSQL bootstrap schema.
-
-Public contracts impacted
-- Extended `FileFolder` payloads with `parent_folder_id`.
-- `POST /api/file-folders` accepts optional `parent_folder_id` and enforces depth <= 5.
-- Folder delete endpoint now applies subtree behavior for move/delete modes.
-
-Validation status
-- lint/type-check: pending final validation in this task.
-- build: pending final validation in this task.
-
-Approval trail
-- User requested matching nested-folder support on PostgreSQL branch with max depth 5 on 2026-07-18.
-
----
-
-Intent
-Replicated the All Files folder organization feature onto the PostgreSQL branch with PostgreSQL-native runtime DDL and canonical bootstrap schema support.
+Added user-managed folders inside All Files so users can organize files into per-user folders, move files between folders/root, upload directly into the selected folder, and choose folder-only or folder-plus-files deletion.
 
 Change class
 🔴 CRITICAL
@@ -469,14 +956,15 @@ Files changed
   - Added `FileFolder` DTO.
   - Extended `FileMetadata` with nullable `folder_id` and `folder_name`.
 - src/server.ts:
-  - Added folder list/create/rename/delete APIs using PostgreSQL-compatible queries and `RETURNING`.
-  - Added file move API for assigning files to folders or All Files root.
-  - Extended file listing/admin listing/upload responses with folder metadata.
-  - Added PostgreSQL runtime bootstrap for `file_folders`, `files.folder_id`, FK, and indexes.
+  - Added file folder schema bootstrap for `file_folders` and `files.folder_id`.
+  - Added folder list/create/rename/delete APIs.
+  - Added `POST /api/files/:id/folder` to move files to a folder or All Files root.
+  - Updated file listing/admin listing/upload mapping to include folder metadata.
+  - Updated direct and resumable uploads to accept `folder_id`.
 - src/app/features/files/pages/user-dashboard.tsx:
-  - Added folder navigation, folder cards, create/rename/delete controls, upload-to-current-folder, and per-file move selectors.
-- Documentation/SQL/postgresql_schema.sql:
-  - Added canonical PostgreSQL `file_folders` table, `files.folder_id`, indexes, and FK for fresh product deployments.
+  - Added folder navigation in All Files, folder cards, create/rename/delete controls, upload-to-current-folder, and per-file move selectors.
+- Documentation/SQL/production_schema.sql:
+  - Added canonical `file_folders` table, `files.folder_id`, indexes, defaults, and foreign keys.
 
 Public contracts impacted
 - Added API endpoint: GET /api/file-folders
@@ -488,26 +976,110 @@ Public contracts impacted
 - Extended upload requests with optional `folder_id`.
 
 Risks
-- Persistence contract changed; deployed PostgreSQL databases need the runtime bootstrap migration to run or equivalent SQL applied.
+- Persistence contract changed; deployed databases need the bootstrap migration to run or equivalent SQL applied.
 - Folder deletion with `delete_files=true` physically removes vault files and file rows for files in that folder.
 - Folder names are unique per owner and limited to 120 characters.
-- `FK files(folder_id) -> file_folders(id)` uses `ON DELETE NO ACTION`; the app clears or deletes folder files before deleting a folder.
+- SQL Server does not allow `ON DELETE SET NULL` here because `users -> files` and `users -> file_folders -> files` create multiple cascade paths; `FK_files_file_folders` intentionally uses `ON DELETE NO ACTION`, and the app clears/moves folder files before deleting a folder.
 
 Test coverage status + handoff hint for test-engineer
 - No automated tests added (out of scope for DevEngineer mode).
 - Handoff focus:
-  - Verify create/rename/delete folder flows on PostgreSQL.
-  - Verify folder-only delete moves files back to root.
-  - Verify folder-plus-files delete removes rows, cascaded share links, vault files, and decrements storage.
+  - Verify creating, renaming, and deleting folders as a normal user.
+  - Verify deleting only grouping moves files back to All Files root.
+  - Verify deleting folder plus files removes file rows, vault files, share links via cascade, and decrements user storage usage.
   - Verify direct and resumable uploads target the selected folder.
   - Verify users cannot move files into another user's folder.
 
 Validation status
-- lint/type-check: PASSED (`pnpm lint`)
+- build: PASSED (`pnpm build`, rerun after SQL Server FK action correction)
+- lint/type-check: FAILED only on existing unrelated JSX namespace baseline issues in maintenance components.
+
+Approval trail
+- User explicitly approved CRITICAL contract change with `GO` on 2026-07-18.
+
+---
+
+Intent
+Updated project dependencies to current safe versions (patch/minor within existing major ranges), removed unused packages, and validated build/type-check/test stability.
+
+Change class
+🟡 STANDARD
+
+Files changed
+- package.json:
+  - Removed unused dependencies: `date-fns`, `autoprefixer`.
+  - Removed duplicate runtime `vite` entry from dependencies (kept in devDependencies).
+  - Updated multiple dependency ranges to current releases within the same major.
+- pnpm-lock.yaml:
+  - Refreshed lockfile after dependency update and removals.
+- src/app/shared/components/maintenance-mode-banner.tsx:
+  - Added `type JSX` import from React to preserve JSX return typing compatibility with updated React type packages.
+- src/app/shared/components/maintenance-mode-control.tsx:
+  - Added `type JSX` import from React to preserve JSX return typing compatibility with updated React type packages.
+
+Public contracts impacted
+- None. No API route shape, request/response schema, or shared DTO contract changes.
+
+Deferred updates (intentional)
+- Left major-version upgrades for a dedicated migration pass due higher regression risk:
+  - `express` 4 -> 5
+  - `@vitejs/plugin-react` 5 -> 6
+  - `vite` 6 -> 8
+  - `typescript` 5 -> 7
+  - `nodemailer` 8 -> 9
+  - `lucide-react` 0.x -> 1.x
+
+Validation status
+- Build: PASSED (`pnpm run build`).
+- Type-check: PASSED (`pnpm run lint`).
+- Tests: PASSED (`pnpm exec tsx --test tests/*.test.ts`) — 11 passed, 0 failed.
+- Note: existing non-blocking build warning remains about `import.meta` in CJS bundle output.
+
+Handoff notes
+- TestEngineer focus:
+  - Run full app smoke checks on auth, file operations, sharing, admin maintenance controls, and email flows due dependency drift on core packages.
+  - Confirm no runtime issue around updated `mssql`, `multer`, `express-rate-limit`, and `@google/genai` integrations.
+- QaEngineer focus:
+  - Validate release risk remains low because only non-major updates were applied and all current automated checks pass.
+  - Track deferred major upgrades as a separate migration workstream.
+
+Approval trail
+- Not required (STANDARD change).
+
+---
+
+Intent
+Extended All Files folders to support nested sub-folders on the MSSQL branch with a maximum depth of 5 (Google Drive-like hierarchy), plus recursive folder deletion behavior.
+
+Change class
+🔴 CRITICAL
+
+Files changed
+- src/app/shared/types/index.ts:
+  - Added `parent_folder_id` to `FileFolder`.
+- src/server.ts:
+  - Added parent-aware folder model and max-depth enforcement (`MAX_FOLDER_DEPTH = 5`).
+  - Updated folder list/create/rename APIs to include `parent_folder_id` and parent validation.
+  - Updated folder delete API to operate on full descendant tree (move files to root or delete files recursively).
+  - Updated runtime MSSQL schema bootstrap for `parent_folder_id`, self-FK, and parent-scoped uniqueness/indexing.
+- src/app/features/files/pages/user-dashboard.tsx:
+  - Added nested folder navigation with breadcrumbs.
+  - Added create sub-folder behavior in current folder context.
+  - Added hierarchical folder labels in move-file selector.
+- Documentation/SQL/production_schema.sql:
+  - Added `file_folders.parent_folder_id`, self-FK, and parent-scoped unique/index definitions.
+
+Public contracts impacted
+- Extended folder payloads (`/api/file-folders`) with `parent_folder_id`.
+- `POST /api/file-folders` now accepts optional `parent_folder_id` and enforces max depth 5.
+- Folder delete endpoints now apply to subtree descendants.
+
+Validation status
+- lint/type-check: FAILED only on existing unrelated baseline JSX namespace issues in maintenance components.
 - build: PASSED (`pnpm build`)
 
 Approval trail
-- User requested replication onto `postgresql` branch on 2026-07-18.
+- User approved CRITICAL nested folder change and requested max depth of 5 on 2026-07-18.
 
 ---
 

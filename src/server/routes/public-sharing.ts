@@ -136,16 +136,17 @@ export function shouldServeLargeVideoHtmlFallback(input: {
   rangeHeader: string;
   rawMode: boolean;
 }): boolean {
-  if (input.rawMode || input.rangeHeader) return false;
+  if (input.rawMode) return false;
   if (!input.mimeType || !input.mimeType.toLowerCase().startsWith('video/')) return false;
-
-  const sizeBytes = Number(input.sizeBytes ?? 0);
-  if (!Number.isFinite(sizeBytes) || sizeBytes <= DISCORD_INLINE_VIDEO_LIMIT_BYTES) return false;
 
   const userAgent = input.userAgent.toLowerCase();
   const isCrawlerUa = /discordbot|facebookexternalhit|facebot|meta-externalagent|meta-externalfetcher|twitterbot|slackbot|linkedinbot|whatsapp/.test(userAgent);
 
-  return isCrawlerUa;
+  if (!isCrawlerUa) return false;
+
+  // Always serve a metadata HTML card to crawlers so social platforms can unfurl
+  // and discover the player stream URL, even if they send a probing Range header.
+  return true;
 }
 
 export function cleanupPublicShareDecryptedPreviewFiles(rootPath: string, token: string, fileId: string): number {
@@ -970,6 +971,7 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
     req: express.Request,
     res: express.Response,
     forceDecryptedFromPath = false,
+    forceRawFromPath = false,
   ) => {
     const token = getSingleParam(req.params.token);
     try {
@@ -1019,6 +1021,7 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
 
       const rangeHeader = typeof req.headers.range === 'string' ? req.headers.range.trim() : '';
       const fetchDest = String(req.headers['sec-fetch-dest'] || '').trim().toLowerCase();
+      const fetchSite = String(req.headers['sec-fetch-site'] || '').trim().toLowerCase();
       const acceptHeader = String(req.headers.accept || '').toLowerCase();
       const userAgent = String(req.get('user-agent') || '').toLowerCase();
       const isCrawlerUa =
@@ -1033,13 +1036,15 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
         userAgent.includes('slackbot') ||
         userAgent.includes('linkedinbot') ||
         userAgent.includes('whatsapp');
-      const rawMode = String(req.query.raw || '').trim() === '1';
+      const rawMode = forceRawFromPath || String(req.query.raw || '').trim() === '1';
+      const warmupMode = forceRawFromPath && String(req.query.warmup || '').trim() === '1';
       const forceDecryptedMode = String(req.query.decrypted || '').trim() === '1';
       const compatMode = String(req.query.compat || '').trim() === '1';
       const streamMimeType = compatMode && normalizedMimeType === 'video/quicktime'
         ? 'video/mp4'
         : (normalizedMimeType || 'application/octet-stream');
-      const isDocumentNavigation = fetchDest === 'document' || (fetchDest === '' && !rangeHeader && acceptHeader.includes('text/html'));
+      const isDocumentNavigation = fetchDest === 'document' || (fetchDest === '' && fetchSite === 'none' && !rangeHeader && acceptHeader.includes('text/html'));
+      const isCrossSiteNavigation = fetchSite === 'cross-site';
       const originalName = decryptColumn(row.original_name_encrypted, row.original_name_iv, row.original_name_auth_tag);
       const requestedDecryptedPreview = forceDecryptedFromPath || forceDecryptedMode;
       if (requestedDecryptedPreview && !row.allow_decrypted_external_preview) {
@@ -1063,12 +1068,56 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
         rawMode,
       });
 
+      const mediaStreamPath = forceDecryptedFromPath
+        ? `/api/public/share/${token}/dec_embed_media`
+        : `/api/public/share/${token}/embed_media`;
+
+      const warmEmbedCacheInBackground = () => {
+        try {
+          const vaultFile = path.join(options.vaultPath, row.stored_path);
+          if (!fs.existsSync(vaultFile)) return;
+
+          const cachePath = useDecryptedExternalPreview
+            ? getDecryptedEmbedCachePath(token, row.file_id_join, originalName)
+            : getEmbedCachePath(token, row.file_id_join);
+
+          if (!useDecryptedExternalPreview) {
+            sweepEmbedCache();
+          }
+
+          const cacheKey = `${token}:${row.file_id_join}`;
+          const fileKey = unwrapKey(row.encrypted_key, row.key_iv, row.key_auth_tag);
+
+          void ensureEmbedCacheFile(
+            cachePath,
+            cacheKey,
+            vaultFile,
+            fileKey,
+            row.file_iv,
+            row.file_auth_tag,
+            row.size_bytes,
+            row.checksum_sha256,
+          ).catch((error) => {
+            console.warn(
+              `[public-sharing] Background embed cache warmup failed for token ${token}:`,
+              error instanceof Error ? error.message : error,
+            );
+          });
+        } catch (error) {
+          console.warn(
+            `[public-sharing] Background embed cache warmup setup failed for token ${token}:`,
+            error instanceof Error ? error.message : error,
+          );
+        }
+      };
+
       if (!rawMode && shouldUseLargeVideoHtmlFallback) {
+        warmEmbedCacheInBackground();
         const uploader = decryptColumn(row.owner_username_encrypted, row.owner_username_iv, row.owner_username_auth_tag);
         const sizeLabel = ogFormatBytes(Number(row.size_bytes || 0));
         const previewUrl = `${req.protocol}://${req.get('host') || 'leeks.miku.rip'}${req.originalUrl}`;
         const directUrl = `${req.protocol}://${req.get('host') || 'leeks.miku.rip'}${req.originalUrl}`;
-        const playerUrl = `${directUrl}${directUrl.includes('?') ? '&' : '?'}raw=1${normalizedMimeType === 'video/quicktime' ? '&compat=1' : ''}`;
+        const playerUrl = `${req.protocol}://${req.get('host') || 'leeks.miku.rip'}${mediaStreamPath}${normalizedMimeType === 'video/quicktime' ? '?compat=1' : ''}`;
         const profileImageUrl = resolveProfilePictureOgImageUrl(req.protocol + '://' + (req.get('host') || 'leeks.miku.rip'), row.owner_user_id);
         const ogImageUrl = profileImageUrl || resolveOgImageUrl(req.protocol + '://' + (req.get('host') || 'leeks.miku.rip'));
         const safeName = escapeHtml(originalName);
@@ -1123,8 +1172,8 @@ ${safeOgImageUrl ? `<meta name="twitter:image" content="${safeOgImageUrl}" />` :
 </html>`);
       }
 
-      if (!rawMode && isDocumentNavigation && !isCrawlerUa) {
-        const playerSrc = `${req.originalUrl}${req.originalUrl.includes('?') ? '&' : '?'}raw=1${normalizedMimeType === 'video/quicktime' ? '&compat=1' : ''}`;
+      if (!rawMode && isDocumentNavigation && !isCrawlerUa && !isCrossSiteNavigation) {
+        const playerSrc = `${mediaStreamPath}${normalizedMimeType === 'video/quicktime' ? '?compat=1' : ''}`;
         const safeName = escapeHtml(originalName);
         const safeType = escapeHtml(normalizedMimeType || 'application/octet-stream');
         const safeStreamType = escapeHtml(streamMimeType);
@@ -1159,6 +1208,34 @@ ${safeOgImageUrl ? `<meta name="twitter:image" content="${safeOgImageUrl}" />` :
 
       const vaultFile = path.join(options.vaultPath, row.stored_path);
       if (!fs.existsSync(vaultFile)) return res.status(410).json({ error: 'Vault file not found.' });
+
+      if (warmupMode) {
+        const cachePath = useDecryptedExternalPreview
+          ? getDecryptedEmbedCachePath(token, row.file_id_join, originalName)
+          : getEmbedCachePath(token, row.file_id_join);
+        if (!useDecryptedExternalPreview) {
+          sweepEmbedCache();
+        }
+        const cacheKey = `${token}:${row.file_id_join}`;
+        const fileKey = unwrapKey(row.encrypted_key, row.key_iv, row.key_auth_tag);
+
+        await ensureEmbedCacheFile(
+          cachePath,
+          cacheKey,
+          vaultFile,
+          fileKey,
+          row.file_iv,
+          row.file_auth_tag,
+          row.size_bytes,
+          row.checksum_sha256,
+        );
+
+        res.setHeader('Cache-Control', 'no-store, max-age=0');
+        return res.status(200).json({
+          ready: true,
+          mode: useDecryptedExternalPreview ? 'decrypted' : 'standard',
+        });
+      }
 
       const reserve = await getRequest(); reserve.input('id', sql.UniqueIdentifier, row.id);
       const reservation = await reserve.query(
@@ -1284,8 +1361,16 @@ ${safeOgImageUrl ? `<meta name="twitter:image" content="${safeOgImageUrl}" />` :
     await handleEmbedRoute(req, res, false);
   });
 
+  router.get('/:token/embed_media', async (req, res) => {
+    await handleEmbedRoute(req, res, false, true);
+  });
+
   router.get('/:token/dec_embed', async (req, res) => {
     await handleEmbedRoute(req, res, true);
+  });
+
+  router.get('/:token/dec_embed_media', async (req, res) => {
+    await handleEmbedRoute(req, res, true, true);
   });
 
   return router;
