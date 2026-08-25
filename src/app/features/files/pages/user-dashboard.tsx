@@ -2548,6 +2548,7 @@ export default function UserDashboard({
           password={folderSharePassword}
           expires={folderShareExpires}
           url={folderShareUrl}
+          directLinkBase={`${window.location.origin}/api/public/share/${user.id}/${shareFolder.id}/`}
           canRemove={folderLinks.some((link) => link.folder_id === shareFolder.id)}
           onPassword={setFolderSharePassword}
           onExpires={setFolderShareExpires}
@@ -3310,6 +3311,7 @@ function FolderShareDialog(props: {
   password: string;
   expires: string;
   url: string;
+  directLinkBase: string;
   canRemove: boolean;
   onPassword: (value: string) => void;
   onExpires: (value: string) => void;
@@ -3354,6 +3356,12 @@ function FolderShareDialog(props: {
           </div>
         </div>
         {props.url && <div className="mt-5 flex gap-2"><input readOnly value={props.url} className="min-w-0 flex-1 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-muted)] px-3 py-2 text-sm" /><button type="button" title="Copy link" aria-label="Copy link" onClick={props.onCopy} className="grid h-10 w-10 place-items-center rounded-lg border border-[var(--border-subtle)]"><Copy className="h-4 w-4" /></button></div>}
+        {props.url && !props.password && (
+          <div className="mt-3">
+            <span className="mb-1 block text-xs font-medium text-[var(--text-muted)]">Direct link (for embedding on websites, append the exact filename)</span>
+            <input readOnly value={`${props.directLinkBase}filename.ext`} className="w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-muted)] px-3 py-2 text-xs text-[var(--text-muted)]" />
+          </div>
+        )}
         <div className="mt-6 flex flex-wrap justify-between gap-2">
           <div>{props.canRemove && <button type="button" onClick={props.onRemove} className="rounded-lg border border-[color-mix(in_srgb,var(--error-linear)_42%,transparent)] px-4 py-2 text-sm text-[var(--error-linear)]">Remove link</button>}</div>
           <button type="button" onClick={props.onSave} className="rounded-lg bg-[var(--accent-linear)] px-4 py-2 text-sm font-medium text-[var(--accent-contrast)]">{props.url ? "Update link" : "Create link"}</button>

@@ -1377,5 +1377,131 @@ ${safeOgImageUrl ? `<meta name="twitter:image" content="${safeOgImageUrl}" />` :
     await handleEmbedRoute(req, res, true, true);
   });
 
+  const GUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+  // Direct, stable hotlink route for websites: /api/public/share/:userId/:folderId/:filename
+  // Requires an active, unprotected folder share link; secret-key-protected files are excluded.
+  router.get('/:userId/:folderId/:filename', async (req, res) => {
+    const userId = getSingleParam(req.params.userId);
+    const folderId = getSingleParam(req.params.folderId);
+    const filenameParam = decodeURIComponent(getSingleParam(req.params.filename));
+    if (!GUID_PATTERN.test(userId) || !GUID_PATTERN.test(folderId)) {
+      return res.status(404).json({ error: 'Shared folder not found.' });
+    }
+    try {
+      const shareRequest = await getRequest();
+      shareRequest.input('folderId', sql.UniqueIdentifier, folderId);
+      shareRequest.input('userId', sql.UniqueIdentifier, userId);
+      const shareResult = await shareRequest.query<{
+        public_token: string; password_hash: string | null; expires_at: Date | null; is_active: boolean;
+      }>(
+        `SELECT fsl.public_token,fsl.password_hash,fsl.expires_at,fsl.is_active
+         FROM folder_share_links fsl
+         INNER JOIN file_folders ff ON ff.id=fsl.folder_id
+         WHERE fsl.folder_id=@folderId AND ff.owner_user_id=@userId`,
+      );
+      const shareRow = shareResult.recordset[0];
+      if (!shareRow || !shareRow.is_active) {
+        return res.status(404).json({ error: 'Shared folder not found.' });
+      }
+      if (shareRow.expires_at && new Date(shareRow.expires_at) <= new Date()) {
+        return res.status(410).json({ error: 'Shared folder link has expired.' });
+      }
+      if (shareRow.password_hash) {
+        return res.status(403).json({ error: 'Password-protected folders cannot be used as direct links.' });
+      }
+
+      const filesRequest = await getRequest();
+      filesRequest.input('folderId', sql.UniqueIdentifier, folderId);
+      const filesResult = await filesRequest.query<{
+        file_id: string; stored_path: string; mime_type: string; size_bytes: number; checksum_sha256: string;
+        client_secret_hash: string | null;
+        original_name_encrypted: Buffer; original_name_iv: Buffer; original_name_auth_tag: Buffer;
+        encrypted_key: Buffer; key_iv: Buffer; key_auth_tag: Buffer; file_iv: Buffer; file_auth_tag: Buffer;
+      }>(
+        `;WITH folder_tree AS (
+           SELECT id FROM file_folders WHERE id=@folderId
+           UNION ALL
+           SELECT ff.id FROM file_folders ff INNER JOIN folder_tree ft ON ff.parent_folder_id=ft.id
+         )
+         SELECT f.id AS file_id,f.stored_path,f.mime_type,f.size_bytes,f.checksum_sha256,f.client_secret_hash,
+                f.original_name_encrypted,f.original_name_iv,f.original_name_auth_tag,
+                k.encrypted_key,k.key_iv,k.key_auth_tag,k.file_iv,k.file_auth_tag
+         FROM files f INNER JOIN file_encryption_keys k ON k.file_id=f.id
+         WHERE f.folder_id IN (SELECT id FROM folder_tree)
+           AND COALESCE(f.status,'Available')='Available'
+           AND (f.expires_at IS NULL OR f.expires_at>SYSDATETIMEOFFSET())
+         OPTION (MAXRECURSION 100)`,
+      );
+
+      const normalizedFilename = filenameParam.trim().toLowerCase();
+      const match = filesResult.recordset.find((file) => {
+        const originalName = decryptColumn(file.original_name_encrypted, file.original_name_iv, file.original_name_auth_tag);
+        return originalName.trim().toLowerCase() === normalizedFilename;
+      });
+      if (!match) return res.status(404).json({ error: 'File not found in shared folder.' });
+      if (match.client_secret_hash) {
+        return res.status(403).json({ error: 'Secret-key-protected files cannot be used as direct links.' });
+      }
+
+      const vaultFile = path.join(options.vaultPath, match.stored_path);
+      if (!fs.existsSync(vaultFile)) return res.status(410).json({ error: 'Vault file not found.' });
+
+      const originalName = decryptColumn(match.original_name_encrypted, match.original_name_iv, match.original_name_auth_tag);
+      const cachePath = getEmbedCachePath(folderId, match.file_id);
+      sweepEmbedCache();
+      const cacheKey = `${folderId}:${match.file_id}`;
+      const fileKey = unwrapKey(match.encrypted_key, match.key_iv, match.key_auth_tag);
+      await ensureEmbedCacheFile(
+        cachePath,
+        cacheKey,
+        vaultFile,
+        fileKey,
+        match.file_iv,
+        match.file_auth_tag,
+        match.size_bytes,
+        match.checksum_sha256,
+      );
+
+      const fileSize = fs.statSync(cachePath).size;
+      const rangeHeader = typeof req.headers.range === 'string' ? req.headers.range.trim() : '';
+
+      res.setHeader('Content-Type', match.mime_type || 'application/octet-stream');
+      res.setHeader('Content-Disposition', buildContentDisposition('inline', originalName));
+      res.setHeader('Accept-Ranges', 'bytes');
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Cache-Control', 'public, max-age=300');
+
+      void options.logDownload(req, match.file_id, originalName, shareRow.public_token).catch(() => {});
+
+      if (rangeHeader.toLowerCase().startsWith('bytes=')) {
+        const parsedRange = parseSingleByteRange(rangeHeader, fileSize);
+        if (!parsedRange) {
+          res.status(416);
+          res.setHeader('Content-Range', `bytes */${fileSize}`);
+          return res.json({ error: 'Requested range is not satisfiable.' });
+        }
+        const { start, end } = parsedRange;
+        res.status(206);
+        res.setHeader('Content-Range', `bytes ${start}-${end}/${fileSize}`);
+        res.setHeader('Content-Length', String(end - start + 1));
+        const stream = fs.createReadStream(cachePath, { start, end });
+        stream.on('error', () => stream.destroy());
+        stream.pipe(res);
+        return;
+      }
+
+      res.setHeader('Content-Length', String(fileSize));
+      const stream = fs.createReadStream(cachePath);
+      stream.on('error', () => stream.destroy());
+      stream.pipe(res);
+    } catch (error) {
+      console.error('[GET /api/public/share/:userId/:folderId/:filename]', error);
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Direct file link failed.' });
+      }
+    }
+  });
+
   return router;
 }
