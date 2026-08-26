@@ -1381,10 +1381,13 @@ ${safeOgImageUrl ? `<meta name="twitter:image" content="${safeOgImageUrl}" />` :
 
   // Direct, stable hotlink route for websites: /api/public/share/:userId/:folderId/:filename
   // Requires an active, unprotected folder share link; secret-key-protected files are excluded.
-  router.get('/:userId/:folderId/:filename', async (req, res) => {
+  router.get('/:userId/:folderId/*filePath', async (req, res) => {
     const userId = getSingleParam(req.params.userId);
     const folderId = getSingleParam(req.params.folderId);
-    const filenameParam = decodeURIComponent(getSingleParam(req.params.filename));
+    const rawFilePath = (req.params as Record<string, string | string[] | undefined>).filePath;
+    const filenameParam = (Array.isArray(rawFilePath) ? rawFilePath : [rawFilePath])
+      .map((segment) => decodeURIComponent(segment || ''))
+      .join('/');
     if (!GUID_PATTERN.test(userId) || !GUID_PATTERN.test(folderId)) {
       return res.status(404).json({ error: 'Shared folder not found.' });
     }
@@ -1414,30 +1417,34 @@ ${safeOgImageUrl ? `<meta name="twitter:image" content="${safeOgImageUrl}" />` :
       const filesRequest = await getRequest();
       filesRequest.input('folderId', sql.UniqueIdentifier, folderId);
       const filesResult = await filesRequest.query<{
-        file_id: string; stored_path: string; mime_type: string; size_bytes: number; checksum_sha256: string;
+        file_id: string; relative_path: string; stored_path: string; mime_type: string; size_bytes: number; checksum_sha256: string;
         client_secret_hash: string | null;
         original_name_encrypted: Buffer; original_name_iv: Buffer; original_name_auth_tag: Buffer;
         encrypted_key: Buffer; key_iv: Buffer; key_auth_tag: Buffer; file_iv: Buffer; file_auth_tag: Buffer;
       }>(
-        `;WITH folder_tree AS (
-           SELECT id FROM file_folders WHERE id=@folderId
+         `;WITH folder_tree AS (
+            SELECT id,parent_folder_id,CAST('' AS nvarchar(max)) AS relative_path FROM file_folders WHERE id=@folderId
            UNION ALL
-           SELECT ff.id FROM file_folders ff INNER JOIN folder_tree ft ON ff.parent_folder_id=ft.id
+            SELECT ff.id,ff.parent_folder_id,
+              CAST(CASE WHEN ft.relative_path='' THEN ff.name ELSE ft.relative_path+N'/'+ff.name END AS nvarchar(max))
+            FROM file_folders ff INNER JOIN folder_tree ft ON ff.parent_folder_id=ft.id
          )
-         SELECT f.id AS file_id,f.stored_path,f.mime_type,f.size_bytes,f.checksum_sha256,f.client_secret_hash,
+          SELECT f.id AS file_id,
+            CASE WHEN ft.relative_path='' THEN N'' ELSE ft.relative_path+N'/' END AS relative_path,
+            f.stored_path,f.mime_type,f.size_bytes,f.checksum_sha256,f.client_secret_hash,
                 f.original_name_encrypted,f.original_name_iv,f.original_name_auth_tag,
                 k.encrypted_key,k.key_iv,k.key_auth_tag,k.file_iv,k.file_auth_tag
          FROM files f INNER JOIN file_encryption_keys k ON k.file_id=f.id
-         WHERE f.folder_id IN (SELECT id FROM folder_tree)
-           AND COALESCE(f.status,'Available')='Available'
+          INNER JOIN folder_tree ft ON ft.id=f.folder_id
+          WHERE COALESCE(f.status,'Available')='Available'
            AND (f.expires_at IS NULL OR f.expires_at>SYSDATETIMEOFFSET())
          OPTION (MAXRECURSION 100)`,
       );
 
-      const normalizedFilename = filenameParam.trim().toLowerCase();
+      const normalizedFilename = filenameParam.trim().replace(/\\/g, '/').toLowerCase();
       const match = filesResult.recordset.find((file) => {
         const originalName = decryptColumn(file.original_name_encrypted, file.original_name_iv, file.original_name_auth_tag);
-        return originalName.trim().toLowerCase() === normalizedFilename;
+        return `${file.relative_path}${originalName}`.trim().toLowerCase() === normalizedFilename;
       });
       if (!match) return res.status(404).json({ error: 'File not found in shared folder.' });
       if (match.client_secret_hash) {

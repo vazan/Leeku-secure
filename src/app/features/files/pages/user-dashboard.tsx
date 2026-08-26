@@ -3358,8 +3358,8 @@ function FolderShareDialog(props: {
         {props.url && <div className="mt-5 flex gap-2"><input readOnly value={props.url} className="min-w-0 flex-1 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-muted)] px-3 py-2 text-sm" /><button type="button" title="Copy link" aria-label="Copy link" onClick={props.onCopy} className="grid h-10 w-10 place-items-center rounded-lg border border-[var(--border-subtle)]"><Copy className="h-4 w-4" /></button></div>}
         {props.url && !props.password && (
           <div className="mt-3">
-            <span className="mb-1 block text-xs font-medium text-[var(--text-muted)]">Direct link (for embedding on websites, append the exact filename)</span>
-            <input readOnly value={`${props.directLinkBase}filename.ext`} className="w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-muted)] px-3 py-2 text-xs text-[var(--text-muted)]" />
+            <span className="mb-1 block text-xs font-medium text-[var(--text-muted)]">Direct link (append the path from this folder)</span>
+            <input readOnly value={`${props.directLinkBase}sub-folder/filename.ext`} className="w-full rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-muted)] px-3 py-2 text-xs text-[var(--text-muted)]" />
           </div>
         )}
         <div className="mt-6 flex flex-wrap justify-between gap-2">
