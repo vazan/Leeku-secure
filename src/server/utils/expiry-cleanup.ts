@@ -154,24 +154,31 @@ async function runCleanupCycle(
 
   const successfullyDeleted: string[] = [];
 
-  for (const file of expired) {
-    const deleted = deleteVaultFile(file.storedPath);
+  // Process files asynchronously to avoid blocking the event loop
+  // Process in batches to prevent memory issues with many expired files
+  // Reduced from 50 to 25 to further minimize memory pressure
+  const BATCH_SIZE = 25;
+  for (let i = 0; i < expired.length; i += BATCH_SIZE) {
+    const batch = expired.slice(i, i + BATCH_SIZE);
+    await Promise.all(batch.map(async (file) => {
+      const deleted = deleteVaultFile(file.storedPath);
 
-    if (deleted) {
-      successfullyDeleted.push(file.id);
-      console.log(`[expiry-cleanup] Deleted vault file: ${path.basename(file.storedPath)} (owner: ${file.ownerId})`);
+      if (deleted) {
+        successfullyDeleted.push(file.id);
+        console.log(`[expiry-cleanup] Deleted vault file: ${path.basename(file.storedPath)} (owner: ${file.ownerId})`);
 
-      if (logDeletion) {
-        await logDeletion(file).catch((err) => {
-          console.error('[expiry-cleanup] Failed to write deletion log:', err);
-        });
+        if (logDeletion) {
+          await logDeletion(file).catch((err) => {
+            console.error('[expiry-cleanup] Failed to write deletion log:', err);
+          });
+        }
+      } else {
+        // File was already missing from disk (e.g., manual admin deletion).
+        // Still mark it expired in the DB to keep the state consistent.
+        successfullyDeleted.push(file.id);
+        console.warn(`[expiry-cleanup] Vault file not found on disk (already removed?): ${file.storedPath}`);
       }
-    } else {
-      // File was already missing from disk (e.g., manual admin deletion).
-      // Still mark it expired in the DB to keep the state consistent.
-      successfullyDeleted.push(file.id);
-      console.warn(`[expiry-cleanup] Vault file not found on disk (already removed?): ${file.storedPath}`);
-    }
+    }));
   }
 
   if (successfullyDeleted.length > 0) {

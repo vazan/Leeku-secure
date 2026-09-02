@@ -2270,10 +2270,12 @@ app.post('/api/file-folders/:id/delete', authenticateUser as express.RequestHand
          WHERE owner_user_id=@ownerId AND folder_id IN (SELECT id FROM folder_tree) OPTION (MAXRECURSION 100)`
       );
     } else {
+      // Process files in smaller batches to prevent memory issues and hard crashes
+      // Get all files in the folder tree first
       const filesReq = await getRequest();
       filesReq.input('folderId', sql.UniqueIdentifier, folderId);
       filesReq.input('ownerId', sql.UniqueIdentifier, req.userId!);
-      const folderFiles = await filesReq.query<{id:string;stored_path:string;size_bytes:number;status:string}>(
+      const filesResult = await filesReq.query<{id:string;stored_path:string;size_bytes:number;status:string}>(
         `;WITH folder_tree AS (
            SELECT id FROM file_folders WHERE id=@folderId AND owner_user_id=@ownerId
            UNION ALL
@@ -2286,33 +2288,50 @@ app.post('/api/file-folders/:id/delete', authenticateUser as express.RequestHand
          FROM files
          WHERE owner_user_id=@ownerId AND folder_id IN (SELECT id FROM folder_tree) OPTION (MAXRECURSION 100)`
       );
-      for (const file of folderFiles.recordset) {
-        const vaultPath = path.join(FILE_VAULT, file.stored_path);
-        try { if (fs.existsSync(vaultPath)) fs.unlinkSync(vaultPath); } catch {}
-      }
-      const storageToRemove = folderFiles.recordset
-        .filter((file) => file.status === 'Available')
-        .reduce((total, file) => total + Number(file.size_bytes || 0), 0);
-      const deleteReq = await getRequest();
-      deleteReq.input('folderId', sql.UniqueIdentifier, folderId);
-      deleteReq.input('ownerId', sql.UniqueIdentifier, req.userId!);
-      await deleteReq.query(
-        `;WITH folder_tree AS (
-           SELECT id FROM file_folders WHERE id=@folderId AND owner_user_id=@ownerId
-           UNION ALL
-           SELECT ff.id
-           FROM file_folders ff
-           INNER JOIN folder_tree ft ON ff.parent_folder_id=ft.id
-           WHERE ff.owner_user_id=@ownerId
-         )
-         DELETE FROM files
-         WHERE owner_user_id=@ownerId AND folder_id IN (SELECT id FROM folder_tree) OPTION (MAXRECURSION 100)`
-      );
-      if (storageToRemove > 0) {
-        const storageReq = await getRequest();
-        storageReq.input('sz', sql.BigInt, storageToRemove);
-        storageReq.input('ownerId', sql.UniqueIdentifier, req.userId!);
-        await storageReq.query('UPDATE users SET storage_used_bytes=CASE WHEN storage_used_bytes-@sz<0 THEN 0 ELSE storage_used_bytes-@sz END WHERE id=@ownerId');
+      
+      const files = filesResult.recordset;
+      if (files.length > 0) {
+        // Process vault file deletions in batches
+        const fileBatchSize = 25;
+        for (let i = 0; i < files.length; i += fileBatchSize) {
+          const batch = files.slice(i, i + fileBatchSize);
+          await Promise.all(batch.map((file) => {
+            const vaultPath = path.join(FILE_VAULT, file.stored_path);
+            return fs.promises.unlink(vaultPath).catch((err) => {
+              console.error(`[DELETE FOLDER] Failed to delete vault file ${file.id} (${file.stored_path}):`, err);
+            });
+          }));
+        }
+        
+        // Calculate storage to remove after all vault files are deleted
+        const storageToRemove = files
+          .filter((file) => file.status === 'Available')
+          .reduce((total, file) => total + Number(file.size_bytes || 0), 0);
+        
+        // Delete files from database in a single query with MAXRECURSION limit
+        const deleteReq = await getRequest();
+        deleteReq.input('folderId', sql.UniqueIdentifier, folderId);
+        deleteReq.input('ownerId', sql.UniqueIdentifier, req.userId!);
+        await deleteReq.query(
+          `;WITH folder_tree AS (
+             SELECT id FROM file_folders WHERE id=@folderId AND owner_user_id=@ownerId
+             UNION ALL
+             SELECT ff.id
+             FROM file_folders ff
+             INNER JOIN folder_tree ft ON ff.parent_folder_id=ft.id
+             WHERE ff.owner_user_id=@ownerId
+           )
+           DELETE FROM files
+           WHERE owner_user_id=@ownerId AND folder_id IN (SELECT id FROM folder_tree) OPTION (MAXRECURSION 100)`
+        );
+        
+        // Update user storage
+        if (storageToRemove > 0) {
+          const storageReq = await getRequest();
+          storageReq.input('sz', sql.BigInt, storageToRemove);
+          storageReq.input('ownerId', sql.UniqueIdentifier, req.userId!);
+          await storageReq.query('UPDATE users SET storage_used_bytes=CASE WHEN storage_used_bytes-@sz<0 THEN 0 ELSE storage_used_bytes-@sz END WHERE id=@ownerId');
+        }
       }
     }
 
@@ -3101,7 +3120,11 @@ app.post('/api/files/:id/delete', authenticateUser as express.RequestHandler, as
 
     const originalName = decryptColumn(file.original_name_encrypted, file.original_name_iv, file.original_name_auth_tag);
     const vaultPath = path.join(FILE_VAULT, file.stored_path);
-    if (fs.existsSync(vaultPath)) fs.unlinkSync(vaultPath);
+    try {
+      await fs.promises.unlink(vaultPath);
+    } catch (err) {
+      console.error(`[DELETE FILE] Failed to delete vault file ${file.id} (${file.stored_path}):`, err);
+    }
 
     const delReq = await getRequest();
     delReq.input('id', sql.UniqueIdentifier, fileId);
@@ -3115,7 +3138,129 @@ app.post('/api/files/:id/delete', authenticateUser as express.RequestHandler, as
 
     await logSystemEvent(req.userId!, req.user!.username, 'Delete', 'File', fileId, req, `Deleted "${originalName}".`);
     res.json({ success: true, message: 'File deleted from vault.' });
-  } catch (err) { console.error('[DELETE /api/files/:id]', err); res.status(500).json({ error: 'Failed to delete file.' }); }
+  } catch (err) {
+    console.error('[DELETE /api/files/:id]', err);
+    // Only send response if headers haven't been sent yet
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Failed to delete file.' });
+    }
+  }
+});
+
+// ──────────────────────────────────────────────────────────────
+// API: Files — Bulk Delete
+// ──────────────────────────────────────────────────────────────
+
+app.post('/api/files/delete', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  const fileIds = req.body?.file_ids;
+  
+  // Validate request body
+  if (!Array.isArray(fileIds) || fileIds.length === 0) {
+    return res.status(400).json({ error: 'Invalid request: file_ids must be a non-empty array.' });
+  }
+  
+  // Limit bulk delete to 100 files at a time to prevent resource exhaustion
+  if (fileIds.length > 100) {
+    return res.status(400).json({ error: 'Cannot delete more than 100 files at once. Please delete in smaller batches.' });
+  }
+  
+  // Check maintenance mode before proceeding
+  if (await checkMaintenanceMode('delete', req, res)) return;
+  
+  try {
+    // Validate all files exist and user has permission
+    const fileReq = await getRequest();
+    fileIds.forEach((id: string, i: number) => {
+      fileReq.input(`fileId${i}`, sql.UniqueIdentifier, id);
+    });
+    
+    const fileQuery = `
+      SELECT id, owner_user_id, original_name_encrypted, original_name_iv, original_name_auth_tag,
+             stored_path, size_bytes, status, mime_type, encrypted_size_bytes, checksum_sha256,
+             scan_result, scan_message, is_encrypted, leeku_vibe, ttl_hours, expires_at, created_at
+      FROM files 
+      WHERE id IN (${fileIds.map((_, i) => `@fileId${i}`).join(', ')})
+    `;
+    
+    const fileResult = await fileReq.query<FileRow>(fileQuery);
+    const files = fileResult.recordset;
+    
+    if (files.length === 0) {
+      return res.status(404).json({ error: 'No files found.' });
+    }
+    
+    // Validate ownership for all files
+    for (const file of files) {
+      if (file.owner_user_id !== req.userId && req.user!.role !== 'Admin') {
+        return res.status(403).json({ error: 'You do not have permission to delete one or more files.' });
+      }
+      if (await isDesktopUpdateFile(file.id) && req.user!.role !== 'Admin') {
+        return res.status(403).json({ error: 'Administrator access is required for desktop update artifacts.' });
+      }
+    }
+    
+    // Process each file deletion
+    const deletedFiles: string[] = [];
+    const failedFiles: { id: string; error: string }[] = [];
+    
+    for (const file of files) {
+      try {
+        const originalName = decryptColumn(file.original_name_encrypted, file.original_name_iv, file.original_name_auth_tag);
+        const vaultPath = path.join(FILE_VAULT, file.stored_path);
+        
+        // Delete vault file
+        try {
+          await fs.promises.unlink(vaultPath);
+        } catch (err) {
+          console.error(`[BULK DELETE FILE] Failed to delete vault file ${file.id} (${file.stored_path}):`, err);
+        }
+        
+        // Delete from database
+        const delReq = await getRequest();
+        delReq.input('id', sql.UniqueIdentifier, file.id);
+        await delReq.query('DELETE FROM files WHERE id=@id');
+        
+        // Update user storage
+        if (file.status === 'Available') {
+          const sReq = await getRequest();
+          sReq.input('sz', sql.BigInt, file.size_bytes);
+          sReq.input('uid', sql.UniqueIdentifier, file.owner_user_id);
+          await sReq.query('UPDATE users SET storage_used_bytes=CASE WHEN storage_used_bytes-@sz<0 THEN 0 ELSE storage_used_bytes-@sz END WHERE id=@uid');
+        }
+        
+        // Log the deletion
+        await logSystemEvent(req.userId!, req.user!.username, 'Delete', 'File', file.id, req, `Deleted \"${originalName}\".`);
+        
+        deletedFiles.push(file.id);
+      } catch (err) {
+        console.error(`[BULK DELETE FILE] Error deleting file ${file.id}:`, err);
+        failedFiles.push({ id: file.id, error: 'Failed to delete file.' });
+      }
+    }
+    
+    // Send response with results
+    const successCount = deletedFiles.length;
+    if (successCount === 0) {
+      return res.status(500).json({ 
+        error: `Failed to delete all ${files.length} files.`, 
+        failedCount: failedFiles.length 
+      });
+    }
+    
+    return res.json({ 
+      success: true, 
+      message: successCount === files.length 
+        ? `Successfully deleted ${successCount} file${successCount === 1 ? '' : 's'}.`
+        : `Deleted ${successCount} file${successCount === 1 ? '' : 's'}, but ${failedFiles.length} failed.`,
+      deletedFiles,
+      failedFiles
+    });
+  } catch (err) {
+    console.error('[BULK DELETE /api/files/delete]', err);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Failed to process bulk delete request.' });
+    }
+  }
 });
 
 app.get('/api/files/:id/preview', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
@@ -4331,9 +4476,18 @@ app.post('/api/admin/file-folders/:id/delete', authenticateUser as express.Reque
          WHERE owner_user_id=@ownerId AND folder_id IN (SELECT id FROM folder_tree) OPTION (MAXRECURSION 100)`
       );
 
-      for (const file of folderFiles.recordset) {
-        const vaultPath = path.join(FILE_VAULT, file.stored_path);
-        try { if (fs.existsSync(vaultPath)) fs.unlinkSync(vaultPath); } catch {}
+      // Process files asynchronously to avoid blocking the event loop
+      // Process in batches to prevent memory issues with large folders
+      // Reduced from 50 to 25 to further minimize memory pressure
+      const BATCH_SIZE = 25;
+      for (let i = 0; i < folderFiles.recordset.length; i += BATCH_SIZE) {
+        const batch = folderFiles.recordset.slice(i, i + BATCH_SIZE);
+        await Promise.all(batch.map((file) => {
+          const vaultPath = path.join(FILE_VAULT, file.stored_path);
+          return fs.promises.unlink(vaultPath).catch((err) => {
+            console.error(`[DELETE FOLDER] Failed to delete vault file ${file.id} (${file.stored_path}):`, err);
+          });
+        }));
       }
 
       const storageToRemove = folderFiles.recordset
