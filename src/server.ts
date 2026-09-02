@@ -2252,45 +2252,69 @@ app.post('/api/file-folders/:id/delete', authenticateUser as express.RequestHand
       }
     }
 
+    // Track deletion statistics for progress reporting
+    let filesDeletedCount = 0;
+    let foldersDeletedCount = 0;
+    const BATCH_SIZE = 100; // Process in batches to avoid timeout
+    
     if (!deleteFiles) {
-      const moveReq = await getRequest();
-      moveReq.input('folderId', sql.UniqueIdentifier, folderId);
-      moveReq.input('ownerId', sql.UniqueIdentifier, req.userId!);
-      await moveReq.query(
-        `;WITH folder_tree AS (
-           SELECT id FROM file_folders WHERE id=@folderId AND owner_user_id=@ownerId
-           UNION ALL
-           SELECT ff.id
-           FROM file_folders ff
-           INNER JOIN folder_tree ft ON ff.parent_folder_id=ft.id
-           WHERE ff.owner_user_id=@ownerId
-         )
-         UPDATE files
-         SET folder_id=NULL
-         WHERE owner_user_id=@ownerId AND folder_id IN (SELECT id FROM folder_tree) OPTION (MAXRECURSION 100)`
-      );
+      // Move files to root - process in batches to avoid timeout
+      let offset = 0;
+      while (true) {
+        const moveReq = await getRequest();
+        moveReq.input('folderId', sql.UniqueIdentifier, folderId);
+        moveReq.input('ownerId', sql.UniqueIdentifier, req.userId!);
+        moveReq.input('batchSize', sql.Int, BATCH_SIZE);
+        moveReq.input('offset', sql.Int, offset);
+        
+        const result = await moveReq.query(
+          `;WITH folder_tree AS (
+             SELECT id FROM file_folders WHERE id=@folderId AND owner_user_id=@ownerId
+             UNION ALL
+             SELECT ff.id
+             FROM file_folders ff
+             INNER JOIN folder_tree ft ON ff.parent_folder_id=ft.id
+             WHERE ff.owner_user_id=@ownerId
+           )
+           UPDATE TOP (@batchSize) files
+           SET folder_id=NULL
+           WHERE owner_user_id=@ownerId AND folder_id IN (SELECT id FROM folder_tree) AND folder_id IS NOT NULL`
+        );
+        
+        if (result.rowsAffected[0] === 0) break;
+        offset += BATCH_SIZE;
+      }
     } else {
-      // Process files in smaller batches to prevent memory issues and hard crashes
-      // Get all files in the folder tree first
-      const filesReq = await getRequest();
-      filesReq.input('folderId', sql.UniqueIdentifier, folderId);
-      filesReq.input('ownerId', sql.UniqueIdentifier, req.userId!);
-      const filesResult = await filesReq.query<{id:string;stored_path:string;size_bytes:number;status:string}>(
-        `;WITH folder_tree AS (
-           SELECT id FROM file_folders WHERE id=@folderId AND owner_user_id=@ownerId
-           UNION ALL
-           SELECT ff.id
-           FROM file_folders ff
-           INNER JOIN folder_tree ft ON ff.parent_folder_id=ft.id
-           WHERE ff.owner_user_id=@ownerId
-         )
-         SELECT id, stored_path, size_bytes, status
-         FROM files
-         WHERE owner_user_id=@ownerId AND folder_id IN (SELECT id FROM folder_tree) OPTION (MAXRECURSION 100)`
-      );
+      // Delete files - process in batches to avoid timeout
+      let offset = 0;
+      let totalStorageToRemove = 0n;
       
-      const files = filesResult.recordset;
-      if (files.length > 0) {
+      while (true) {
+        const filesReq = await getRequest();
+        filesReq.input('folderId', sql.UniqueIdentifier, folderId);
+        filesReq.input('ownerId', sql.UniqueIdentifier, req.userId!);
+        filesReq.input('batchSize', sql.Int, BATCH_SIZE);
+        filesReq.input('offset', sql.Int, offset);
+        
+        const filesResult = await filesReq.query<{id:string;stored_path:string;size_bytes:number;status:string}>(
+          `;WITH folder_tree AS (
+             SELECT id FROM file_folders WHERE id=@folderId AND owner_user_id=@ownerId
+             UNION ALL
+             SELECT ff.id
+             FROM file_folders ff
+             INNER JOIN folder_tree ft ON ff.parent_folder_id=ft.id
+             WHERE ff.owner_user_id=@ownerId
+           )
+           SELECT id, stored_path, size_bytes, status
+           FROM files
+           WHERE owner_user_id=@ownerId AND folder_id IN (SELECT id FROM folder_tree)
+           ORDER BY id
+           OFFSET @offset ROWS FETCH NEXT @batchSize ROWS ONLY`
+        );
+        
+        const files = filesResult.recordset;
+        if (files.length === 0) break;
+        
         // Process vault file deletions in batches
         const fileBatchSize = 25;
         for (let i = 0; i < files.length; i += fileBatchSize) {
@@ -2303,15 +2327,19 @@ app.post('/api/file-folders/:id/delete', authenticateUser as express.RequestHand
           }));
         }
         
-        // Calculate storage to remove after all vault files are deleted
-        const storageToRemove = files
+        // Calculate storage to remove
+        const storageForThisBatch = files
           .filter((file) => file.status === 'Available')
-          .reduce((total, file) => total + Number(file.size_bytes || 0), 0);
+          .reduce((total, file) => total + BigInt(Number(file.size_bytes || 0)), 0n);
+        totalStorageToRemove += storageForThisBatch;
         
-        // Delete files from database in a single query with MAXRECURSION limit
+        // Delete database records in batch
         const deleteReq = await getRequest();
         deleteReq.input('folderId', sql.UniqueIdentifier, folderId);
         deleteReq.input('ownerId', sql.UniqueIdentifier, req.userId!);
+        deleteReq.input('batchSize', sql.Int, BATCH_SIZE);
+        deleteReq.input('offset', sql.Int, offset);
+        
         await deleteReq.query(
           `;WITH folder_tree AS (
              SELECT id FROM file_folders WHERE id=@folderId AND owner_user_id=@ownerId
@@ -2321,38 +2349,135 @@ app.post('/api/file-folders/:id/delete', authenticateUser as express.RequestHand
              INNER JOIN folder_tree ft ON ff.parent_folder_id=ft.id
              WHERE ff.owner_user_id=@ownerId
            )
-           DELETE FROM files
-           WHERE owner_user_id=@ownerId AND folder_id IN (SELECT id FROM folder_tree) OPTION (MAXRECURSION 100)`
+           DELETE TOP (@batchSize) FROM files
+           WHERE owner_user_id=@ownerId AND folder_id IN (SELECT id FROM folder_tree)`
         );
         
-        // Update user storage
-        if (storageToRemove > 0) {
-          const storageReq = await getRequest();
-          storageReq.input('sz', sql.BigInt, storageToRemove);
-          storageReq.input('ownerId', sql.UniqueIdentifier, req.userId!);
-          await storageReq.query('UPDATE users SET storage_used_bytes=CASE WHEN storage_used_bytes-@sz<0 THEN 0 ELSE storage_used_bytes-@sz END WHERE id=@ownerId');
-        }
+        filesDeletedCount += files.length;
+        offset += BATCH_SIZE;
+      }
+      
+      // Update user storage once at the end
+      if (totalStorageToRemove > 0n) {
+        const storageReq = await getRequest();
+        storageReq.input('sz', sql.BigInt, totalStorageToRemove);
+        storageReq.input('ownerId', sql.UniqueIdentifier, req.userId!);
+        await storageReq.query('UPDATE users SET storage_used_bytes=CASE WHEN storage_used_bytes-@sz<0 THEN 0 ELSE storage_used_bytes-@sz END WHERE id=@ownerId');
       }
     }
-
-    const deleteFolderReq = await getRequest();
-    deleteFolderReq.input('id', sql.UniqueIdentifier, folderId);
-    deleteFolderReq.input('ownerId', sql.UniqueIdentifier, req.userId!);
-    await deleteFolderReq.query(
+    
+    // Delete folders in bottom-up batches to handle SAME TABLE REFERENCE constraint
+    // Strategy: For each depth level (starting from deepest), delete folders in batches
+    // This ensures children are deleted before parents
+    
+    let depthToDelete = 100; // Start from deepest possible depth
+    let totalDepthFound = -1;
+    
+    // First, find the maximum depth in the tree
+    const depthReq = await getRequest();
+    depthReq.input('folderId', sql.UniqueIdentifier, folderId);
+    depthReq.input('ownerId', sql.UniqueIdentifier, req.userId!);
+    
+    const depthResult = await depthReq.query(
       `;WITH folder_tree AS (
-         SELECT id FROM file_folders WHERE id=@id AND owner_user_id=@ownerId
+         SELECT id, 0 AS depth FROM file_folders WHERE id=@folderId AND owner_user_id=@ownerId
+         UNION ALL
+         SELECT ff.id, ft.depth + 1
+         FROM file_folders ff
+         INNER JOIN folder_tree ft ON ff.parent_folder_id=ft.id
+         WHERE ff.owner_user_id=@ownerId
+       )
+       SELECT MAX(depth) as max_depth FROM folder_tree WHERE depth > 0
+       OPTION (MAXRECURSION 100)`
+    );
+    
+    if (depthResult.recordset && depthResult.recordset[0]) {
+      totalDepthFound = depthResult.recordset[0].max_depth;
+    }
+    
+    // Delete from deepest to shallowest (bottom-up)
+    if (totalDepthFound > 0) {
+      depthToDelete = totalDepthFound;
+      
+      while (depthToDelete > 0) {
+        let foldersDeletedThisDepth = BATCH_SIZE;
+        
+        while (foldersDeletedThisDepth === BATCH_SIZE) {
+          const deleteReq = await getRequest();
+          deleteReq.input('folderId', sql.UniqueIdentifier, folderId);
+          deleteReq.input('ownerId', sql.UniqueIdentifier, req.userId!);
+          deleteReq.input('batchSize', sql.Int, BATCH_SIZE);
+          deleteReq.input('depth', sql.Int, depthToDelete);
+          
+          const result = await deleteReq.query(
+            `;WITH folder_tree AS (
+               SELECT id, 0 AS depth FROM file_folders WHERE id=@folderId AND owner_user_id=@ownerId
+               UNION ALL
+               SELECT ff.id, ft.depth + 1
+               FROM file_folders ff
+               INNER JOIN folder_tree ft ON ff.parent_folder_id=ft.id
+               WHERE ff.owner_user_id=@ownerId
+             )
+             DELETE FROM ff
+             FROM file_folders ff
+             INNER JOIN (
+               SELECT id, depth
+               FROM folder_tree
+               WHERE depth = @depth
+               ORDER BY id
+               OFFSET 0 ROWS
+               FETCH NEXT @batchSize ROWS ONLY
+             ) AS batch ON ff.id = batch.id
+             WHERE ff.owner_user_id = @ownerId
+             OPTION (MAXRECURSION 100)`
+          );
+          
+          foldersDeletedThisDepth = result.rowsAffected[0];
+          foldersDeletedCount += foldersDeletedThisDepth;
+        }
+        
+        depthToDelete--;
+      }
+    }
+    
+    // Step 2: Delete the root folder itself (now it has no children)
+    const rootDeleteReq = await getRequest();
+    rootDeleteReq.input('folderId', sql.UniqueIdentifier, folderId);
+    rootDeleteReq.input('ownerId', sql.UniqueIdentifier, req.userId!);
+    await rootDeleteReq.query(
+      `DELETE FROM file_folders WHERE id=@folderId AND owner_user_id=@ownerId`
+    );
+    foldersDeletedCount += 1;  // Count the root folder
+    
+    // Get total folder count for progress tracking
+    const countReq = await getRequest();
+    countReq.input('folderId', sql.UniqueIdentifier, folderId);
+    countReq.input('ownerId', sql.UniqueIdentifier, req.userId!);
+    const countResult = await countReq.query(
+      `;WITH folder_tree AS (
+         SELECT id FROM file_folders WHERE id=@folderId AND owner_user_id=@ownerId
          UNION ALL
          SELECT ff.id
          FROM file_folders ff
          INNER JOIN folder_tree ft ON ff.parent_folder_id=ft.id
          WHERE ff.owner_user_id=@ownerId
        )
-       DELETE ff
-       FROM file_folders ff
-       INNER JOIN folder_tree ft ON ff.id=ft.id OPTION (MAXRECURSION 100)`
+       SELECT 
+         (SELECT COUNT(*) FROM folder_tree) as totalFolders,
+         (SELECT COUNT(*) FROM files WHERE folder_id IN (SELECT id FROM folder_tree) AND owner_user_id=@ownerId) as totalFiles
+      OPTION (MAXRECURSION 100)`
     );
+    
+    const totalFolders = countResult.recordset?.[0]?.totalFolders || 0;
+    const totalFiles = countResult.recordset?.[0]?.totalFiles || 0;
     await logSystemEvent(req.userId!, req.user!.username, 'Delete', 'Folder', folderId, req, deleteFiles ? `Deleted folder tree "${folder.name}" and its files.` : `Deleted folder tree "${folder.name}" and moved files to All Files root.`);
-    res.json({ success: true });
+    res.json({ 
+      success: true, 
+      foldersDeleted: foldersDeletedCount, 
+      filesDeleted: filesDeletedCount,
+      foldersTotal: totalFolders,
+      filesTotal: totalFiles 
+    });
   } catch (err) { console.error('[POST /api/file-folders/:id/delete]', err); res.status(500).json({ error: 'Failed to delete folder.' }); }
 });
 
@@ -4442,98 +4567,216 @@ app.post('/api/admin/file-folders/:id/delete', authenticateUser as express.Reque
     }
 
     if (!deleteFiles) {
-      const moveReq = await getRequest();
-      moveReq.input('folderId', sql.UniqueIdentifier, folderId);
-      moveReq.input('ownerId', sql.UniqueIdentifier, ownerId);
-      await moveReq.query(
-        `;WITH folder_tree AS (
-           SELECT id FROM file_folders WHERE id=@folderId AND owner_user_id=@ownerId
-           UNION ALL
-           SELECT ff.id
-           FROM file_folders ff
-           INNER JOIN folder_tree ft ON ff.parent_folder_id=ft.id
-           WHERE ff.owner_user_id=@ownerId
-         )
-         UPDATE files
-         SET folder_id=NULL
-         WHERE owner_user_id=@ownerId AND folder_id IN (SELECT id FROM folder_tree) OPTION (MAXRECURSION 100)`
-      );
-    } else {
-      const filesReq = await getRequest();
-      filesReq.input('folderId', sql.UniqueIdentifier, folderId);
-      filesReq.input('ownerId', sql.UniqueIdentifier, ownerId);
-      const folderFiles = await filesReq.query<{id:string;stored_path:string;size_bytes:number;status:string}>(
-        `;WITH folder_tree AS (
-           SELECT id FROM file_folders WHERE id=@folderId AND owner_user_id=@ownerId
-           UNION ALL
-           SELECT ff.id
-           FROM file_folders ff
-           INNER JOIN folder_tree ft ON ff.parent_folder_id=ft.id
-           WHERE ff.owner_user_id=@ownerId
-         )
-         SELECT id, stored_path, size_bytes, status
-         FROM files
-         WHERE owner_user_id=@ownerId AND folder_id IN (SELECT id FROM folder_tree) OPTION (MAXRECURSION 100)`
-      );
-
-      // Process files asynchronously to avoid blocking the event loop
-      // Process in batches to prevent memory issues with large folders
-      // Reduced from 50 to 25 to further minimize memory pressure
-      const BATCH_SIZE = 25;
-      for (let i = 0; i < folderFiles.recordset.length; i += BATCH_SIZE) {
-        const batch = folderFiles.recordset.slice(i, i + BATCH_SIZE);
-        await Promise.all(batch.map((file) => {
-          const vaultPath = path.join(FILE_VAULT, file.stored_path);
-          return fs.promises.unlink(vaultPath).catch((err) => {
-            console.error(`[DELETE FOLDER] Failed to delete vault file ${file.id} (${file.stored_path}):`, err);
-          });
-        }));
+      // Move files to root - process in batches to avoid timeout
+      let offset = 0;
+      while (true) {
+        const moveReq = await getRequest();
+        moveReq.input('folderId', sql.UniqueIdentifier, folderId);
+        moveReq.input('ownerId', sql.UniqueIdentifier, ownerId);
+        moveReq.input('batchSize', sql.Int, 100);
+        moveReq.input('offset', sql.Int, offset);
+        
+        const result = await moveReq.query(
+          `;WITH folder_tree AS (
+             SELECT id FROM file_folders WHERE id=@folderId AND owner_user_id=@ownerId
+             UNION ALL
+             SELECT ff.id
+             FROM file_folders ff
+             INNER JOIN folder_tree ft ON ff.parent_folder_id=ft.id
+             WHERE ff.owner_user_id=@ownerId
+           )
+           UPDATE TOP (@batchSize) files
+           SET folder_id=NULL
+           WHERE owner_user_id=@ownerId AND folder_id IN (SELECT id FROM folder_tree) AND folder_id IS NOT NULL`
+        );
+        
+        if (result.rowsAffected[0] === 0) break;
+        offset += 100;
       }
-
-      const storageToRemove = folderFiles.recordset
-        .filter((file) => file.status === 'Available')
-        .reduce((total, file) => total + Number(file.size_bytes || 0), 0);
-
-      const deleteReq = await getRequest();
-      deleteReq.input('folderId', sql.UniqueIdentifier, folderId);
-      deleteReq.input('ownerId', sql.UniqueIdentifier, ownerId);
-      await deleteReq.query(
-        `;WITH folder_tree AS (
-           SELECT id FROM file_folders WHERE id=@folderId AND owner_user_id=@ownerId
-           UNION ALL
-           SELECT ff.id
-           FROM file_folders ff
-           INNER JOIN folder_tree ft ON ff.parent_folder_id=ft.id
-           WHERE ff.owner_user_id=@ownerId
-         )
-         DELETE FROM files
-         WHERE owner_user_id=@ownerId AND folder_id IN (SELECT id FROM folder_tree) OPTION (MAXRECURSION 100)`
-      );
-
-      if (storageToRemove > 0) {
+    } else {
+      // Delete files - process in batches to avoid timeout
+      let offset = 0;
+      let totalStorageToRemove = 0n;
+      
+      while (true) {
+        const filesReq = await getRequest();
+        filesReq.input('folderId', sql.UniqueIdentifier, folderId);
+        filesReq.input('ownerId', sql.UniqueIdentifier, ownerId);
+        filesReq.input('batchSize', sql.Int, 100);
+        filesReq.input('offset', sql.Int, offset);
+        
+        const filesResult = await filesReq.query<{id:string;stored_path:string;size_bytes:number;status:string}>(
+          `;WITH folder_tree AS (
+             SELECT id FROM file_folders WHERE id=@folderId AND owner_user_id=@ownerId
+             UNION ALL
+             SELECT ff.id
+             FROM file_folders ff
+             INNER JOIN folder_tree ft ON ff.parent_folder_id=ft.id
+             WHERE ff.owner_user_id=@ownerId
+           )
+           SELECT id, stored_path, size_bytes, status
+           FROM files
+           WHERE owner_user_id=@ownerId AND folder_id IN (SELECT id FROM folder_tree)
+           ORDER BY id
+           OFFSET @offset ROWS FETCH NEXT @batchSize ROWS ONLY`
+        );
+        
+        const files = filesResult.recordset;
+        if (files.length === 0) break;
+        
+        // Process vault file deletions in batches
+        const fileBatchSize = 25;
+        for (let i = 0; i < files.length; i += fileBatchSize) {
+          const batch = files.slice(i, i + fileBatchSize);
+          await Promise.all(batch.map((file) => {
+            const vaultPath = path.join(FILE_VAULT, file.stored_path);
+            return fs.promises.unlink(vaultPath).catch((err) => {
+              console.error(`[DELETE FOLDER] Failed to delete vault file ${file.id} (${file.stored_path}):`, err);
+            });
+          }));
+        }
+        
+        // Calculate storage to remove
+        const storageForThisBatch = files
+          .filter((file) => file.status === 'Available')
+          .reduce((total, file) => total + BigInt(Number(file.size_bytes || 0)), 0n);
+        totalStorageToRemove += storageForThisBatch;
+        
+        // Delete database records in batch
+        const deleteReq = await getRequest();
+        deleteReq.input('folderId', sql.UniqueIdentifier, folderId);
+        deleteReq.input('ownerId', sql.UniqueIdentifier, ownerId);
+        deleteReq.input('batchSize', sql.Int, 100);
+        deleteReq.input('offset', sql.Int, offset);
+        
+        await deleteReq.query(
+          `;WITH folder_tree AS (
+             SELECT id FROM file_folders WHERE id=@folderId AND owner_user_id=@ownerId
+             UNION ALL
+             SELECT ff.id
+             FROM file_folders ff
+             INNER JOIN folder_tree ft ON ff.parent_folder_id=ft.id
+             WHERE ff.owner_user_id=@ownerId
+           )
+           DELETE TOP (@batchSize) FROM files
+           WHERE owner_user_id=@ownerId AND folder_id IN (SELECT id FROM folder_tree)`
+        );
+        
+        offset += 100;
+      }
+      
+      // Update user storage once at the end
+      if (totalStorageToRemove > 0n) {
         const storageReq = await getRequest();
-        storageReq.input('sz', sql.BigInt, storageToRemove);
+        storageReq.input('sz', sql.BigInt, totalStorageToRemove);
         storageReq.input('ownerId', sql.UniqueIdentifier, ownerId);
         await storageReq.query('UPDATE users SET storage_used_bytes=CASE WHEN storage_used_bytes-@sz<0 THEN 0 ELSE storage_used_bytes-@sz END WHERE id=@ownerId');
       }
     }
-
-    const deleteFolderReq = await getRequest();
-    deleteFolderReq.input('id', sql.UniqueIdentifier, folderId);
-    deleteFolderReq.input('ownerId', sql.UniqueIdentifier, ownerId);
-    await deleteFolderReq.query(
+    
+    // Delete folders in bottom-up batches to handle SAME TABLE REFERENCE constraint
+    // Strategy: For each depth level (starting from deepest), delete folders in batches
+    // This ensures children are deleted before parents
+    
+    let depthToDelete = 100; // Start from deepest possible depth
+    let totalDepthFound = -1;
+    
+    // First, find the maximum depth in the tree
+    const depthReq = await getRequest();
+    depthReq.input('folderId', sql.UniqueIdentifier, folderId);
+    depthReq.input('ownerId', sql.UniqueIdentifier, ownerId);
+    
+    const depthResult = await depthReq.query(
       `;WITH folder_tree AS (
-         SELECT id FROM file_folders WHERE id=@id AND owner_user_id=@ownerId
+         SELECT id, 0 AS depth FROM file_folders WHERE id=@folderId AND owner_user_id=@ownerId
+         UNION ALL
+         SELECT ff.id, ft.depth + 1
+         FROM file_folders ff
+         INNER JOIN folder_tree ft ON ff.parent_folder_id=ft.id
+         WHERE ff.owner_user_id=@ownerId
+       )
+       SELECT MAX(depth) as max_depth FROM folder_tree WHERE depth > 0
+       OPTION (MAXRECURSION 100)`
+    );
+    
+    if (depthResult.recordset && depthResult.recordset[0]) {
+      totalDepthFound = depthResult.recordset[0].max_depth;
+    }
+    
+    // Delete from deepest to shallowest (bottom-up)
+    if (totalDepthFound > 0) {
+      depthToDelete = totalDepthFound;
+      
+      while (depthToDelete > 0) {
+        let foldersDeletedThisDepth = 100;
+        
+        while (foldersDeletedThisDepth === 100) {
+          const deleteReq = await getRequest();
+          deleteReq.input('folderId', sql.UniqueIdentifier, folderId);
+          deleteReq.input('ownerId', sql.UniqueIdentifier, ownerId);
+          deleteReq.input('batchSize', sql.Int, 100);
+          deleteReq.input('depth', sql.Int, depthToDelete);
+          
+          const result = await deleteReq.query(
+            `;WITH folder_tree AS (
+               SELECT id, 0 AS depth FROM file_folders WHERE id=@folderId AND owner_user_id=@ownerId
+               UNION ALL
+               SELECT ff.id, ft.depth + 1
+               FROM file_folders ff
+               INNER JOIN folder_tree ft ON ff.parent_folder_id=ft.id
+               WHERE ff.owner_user_id=@ownerId
+             )
+             DELETE FROM ff
+             FROM file_folders ff
+             INNER JOIN (
+               SELECT id, depth
+               FROM folder_tree
+               WHERE depth = @depth
+               ORDER BY id
+               OFFSET 0 ROWS
+               FETCH NEXT @batchSize ROWS ONLY
+             ) AS batch ON ff.id = batch.id
+             WHERE ff.owner_user_id = @ownerId
+             OPTION (MAXRECURSION 100)`
+          );
+          
+          foldersDeletedThisDepth = result.rowsAffected[0];
+          foldersDeletedCount += foldersDeletedThisDepth;
+        }
+        
+        depthToDelete--;
+      }
+    }
+    
+    // Step 2: Delete the root folder itself (now it has no children)
+    const rootDeleteReq = await getRequest();
+    rootDeleteReq.input('folderId', sql.UniqueIdentifier, folderId);
+    rootDeleteReq.input('ownerId', sql.UniqueIdentifier, ownerId);
+    await rootDeleteReq.query(
+      `DELETE FROM file_folders WHERE id=@folderId AND owner_user_id=@ownerId`
+    );
+    // Get total folder count for progress tracking
+    const countReq = await getRequest();
+    countReq.input('folderId', sql.UniqueIdentifier, folderId);
+    countReq.input('ownerId', sql.UniqueIdentifier, ownerId);
+    const countResult = await countReq.query(
+      `;WITH folder_tree AS (
+         SELECT id FROM file_folders WHERE id=@folderId AND owner_user_id=@ownerId
          UNION ALL
          SELECT ff.id
          FROM file_folders ff
          INNER JOIN folder_tree ft ON ff.parent_folder_id=ft.id
          WHERE ff.owner_user_id=@ownerId
        )
-       DELETE ff
-       FROM file_folders ff
-       INNER JOIN folder_tree ft ON ff.id=ft.id OPTION (MAXRECURSION 100)`
+       SELECT 
+         (SELECT COUNT(*) FROM folder_tree) as totalFolders,
+         (SELECT COUNT(*) FROM files WHERE folder_id IN (SELECT id FROM folder_tree) AND owner_user_id=@ownerId) as totalFiles
+      OPTION (MAXRECURSION 100)`
     );
+    
+    const totalFolders = countResult.recordset?.[0]?.totalFolders || 0;
+    const totalFiles = countResult.recordset?.[0]?.totalFiles || 0;
+    foldersDeletedCount += 1;  // Count the root folder
 
     await logSystemEvent(
       req.userId!,
@@ -4547,7 +4790,13 @@ app.post('/api/admin/file-folders/:id/delete', authenticateUser as express.Reque
         : `Admin deleted folder tree "${folder.name}" and moved files to owner root.`,
     );
 
-    res.json({ success: true });
+    res.json({
+      success: true,
+      foldersDeleted: foldersDeletedCount,
+      foldersTotal: totalFolders,
+      filesDeleted: offset,
+      filesTotal: totalFiles
+    });
   } catch (err) {
     console.error('[POST /api/admin/file-folders/:id/delete]', err);
     res.status(500).json({ error: 'Failed to delete folder.' });

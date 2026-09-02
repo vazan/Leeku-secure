@@ -1279,19 +1279,89 @@ export default function UserDashboard({
   const deleteFolder = async (folder: FileFolder) => {
     if (!window.confirm(`Delete folder "${folder.name}"?`)) return;
     const deleteFiles = window.confirm(
-      `Delete all files inside "${folder.name}" too?\n\nOK deletes the files. Cancel deletes only the folder and moves files back to All Files.`,
+      `Delete all files inside "${folder.name}" too?\\n\\nOK deletes the files. Cancel deletes only the folder and moves files back to All Files.`,
     );
-    const response = await fetch(`/api/file-folders/${folder.id}/delete`, {
-      method: "POST",
-      headers: { ...authHeaders(token), "Content-Type": "application/json" },
-      body: JSON.stringify({ delete_files: deleteFiles }),
-    });
-    if (response.ok) {
-      notify(deleteFiles ? "Folder and files deleted." : "Folder deleted. Files moved to All Files.");
-      setActiveFolderId(folder.parent_folder_id || null);
-      await loadFilesAndLinks();
-      onTriggerRefreshUser();
-    } else notifyError((await response.json()).error || "Could not delete folder.");
+
+    // Show progress modal
+    const modal = document.createElement("div");
+    modal.className = "fixed inset-0 z-[1000] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4";
+    modal.innerHTML = `
+      <div class="w-full max-w-md overflow-hidden rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] shadow-[var(--shadow-panel)]">
+        <div class="flex items-center gap-3 px-6 py-4">
+          <div class="grid h-10 w-10 shrink-0 place-items-center rounded-lg bg-[var(--bg-hover)] text-[var(--text-secondary)]">
+            <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>
+          </div>
+          <div class="min-w-0 flex-1">
+            <div class="flex items-center justify-between gap-4">
+              <span class="font-medium text-sm">Deleting folder...</span>
+              <span class="font-mono text-xs text-[var(--text-muted)]">0%</span>
+            </div>
+            <div class="mt-2 flex items-center justify-between gap-4 text-xs text-[var(--text-muted)]">
+              <span id="delete-progress-label">Removing items</span>
+            </div>
+          </div>
+        </div>
+        <div class="h-1.5 bg-[var(--bg-hover)]">
+          <div class="h-full bg-[var(--accent-linear)] transition-[width] duration-150" id="delete-progress-bar" style="width: 0%"></div>
+        </div>
+        <div class="flex justify-between px-6 py-3 font-mono text-xs text-[var(--text-muted)]">
+          <span id="delete-progress-text">0 / 0</span>
+          <span id="delete-progress-eta">--</span>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(modal);
+
+    const progressBar = document.getElementById("delete-progress-bar");
+    const progressText = document.getElementById("delete-progress-text");
+    const progressLabel = document.getElementById("delete-progress-label");
+    const progressETA = document.getElementById("delete-progress-eta");
+
+    try {
+      const response = await fetch(`/api/file-folders/${folder.id}/delete`, {
+        method: "POST",
+        headers: { ...authHeaders(token), "Content-Type": "application/json" },
+        body: JSON.stringify({ delete_files: deleteFiles }),
+      });
+      
+      const data = await response.json();
+      
+      // Update progress to 100% when complete
+      if (data.success) {
+        const foldersTotal = data.foldersTotal || 0;
+        const foldersDeleted = data.foldersDeleted || 0;
+        const filesTotal = data.filesTotal || 0;
+        const filesDeleted = data.filesDeleted || 0;
+        const totalItems = foldersTotal + filesTotal;
+        const completedItems = foldersDeleted + filesDeleted;
+        const percent = totalItems > 0 ? Math.round((completedItems / totalItems) * 100) : 100;
+        
+        progressBar.style.width = "100%";
+        progressText.textContent = `${foldersDeleted} folders, ${filesDeleted} files deleted`;
+        progressLabel.textContent = "Deletion complete";
+        
+        // Wait briefly to show completion
+        await new Promise(resolve => setTimeout(resolve, 300));
+      }
+      
+      document.body.removeChild(modal);
+      
+      if (response.ok && data.success) {
+        notify(data.filesTotal > 0 
+          ? `Deleted ${data.foldersDeleted} folders and ${data.filesDeleted} files.`
+          : "Folder deleted."
+        );
+        setActiveFolderId(folder.parent_folder_id || null);
+        await loadFilesAndLinks();
+        onTriggerRefreshUser();
+      } else {
+        notifyError(data.error || "Could not delete folder.");
+      }
+    } catch (err) {
+      document.body.removeChild(modal);
+      console.error(err);
+      notifyError("Failed to delete folder.");
+    }
   };
 
   const moveFileToFolder = async (file: FileMetadata, folderId: string | null) => {
