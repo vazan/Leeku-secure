@@ -410,7 +410,7 @@ export default function UserDashboard({
 
     setFoldersLoading(true);
     try {
-      const foldersResponse = await fetch("/api/file-folders", {
+      const foldersResponse = await fetch("/api/file-folders?_t=" + Date.now(), {
         headers: authHeaders(token),
       });
       if (foldersResponse.ok) {
@@ -440,8 +440,8 @@ export default function UserDashboard({
 
   const loadFilesAndLinks = async () => {
     const [filesResponse, linksResponse] = await Promise.all([
-      fetch("/api/files", { headers: authHeaders(token) }),
-      fetch("/api/sharing/links", { headers: authHeaders(token) }),
+      fetch("/api/files?_t=" + Date.now(), { headers: authHeaders(token) }),
+      fetch("/api/sharing/links?_t=" + Date.now(), { headers: authHeaders(token) }),
     ]);
     if (filesResponse.ok) {
       setFiles((await filesResponse.json()).files || []);
@@ -478,11 +478,11 @@ export default function UserDashboard({
     const headers = authHeaders(token);
     const [usersResponse, filesResponse, foldersResponse, logsResponse, statsResponse] =
       await Promise.all([
-        fetch("/api/admin/users", { headers }),
-        fetch("/api/admin/files", { headers }),
-        fetch("/api/admin/file-folders", { headers }),
-        fetch("/api/admin/logs", { headers }),
-        fetch("/api/stats"),
+        fetch("/api/admin/users?_t=" + Date.now(), { headers }),
+        fetch("/api/admin/files?_t=" + Date.now(), { headers }),
+        fetch("/api/admin/file-folders?_t=" + Date.now(), { headers }),
+        fetch("/api/admin/logs?_t=" + Date.now(), { headers }),
+        fetch("/api/stats?_t=" + Date.now()),
       ]);
     if (usersResponse.ok)
       setAdminUsers((await usersResponse.json()).users || []);
@@ -1237,6 +1237,7 @@ export default function UserDashboard({
       setFolders((current) => [...current, data.folder].sort((a, b) => a.name.localeCompare(b.name)));
       setActiveFolderId(data.folder.id);
       notify("Folder created.");
+      void loadFolders(true);
       return;
     }
 
@@ -1274,6 +1275,7 @@ export default function UserDashboard({
     if (response.ok) {
       setFolders((current) => current.map((item) => (item.id === folder.id ? data.folder : item)).sort((a, b) => a.name.localeCompare(b.name)));
       notify("Folder renamed.");
+      void loadFolders(true);
     } else notifyError(data.error || "Could not rename folder.");
   };
 
@@ -1353,6 +1355,7 @@ export default function UserDashboard({
         );
         setActiveFolderId(folder.parent_folder_id || null);
         await loadFilesAndLinks();
+        await loadFolders(true);
         onTriggerRefreshUser();
       } else {
         notifyError(data.error || "Could not delete folder.");
