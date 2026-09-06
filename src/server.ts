@@ -2286,7 +2286,6 @@ app.post('/api/file-folders/:id/delete', authenticateUser as express.RequestHand
       }
     } else {
       // Delete files - process in batches to avoid timeout
-      let offset = 0;
       let totalStorageToRemove = 0n;
       
       while (true) {
@@ -2294,7 +2293,6 @@ app.post('/api/file-folders/:id/delete', authenticateUser as express.RequestHand
         filesReq.input('folderId', sql.UniqueIdentifier, folderId);
         filesReq.input('ownerId', sql.UniqueIdentifier, req.userId!);
         filesReq.input('batchSize', sql.Int, BATCH_SIZE);
-        filesReq.input('offset', sql.Int, offset);
         
         const filesResult = await filesReq.query<{id:string;stored_path:string;size_bytes:number;status:string}>(
           `;WITH folder_tree AS (
@@ -2309,7 +2307,7 @@ app.post('/api/file-folders/:id/delete', authenticateUser as express.RequestHand
            FROM files
            WHERE owner_user_id=@ownerId AND folder_id IN (SELECT id FROM folder_tree)
            ORDER BY id
-           OFFSET @offset ROWS FETCH NEXT @batchSize ROWS ONLY`
+           OFFSET 0 ROWS FETCH NEXT @batchSize ROWS ONLY`
         );
         
         const files = filesResult.recordset;
@@ -2338,7 +2336,6 @@ app.post('/api/file-folders/:id/delete', authenticateUser as express.RequestHand
         deleteReq.input('folderId', sql.UniqueIdentifier, folderId);
         deleteReq.input('ownerId', sql.UniqueIdentifier, req.userId!);
         deleteReq.input('batchSize', sql.Int, BATCH_SIZE);
-        deleteReq.input('offset', sql.Int, offset);
         
         await deleteReq.query(
           `;WITH folder_tree AS (
@@ -2354,7 +2351,6 @@ app.post('/api/file-folders/:id/delete', authenticateUser as express.RequestHand
         );
         
         filesDeletedCount += files.length;
-        offset += BATCH_SIZE;
       }
       
       // Update user storage once at the end

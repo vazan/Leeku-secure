@@ -654,6 +654,46 @@ Validation status
 - QaEngineer focus:
 Approval trail
 - Not required (STANDARD change).
+
+---
+
+Intent
+Prevent large recursive folder deletions from leaving file records that reference folders being removed.
+
+Change class
+STANDARD
+
+Root cause
+- The `delete_files=true` batch loop selected files with a cumulative `OFFSET` after deleting each preceding batch. SQL Server shifts the remaining rows after each delete, so this skipped every subsequent batch and left `files.folder_id` references that blocked folder deletion through `FK_files_file_folders`.
+
+Files changed
+- src/server.ts:
+  - Selects the first remaining batch on every iteration and removes unused offset bookkeeping. Each batch remains limited to 100 records.
+
+Public contracts impacted
+- No API contract changes. `POST /api/file-folders/:id/delete` retains its request and response shapes.
+
+Risks
+- Low: The deletion loop now continues until no descendant file remains, which is required before deleting the folder rows. Vault unlink behavior and per-batch limits are unchanged.
+
+Technical debt observed
+- This checkout is missing installed dependencies: `npm run lint` cannot resolve Node/dependency types and `npm run build` cannot find `cross-env`.
+
+Test coverage status + handoff hint for TestEngineer
+- No automated tests were added (out of scope for DevEngineer mode).
+- Handoff focus:
+  - Against MSSQL, create a folder tree containing more than 100 files across multiple descendant folders, call `POST /api/file-folders/:id/delete` with `delete_files=true`, and verify all file and folder rows are removed without foreign-key errors.
+  - Repeat with `delete_files=false` and verify all files have `folder_id=NULL` before the folder tree is deleted.
+
+Handoff QaEngineer
+- Confirm the MSSQL integration scenario completes with no `FK_files_file_folders` violation and storage usage is reduced by the deleted available files.
+
+Validation status
+- lint/type-check: BLOCKED (`npm run lint`): repository dependency/type resolution is unavailable, producing unrelated missing Node/dependency declarations.
+- build: BLOCKED (`npm run build`): `cross-env` is not installed in this checkout.
+
+Approval trail
+- Not required (STANDARD change).
 ---
 agent: DevEngineer | date: 2026-08-06 | model: GPT-5.3-Codex
 plan: /memories/session/dev-plan.md
