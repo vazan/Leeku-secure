@@ -411,6 +411,17 @@ export default function UserDashboard({
 
   const activeFolderDepth = folderPath.length;
 
+  // Get folders to display in sidebar
+  const displayFolders = useMemo(() => {
+    if (activeFolderId) {
+      // Inside a folder - show the path
+      return folderPath;
+    } else {
+      // At "All Files" root - show root-level folders (no parent)
+      return folders.filter((folder) => !folder.parent_folder_id);
+    }
+  }, [activeFolderId, folderPath, folders]);
+
   const uploadFolderOptions = useMemo(() => {
     const toPathLabel = (folder: FileFolder) => {
       const names = [folder.name];
@@ -551,9 +562,8 @@ export default function UserDashboard({
   };
 
   useEffect(() => {
-    loadFilesAndLinks().catch(() =>
-      notifyError("Could not refresh your files."),
-    );
+    loadFolders().catch(() => notifyError("Could not refresh folders."));
+    loadFilesAndLinks().catch(() => notifyError("Could not refresh your files."));
     loadAdmin().catch(() => notifyError("Could not refresh admin data."));
   }, []);
 
@@ -1818,8 +1828,11 @@ export default function UserDashboard({
         view={view}
         navItems={navItems}
         storageLimit={storageLimit}
+        folders={folders}
         onView={navigateDashboard}
         onLogout={onLogout}
+        folderPath={displayFolders}
+        onNavigateFolder={setActiveFolderId}
       />
 
       <main className="min-w-0 overflow-x-hidden lg:pl-64">
@@ -2118,29 +2131,6 @@ export default function UserDashboard({
                     </>
                   )}
                 </div>
-                {folderPath.length > 0 && (
-                  <div className="mt-3 flex flex-wrap items-center justify-center gap-1 text-xs text-[var(--text-muted)]">
-                    <button
-                      type="button"
-                      onClick={() => setActiveFolderId(null)}
-                      className="hover:text-[var(--text-primary)]"
-                    >
-                      All Files
-                    </button>
-                    {folderPath.map((folder) => (
-                      <React.Fragment key={folder.id}>
-                        <span>/</span>
-                        <button
-                          type="button"
-                          onClick={() => setActiveFolderId(folder.id)}
-                          className="max-w-[10rem] truncate hover:text-[var(--text-primary)]"
-                        >
-                          {folder.name}
-                        </button>
-                      </React.Fragment>
-                    ))}
-                  </div>
-                )}
               </div>
 
               {visibleFolders.length > 0 && (
