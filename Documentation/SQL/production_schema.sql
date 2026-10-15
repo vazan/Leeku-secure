@@ -274,8 +274,19 @@ CREATE TABLE [dbo].[files](
     [client_crypto_salt] [varbinary](32) NULL,
     [client_crypto_iv] [varbinary](16) NULL,
     [client_crypto_iterations] [int] NULL,
+    [thumbnail_preview] [varbinary](max) NULL,
+    [thumbnail_generated] [datetimeoffset](7) NULL,
     CONSTRAINT [PK_files] PRIMARY KEY CLUSTERED ([id] ASC)
 ) ON [PRIMARY] TEXTIMAGE_ON [PRIMARY]
+GO
+
+-- Index for thumbnail scanning
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_files_thumbnail' AND object_id=OBJECT_ID('dbo.files'))
+BEGIN
+    CREATE INDEX IX_files_thumbnail ON dbo.files(mime_type, status, owner_user_id, thumbnail_generated)
+    INCLUDE (stored_path, original_name_encrypted, original_name_iv, original_name_auth_tag);
+    PRINT 'Created IX_files_thumbnail index';
+END
 GO
 
 -- Step 5: file_encryption_keys (depends on files)

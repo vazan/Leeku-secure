@@ -2992,12 +2992,12 @@ function FileThumbnail({
     const controller = new AbortController();
     let objectUrl: string | null = null;
 
-    fetch(`/api/files/${file.id}/preview`, {
+    fetch(`/api/files/${file.id}/thumbnail`, {
       headers: authHeaders(token),
       signal: controller.signal,
     })
       .then((response) => {
-        if (!response.ok) throw new Error("Preview unavailable.");
+        if (!response.ok) throw new Error("Thumbnail unavailable.");
         return response.blob();
       })
       .then((blob) => {
@@ -3007,7 +3007,7 @@ function FileThumbnail({
       .catch((error) => {
         if (!controller.signal.aborted) {
           setFailed(true);
-          console.warn("[thumbnail] Preview unavailable.", {
+          console.warn("[FileThumbnail] Thumbnail unavailable.", {
             fileId: file.id,
             error: error instanceof Error ? error.message : String(error),
           });
@@ -3084,6 +3084,7 @@ function FileThumbnail({
           src={previewUrl}
           alt=""
           className="h-full w-full object-cover"
+          style={{ objectFit: "contain" }}
           onError={() => setFailed(true)}
         />
       ) : isVideo && previewUrl && !failed ? (

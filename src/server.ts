@@ -23,6 +23,7 @@ import { fileURLToPath } from 'url';
 import { execFileSync } from 'child_process';
 import { GoogleGenAI } from '@google/genai';
 import si from 'systeminformation';
+import sharp from 'sharp';
 
 import { getPool, closePool, getRequest, sql } from './server/db.js';
 import {
@@ -3049,6 +3050,28 @@ app.post(
         }
       }
 
+      // Generate thumbnail for images (before encryption, while temp file is available)
+      let thumbnailBuffer: Buffer | null = null;
+      if (verifiedMimeType.startsWith('image/')) {
+        currentStage = 'generate_thumbnail';
+        sendUploadProgress({
+          type: 'processing',
+          phase: 'Generating thumbnail',
+          loaded: 200,
+          total: processingTotal,
+        });
+        try {
+          thumbnailBuffer = await generateImageThumbnail(tempFilePath, 128);
+          console.info('[upload] Thumbnail generated.', { userId: user.id, originalName: original_name });
+        } catch (err) {
+          console.warn('[upload] Thumbnail generation failed (non-critical).', {
+            userId: user.id,
+            originalName: original_name,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+
       if (uploadSecretHash && !payloadAlreadyClientProtected) {
         currentStage = 'secret_protect_fallback';
         uploadSecretIterations = 250000;
@@ -3411,6 +3434,7 @@ app.post('/api/files/delete', authenticateUser as express.RequestHandler, async 
 
 app.get('/api/files/:id/preview', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
   const fileId = getSingleParam(req.params.id);
+  const size = parseInt(req.query.size as string) || 0;
   let textPreviewPath: string | null = null;
 
   const cleanupTextPreview = () => {
@@ -3538,6 +3562,88 @@ app.get('/api/files/:id/preview', authenticateUser as express.RequestHandler, as
     if (!res.headersSent) res.status(500).json({ error: 'Preview failed.' });
   } finally {
     cleanupTextPreview();
+  }
+});
+
+// GET /api/files/:id/thumbnail - Serve a smaller thumbnail for images
+// ─────────────────────────────────────────────────────────────────
+app.get('/api/files/:id/thumbnail', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  const fileId = getSingleParam(req.params.id);
+  const size = Math.min(parseInt(req.query.size as string) || 128, 256); // Max 256px
+
+  try {
+    const fileReq = await getRequest();
+    fileReq.input('id', sql.UniqueIdentifier, fileId);
+    const fileResult = await fileReq.query<FileRow>(
+      `SELECT id,owner_user_id,original_name_encrypted,original_name_iv,original_name_auth_tag,
+              stored_path,size_bytes,status,mime_type,encrypted_size_bytes,checksum_sha256,
+              scan_result,scan_message,is_encrypted,leeku_vibe,ttl_hours,
+              client_secret_hash,client_crypto_salt,client_crypto_iv,client_crypto_iterations,
+              expires_at,created_at,thumbnail_preview
+       FROM files WHERE id=@id`
+    );
+    if (!fileResult.recordset.length) return res.status(404).json({ error: 'File not found.' });
+    const file = fileResult.recordset[0];
+    if (file.owner_user_id !== req.userId && req.user!.role !== 'Admin')
+      return res.status(403).json({ error: 'You do not have permission to preview this file.' });
+    if (file.status === 'Blocked')
+      return res.status(410).json({ error: 'Blocked files cannot be previewed.' });
+
+    const mediaPreviewable = file.mime_type.startsWith('image/') || file.mime_type.startsWith('video/');
+    if (!mediaPreviewable)
+      return res.status(415).json({ error: 'Thumbnail is not available for this file type.' });
+
+    const originalName = decryptColumn(file.original_name_encrypted, file.original_name_iv, file.original_name_auth_tag);
+    const vaultPath = path.join(FILE_VAULT, file.stored_path);
+    if (!fs.existsSync(vaultPath)) return res.status(410).json({ error: 'Vault file not found.' });
+
+    const keyReq = await getRequest();
+    keyReq.input('fid', sql.UniqueIdentifier, fileId);
+    const keyRes = await keyReq.query<{ encrypted_key: Buffer; key_iv: Buffer; key_auth_tag: Buffer; file_iv: Buffer; file_auth_tag: Buffer }>(
+      'SELECT encrypted_key,key_iv,key_auth_tag,file_iv,file_auth_tag FROM file_encryption_keys WHERE file_id=@fid'
+    );
+    if (!keyRes.recordset.length) return res.status(500).json({ error: 'Encryption key not found.' });
+
+    const keyRow = keyRes.recordset[0];
+    const fileKey = unwrapKey(keyRow.encrypted_key, keyRow.key_iv, keyRow.key_auth_tag);
+
+    // Check if we have a stored thumbnail
+    if (file.thumbnail_preview && file.thumbnail_preview.length > 0) {
+      // Serve the stored thumbnail directly (already decrypted JPEG)
+      res.setHeader('Content-Type', 'image/jpeg');
+      res.setHeader('Content-Length', String(file.thumbnail_preview.length));
+      res.setHeader('Cache-Control', 'private, max-age=300');
+      res.end(file.thumbnail_preview);
+      return;
+    }
+
+    // Generate thumbnail on-demand (for backward compatibility)
+    const tempThumbnailPath = buildUniqueTempFilePath(UPLOAD_TEMP, 'leeku-thumb-tmp', fileId);
+    registerTempFile(tempThumbnailPath);
+
+    try {
+      await decryptFileStream(vaultPath, tempThumbnailPath, fileKey, keyRow.file_iv, keyRow.file_auth_tag, undefined, undefined, size);
+      if (!fs.existsSync(tempThumbnailPath)) {
+        console.warn(`[GET /api/files/:id/thumbnail] Decryption succeeded but file not found: ${tempThumbnailPath}`);
+        throw new Error('Decryption succeeded but output file not found');
+      }
+      
+      // Use promises API to read the file, which waits for any pending writes to complete
+      const fileBuffer = await fs.promises.readFile(tempThumbnailPath);
+      const stat = fs.statSync(tempThumbnailPath);
+      res.setHeader('Content-Type', 'image/jpeg');
+      res.setHeader('Content-Length', String(stat.size));
+      res.setHeader('Cache-Control', 'private, max-age=300');
+      res.end(fileBuffer);
+    } catch (err) {
+      console.error('[GET /api/files/:id/thumbnail] Thumbnail generation failed:', err);
+      if (!res.headersSent) res.status(500).json({ error: 'Thumbnail generation failed.' });
+    } finally {
+      try { if (fs.existsSync(tempThumbnailPath)) fs.unlinkSync(tempThumbnailPath); } catch {}
+    }
+  } catch (err) {
+    console.error('[GET /api/files/:id/thumbnail]', err);
+    if (!res.headersSent) res.status(500).json({ error: 'Thumbnail failed.' });
   }
 });
 
@@ -4972,21 +5078,251 @@ async function logExpiredFile(file: ExpiredFileRecord): Promise<void> {
 }
 
 // ──────────────────────────────────────────────────────────────
+// Thumbnail background scan job
+// ──────────────────────────────────────────────────────────────
+
+let thumbnailScanInterval: NodeJS.Timeout | null = null;
+
+export function startThumbnailScan(intervalMinutes: number = 60): void {
+  if (thumbnailScanInterval) {
+    console.warn('[thumbnail-scan] Scan already running.');
+    return;
+  }
+
+  const scan = async () => {
+    try {
+      // Try a simple query to check if dbo.files table exists
+      try {
+        const checkRequest = await getRequest();
+        await checkRequest.query(`SELECT TOP 1 id FROM dbo.files WHERE 1=0`);
+      } catch (err: any) {
+        if (err.message && (err.message.includes('Cannot find the object') || err.message.includes('Invalid object name') || err.message.includes('does not exist'))) {
+          console.warn('[thumbnail-scan] dbo.files table not found, skipping scan.');
+          return;
+        }
+        throw err;
+      }
+      
+      const request = await getRequest();
+      
+      // Add columns if they don't exist
+      try {
+        const colCheck = await request.query(`
+          SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS 
+          WHERE TABLE_NAME = 'files' AND TABLE_SCHEMA = 'dbo' AND COLUMN_NAME IN ('thumbnail_preview', 'thumbnail_generated')
+        `);
+        
+        const existingColumns = colCheck.recordset.map((r: any) => r.COLUMN_NAME);
+        const columnsToAdd = ['thumbnail_preview', 'thumbnail_generated'].filter(c => !existingColumns.includes(c));
+        
+        for (const col of columnsToAdd) {
+          await request.query(`ALTER TABLE dbo.files ADD ${col} ${col === 'thumbnail_preview' ? 'VARBINARY(MAX) NULL' : 'DATETIMEOFFSET(7) NULL'}`);
+          console.log(`[migration] Added column ${col} to dbo.files table (from thumbnail scan)`);
+        }
+      } catch (err: any) {
+        // If we still can't add columns, just skip the scan
+        if (err.message && (err.message.includes('Cannot find the object') || err.message.includes('Invalid object name') || err.message.includes('does not exist'))) {
+          console.warn('[thumbnail-scan] dbo.files table not found, skipping scan.');
+          return;
+        }
+        if (err.message && (err.message.includes('Invalid column name') || err.message.includes('Incorrect syntax'))) {
+          console.warn('[thumbnail-scan] Cannot add thumbnail columns, skipping scan.');
+          return;
+        }
+        // Re-throw if it's a different error
+        throw err;
+      }
+      
+      request.input('minutes', sql.Int, intervalMinutes * 2);
+      const result = await request.query<{
+        id: string;
+        stored_path: string;
+        owner_user_id: string;
+        original_name_encrypted: Buffer;
+        original_name_iv: Buffer;
+        original_name_auth_tag: Buffer;
+        mime_type: string;
+        thumbnail_generated: string | null;
+        size_bytes: number;
+      }>(
+        `SELECT id,stored_path,owner_user_id,original_name_encrypted,original_name_iv,original_name_auth_tag,mime_type,thumbnail_generated,size_bytes
+         FROM dbo.files WHERE mime_type LIKE 'image/%' AND (thumbnail_generated IS NULL OR thumbnail_generated < DATEADD(MINUTE, -@minutes, SYSDATETIMEOFFSET()) OR thumbnail_preview IS NULL)
+         AND status = 'Available' AND owner_user_id IS NOT NULL`
+      );
+
+      const files = result.recordset.map((r) => ({
+        id: r.id,
+        stored_path: r.stored_path,
+        owner_user_id: r.owner_user_id,
+        original_name_encrypted: r.original_name_encrypted,
+        original_name_iv: r.original_name_iv,
+        original_name_auth_tag: r.original_name_auth_tag,
+        mime_type: r.mime_type,
+        thumbnail_generated: r.thumbnail_generated ? new Date(r.thumbnail_generated) : null,
+        size_bytes: r.size_bytes,
+        original_name: decryptColumn(r.original_name_encrypted, r.original_name_iv, r.original_name_auth_tag),
+      }));
+
+      if (files.length === 0) {
+        console.log('[thumbnail-scan] No files need thumbnail generation.');
+        return;
+      }
+
+      console.log(`[thumbnail-scan] Found ${files.length} files missing or stale thumbnails.`);
+
+      // Generate thumbnails for each file
+      for (const file of files) {
+        const vaultPath = path.join(FILE_VAULT, file.stored_path);
+
+        if (!fs.existsSync(vaultPath)) {
+          console.warn(`[thumbnail-scan] Vault file not found for ${file.original_name}, skipping.`);
+          continue;
+        }
+
+        // Generate thumbnail path
+        const tempThumbnailPath = buildUniqueTempFilePath(UPLOAD_TEMP, 'leeku-thumb', file.id);
+        registerTempFile(tempThumbnailPath);
+
+        try {
+          // Read the encrypted file and generate thumbnail
+          const keyReq = await getRequest();
+          keyReq.input('fid', sql.UniqueIdentifier, file.id);
+          const keyRes = await keyReq.query<{ encrypted_key: Buffer; key_iv: Buffer; key_auth_tag: Buffer; file_iv: Buffer; file_auth_tag: Buffer }>(
+            'SELECT encrypted_key,key_iv,key_auth_tag,file_iv,file_auth_tag FROM file_encryption_keys WHERE file_id=@fid'
+          );
+
+          if (!keyRes.recordset.length) {
+            console.warn(`[thumbnail-scan] Encryption key not found for ${file.original_name}, skipping.`);
+            continue;
+          }
+
+          const keyRow = keyRes.recordset[0];
+          const fileKey = unwrapKey(keyRow.encrypted_key, keyRow.key_iv, keyRow.key_auth_tag);
+
+          // Decrypt to temp file, generate thumbnail, then re-encrypt
+          const decryptedTempPath = buildUniqueTempFilePath(UPLOAD_TEMP, 'leeku-thumb-dec', file.id);
+          registerTempFile(decryptedTempPath);
+
+          try {
+            await decryptFileStream(vaultPath, decryptedTempPath, fileKey, keyRow.file_iv, keyRow.file_auth_tag);
+
+            // Generate thumbnail using sharp
+            await sharp(decryptedTempPath)
+              .resize({ width: 128, height: 128, fit: 'inside', withoutEnlargement: true })
+              .jpeg({ quality: 80, progressive: true, optimize: true })
+              .toFile(tempThumbnailPath);
+
+            // Read the thumbnail as raw bytes and store directly in database
+            const thumbnailBuffer = fs.readFileSync(tempThumbnailPath);
+            console.log(`[thumbnail-scan] Thumbnail buffer size for ${file.original_name}: ${thumbnailBuffer.length} bytes`);
+
+            // Update the database with the thumbnail (stored as raw bytes, not re-encrypted)
+            const updateReq = await getRequest();
+            updateReq.input('fid', sql.UniqueIdentifier, file.id);
+            updateReq.input('tmb', sql.VarBinary(sql.MAX), thumbnailBuffer);
+            updateReq.input('tg', sql.DateTimeOffset, new Date());
+            await updateReq.query(
+              `UPDATE files 
+               SET thumbnail_preview = @tmb, 
+                   thumbnail_generated = @tg 
+               WHERE id = @fid`
+            );
+            
+            console.log(`[thumbnail-scan] Stored thumbnail for ${file.original_name} (${thumbnailBuffer.length} bytes)`);
+          } catch (err: any) {
+            // Ignore ENOENT errors from temp file cleanup during processing
+            if (err.message && err.message.includes('ENOENT')) {
+              console.warn(`[thumbnail-scan] Temp file error for ${file.original_name}: ${err.message}`);
+            } else {
+              throw err;
+            }
+          } finally {
+            try { if (fs.existsSync(decryptedTempPath)) fs.unlinkSync(decryptedTempPath); } catch {}
+            try { if (fs.existsSync(tempThumbnailPath)) fs.unlinkSync(tempThumbnailPath); } catch {}
+          }
+        } catch (err) {
+          console.error(`[thumbnail-scan] Failed to generate thumbnail for ${file.original_name}:`, err);
+        } finally {
+          try { if (fs.existsSync(tempThumbnailPath)) fs.unlinkSync(tempThumbnailPath); } catch {}
+        }
+      }
+    } catch (err) {
+      console.error('[thumbnail-scan] Scan error:', err);
+    }
+  };
+
+  // Run immediately on startup
+  scan();
+  
+  // Then run periodically
+  thumbnailScanInterval = setInterval(scan, intervalMinutes * 60 * 1000);
+  console.log(`[thumbnail-scan] Scan started, running every ${intervalMinutes} minutes.`);
+}
+
+export function stopThumbnailScan(): void {
+  if (thumbnailScanInterval) {
+    clearInterval(thumbnailScanInterval);
+    thumbnailScanInterval = null;
+  }
+}
+
+// ──────────────────────────────────────────────────────────────
 // Bootstrap
 // ──────────────────────────────────────────────────────────────
 
 async function ensureOptionalFileSecretColumns(): Promise<void> {
   const request = await getRequest();
-  await request.query(`
-    IF COL_LENGTH('files', 'client_secret_hash') IS NULL
-      ALTER TABLE files ADD client_secret_hash NVARCHAR(512) NULL;
-    IF COL_LENGTH('files', 'client_crypto_salt') IS NULL
-      ALTER TABLE files ADD client_crypto_salt VARBINARY(32) NULL;
-    IF COL_LENGTH('files', 'client_crypto_iv') IS NULL
-      ALTER TABLE files ADD client_crypto_iv VARBINARY(16) NULL;
-    IF COL_LENGTH('files', 'client_crypto_iterations') IS NULL
-      ALTER TABLE files ADD client_crypto_iterations INT NULL;
-  `);
+  
+  // First check if dbo.files exists
+  let tableExists = false;
+  
+  // Try dbo.files first
+  try {
+    await request.query(`SELECT TOP 1 id FROM dbo.files WHERE 1=0`);
+    tableExists = true;
+    console.log('[migration] Found dbo.files table');
+  } catch (err: any) {
+    if (err.message && err.message.includes('Cannot find the object')) {
+      console.log('[migration] dbo.files table not found');
+    } else {
+      // Some other error - might be permission or something else
+      console.log('[migration] Error checking dbo.files:', err.message);
+    }
+  }
+  
+  if (!tableExists) {
+    console.log('[migration] dbo.files table not found, skipping thumbnail columns migration.');
+    return;
+  }
+  
+  // Add columns individually - use dbo.files explicitly
+  const columnsToAdd = [
+    { name: 'thumbnail_preview', definition: 'VARBINARY(MAX) NULL' },
+    { name: 'thumbnail_generated', definition: 'DATETIMEOFFSET(7) NULL' }
+  ];
+  
+  for (const { name, definition } of columnsToAdd) {
+    try {
+      // Try direct ALTER first
+      await request.query(`ALTER TABLE dbo.files ADD ${name} ${definition}`);
+      console.log(`[migration] Added column ${name} to dbo.files table`);
+    } catch (err: any) {
+      // If that fails, try EXEC sp_executesql
+      try {
+        await request.query(`EXEC sp_executesql N'ALTER TABLE dbo.files ADD ${name} ${definition}'`);
+        console.log(`[migration] Added column ${name} to dbo.files table (via sp_executesql)`);
+      } catch (err2: any) {
+        // Check if it's about the column already existing
+        if (err.message && (err.message.includes('already exists') || err.message.includes('duplicate') || err.message.includes('Column names in each table must be unique'))) {
+          console.log(`[migration] Column ${name} already exists in dbo.files`);
+        } else if (err2.message && (err2.message.includes('already exists') || err2.message.includes('duplicate') || err2.message.includes('Column names in each table must be unique'))) {
+          console.log(`[migration] Column ${name} already exists in dbo.files (via sp_executesql)`);
+        } else {
+          console.log(`[migration] Error adding column ${name}: ${err.message || err2.message}`);
+        }
+      }
+    }
+  }
 }
 
 async function ensureOptionalShareLinkColumns(): Promise<void> {
@@ -5004,6 +5340,8 @@ async function ensureOptionalShareLinkColumns(): Promise<void> {
 
 async function ensureFileFolderSchema(): Promise<void> {
   const request = await getRequest();
+  
+  // Create file_folders table if it doesn't exist
   await request.query(`
     IF OBJECT_ID('dbo.file_folders', 'U') IS NULL
     BEGIN
@@ -5017,29 +5355,93 @@ async function ensureFileFolderSchema(): Promise<void> {
         CONSTRAINT PK_file_folders PRIMARY KEY CLUSTERED (id ASC),
         CONSTRAINT FK_file_folders_users FOREIGN KEY (owner_user_id) REFERENCES dbo.users(id) ON DELETE CASCADE
       );
-    END;
+    END
+  `);
+  
+  // Add columns to file_folders if needed
+  const fc = await getRequest();
+  await fc.query(`
     IF COL_LENGTH('file_folders', 'parent_folder_id') IS NULL
       ALTER TABLE file_folders ADD parent_folder_id UNIQUEIDENTIFIER NULL;
+  `);
+  
+  // Add foreign key if needed
+  const fk = await getRequest();
+  await fk.query(`
     IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name='FK_file_folders_parent')
       ALTER TABLE file_folders ADD CONSTRAINT FK_file_folders_parent FOREIGN KEY (parent_folder_id) REFERENCES dbo.file_folders(id) ON DELETE NO ACTION;
-
+  `);
+  
+  // Handle constraints
+  const c1 = await getRequest();
+  await c1.query(`
     IF EXISTS (SELECT 1 FROM sys.objects WHERE type='UQ' AND name='UQ_file_folders_owner_name')
       ALTER TABLE file_folders DROP CONSTRAINT UQ_file_folders_owner_name;
+  `);
+  
+  const c2 = await getRequest();
+  await c2.query(`
     IF NOT EXISTS (SELECT 1 FROM sys.objects WHERE type='UQ' AND name='UQ_file_folders_owner_parent_name')
       ALTER TABLE file_folders ADD CONSTRAINT UQ_file_folders_owner_parent_name UNIQUE (owner_user_id, parent_folder_id, name);
-
+  `);
+  
+  // Handle indexes
+  const idx1 = await getRequest();
+  await idx1.query(`
     IF EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_file_folders_owner' AND object_id=OBJECT_ID('dbo.file_folders'))
       DROP INDEX IX_file_folders_owner ON dbo.file_folders;
+  `);
+  
+  const idx2 = await getRequest();
+  await idx2.query(`
     IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_file_folders_owner_parent' AND object_id=OBJECT_ID('dbo.file_folders'))
       CREATE INDEX IX_file_folders_owner_parent ON dbo.file_folders(owner_user_id, parent_folder_id, name);
-
-    IF COL_LENGTH('files', 'folder_id') IS NULL
-      ALTER TABLE files ADD folder_id UNIQUEIDENTIFIER NULL;
-    IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name='FK_files_file_folders')
-      ALTER TABLE files ADD CONSTRAINT FK_files_file_folders FOREIGN KEY (folder_id) REFERENCES dbo.file_folders(id) ON DELETE NO ACTION;
-    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_files_folder_id' AND object_id=OBJECT_ID('dbo.files'))
-      CREATE INDEX IX_files_folder_id ON dbo.files(folder_id, owner_user_id);
   `);
+  
+  // Only alter files table if it exists - check dbo.files first
+  try {
+    await request.query(`SELECT TOP 1 id FROM dbo.files WHERE 1=0`);
+    console.log('[migration] Altering dbo.files table');
+  } catch (err: any) {
+    console.log('[migration] dbo/files table not found, skipping files table schema migration.');
+    return;
+  }
+  
+  // Add columns to dbo.files table if they don't exist
+  const columnsToAdd = [
+    { name: 'folder_id', definition: 'UNIQUEIDENTIFIER NULL' },
+    { name: 'thumbnail_preview', definition: 'VARBINARY(MAX) NULL' }
+  ];
+  
+  for (const { name, definition } of columnsToAdd) {
+    try {
+      await request.query(`ALTER TABLE dbo.files ADD ${name} ${definition}`);
+      console.log(`[migration] Added column ${name} to dbo.files table`);
+    } catch (err: any) {
+      if (!err.message || !err.message.includes('already exists') && !err.message.includes('duplicate')) {
+        console.log(`[migration] Column ${name} may already exist or error: ${err.message}`);
+      }
+    }
+  }
+  
+  // Add foreign key and index if needed
+  try {
+    await request.query(`
+      IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name='FK_files_file_folders')
+        ALTER TABLE files ADD CONSTRAINT FK_files_file_folders FOREIGN KEY (folder_id) REFERENCES dbo.file_folders(id) ON DELETE NO ACTION;
+    `);
+  } catch (err: any) {
+    console.log(`[migration] FK_files_file_folders may already exist: ${err.message}`);
+  }
+  
+  try {
+    await request.query(`
+      IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_files_folder_id' AND object_id=OBJECT_ID('dbo.files'))
+        CREATE INDEX IX_files_folder_id ON dbo.files(folder_id, owner_user_id);
+    `);
+  } catch (err: any) {
+    console.log(`[migration] IX_files_folder_id may already exist: ${err.message}`);
+  }
 }
 
 async function bootstrap() {
@@ -5090,6 +5492,9 @@ async function bootstrap() {
 
   // 6d. Start UNC share health monitor (auto-maintenance toggle)
   startUncShareMonitor();
+
+  // 6e. Start thumbnail background scan job
+  startThumbnailScan(60); // Run every 60 minutes
 
   // 7. Share link vanity path (Discord embeds) & SPA fallback
   const distPath = path.join(process.cwd(), 'dist');
