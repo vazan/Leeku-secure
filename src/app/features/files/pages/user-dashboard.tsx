@@ -212,22 +212,79 @@ function formatBytes(bytes: number) {
 }
 
 function fileKind(file: FileMetadata) {
-  if (file.mime_type.includes("image")) return "Image";
-  if (file.mime_type.includes("video")) return "Video";
-  if (file.mime_type.includes("pdf")) return "PDF";
-  if (file.mime_type.includes("zip") || file.mime_type.includes("compressed"))
+  // Normalize MIME type for comparison
+  const normalizedMimeType = (file.mime_type || "").trim().toLowerCase();
+  
+  // Handle common incorrect MIME types that should be images
+  if (normalizedMimeType === "document" || normalizedMimeType === "application/octet-stream") {
+    // Check file extension as fallback
+    const fileName = file.original_name.toLowerCase();
+    if (fileName.endsWith(".jpg") || fileName.endsWith(".jpeg") || fileName.endsWith(".png") || 
+        fileName.endsWith(".gif") || fileName.endsWith(".webp") || fileName.endsWith(".bmp") || 
+        fileName.endsWith(".svg") || fileName.endsWith(".tiff") || fileName.endsWith(".tif")) {
+      return "Image";
+    }
+    // Check for video extensions
+    if (fileName.endsWith(".mp4") || fileName.endsWith(".mkv") || fileName.endsWith(".avi") || 
+        fileName.endsWith(".mov") || fileName.endsWith(".wmv") || fileName.endsWith(".webm")) {
+      return "Video";
+    }
+    // Check for PDF
+    if (fileName.endsWith(".pdf")) {
+      return "PDF";
+    }
+    // Check for archives
+    if (fileName.endsWith(".zip") || fileName.endsWith(".rar") || fileName.endsWith(".7z") || 
+        fileName.endsWith(".tar") || fileName.endsWith(".gz")) {
+      return "Archive";
+    }
+  }
+  
+  if (normalizedMimeType.includes("image")) return "Image";
+  if (normalizedMimeType.includes("video")) return "Video";
+  if (normalizedMimeType.includes("pdf")) return "PDF";
+  if (normalizedMimeType.includes("zip") || normalizedMimeType.includes("compressed"))
     return "Archive";
   return "Document";
 }
 
 function supportsExternalPreview(file: FileMetadata) {
+  const normalizedMimeType = (file.mime_type || "").trim().toLowerCase();
+  
+  // Handle common incorrect MIME types that should be previewable
+  if (normalizedMimeType === "document" || normalizedMimeType === "application/octet-stream") {
+    // Check file extension as fallback
+    const fileName = file.original_name.toLowerCase();
+    if (fileName.endsWith(".jpg") || fileName.endsWith(".jpeg") || fileName.endsWith(".png") || 
+        fileName.endsWith(".gif") || fileName.endsWith(".webp") || fileName.endsWith(".bmp") || 
+        fileName.endsWith(".svg")) {
+      return true;
+    }
+    if (fileName.endsWith(".mp4") || fileName.endsWith(".mkv") || fileName.endsWith(".avi") || 
+        fileName.endsWith(".mov") || fileName.endsWith(".wmv") || fileName.endsWith(".webm")) {
+      return true;
+    }
+  }
+  
   return (
-    file.mime_type.startsWith("image/") || file.mime_type.startsWith("video/")
+    normalizedMimeType.startsWith("image/") || normalizedMimeType.startsWith("video/")
   );
 }
 
 function isVideoFile(file: FileMetadata) {
-  return file.mime_type.startsWith("video/");
+  const normalizedMimeType = (file.mime_type || "").trim().toLowerCase();
+  
+  // Handle common incorrect MIME types
+  if (normalizedMimeType === "document" || normalizedMimeType === "application/octet-stream") {
+    // Check file extension as fallback
+    const fileName = file.original_name.toLowerCase();
+    if (fileName.endsWith(".mp4") || fileName.endsWith(".mkv") || fileName.endsWith(".avi") || 
+        fileName.endsWith(".mov") || fileName.endsWith(".wmv") || fileName.endsWith(".webm")) {
+      return true;
+    }
+  }
+  
+  return normalizedMimeType.startsWith("video/");
 }
 
 function pad2(value: number) {
