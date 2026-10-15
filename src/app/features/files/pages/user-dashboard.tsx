@@ -287,6 +287,23 @@ function isVideoFile(file: FileMetadata) {
   return normalizedMimeType.startsWith("video/");
 }
 
+function isImageFile(file: FileMetadata) {
+  const normalizedMimeType = (file.mime_type || "").trim().toLowerCase();
+  
+  // Handle common incorrect MIME types
+  if (normalizedMimeType === "document" || normalizedMimeType === "application/octet-stream") {
+    // Check file extension as fallback
+    const fileName = file.original_name.toLowerCase();
+    if (fileName.endsWith(".jpg") || fileName.endsWith(".jpeg") || fileName.endsWith(".png") || 
+        fileName.endsWith(".gif") || fileName.endsWith(".webp") || fileName.endsWith(".bmp") || 
+        fileName.endsWith(".svg")) {
+      return true;
+    }
+  }
+  
+  return normalizedMimeType.startsWith("image/");
+}
+
 function pad2(value: number) {
   return String(value).padStart(2, "0");
 }
@@ -340,6 +357,7 @@ export default function UserDashboard({
   const [shareFile, setShareFile] = useState<FileMetadata | null>(null);
   const [shareFolder, setShareFolder] = useState<FileFolder | null>(null);
   const [videoFile, setVideoFile] = useState<FileMetadata | null>(null);
+  const [imageFile, setImageFile] = useState<FileMetadata | null>(null);
   const [textPreviewFile, setTextPreviewFile] = useState<FileMetadata | null>(null);
   const [moveFile, setMoveFile] = useState<FileMetadata | null>(null);
   const [moveTargetFolderId, setMoveTargetFolderId] = useState("");
@@ -2201,12 +2219,16 @@ export default function UserDashboard({
                         </div>
                       </div>
                       <div className="mt-4 grid w-full min-w-0 gap-2 min-[380px]:grid-cols-2">
-                        {(file.preview_available || isVideoFile(file)) && (
+                        {(file.preview_available || isVideoFile(file) || isImageFile(file)) && (
                           <FileActionButton
-                            label={isVideoFile(file) ? "Watch" : "Preview"}
+                            label={isVideoFile(file) ? "Watch" : isImageFile(file) ? "Preview" : "Preview"}
                             onClick={() => {
                               if (isVideoFile(file)) {
                                 setVideoFile(file);
+                                return;
+                              }
+                              if (isImageFile(file)) {
+                                setImageFile(file);
                                 return;
                               }
                               setTextPreviewFile(file);
@@ -2301,12 +2323,16 @@ export default function UserDashboard({
                         </td>
                         <td className="w-48 px-2 py-3">
                           <div className="flex w-44 justify-end gap-1">
-                            {(file.preview_available || isVideoFile(file)) && (
+                            {(file.preview_available || isVideoFile(file) || isImageFile(file)) && (
                               <IconButton
-                                label={isVideoFile(file) ? "Watch" : "Preview"}
+                                label={isVideoFile(file) ? "Watch" : isImageFile(file) ? "Preview" : "Preview"}
                                 onClick={() => {
                                   if (isVideoFile(file)) {
                                     setVideoFile(file);
+                                    return;
+                                  }
+                                  if (isImageFile(file)) {
+                                    setImageFile(file);
                                     return;
                                   }
                                   setTextPreviewFile(file);
@@ -2680,6 +2706,9 @@ export default function UserDashboard({
       )}
       {videoFile && (
         <VideoPlayer file={videoFile} onClose={() => setVideoFile(null)} />
+      )}
+      {imageFile && (
+        <ImagePreviewDialog file={imageFile} onClose={() => setImageFile(null)} />
       )}
       {textPreviewFile && (
         <TextPreviewDialog
@@ -3273,6 +3302,50 @@ function VideoPlayer({
         playsInline
         className="min-h-0 w-full flex-1 object-contain"
       />
+    </div>
+  );
+}
+
+function ImagePreviewDialog({
+  file,
+  onClose,
+}: {
+  file: FileMetadata;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", closeOnEscape);
+    return () => document.removeEventListener("keydown", closeOnEscape);
+  }, [onClose]);
+
+  return (
+    <div
+      className="fixed inset-0 z-[60] flex flex-col bg-black/95 p-4 backdrop-blur-md"
+      onPointerDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      <div className="mb-3 flex items-center justify-between gap-4 text-white">
+        <p className="min-w-0 truncate text-sm font-medium">{file.original_name}</p>
+        <button
+          type="button"
+          aria-label="Close preview"
+          onClick={onClose}
+          className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-white/10 hover:bg-white/20"
+        >
+          <X className="h-4 w-4" />
+        </button>
+      </div>
+      <div className="flex min-h-0 flex-1 items-center justify-center overflow-hidden">
+        <img
+          src={`/api/files/${file.id}/preview`}
+          alt={file.original_name}
+          className="max-h-full max-w-full object-contain"
+        />
+      </div>
     </div>
   );
 }
