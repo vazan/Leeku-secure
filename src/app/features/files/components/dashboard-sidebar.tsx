@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 import { Folder, FolderOpen, ChevronRight, ChevronDown, LogOut } from "lucide-react";
 import type { User, FileFolder } from "@/app/shared/types";
-import { useMemo, useState } from "react";
+import { useMemo, useState, useEffect } from "react";
 
 export type DashboardView = "home" | "files" | "shared" | "settings" | "admin";
 export type DashboardNavItem = [DashboardView, ReactNode, string];
@@ -43,6 +43,20 @@ export default function DashboardSidebar({
 
   // Track expanded folders (for tree view)
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
+
+  // Expand all folders in the current path when folderPath changes
+  useEffect(() => {
+    if (folderPath.length > 0) {
+      setExpandedFolders((prev) => {
+        const next = new Set(prev);
+        // Add all folders in the path to expanded (except the last one which is the current folder)
+        for (let i = 0; i < folderPath.length - 1; i++) {
+          next.add(folderPath[i].id);
+        }
+        return next;
+      });
+    }
+  }, [folderPath]);
 
   const toggleFolder = (folderId: string) => {
     setExpandedFolders((prev) => {

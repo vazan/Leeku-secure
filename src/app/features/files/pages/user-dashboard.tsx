@@ -1849,7 +1849,7 @@ export default function UserDashboard({
         folders={folders}
         onView={navigateDashboard}
         onLogout={onLogout}
-        folderPath={displayFolders}
+        folderPath={activeFolderId ? folderPath : []}
         onNavigateFolder={setActiveFolderId}
       />
 
