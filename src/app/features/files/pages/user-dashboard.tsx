@@ -336,6 +336,7 @@ export default function UserDashboard({
     getSavedDashboardView(user),
   );
   const [files, setFiles] = useState<FileMetadata[]>([]);
+  const [filesLoading, setFilesLoading] = useState(false);
   const [folders, setFolders] = useState<FileFolder[]>([]);
   const [foldersLoaded, setFoldersLoaded] = useState(false);
   const [foldersLoading, setFoldersLoading] = useState(false);
@@ -525,36 +526,41 @@ export default function UserDashboard({
   };
 
   const loadFilesAndLinks = async () => {
-    const [filesResponse, linksResponse] = await Promise.all([
-      fetch("/api/files?_t=" + Date.now(), { headers: authHeaders(token) }),
-      fetch("/api/sharing/links?_t=" + Date.now(), { headers: authHeaders(token) }),
-    ]);
-    if (filesResponse.ok) {
-      setFiles((await filesResponse.json()).files || []);
-    } else {
-      let message = "Could not load your files.";
-      try {
-        const payload = await filesResponse.json();
-        message = payload?.error || message;
-      } catch {
-        // Keep generic message when response is not JSON.
+    setFilesLoading(true);
+    try {
+      const [filesResponse, linksResponse] = await Promise.all([
+        fetch("/api/files?_t=" + Date.now(), { headers: authHeaders(token) }),
+        fetch("/api/sharing/links?_t=" + Date.now(), { headers: authHeaders(token) }),
+      ]);
+      if (filesResponse.ok) {
+        setFiles((await filesResponse.json()).files || []);
+      } else {
+        let message = "Could not load your files.";
+        try {
+          const payload = await filesResponse.json();
+          message = payload?.error || message;
+        } catch {
+          // Keep generic message when response is not JSON.
+        }
+        notifyError(message);
       }
-      notifyError(message);
-    }
 
-    if (linksResponse.ok) {
-      const sharingPayload = await linksResponse.json();
-      setLinks(sharingPayload.links || []);
-      setFolderLinks(sharingPayload.folder_links || []);
-    } else {
-      let message = "Could not load sharing links.";
-      try {
-        const payload = await linksResponse.json();
-        message = payload?.error || message;
-      } catch {
-        // Keep generic message when response is not JSON.
+      if (linksResponse.ok) {
+        const sharingPayload = await linksResponse.json();
+        setLinks(sharingPayload.links || []);
+        setFolderLinks(sharingPayload.folder_links || []);
+      } else {
+        let message = "Could not load sharing links.";
+        try {
+          const payload = await linksResponse.json();
+          message = payload?.error || message;
+        } catch {
+          // Keep generic message when response is not JSON.
+        }
+        notifyError(message);
       }
-      notifyError(message);
+    } finally {
+      setFilesLoading(false);
     }
   };
 
@@ -2084,11 +2090,20 @@ export default function UserDashboard({
                   {activeFolder ? activeFolder.name : "All files"}
                 </h1>
                 <p className="mt-1 text-sm text-[var(--text-muted)]">
-                  {currentFolderFiles.length} file{currentFolderFiles.length === 1 ? "" : "s"} {activeFolder ? "in this folder" : "in All Files root"}.
-                  {normalizedSearch && (
+                  {filesLoading ? (
+                    <span className="inline-flex items-center gap-1.5">
+                      <div className="h-4 w-4 animate-spin rounded-full border-2 border-[var(--border-subtle)] border-t-[var(--accent-linear)]" />
+                      Loading files...
+                    </span>
+                  ) : (
                     <>
-                      {" "}
-                      ({visibleFiles.length} matching "{search.trim()}")
+                      {currentFolderFiles.length} file{currentFolderFiles.length === 1 ? "" : "s"} {activeFolder ? "in this folder" : "in All Files root"}.
+                      {normalizedSearch && (
+                        <>
+                          {" "}
+                          ({visibleFiles.length} matching "{search.trim()}")
+                        </>
+                      )}
                     </>
                   )}
                 </p>
@@ -2180,7 +2195,15 @@ export default function UserDashboard({
                 </div>
               )}
 
-              {visibleFiles.length === 0 ? (
+              {filesLoading ? (
+                <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] p-8 text-center shadow-[var(--shadow-hairline)]">
+                  <div className="mx-auto mb-3 h-8 w-8 animate-spin rounded-full border-2 border-[var(--border-subtle)] border-t-[var(--accent-linear)]" />
+                  <p className="text-sm font-medium">Loading files...</p>
+                  <p className="mt-1 text-xs text-[var(--text-muted)]">
+                    Please wait while we fetch your files.
+                  </p>
+                </div>
+              ) : visibleFiles.length === 0 ? (
                 <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] p-8 text-center shadow-[var(--shadow-hairline)]">
                   <p className="text-sm font-medium">No matching files</p>
                   <p className="mt-1 text-xs text-[var(--text-muted)]">
