@@ -5170,6 +5170,12 @@ export function startThumbnailScan(intervalMinutes: number = 60): void {
 
       console.log(`[thumbnail-scan] Found ${files.length} files missing or stale thumbnails.`);
 
+      // Debug: log files that have thumbnail_preview but NULL thumbnail_generated
+      const filesWithPreviewButNoTimestamp = files.filter(f => f.thumbnail_generated === null);
+      if (filesWithPreviewButNoTimestamp.length > 0) {
+        console.log(`[thumbnail-scan] ${filesWithPreviewButNoTimestamp.length} file(s) have thumbnail_preview but NULL thumbnail_generated - these will be re-processed to set thumbnail_generated`);
+      }
+
       // Generate thumbnails for each file
       for (const file of files) {
         const vaultPath = path.join(FILE_VAULT, file.stored_path);
@@ -5183,8 +5189,8 @@ export function startThumbnailScan(intervalMinutes: number = 60): void {
         const tempThumbnailPath = buildUniqueTempFilePath(UPLOAD_TEMP, 'leeku-thumb', file.id);
         registerTempFile(tempThumbnailPath);
 
+        // Read the encrypted file and generate thumbnail
         try {
-          // Read the encrypted file and generate thumbnail
           const keyReq = await getRequest();
           keyReq.input('fid', sql.UniqueIdentifier, file.id);
           const keyRes = await keyReq.query<{ encrypted_key: Buffer; key_iv: Buffer; key_auth_tag: Buffer; file_iv: Buffer; file_auth_tag: Buffer }>(
@@ -5193,13 +5199,14 @@ export function startThumbnailScan(intervalMinutes: number = 60): void {
 
           if (!keyRes.recordset.length) {
             console.warn(`[thumbnail-scan] Encryption key not found for ${file.original_name}, skipping.`);
+            unregisterTempFile(tempThumbnailPath);
             continue;
           }
 
           const keyRow = keyRes.recordset[0];
           const fileKey = unwrapKey(keyRow.encrypted_key, keyRow.key_iv, keyRow.key_auth_tag);
 
-          // Decrypt to temp file, generate thumbnail, then re-encrypt
+          // Decrypt to temp file and generate thumbnail
           const decryptedTempPath = buildUniqueTempFilePath(UPLOAD_TEMP, 'leeku-thumb-dec', file.id);
           registerTempFile(decryptedTempPath);
 
@@ -5215,38 +5222,53 @@ export function startThumbnailScan(intervalMinutes: number = 60): void {
             // Read the thumbnail as raw bytes and store directly in database
             const thumbnailBuffer = fs.readFileSync(tempThumbnailPath);
             console.log(`[thumbnail-scan] Thumbnail buffer size for ${file.original_name}: ${thumbnailBuffer.length} bytes`);
+            
+            // Check if thumbnail already exists in database
+            const checkReq = await getRequest();
+            checkReq.input('fid', sql.UniqueIdentifier, file.id);
+            const checkResult = await checkReq.query(
+              `SELECT thumbnail_preview, thumbnail_generated FROM files WHERE id = @fid`
+            );
+            const existing = checkResult.recordset[0];
+            console.log(`[thumbnail-scan] Existing thumbnail for ${file.original_name}: preview=${existing.thumbnail_preview ? 'exists' : 'NULL'}, generated=${existing.thumbnail_generated ? existing.thumbnail_generated : 'NULL'}`);
 
-            // Update the database with the thumbnail (stored as raw bytes, not re-encrypted)
+            // Update the database with the thumbnail
             const updateReq = await getRequest();
             updateReq.input('fid', sql.UniqueIdentifier, file.id);
             updateReq.input('tmb', sql.VarBinary(sql.MAX), thumbnailBuffer);
-            updateReq.input('tg', sql.DateTimeOffset, new Date());
-            await updateReq.query(
+            const result1 = await updateReq.query(
               `UPDATE files 
-               SET thumbnail_preview = @tmb, 
-                   thumbnail_generated = @tg 
+               SET thumbnail_preview = @tmb 
                WHERE id = @fid`
             );
+            console.log(`[thumbnail-scan] Update 1 (thumbnail_preview): ${result1.rowsAffected[0]} row(s) affected`);
+            
+            // Update thumbnail_generated timestamp AFTER successful storage
+            const updateReq2 = await getRequest();
+            updateReq2.input('fid', sql.UniqueIdentifier, file.id);
+            updateReq2.input('tg', sql.DateTimeOffset, new Date());
+            const result2 = await updateReq2.query(
+              `UPDATE files 
+               SET thumbnail_generated = @tg 
+               WHERE id = @fid`
+            );
+            console.log(`[thumbnail-scan] Update 2 (thumbnail_generated): ${result2.rowsAffected[0]} row(s) affected`);
             
             console.log(`[thumbnail-scan] Stored thumbnail for ${file.original_name} (${thumbnailBuffer.length} bytes)`);
           } catch (err: any) {
-            // Ignore ENOENT errors from temp file cleanup during processing
-            if (err.message && err.message.includes('ENOENT')) {
-              console.warn(`[thumbnail-scan] Temp file error for ${file.original_name}: ${err.message}`);
-            } else {
-              throw err;
-            }
+            console.error(`[thumbnail-scan] Failed to generate thumbnail for ${file.original_name}:`, err);
           } finally {
             try { if (fs.existsSync(decryptedTempPath)) fs.unlinkSync(decryptedTempPath); } catch {}
-            try { if (fs.existsSync(tempThumbnailPath)) fs.unlinkSync(tempThumbnailPath); } catch {}
+            unregisterTempFile(decryptedTempPath);
           }
-        } catch (err) {
-          console.error(`[thumbnail-scan] Failed to generate thumbnail for ${file.original_name}:`, err);
+        } catch (err: any) {
+          console.error(`[thumbnail-scan] Error for ${file.original_name}:`, err);
         } finally {
           try { if (fs.existsSync(tempThumbnailPath)) fs.unlinkSync(tempThumbnailPath); } catch {}
+          unregisterTempFile(tempThumbnailPath);
         }
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error('[thumbnail-scan] Scan error:', err);
     }
   };
