@@ -4640,17 +4640,10 @@ app.get('/api/admin/files', authenticateUser as express.RequestHandler, verifyAd
 app.get('/api/admin/file-folders', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, async (req, res) => {
   try {
     const request = await getRequest();
-    const result = await request.query<AdminFolderRow>(
-      `SELECT ff.id, ff.owner_user_id, ff.parent_folder_id, ff.name, ff.created_at, ff.updated_at,
-              COUNT(f.id) AS file_count,
-              u.username_encrypted, u.username_iv, u.username_auth_tag
-       FROM file_folders ff
-       INNER JOIN users u ON u.id=ff.owner_user_id
-       LEFT JOIN files f ON f.folder_id=ff.id AND COALESCE(f.status,'Available')!='Expired'
-       GROUP BY ff.id, ff.owner_user_id, ff.parent_folder_id, ff.name, ff.created_at, ff.updated_at,
-                u.username_encrypted, u.username_iv, u.username_auth_tag
-       ORDER BY ff.owner_user_id ASC, ff.parent_folder_id ASC, ff.name ASC`
-    );
+    const queryText = `SELECT ff.id, ff.owner_user_id, ff.parent_folder_id, ff.name, ff.created_at, ff.updated_at, COUNT(f.id) AS file_count, u.username_encrypted, u.username_iv, u.username_auth_tag FROM file_folders ff INNER JOIN users u ON u.id=ff.owner_user_id LEFT JOIN files f ON f.folder_id=ff.id AND COALESCE(f.status,'Available')!='Expired' GROUP BY ff.id, ff.owner_user_id, ff.parent_folder_id, ff.name, ff.created_at, ff.updated_at, u.username_encrypted, u.username_iv, u.username_auth_tag ORDER BY ff.owner_user_id ASC, ff.parent_folder_id ASC, ff.name ASC`;
+    console.log('[DEBUG] Executing admin file-folders query');
+    const result = await request.query<AdminFolderRow>(queryText);
+    console.log('[DEBUG] Query returned', result.recordset.length, 'rows');
     const folders: AdminFileFolder[] = result.recordset.map((row) => ({
       ...mapFolderRow(row),
       username: decryptColumn(row.username_encrypted, row.username_iv, row.username_auth_tag),
