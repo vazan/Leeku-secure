@@ -181,8 +181,18 @@ CREATE TABLE IF NOT EXISTS files (
 	client_crypto_salt BYTEA NULL,
 	client_crypto_iv BYTEA NULL,
 	client_crypto_iterations INTEGER NULL,
+	thumbnail_preview BYTEA NULL,
+	thumbnail_generated TIMESTAMPTZ NULL,
 	created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+ALTER TABLE files ADD COLUMN IF NOT EXISTS thumbnail_preview BYTEA;
+ALTER TABLE files ADD COLUMN IF NOT EXISTS thumbnail_generated TIMESTAMPTZ;
+
+CREATE INDEX IF NOT EXISTS ix_files_thumbnail
+	ON files (thumbnail_generated)
+	WHERE mime_type LIKE 'image/%' AND status = 'Available'
+		AND deleted_at IS NULL AND client_secret_hash IS NULL;
 
 CREATE TABLE IF NOT EXISTS file_encryption_keys (
 	file_id UUID PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,

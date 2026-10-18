@@ -3015,7 +3015,7 @@ function FileThumbnail({
     const controller = new AbortController();
     let objectUrl: string | null = null;
 
-    fetch(`/api/files/${file.id}/preview`, {
+    fetch(`/api/files/${file.id}/${isImage ? "thumbnail" : "preview"}`, {
       headers: authHeaders(token),
       signal: controller.signal,
     })
@@ -3041,7 +3041,7 @@ function FileThumbnail({
       controller.abort();
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [file.id, isPreviewable, token]);
+  }, [file.id, isImage, isPreviewable, token]);
 
   const playVideo = async () => {
     const video = videoRef.current;
