@@ -155,41 +155,52 @@ function kindFromFile(fileName: string, mimeType: string): FileIconKind {
   const fromExtension = extensionToKind[ext];
   if (fromExtension) return fromExtension;
 
-  if (mimeType.startsWith("font/")) return "font";
-  if (mimeType.startsWith("image/")) return "image";
-  if (mimeType.startsWith("video/")) return "media";
-  if (mimeType.startsWith("audio/")) return "audio";
-  if (mimeType.includes("presentation") || mimeType.includes("powerpoint"))
+  // Normalize MIME type for comparison
+  const normalizedMimeType = (mimeType || "").trim().toLowerCase();
+
+  // Handle common incorrect MIME types that should be images
+  if (normalizedMimeType === "document" || normalizedMimeType === "application/octet-stream") {
+    // Check file extension as fallback
+    if (ext && ["jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "tiff", "tif"].includes(ext)) {
+      return "image";
+    }
+  }
+
+  if (normalizedMimeType.startsWith("font/")) return "font";
+  if (normalizedMimeType.startsWith("image/")) return "image";
+  if (normalizedMimeType.startsWith("video/")) return "media";
+  if (normalizedMimeType.startsWith("audio/")) return "audio";
+  if (normalizedMimeType.includes("presentation") || normalizedMimeType.includes("powerpoint"))
     return "presentation";
   if (
-    mimeType.includes("photoshop") ||
-    mimeType.includes("postscript") ||
-    mimeType.includes("illustrator")
+    normalizedMimeType.includes("photoshop") ||
+    normalizedMimeType.includes("postscript") ||
+    normalizedMimeType.includes("illustrator")
   )
     return "design";
-  if (mimeType.includes("cad") || mimeType.includes("dwg")) return "cad";
-  if (mimeType.includes("pdf")) return "pdf";
-  if (mimeType.includes("spreadsheet") || mimeType.includes("csv"))
+  if (normalizedMimeType.includes("cad") || normalizedMimeType.includes("dwg")) return "cad";
+  if (normalizedMimeType.includes("pdf")) return "pdf";
+  if (normalizedMimeType.includes("spreadsheet") || normalizedMimeType.includes("csv"))
     return "spreadsheet";
   if (
-    mimeType.includes("json") ||
-    mimeType.includes("xml") ||
-    mimeType.includes("sql")
+    normalizedMimeType.includes("json") ||
+    normalizedMimeType.includes("xml") ||
+    normalizedMimeType.includes("sql")
   )
     return "data";
   if (
-    mimeType.includes("javascript") ||
-    mimeType.includes("typescript") ||
-    mimeType.includes("python") ||
-    mimeType.includes("java") ||
-    mimeType.includes("csharp")
+    normalizedMimeType.includes("javascript") ||
+    normalizedMimeType.includes("typescript") ||
+    normalizedMimeType.includes("python") ||
+    normalizedMimeType.includes("java") ||
+    normalizedMimeType.includes("csharp")
   )
     return "code";
-  if (mimeType.includes("script") || mimeType.includes("shell"))
+  if (normalizedMimeType.includes("script") || normalizedMimeType.includes("shell"))
     return "script";
-  if (mimeType.includes("zip") || mimeType.includes("compressed"))
+  if (normalizedMimeType.includes("zip") || normalizedMimeType.includes("compressed"))
     return "archive";
-  if (mimeType.startsWith("text/")) return "text";
+  if (normalizedMimeType.startsWith("text/")) return "text";
   return "document";
 }
 

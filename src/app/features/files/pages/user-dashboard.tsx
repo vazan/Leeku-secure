@@ -212,26 +212,100 @@ function formatBytes(bytes: number) {
 }
 
 function fileKind(file: FileMetadata) {
-  if (file.mime_type.includes("image")) return "Image";
-  if (file.mime_type.includes("video")) return "Video";
-  if (file.mime_type.includes("pdf")) return "PDF";
-  if (file.mime_type.includes("zip") || file.mime_type.includes("compressed"))
+  // Normalize MIME type for comparison
+  const normalizedMimeType = (file.mime_type || "").trim().toLowerCase();
+  
+  // Handle common incorrect MIME types that should be images
+  if (normalizedMimeType === "document" || normalizedMimeType === "application/octet-stream") {
+    // Check file extension as fallback
+    const fileName = file.original_name.toLowerCase();
+    if (fileName.endsWith(".jpg") || fileName.endsWith(".jpeg") || fileName.endsWith(".png") || 
+        fileName.endsWith(".gif") || fileName.endsWith(".webp") || fileName.endsWith(".bmp") || 
+        fileName.endsWith(".svg") || fileName.endsWith(".tiff") || fileName.endsWith(".tif")) {
+      return "Image";
+    }
+    // Check for video extensions
+    if (fileName.endsWith(".mp4") || fileName.endsWith(".mkv") || fileName.endsWith(".avi") || 
+        fileName.endsWith(".mov") || fileName.endsWith(".wmv") || fileName.endsWith(".webm")) {
+      return "Video";
+    }
+    // Check for PDF
+    if (fileName.endsWith(".pdf")) {
+      return "PDF";
+    }
+    // Check for archives
+    if (fileName.endsWith(".zip") || fileName.endsWith(".rar") || fileName.endsWith(".7z") || 
+        fileName.endsWith(".tar") || fileName.endsWith(".gz")) {
+      return "Archive";
+    }
+  }
+  
+  if (normalizedMimeType.includes("image")) return "Image";
+  if (normalizedMimeType.includes("video")) return "Video";
+  if (normalizedMimeType.includes("pdf")) return "PDF";
+  if (normalizedMimeType.includes("zip") || normalizedMimeType.includes("compressed"))
     return "Archive";
   return "Document";
 }
 
 function supportsExternalPreview(file: FileMetadata) {
+  const normalizedMimeType = (file.mime_type || "").trim().toLowerCase();
+  
+  // Handle common incorrect MIME types that should be previewable
+  if (normalizedMimeType === "document" || normalizedMimeType === "application/octet-stream") {
+    // Check file extension as fallback
+    const fileName = file.original_name.toLowerCase();
+    if (fileName.endsWith(".jpg") || fileName.endsWith(".jpeg") || fileName.endsWith(".png") || 
+        fileName.endsWith(".gif") || fileName.endsWith(".webp") || fileName.endsWith(".bmp") || 
+        fileName.endsWith(".svg")) {
+      return true;
+    }
+    if (fileName.endsWith(".mp4") || fileName.endsWith(".mkv") || fileName.endsWith(".avi") || 
+        fileName.endsWith(".mov") || fileName.endsWith(".wmv") || fileName.endsWith(".webm")) {
+      return true;
+    }
+  }
+
   return (
-    file.mime_type.startsWith("image/") || file.mime_type.startsWith("video/")
+    normalizedMimeType.startsWith("image/") || normalizedMimeType.startsWith("video/")
   );
 }
 
 function isVideoFile(file: FileMetadata) {
-  return file.mime_type.startsWith("video/");
+  const normalizedMimeType = (file.mime_type || "").trim().toLowerCase();
+  
+  // Handle common incorrect MIME types
+  if (normalizedMimeType === "document" || normalizedMimeType === "application/octet-stream") {
+    // Check file extension as fallback
+    const fileName = file.original_name.toLowerCase();
+    if (fileName.endsWith(".mp4") || fileName.endsWith(".mkv") || fileName.endsWith(".avi") || 
+        fileName.endsWith(".mov") || fileName.endsWith(".wmv") || fileName.endsWith(".webm")) {
+      return true;
+    }
+  }
+  
+  return normalizedMimeType.startsWith("video/");
 }
 
 function pad2(value: number) {
   return String(value).padStart(2, "0");
+}
+
+function isImageFile(file: FileMetadata) {
+  const normalizedMimeType = (file.mime_type || "").trim().toLowerCase();
+  
+  // Handle common incorrect MIME types
+  if (normalizedMimeType === "document" || normalizedMimeType === "application/octet-stream") {
+    // Check file extension as fallback
+    const fileName = file.original_name.toLowerCase();
+    if (fileName.endsWith(".jpg") || fileName.endsWith(".jpeg") || fileName.endsWith(".png") || 
+        fileName.endsWith(".gif") || fileName.endsWith(".webp") || fileName.endsWith(".bmp") || 
+        fileName.endsWith(".svg")) {
+      return true;
+    }
+  }
+  
+  return normalizedMimeType.startsWith("image/");
 }
 
 function toLocalDateTimeValue(date: Date) {
@@ -283,6 +357,7 @@ export default function UserDashboard({
   const [shareFile, setShareFile] = useState<FileMetadata | null>(null);
   const [shareFolder, setShareFolder] = useState<FileFolder | null>(null);
   const [videoFile, setVideoFile] = useState<FileMetadata | null>(null);
+  const [imageFile, setImageFile] = useState<FileMetadata | null>(null);
   const [textPreviewFile, setTextPreviewFile] = useState<FileMetadata | null>(null);
   const [moveFile, setMoveFile] = useState<FileMetadata | null>(null);
   const [moveTargetFolderId, setMoveTargetFolderId] = useState("");
@@ -353,6 +428,17 @@ export default function UserDashboard({
   }, [activeFolderId, folderById]);
 
   const activeFolderDepth = folderPath.length;
+
+  // Get folders to display in sidebar
+  const displayFolders = useMemo(() => {
+    if (activeFolderId) {
+      // Inside a folder - show the path
+      return folderPath;
+    } else {
+      // At "All Files" root - show root-level folders (no parent)
+      return folders.filter((folder) => !folder.parent_folder_id);
+    }
+  }, [activeFolderId, folderPath, folders]);
 
   const uploadFolderOptions = useMemo(() => {
     const toPathLabel = (folder: FileFolder) => {
@@ -495,9 +581,8 @@ export default function UserDashboard({
   };
 
   useEffect(() => {
-    loadFilesAndLinks().catch(() =>
-      notifyError("Could not refresh your files."),
-    );
+    loadFolders().catch(() => notifyError("Could not refresh folders."));
+    loadFilesAndLinks().catch(() => notifyError("Could not refresh your files."));
     loadAdmin().catch(() => notifyError("Could not refresh admin data."));
   }, []);
 
@@ -1761,8 +1846,11 @@ export default function UserDashboard({
         view={view}
         navItems={navItems}
         storageLimit={storageLimit}
+        folders={folders}
         onView={navigateDashboard}
         onLogout={onLogout}
+        folderPath={activeFolderId ? folderPath : []}
+        onNavigateFolder={setActiveFolderId}
       />
 
       <main className="min-w-0 overflow-x-hidden lg:pl-64">
@@ -2061,37 +2149,6 @@ export default function UserDashboard({
                     </>
                   )}
                 </div>
-                {folderPath.length > 0 && (
-                  <div className="mt-3 flex flex-wrap items-center justify-center gap-1 text-xs text-[var(--text-muted)]">
-                    <button
-                      type="button"
-                      onClick={() => setActiveFolderId(null)}
-                      disabled={foldersLoading}
-                      className="hover:text-[var(--text-primary)] disabled:opacity-60"
-                    >
-                      {foldersLoading ? (
-                        <span className="inline-flex items-center gap-1.5">
-                          <Loader2 className="h-3 w-3 animate-spin" />
-                          Loading...
-                        </span>
-                      ) : (
-                        "All Files"
-                      )}
-                    </button>
-                    {folderPath.map((folder) => (
-                      <React.Fragment key={folder.id}>
-                        <span>/</span>
-                        <button
-                          type="button"
-                          onClick={() => setActiveFolderId(folder.id)}
-                          className="max-w-[10rem] truncate hover:text-[var(--text-primary)]"
-                        >
-                          {folder.name}
-                        </button>
-                      </React.Fragment>
-                    ))}
-                  </div>
-                )}
               </div>
 
               {visibleFolders.length > 0 && (
@@ -2162,12 +2219,16 @@ export default function UserDashboard({
                         </div>
                       </div>
                       <div className="mt-4 grid w-full min-w-0 gap-2 min-[380px]:grid-cols-2">
-                        {(file.preview_available || isVideoFile(file)) && (
+                        {(file.preview_available || isVideoFile(file) || isImageFile(file)) && (
                           <FileActionButton
-                            label={isVideoFile(file) ? "Watch" : "Preview"}
+                            label={isVideoFile(file) ? "Watch" : isImageFile(file) ? "Preview" : "Preview"}
                             onClick={() => {
                               if (isVideoFile(file)) {
                                 setVideoFile(file);
+                                return;
+                              }
+                              if (isImageFile(file)) {
+                                setImageFile(file);
                                 return;
                               }
                               setTextPreviewFile(file);
@@ -2262,12 +2323,16 @@ export default function UserDashboard({
                         </td>
                         <td className="w-48 px-2 py-3">
                           <div className="flex w-44 justify-end gap-1">
-                            {(file.preview_available || isVideoFile(file)) && (
+                            {(file.preview_available || isVideoFile(file) || isImageFile(file)) && (
                               <IconButton
-                                label={isVideoFile(file) ? "Watch" : "Preview"}
+                                label={isVideoFile(file) ? "Watch" : isImageFile(file) ? "Preview" : "Preview"}
                                 onClick={() => {
                                   if (isVideoFile(file)) {
                                     setVideoFile(file);
+                                    return;
+                                  }
+                                  if (isImageFile(file)) {
+                                    setImageFile(file);
                                     return;
                                   }
                                   setTextPreviewFile(file);
@@ -2641,6 +2706,9 @@ export default function UserDashboard({
       )}
       {videoFile && (
         <VideoPlayer file={videoFile} onClose={() => setVideoFile(null)} />
+      )}
+      {imageFile && (
+        <ImagePreviewDialog file={imageFile} onClose={() => setImageFile(null)} />
       )}
       {textPreviewFile && (
         <TextPreviewDialog
@@ -3234,6 +3302,50 @@ function VideoPlayer({
         playsInline
         className="min-h-0 w-full flex-1 object-contain"
       />
+    </div>
+  );
+}
+
+function ImagePreviewDialog({
+  file,
+  onClose,
+}: {
+  file: FileMetadata;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", closeOnEscape);
+    return () => document.removeEventListener("keydown", closeOnEscape);
+  }, [onClose]);
+
+  return (
+    <div
+      className="fixed inset-0 z-[60] flex flex-col bg-black/95 p-4 backdrop-blur-md"
+      onPointerDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      <div className="mb-3 flex items-center justify-between gap-4 text-white">
+        <p className="min-w-0 truncate text-sm font-medium">{file.original_name}</p>
+        <button
+          type="button"
+          aria-label="Close preview"
+          onClick={onClose}
+          className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-white/10 hover:bg-white/20"
+        >
+          <X className="h-4 w-4" />
+        </button>
+      </div>
+      <div className="flex min-h-0 flex-1 items-center justify-center overflow-hidden">
+        <img
+          src={`/api/files/${file.id}/preview`}
+          alt={file.original_name}
+          className="max-h-full max-w-full object-contain"
+        />
+      </div>
     </div>
   );
 }

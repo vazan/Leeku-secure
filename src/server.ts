@@ -42,6 +42,7 @@ import {
   getProfilePictureFiles,
   resolveProfilePictureUserIdFromToken,
 } from './server/utils/profile-picture.js';
+import { detectFileMime } from './server/utils/file-mime-detect.js';
 import {
   startExpiryCleanup, stopExpiryCleanup,
   computeExpiresAt, isValidTtl,
@@ -838,6 +839,19 @@ function mapUserRow(row: UserRow): User {
 function mapFileRow(row: FileRow, ownerUsername: string): FileMetadata {
   const originalName = decryptColumn(row.original_name_encrypted, row.original_name_iv, row.original_name_auth_tag);
   const previewKind = getTextPreviewKind(originalName, row.mime_type || '');
+
+  // Only verify MIME type for files that might have incorrect metadata
+  // (Document type is a known issue from secondary tools)
+  let verifiedMimeType = row.mime_type;
+  if (row.mime_type && row.mime_type === 'Document') {
+    const vaultPath = path.join(FILE_VAULT, row.stored_path);
+    const detectedMime = detectFileMime(vaultPath);
+    if (detectedMime) {
+      console.info(`[mapFileRow] Corrected MIME type for file ${originalName}: ${row.mime_type} -> ${detectedMime}`);
+      verifiedMimeType = detectedMime;
+    }
+  }
+
   return {
     id:             row.id,
     owner_user_id:  row.owner_user_id,
@@ -846,7 +860,7 @@ function mapFileRow(row: FileRow, ownerUsername: string): FileMetadata {
     folder_name:    row.folder_name || null,
     original_name:  originalName,
     stored_name:    row.stored_path,
-    mime_type:      row.mime_type,
+    mime_type:      verifiedMimeType,
     size:           Number(row.size_bytes),
     has_user_secret: !!row.client_secret_hash,
     encrypted_size: Number(row.encrypted_size_bytes),
@@ -2953,6 +2967,17 @@ app.post(
         ? `Development bypass: Bitdefender scanner unavailable; file was not scanned. ${scanResult.message}`
         : scanResult.message;
 
+      // Verify and correct MIME type based on file content
+      // Only do this for files that might have incorrect metadata (e.g., "Document" type)
+      let verifiedMimeType = mime_type;
+      if (mime_type === 'Document') {
+        const detectedMime = detectFileMime(tempFilePath);
+        if (detectedMime) {
+          console.info(`[upload] Corrected MIME type for ${original_name}: ${mime_type} -> ${detectedMime}`);
+          verifiedMimeType = detectedMime;
+        }
+      }
+
       if (uploadSecretHash && !payloadAlreadyClientProtected) {
         currentStage = 'secret_protect_fallback';
         uploadSecretIterations = 250000;
@@ -3025,7 +3050,7 @@ app.post(
       fileReq.input('nIv',    sql.VarBinary(16),   encName.iv);
       fileReq.input('nTag',   sql.VarBinary(16),   encName.authTag);
       fileReq.input('spath',  sql.NVarChar(1000),  vaultFileName);
-      fileReq.input('mime',   sql.NVarChar(255),   mime_type);
+      fileReq.input('mime',   sql.NVarChar(255),   verifiedMimeType);
       fileReq.input('sz',     sql.BigInt,          size);
       fileReq.input('esz',    sql.BigInt,          encryptResult.encryptedSize);
       fileReq.input('chk',    sql.Char(64),        encryptResult.checksum);
