@@ -51,7 +51,7 @@ type BoundValue = {
   value: unknown;
 };
 
-class PgRequest {
+export class PgRequest {
   private readonly params = new Map<string, BoundValue>();
 
   input(name: string, type: SqlTypeDescriptor | ReturnType<typeof sizedType>, value: unknown): this;
@@ -67,6 +67,10 @@ class PgRequest {
       value: maybeValue,
     });
     return this;
+  }
+
+  translateQuery(queryText: string, params: Map<string, BoundValue>): { text: string; values: unknown[] } {
+    return translateQuery(queryText, params);
   }
 
   async query<T extends QueryResultRow = QueryResultRow>(queryText: string): Promise<QueryResponse<T>> {
@@ -109,7 +113,7 @@ function normalizeValue(type: SqlInputType, value: unknown): unknown {
   return value;
 }
 
-function buildConfig(): PoolConfig {
+export function buildConfig(): PoolConfig {
   const user = process.env.DB_USER;
   const password = process.env.DB_PASSWORD;
 
@@ -234,7 +238,7 @@ function translateQuery(queryText: string, params: Map<string, BoundValue>): { t
   return { text, values };
 }
 
-function translateTopClause(text: string): string {
+export function translateTopClause(text: string): string {
   const match = text.match(/^\s*SELECT\s+TOP\s*\(([^)]+)\)\s+/i);
   if (!match) return text;
 
@@ -242,3 +246,6 @@ function translateTopClause(text: string): string {
   const withoutTop = text.replace(/^(\s*SELECT)\s+TOP\s*\(([^)]+)\)\s+/i, '$1 ');
   return `${withoutTop} LIMIT ${limitExpr}`;
 }
+
+// Export the private function for testing
+export { translateQuery };

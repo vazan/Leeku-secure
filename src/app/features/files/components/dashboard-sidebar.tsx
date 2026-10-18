@@ -35,7 +35,7 @@ export default function DashboardSidebar({
       className="fixed inset-y-0 left-0 z-20 hidden w-64 border-r border-[var(--border-subtle)] bg-[var(--bg-panel)] p-5 lg:flex lg:flex-col"
     >
       <div 
-          className="flex items-center gap-3 cursor-pointer group"
+          className="flex items-center gap-3 cursor-pointer group shrink-0"
         >
           <div className="w-10 h-10 bg-[#00F2FF] rounded-sm rotate-12 flex items-center justify-center border-2 border-[#FF007F] font-display font-black text-[#0A0E14] text-xl leading-none shadow-[0_0_15px_rgba(0,242,255,0.4)] group-hover:scale-115 transition-transform duration-300">
             L
@@ -47,7 +47,7 @@ export default function DashboardSidebar({
             <span className="block font-mono text-[9px] uppercase tracking-wider text-gray-500 font-bold">Miku Bunker Secure</span>
           </div>
         </div>
-      <nav className="mt-8 space-y-1">
+      <nav className="mt-8 space-y-1 overflow-y-auto pr-2 -mr-2">
         {navItems.map(([id, icon, label]) => (
           <button
             key={id}
@@ -60,7 +60,7 @@ export default function DashboardSidebar({
           </button>
         ))}
       </nav>
-      <div className="mt-auto">
+      <div className="mt-auto shrink-0">
         <div className="mb-4 rounded-xl border border-[var(--border-subtle)] p-3">
           <div className="mb-2 text-xs">
             <span className="text-[var(--text-muted)]">Storage</span>

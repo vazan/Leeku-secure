@@ -11,6 +11,8 @@
     "start": "cross-env NODE_ENV=production node dist/server.cjs",
     "clean": "rimraf dist",
     "test:desktop-updates": "tsx --test tests/desktop-updates-path.test.ts",
+    "test:database": "tsx --test tests/database.test.ts",
+    "test:encryption": "tsx --test tests/encryption.test.ts",
     "lint": "tsc --noEmit"
   },
   "dependencies": {

@@ -2066,9 +2066,17 @@ export default function UserDashboard({
                     <button
                       type="button"
                       onClick={() => setActiveFolderId(null)}
-                      className="hover:text-[var(--text-primary)]"
+                      disabled={foldersLoading}
+                      className="hover:text-[var(--text-primary)] disabled:opacity-60"
                     >
-                      All Files
+                      {foldersLoading ? (
+                        <span className="inline-flex items-center gap-1.5">
+                          <Loader2 className="h-3 w-3 animate-spin" />
+                          Loading...
+                        </span>
+                      ) : (
+                        "All Files"
+                      )}
                     </button>
                     {folderPath.map((folder) => (
                       <React.Fragment key={folder.id}>
