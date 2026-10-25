@@ -14,6 +14,8 @@
 - Canonical API contract: [API-CONTRACT-CANONICAL](../01-Technical/API-CONTRACT-CANONICAL.md)
 - Operations: [OPERATIONS-GUIDE](../02-Non-Technical/OPERATIONS-GUIDE.md)
 - Risk status: [RISK-REGISTER](../04-Risk-And-Corrections/RISK-REGISTER.md)
+- Security posture: [SECURITY-POSTURE](../04-Risk-And-Corrections/SECURITY-POSTURE.md)
+- Security changelog: [SECURITY-CHANGELOG](../04-Risk-And-Corrections/SECURITY-CHANGELOG.md)
 - PostgreSQL drill evidence: [POSTGRESQL-DRILL-EVIDENCE](../04-Risk-And-Corrections/POSTGRESQL-DRILL-EVIDENCE.md)
 - Plan: [DOCUMENTATION-ROADMAP](../05-Roadmap/DOCUMENTATION-ROADMAP.md)
 - Governance policy: [DOCUMENTATION-GOVERNANCE](./DOCUMENTATION-GOVERNANCE.md)
