@@ -127,6 +127,15 @@ if (!process.env.UPLOAD_TEMP_PATH) {
   console.warn(`[server] UPLOAD_TEMP_PATH is not set. Upload temp files will use fallback path: ${UPLOAD_TEMP}`);
 }
 
+// Cookie domain validation in production
+if (NODE_ENV === 'production') {
+  const cookieDomain = process.env.COOKIE_DOMAIN?.trim();
+  if (!cookieDomain) {
+    console.warn('[server] WARNING: COOKIE_DOMAIN is not set in production. Cookies may not work correctly.');
+    console.warn('[server] Please set COOKIE_DOMAIN in your .env file (e.g., COOKIE_DOMAIN=leeks.miku.rip)');
+  }
+}
+
 function parseNonNegativeIntEnv(name: string, fallback: number): number {
   const raw = process.env[name];
   if (!raw) return fallback;
@@ -356,32 +365,38 @@ function escapeHtml(value: string): string {
 }
 
 function getSessionCookieOptions(): express.CookieOptions {
+  const cookieDomain = process.env.COOKIE_DOMAIN?.trim();
   return {
     httpOnly: true,
     secure: NODE_ENV === 'production',
     sameSite: 'lax',
     path: '/',
+    domain: cookieDomain || undefined,
     maxAge: JWT_EXPIRY * 1000,
   };
 }
 
 function getRefreshCookieOptions(): express.CookieOptions {
+  const cookieDomain = process.env.COOKIE_DOMAIN?.trim();
   return {
     httpOnly: true,
     secure: NODE_ENV === 'production',
     sameSite: 'lax',
     path: '/api/auth',
+    domain: cookieDomain || undefined,
     maxAge: REFRESH_EXPIRY * 1000,
   };
 }
 
 function setAuthCookie(res: express.Response, token: string): void {
+  const cookieDomain = process.env.COOKIE_DOMAIN?.trim();
   res.cookie(SESSION_COOKIE_NAME, token, getSessionCookieOptions());
   res.cookie(CSRF_COOKIE_NAME, generateSecureToken(24), {
     httpOnly: false,
     secure: NODE_ENV === 'production',
     sameSite: 'lax',
     path: '/',
+    domain: cookieDomain || undefined,
     maxAge: REFRESH_EXPIRY * 1000,
   });
 }
