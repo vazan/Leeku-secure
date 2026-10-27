@@ -6,9 +6,9 @@
   "type": "module",
   "scripts": {
     "dev": "concurrently --kill-others --names client,server \"vite --host 0.0.0.0\" \"cross-env NODE_ENV=development tsx watch src/server.ts\"",
-    "build": "cross-env NODE_ENV=production vite build && esbuild src/server.ts --bundle --platform=node --format=esm --packages=external --sourcemap --outfile=dist/server.mjs",
-    "preview": "cross-env NODE_ENV=production node dist/server.mjs",
-    "start": "cross-env NODE_ENV=production node dist/server.mjs",
+    "build": "cross-env NODE_ENV=production vite build && esbuild src/server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
+    "preview": "cross-env NODE_ENV=production node dist/server.cjs",
+    "start": "cross-env NODE_ENV=production node dist/server.cjs",
     "clean": "rimraf dist",
     "test:desktop-updates": "tsx --test tests/desktop-updates-path.test.ts",
     "lint": "tsc --noEmit"
