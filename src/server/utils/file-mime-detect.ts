@@ -88,8 +88,8 @@ export function detectFileMime(filePath: string): string | null {
       // Check each signature
       for (const sig of fileSignatures) {
         const sigOffset = sig.offset ?? 0;
-        if (bytesRead >= sig.length + sigOffset) {
-          const slice = data.slice(sigOffset, sigOffset + sig.length);
+        if (bytesRead >= sig.signature.length + sigOffset) {
+          const slice = data.slice(sigOffset, sigOffset + sig.signature.length);
           if (slice.equals(sig.signature)) {
             return sig.mimeType;
           }

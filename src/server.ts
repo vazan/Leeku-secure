@@ -67,6 +67,7 @@ import { createMaintenanceModeRouter } from './server/routes/maintenance-mode.js
 import { createDesktopUpdatesRouter, SYSTEM_UPDATE_FOLDER_NAME } from './server/routes/desktop-updates.js';
 import { validateProductionConfig } from './server/utils/production.js';
 import { getTextPreviewKind, TEXT_PREVIEW_MAX_BYTES } from './server/utils/text-preview.js';
+import { decryptThumbnail, generateEncryptedThumbnail, MAX_THUMBNAIL_SOURCE_BYTES } from './server/utils/thumbnail.js';
 import type { AdminFileFolder, Quota, User, FileMetadata, FileFolder, FolderShareLink, ShareLink, SystemLog, SystemStats } from './app/shared/types/index.js';
 
 const runtimeDir = (() => {
@@ -3341,6 +3342,62 @@ app.post('/api/files/delete', authenticateUser as express.RequestHandler, async 
   }
 });
 
+app.get('/api/files/:id/thumbnail', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  const fileId = getSingleParam(req.params.id);
+  try {
+    const request = await getRequest();
+    request.input('id', sql.UniqueIdentifier, fileId);
+    const result = await request.query<{
+      owner_user_id: string; status: string; mime_type: string; deleted_at: Date | null;
+      expires_at: Date | null; client_secret_hash: string | null; size_bytes: number;
+      thumbnail_preview: Buffer | null; thumbnail_generated: Date | null;
+    }>(`SELECT owner_user_id,status,mime_type,deleted_at,expires_at,client_secret_hash,size_bytes,
+               thumbnail_preview,thumbnail_generated FROM files WHERE id=@id`);
+    const file = result.recordset[0];
+    if (!file) return res.status(404).json({ error: `File not found: ${fileId}` });
+    if (file.owner_user_id !== req.userId && req.user!.role !== 'Admin')
+      return res.status(403).json({ error: 'You do not have permission to preview this file.' });
+    if (await isDesktopUpdateFile(fileId) && req.user!.role !== 'Admin')
+      return res.status(403).json({ error: 'Administrator access is required for desktop update artifacts.' });
+    if (file.status !== 'Available' || file.deleted_at || (file.expires_at && new Date(file.expires_at).getTime() <= Date.now()))
+      return res.status(410).json({ error: 'File is no longer available.' });
+    if (file.client_secret_hash)
+      return res.status(403).json({ error: 'This file requires its secret key and cannot be previewed inline.' });
+    if (!file.mime_type.startsWith('image/'))
+      return res.status(415).json({ error: 'Thumbnails are only available for images.' });
+    if (file.size_bytes > MAX_THUMBNAIL_SOURCE_BYTES)
+      return res.status(413).json({ error: 'This image is larger than the 50 MB thumbnail limit.' });
+
+    const payload = file.thumbnail_preview && file.thumbnail_generated
+      ? file.thumbnail_preview
+      : await generateFileThumbnail(fileId);
+    if (!payload) {
+      res.setHeader('Retry-After', '5');
+      return res.status(503).json({ error: 'Thumbnail is not available yet.' });
+    }
+    const keyRequest = await getRequest();
+    keyRequest.input('id', sql.UniqueIdentifier, fileId);
+    const keys = await keyRequest.query<{ encrypted_key: Buffer; key_iv: Buffer; key_auth_tag: Buffer }>(
+      'SELECT encrypted_key,key_iv,key_auth_tag FROM file_encryption_keys WHERE file_id=@id',
+    );
+    const key = keys.recordset[0];
+    if (!key) {
+      console.error(`[thumbnail] No encryption keys found for file: ${fileId}`);
+      return res.status(404).json({ error: 'Thumbnail is not available.' });
+    }
+    const decryptedKey = unwrapKey(key.encrypted_key, key.key_iv, key.key_auth_tag);
+    const image = decryptThumbnail(payload, decryptedKey, fileId);
+    res.setHeader('Content-Type', 'image/jpeg');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Cache-Control', 'no-store');
+    return res.send(image);
+  } catch (err) {
+    console.error('[thumbnail] Request failed:', err instanceof Error ? err.message : String(err));
+    console.error('[thumbnail] Request failed.');
+    if (!res.headersSent) res.status(500).json({ error: 'Thumbnail generation failed.' });
+  }
+});
+
 app.get('/api/files/:id/preview', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
   const fileId = getSingleParam(req.params.id);
   let textPreviewPath: string | null = null;
@@ -4832,6 +4889,128 @@ async function logExpiredFile(file: ExpiredFileRecord): Promise<void> {
 // Bootstrap
 // ──────────────────────────────────────────────────────────────
 
+const thumbnailJobs = new Map<string, Promise<Buffer | null>>();
+let thumbnailScanInterval: ReturnType<typeof setInterval> | null = null;
+let thumbnailScanRunning = false;
+let thumbnailScanStopped = false;
+
+function generateFileThumbnail(fileId: string): Promise<Buffer | null> {
+  const existing = thumbnailJobs.get(fileId);
+  if (existing) return existing;
+  if (thumbnailScanStopped || thumbnailJobs.size >= 2) return Promise.resolve(null);
+  const job = (async () => {
+    try {
+      const request = await getRequest();
+      request.input('id', sql.UniqueIdentifier, fileId);
+      request.input('maxBytes', sql.BigInt, MAX_THUMBNAIL_SOURCE_BYTES);
+      const result = await request.query<{
+        stored_path: string; checksum_sha256: string; encrypted_key: Buffer; key_iv: Buffer;
+        key_auth_tag: Buffer; file_iv: Buffer; file_auth_tag: Buffer;
+      }>(`SELECT f.stored_path,f.checksum_sha256,k.encrypted_key,k.key_iv,k.key_auth_tag,k.file_iv,k.file_auth_tag
+          FROM files f INNER JOIN file_encryption_keys k ON k.file_id=f.id
+          WHERE f.id=@id AND f.status='Available' AND f.deleted_at IS NULL
+            AND (f.expires_at IS NULL OR f.expires_at>CURRENT_TIMESTAMP)
+            AND f.client_secret_hash IS NULL AND f.mime_type LIKE 'image/%' AND f.size_bytes<=@maxBytes`);
+      const file = result.recordset[0];
+      if (!file) {
+        console.warn(`[generateFileThumbnail] No file found for ID: ${fileId}`);
+        return null;
+      }
+    const vaultPath = path.resolve(FILE_VAULT, file.stored_path);
+    const relativePath = path.relative(path.resolve(FILE_VAULT), vaultPath);
+    if (relativePath.startsWith('..') || path.isAbsolute(relativePath)) throw new Error('Invalid vault path.');
+      const fileKey = unwrapKey(file.encrypted_key, file.key_iv, file.key_auth_tag);
+      const tempPath = buildUniqueTempFilePath(UPLOAD_TEMP, 'leeku-thumb-dec', fileId);
+      registerTempFile(tempPath);
+      try {
+        const hash = crypto.createHash('sha256');
+        await decryptFileStream(vaultPath, tempPath, fileKey, file.file_iv, file.file_auth_tag, undefined, hash);
+        if (hash.digest('hex') !== file.checksum_sha256) throw new Error('File integrity check failed.');
+        const payload = await generateEncryptedThumbnail(tempPath, fileKey, fileId);
+        const update = await getRequest();
+        update.input('id', sql.UniqueIdentifier, fileId);
+        update.input('preview', sql.VarBinary(sql.MAX), payload);
+        const updated = await update.query(`UPDATE files SET thumbnail_preview=@preview,thumbnail_generated=CURRENT_TIMESTAMP
+          WHERE id=@id AND status='Available' AND deleted_at IS NULL AND client_secret_hash IS NULL
+            AND (expires_at IS NULL OR expires_at>CURRENT_TIMESTAMP)`);
+        return updated.rowsAffected[0] === 1 ? payload : null;
+      } finally {
+        await fs.promises.rm(tempPath, { force: true });
+        unregisterTempFile(tempPath);
+      }
+    } catch (err) {
+      console.error(`[generateFileThumbnail] Failed for file ID ${fileId}:`, err instanceof Error ? err.message : String(err));
+      throw err;
+    }
+  })().finally(() => { thumbnailJobs.delete(fileId); });
+  thumbnailJobs.set(fileId, job);
+  return job;
+}
+
+function startThumbnailScan(): void {
+  thumbnailScanStopped = false;
+  const scan = async () => {
+    if (thumbnailScanRunning || thumbnailScanStopped) return;
+    thumbnailScanRunning = true;
+    try {
+      const cutoffSeconds = Math.floor(Date.now() / 1000) - 2 * 60 * 60; // seconds since epoch - 2 hours
+      const request = await getRequest();
+      request.input('maxBytes', sql.BigInt, MAX_THUMBNAIL_SOURCE_BYTES);
+      request.input('cutoffSeconds', sql.BigInt, cutoffSeconds);
+      const result = await request.query<{ id: string }>(`
+        SELECT f.id FROM files f
+        WHERE f.mime_type LIKE 'image/%' AND f.status='Available' AND f.deleted_at IS NULL
+          AND f.client_secret_hash IS NULL AND f.size_bytes<=@maxBytes
+          AND (f.expires_at IS NULL OR f.expires_at > CURRENT_TIMESTAMP)
+          AND f.thumbnail_preview IS NULL
+        UNION
+        SELECT f.id FROM files f
+        WHERE f.mime_type LIKE 'image/%' AND f.status='Available' AND f.deleted_at IS NULL
+          AND f.client_secret_hash IS NULL AND f.size_bytes<=@maxBytes
+          AND (f.expires_at IS NULL OR f.expires_at > CURRENT_TIMESTAMP)
+          AND f.thumbnail_generated IS NULL
+        UNION
+        SELECT f.id FROM files f
+        WHERE f.mime_type LIKE 'image/%' AND f.status='Available' AND f.deleted_at IS NULL
+          AND f.client_secret_hash IS NULL AND f.size_bytes<=@maxBytes
+          AND (f.expires_at IS NULL OR f.expires_at > CURRENT_TIMESTAMP)
+          AND f.thumbnail_generated IS NOT NULL
+          AND f.thumbnail_generated < to_timestamp(@cutoffSeconds)
+      `);
+      let stored = 0;
+      let failed = 0;
+      for (const file of result.recordset) {
+        if (thumbnailScanStopped) break;
+        try {
+          if (await generateFileThumbnail(file.id)) stored++;
+          else {
+            failed++;
+            console.warn(`[thumbnail-scan] Skipped file (no thumbnail generated): ${file.id}`);
+          }
+        } catch (err) {
+          failed++;
+          console.error(`[thumbnail-scan] Failed to generate thumbnail for file ${file.id}:`, err instanceof Error ? err.message : String(err));
+        }
+      }
+      console.log(`[thumbnail-scan] Stored: ${stored}; failed: ${failed}.`);
+    } catch (err) {
+      console.error('[thumbnail-scan] Scan failed:', err instanceof Error ? err.message : String(err));
+      console.error('[thumbnail-scan] Scan failed. Check database availability and thumbnail migration.');
+    } finally {
+      thumbnailScanRunning = false;
+    }
+  };
+  void scan();
+  thumbnailScanInterval = setInterval(() => { void scan(); }, 60 * 60_000);
+}
+
+async function stopThumbnailScan(): Promise<void> {
+  thumbnailScanStopped = true;
+  if (thumbnailScanInterval) clearInterval(thumbnailScanInterval);
+  thumbnailScanInterval = null;
+  await Promise.allSettled(thumbnailJobs.values());
+}
+
 async function ensureOptionalFileSecretColumns(): Promise<void> {
   const addSecretHash = await getRequest();
   await addSecretHash.query('ALTER TABLE files ADD COLUMN IF NOT EXISTS client_secret_hash TEXT');
@@ -5051,6 +5230,7 @@ async function bootstrap() {
 
   // 6b. Clean up stale download temp files from previous crashes
   cleanupStaleTempFiles(UPLOAD_TEMP);
+  startThumbnailScan();
 
   // 6c. Start periodic sweep of expired download sessions
   startPrivateDownloadSweep();
@@ -5155,6 +5335,7 @@ async function bootstrap() {
     stopUncShareMonitor();
     sweepPrivateDownloadSessions();
     stopExpiryCleanup();
+    await stopThumbnailScan();
     await closePool();
     process.exit(0);
   };
