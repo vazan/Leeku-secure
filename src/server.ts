@@ -4681,6 +4681,10 @@ app.post('/api/admin/file-folders/:id/delete', authenticateUser as express.Reque
       }
     }
 
+    // Track deletion statistics for progress reporting
+    let filesDeletedCount = 0;
+    let foldersDeletedCount = 0;
+
     if (!deleteFiles) {
       // Move files to root - process in batches to avoid timeout
       let offset = 0;
@@ -4777,6 +4781,7 @@ app.post('/api/admin/file-folders/:id/delete', authenticateUser as express.Reque
            WHERE owner_user_id=@ownerId AND folder_id IN (SELECT id FROM folder_tree)`
         );
         
+        filesDeletedCount += files.length;
         offset += 100;
       }
       
@@ -4909,7 +4914,7 @@ app.post('/api/admin/file-folders/:id/delete', authenticateUser as express.Reque
       success: true,
       foldersDeleted: foldersDeletedCount,
       foldersTotal: totalFolders,
-      filesDeleted: offset,
+      filesDeleted: filesDeletedCount,
       filesTotal: totalFiles
     });
   } catch (err) {
