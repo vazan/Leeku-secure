@@ -1,5 +1,4 @@
 allowBuilds:
-  '@google/genai': true
   argon2: true
   esbuild: true
   protobufjs: true
