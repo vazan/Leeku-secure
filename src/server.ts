@@ -21,7 +21,6 @@ import crypto from 'crypto';
 import cluster from 'cluster';
 import { fileURLToPath } from 'url';
 import { execFileSync } from 'child_process';
-import { GoogleGenAI } from '@google/genai';
 import si from 'systeminformation';
 import sharp from 'sharp';
 
@@ -106,7 +105,6 @@ const MAX_LOGIN_ATTEMPTS = parseInt(process.env.MAX_LOGIN_ATTEMPTS || '5', 10);
 const LOCKOUT_DURATION_MS= parseInt(process.env.LOCKOUT_DURATION_MINUTES || '15', 10) * 60_000;
 const PROXY_TRUST_HOPS   = parseInt(process.env.PROXY_TRUST_HOPS || '0', 10);
 const SMTP_ENABLED       = !!process.env.SMTP_HOST && !!process.env.SMTP_USER && !!process.env.SMTP_PASSWORD;
-const GEMINI_API_KEY     = process.env.GEMINI_API_KEY;
 const JWT_EXPIRY         = parseInt(process.env.JWT_ACCESS_EXPIRY_SECONDS || '900', 10);
 const REFRESH_EXPIRY     = parseInt(process.env.JWT_REFRESH_EXPIRY_SECONDS || '604800', 10);
 const JWT_ISSUER         = process.env.JWT_ISSUER   || APP_URL;
@@ -537,14 +535,10 @@ if (!fs.existsSync(PROFILE_PICTURE_PATH)) {
 // Profile picture helpers are provided by the shared utility module.
 
 // ──────────────────────────────────────────────────────────────
-// Gemini AI (optional)
+// Leeku vibe messages (local fallback; @google/genai removed 2026-10-29)
+// Uploads are never dependent on this — it only supplies a friendly
+// status message shown after a scan outcome.
 // ──────────────────────────────────────────────────────────────
-
-let genai: GoogleGenAI | null = null;
-if (GEMINI_API_KEY && GEMINI_API_KEY !== 'CHANGE_ME') {
-  genai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
-  console.log('[server] Gemini AI enabled for leeku_vibe messages.');
-}
 
 async function generateLeekuVibe(filename: string, clean: boolean): Promise<string> {
   const fallbacks = clean
@@ -560,21 +554,7 @@ async function generateLeekuVibe(filename: string, clean: boolean): Promise<stri
         'Security scan failed. Upload denied.',
       ];
 
-  if (!genai) {
-    return fallbacks[Math.floor(Math.random() * fallbacks.length)];
-  }
-
-  try {
-    const prompt = clean
-      ? `Write a concise professional status message, at most 80 characters, confirming that "${filename}" passed its security scan.`
-      : `Write a concise professional status message, at most 80 characters, explaining that "${filename}" was blocked by its security scan.`;
-
-    const result = await genai.models.generateContent({ model: 'gemini-2.0-flash', contents: prompt });
-    const text = result.text?.trim();
-    return text || fallbacks[0];
-  } catch {
-    return fallbacks[Math.floor(Math.random() * fallbacks.length)];
-  }
+  return fallbacks[Math.floor(Math.random() * fallbacks.length)];
 }
 
 // ──────────────────────────────────────────────────────────────
