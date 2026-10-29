@@ -5086,14 +5086,17 @@ export function startThumbnailScan(intervalMinutes: number = 60): void {
       try {
         const colCheck = await request.query(`
           SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS 
-          WHERE TABLE_NAME = 'files' AND TABLE_SCHEMA = 'dbo' AND COLUMN_NAME IN ('thumbnail_preview', 'thumbnail_generated')
+          WHERE TABLE_NAME = 'files' AND TABLE_SCHEMA = 'dbo' AND COLUMN_NAME IN ('thumbnail_preview', 'thumbnail_generated', 'thumbnail_excluded')
         `);
         
         const existingColumns = colCheck.recordset.map((r: any) => r.COLUMN_NAME);
-        const columnsToAdd = ['thumbnail_preview', 'thumbnail_generated'].filter(c => !existingColumns.includes(c));
+        const columnsToAdd = ['thumbnail_preview', 'thumbnail_generated', 'thumbnail_excluded'].filter(c => !existingColumns.includes(c));
         
         for (const col of columnsToAdd) {
-          await request.query(`ALTER TABLE dbo.files ADD ${col} ${col === 'thumbnail_preview' ? 'VARBINARY(MAX) NULL' : 'DATETIMEOFFSET(7) NULL'}`);
+          const typeSql = col === 'thumbnail_preview' ? 'VARBINARY(MAX) NULL'
+                        : col === 'thumbnail_generated' ? 'DATETIMEOFFSET(7) NULL'
+                        : 'BIT NOT NULL DEFAULT 0'; // thumbnail_excluded
+          await request.query(`ALTER TABLE dbo.files ADD ${col} ${typeSql}`);
           console.log(`[migration] Added column ${col} to dbo.files table (from thumbnail scan)`);
         }
       } catch (err: any) {
@@ -5124,7 +5127,7 @@ export function startThumbnailScan(intervalMinutes: number = 60): void {
       }>(
         `SELECT id,stored_path,owner_user_id,original_name_encrypted,original_name_iv,original_name_auth_tag,mime_type,thumbnail_generated,size_bytes
          FROM dbo.files WHERE mime_type LIKE 'image/%' AND (thumbnail_generated IS NULL OR thumbnail_generated < DATEADD(MINUTE, -@minutes, SYSDATETIMEOFFSET()) OR thumbnail_preview IS NULL)
-         AND status = 'Available' AND owner_user_id IS NOT NULL`
+         AND status = 'Available' AND owner_user_id IS NOT NULL AND thumbnail_excluded = 0`
       );
 
       const files = result.recordset.map((r) => ({
@@ -5147,10 +5150,11 @@ export function startThumbnailScan(intervalMinutes: number = 60): void {
 
       console.log(`[thumbnail-scan] Found ${files.length} files missing or stale thumbnails.`);
 
-      // Debug: log files that have thumbnail_preview but NULL thumbnail_generated
-      const filesWithPreviewButNoTimestamp = files.filter(f => f.thumbnail_generated === null);
-      if (filesWithPreviewButNoTimestamp.length > 0) {
-        console.log(`[thumbnail-scan] ${filesWithPreviewButNoTimestamp.length} file(s) have thumbnail_preview but NULL thumbnail_generated - these will be re-processed to set thumbnail_generated`);
+      // Debug: count files with a NULL thumbnail_generated timestamp (never
+      // successfully stored a thumbnail - may be previously-failing files)
+      const filesWithoutTimestamp = files.filter(f => f.thumbnail_generated === null);
+      if (filesWithoutTimestamp.length > 0) {
+        console.log(`[thumbnail-scan] ${filesWithoutTimestamp.length} file(s) have NULL thumbnail_generated (previously-failing or never-thumbnailed files). Files that fail generation this cycle will be excluded from future scans.`);
       }
 
       // Generate thumbnails for each file
@@ -5209,31 +5213,35 @@ export function startThumbnailScan(intervalMinutes: number = 60): void {
             const existing = checkResult.recordset[0];
             console.log(`[thumbnail-scan] Existing thumbnail for ${file.original_name}: preview=${existing.thumbnail_preview ? 'exists' : 'NULL'}, generated=${existing.thumbnail_generated ? existing.thumbnail_generated : 'NULL'}`);
 
-            // Update the database with the thumbnail
+            // Atomic single UPDATE: store preview AND timestamp together so a
+            // file can never end up with thumbnail_preview set but NULL
+            // thumbnail_generated (which would make the scan re-process it forever).
             const updateReq = await getRequest();
             updateReq.input('fid', sql.UniqueIdentifier, file.id);
             updateReq.input('tmb', sql.VarBinary(sql.MAX), thumbnailBuffer);
-            const result1 = await updateReq.query(
+            updateReq.input('tg', sql.DateTimeOffset, new Date());
+            const updateResult = await updateReq.query(
               `UPDATE files 
-               SET thumbnail_preview = @tmb 
+               SET thumbnail_preview = @tmb, 
+                   thumbnail_generated = @tg 
                WHERE id = @fid`
             );
-            console.log(`[thumbnail-scan] Update 1 (thumbnail_preview): ${result1.rowsAffected[0]} row(s) affected`);
-            
-            // Update thumbnail_generated timestamp AFTER successful storage
-            const updateReq2 = await getRequest();
-            updateReq2.input('fid', sql.UniqueIdentifier, file.id);
-            updateReq2.input('tg', sql.DateTimeOffset, new Date());
-            const result2 = await updateReq2.query(
-              `UPDATE files 
-               SET thumbnail_generated = @tg 
-               WHERE id = @fid`
-            );
-            console.log(`[thumbnail-scan] Update 2 (thumbnail_generated): ${result2.rowsAffected[0]} row(s) affected`);
-            
+            console.log(`[thumbnail-scan] Update (thumbnail_preview + thumbnail_generated): ${updateResult.rowsAffected[0]} row(s) affected`);
+
             console.log(`[thumbnail-scan] Stored thumbnail for ${file.original_name} (${thumbnailBuffer.length} bytes)`);
           } catch (err: any) {
             console.error(`[thumbnail-scan] Failed to generate thumbnail for ${file.original_name}:`, err);
+            // Permanently exclude corrupted/unprocessable files so the scan stops
+            // retrying them every cycle. Excluded files can be un-excluded manually
+            // (SET thumbnail_excluded = 0) if the underlying data is ever repaired.
+            try {
+              const exclReq = await getRequest();
+              exclReq.input('fid', sql.UniqueIdentifier, file.id);
+              await exclReq.query(`UPDATE files SET thumbnail_excluded = 1 WHERE id = @fid`);
+              console.warn(`[thumbnail-scan] Marked ${file.original_name} as thumbnail_excluded (permanently skip).`);
+            } catch (exclErr: any) {
+              console.error(`[thumbnail-scan] Failed to mark ${file.original_name} as thumbnail_excluded:`, exclErr);
+            }
           } finally {
             try { if (fs.existsSync(decryptedTempPath)) fs.unlinkSync(decryptedTempPath); } catch {}
             unregisterTempFile(decryptedTempPath);
@@ -5297,7 +5305,8 @@ async function ensureOptionalFileSecretColumns(): Promise<void> {
   // Add columns individually - use dbo.files explicitly
   const columnsToAdd = [
     { name: 'thumbnail_preview', definition: 'VARBINARY(MAX) NULL' },
-    { name: 'thumbnail_generated', definition: 'DATETIMEOFFSET(7) NULL' }
+    { name: 'thumbnail_generated', definition: 'DATETIMEOFFSET(7) NULL' },
+    { name: 'thumbnail_excluded', definition: 'BIT NOT NULL DEFAULT 0' }
   ];
   
   for (const { name, definition } of columnsToAdd) {
