@@ -783,6 +783,8 @@ interface FileRow {
   client_crypto_salt?: Buffer | null;
   client_crypto_iv?: Buffer | null;
   client_crypto_iterations?: number | null;
+  thumbnail_preview?: Buffer | null;
+  thumbnail_generated?: Date | string | null;
   expires_at: Date | null; created_at: Date;
 }
 
@@ -3045,27 +3047,9 @@ app.post(
         }
       }
 
-      // Generate thumbnail for images (before encryption, while temp file is available)
-      let thumbnailBuffer: Buffer | null = null;
-      if (verifiedMimeType.startsWith('image/')) {
-        currentStage = 'generate_thumbnail';
-        sendUploadProgress({
-          type: 'processing',
-          phase: 'Generating thumbnail',
-          loaded: 200,
-          total: processingTotal,
-        });
-        try {
-          thumbnailBuffer = await generateImageThumbnail(tempFilePath, 128);
-          console.info('[upload] Thumbnail generated.', { userId: user.id, originalName: original_name });
-        } catch (err) {
-          console.warn('[upload] Thumbnail generation failed (non-critical).', {
-            userId: user.id,
-            originalName: original_name,
-            error: err instanceof Error ? err.message : String(err),
-          });
-        }
-      }
+      // (Thumbnails are backfilled by the thumbnail-scan job; upload-time
+      //  generation was removed 2026-10-29 — the old block called a missing
+      //  helper and never stored its result.)
 
       if (uploadSecretHash && !payloadAlreadyClientProtected) {
         currentStage = 'secret_protect_fallback';
@@ -3617,7 +3601,7 @@ app.get('/api/files/:id/thumbnail', authenticateUser as express.RequestHandler, 
     registerTempFile(tempThumbnailPath);
 
     try {
-      await decryptFileStream(vaultPath, tempThumbnailPath, fileKey, keyRow.file_iv, keyRow.file_auth_tag, undefined, undefined, size);
+      await decryptFileStream(vaultPath, tempThumbnailPath, fileKey, keyRow.file_iv, keyRow.file_auth_tag);
       if (!fs.existsSync(tempThumbnailPath)) {
         console.warn(`[GET /api/files/:id/thumbnail] Decryption succeeded but file not found: ${tempThumbnailPath}`);
         throw new Error('Decryption succeeded but output file not found');
