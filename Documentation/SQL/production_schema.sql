@@ -276,6 +276,7 @@ CREATE TABLE [dbo].[files](
     [client_crypto_iterations] [int] NULL,
     [thumbnail_preview] [varbinary](max) NULL,
     [thumbnail_generated] [datetimeoffset](7) NULL,
+    [thumbnail_excluded] [bit] NOT NULL DEFAULT 0,
     CONSTRAINT [PK_files] PRIMARY KEY CLUSTERED ([id] ASC)
 ) ON [PRIMARY] TEXTIMAGE_ON [PRIMARY]
 GO
