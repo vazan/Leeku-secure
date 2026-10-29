@@ -9,3 +9,7 @@ coverage/
 !.env.docker.dev.example
 !.env.docker.prod.example
 vault/
+
+# pnpm lockfiles (npm is canonical — see CONTRIBUTING.md)
+pnpm-lock.yaml
+pnpm-lock.yaml.backup
