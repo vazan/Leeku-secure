@@ -5193,7 +5193,7 @@ export function startThumbnailScan(intervalMinutes: number = 60): void {
             // Generate thumbnail using sharp
             await sharp(decryptedTempPath)
               .resize({ width: 128, height: 128, fit: 'inside', withoutEnlargement: true })
-              .jpeg({ quality: 80, progressive: true, optimize: true })
+              .jpeg({ quality: 80, progressive: true, optimizeCoding: true })
               .toFile(tempThumbnailPath);
 
             // Read the thumbnail as raw bytes and store directly in database

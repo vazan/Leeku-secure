@@ -1428,10 +1428,10 @@ export default function UserDashboard({
         const totalItems = foldersTotal + filesTotal;
         const completedItems = foldersDeleted + filesDeleted;
         const percent = totalItems > 0 ? Math.round((completedItems / totalItems) * 100) : 100;
-        
-        progressBar.style.width = "100%";
-        progressText.textContent = `${foldersDeleted} folders, ${filesDeleted} files deleted`;
-        progressLabel.textContent = "Deletion complete";
+
+        if (progressBar) progressBar.style.width = "100%";
+        if (progressText) progressText.textContent = `${foldersDeleted} folders, ${filesDeleted} files deleted`;
+        if (progressLabel) progressLabel.textContent = "Deletion complete";
         
         // Wait briefly to show completion
         await new Promise(resolve => setTimeout(resolve, 300));
