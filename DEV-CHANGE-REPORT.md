@@ -276,3 +276,17 @@ Smoke: ⚠SKIPPED (no reachable MSSQL harness in this environment).
 
 ## Handoff QaEngineer
 Manual browser smoke recommended for the 6 cases above on the feature branch before merge.
+
+## UI tweak — hide the Versions icon for single-version files
+Classe : TRIVIAL. `user-dashboard.tsx` renders the "Versions" action in three file-list spots (desktop table,
+mobile grid, FileCard dropdown in "Recent files"). Each is now wrapped in
+`file.version_count > 1`, so files without version history (including pre-feature files where `version_count`
+is `undefined`) no longer show the icon. Validated: `tsc --noEmit` ✅, `vite build` ✅. No contract change.
+
+## Follow-up — `version_count` missing from `GET /api/files`
+After the icon tweak, a 2-version file stopped showing the icon because `GET /api/files` did not select
+`version_count` (it relied on `f.*` only inside the subquery), so `mapFileRow` fell back to `?? 1` and the
+frontend never saw the real count. Added `version_count` to the `/api/files` outer SELECT and `NULL AS
+version_count` in the legacy fallback (pre-migration rows still resolve to 1). This is what the dashboard's
+"All Files"/"Recent files"/folder views consumeive=for the icon. Validated: `tsc --noEmit` ✅, esbuild server
+bundle ✅.

@@ -2595,12 +2595,14 @@ export default function UserDashboard({
                         >
                           <Share2 className="h-3.5 w-3.5" />
                         </FileActionButton>
-                        <FileActionButton
-                          label="Versions"
-                          onClick={() => openVersions(file)}
-                        >
-                          <History className="h-3.5 w-3.5" />
-                        </FileActionButton>
+                        {typeof file.version_count === "number" && file.version_count > 1 && (
+                          <FileActionButton
+                            label="Versions"
+                            onClick={() => openVersions(file)}
+                          >
+                            <History className="h-3.5 w-3.5" />
+                          </FileActionButton>
+                        )}
                         <FileActionButton
                           label="Delete"
                           destructive
@@ -2711,12 +2713,14 @@ export default function UserDashboard({
                             >
                               <Share2 className="h-4 w-4" />
                             </IconButton>
-                            <IconButton
-                              label="Versions"
-                              onClick={() => openVersions(file)}
-                            >
-                              <History className="h-4 w-4" />
-                            </IconButton>
+                            {typeof file.version_count === "number" && file.version_count > 1 && (
+                              <IconButton
+                                label="Versions"
+                                onClick={() => openVersions(file)}
+                              >
+                                <History className="h-4 w-4" />
+                              </IconButton>
+                            )}
                             <IconButton
                               label="Move to folder"
                               onClick={() => openMoveDialog(file)}
@@ -3944,21 +3948,21 @@ function FileCard({
                 <Share2 className="h-3.5 w-3.5" />
                 Share
               </button>
-              <button
-                onClick={() => {
-                  setMenuOpen(false);
-                  onVersions();
-                }}
-                className="flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-[var(--bg-hover)]"
-              >
-                <History className="h-3.5 w-3.5" />
-                Versions
-                {typeof file.version_count === "number" && file.version_count > 1 && (
+              {typeof file.version_count === "number" && file.version_count > 1 && (
+                <button
+                  onClick={() => {
+                    setMenuOpen(false);
+                    onVersions();
+                  }}
+                  className="flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-[var(--bg-hover)]"
+                >
+                  <History className="h-3.5 w-3.5" />
+                  Versions
                   <span className="ml-auto rounded-full bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[10px] text-[var(--text-secondary)]">
                     {file.version_count}
                   </span>
-                )}
-              </button>
+                </button>
+              )}
               <button
                 onClick={() => {
                   setMenuOpen(false);
