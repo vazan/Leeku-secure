@@ -183,11 +183,13 @@ CREATE TABLE IF NOT EXISTS files (
 	client_crypto_iterations INTEGER NULL,
 	thumbnail_preview BYTEA NULL,
 	thumbnail_generated TIMESTAMPTZ NULL,
+	thumbnail_excluded BOOLEAN NOT NULL DEFAULT FALSE,
 	created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 ALTER TABLE files ADD COLUMN IF NOT EXISTS thumbnail_preview BYTEA;
 ALTER TABLE files ADD COLUMN IF NOT EXISTS thumbnail_generated TIMESTAMPTZ;
+ALTER TABLE files ADD COLUMN IF NOT EXISTS thumbnail_excluded BOOLEAN NOT NULL DEFAULT FALSE;
 
 CREATE INDEX IF NOT EXISTS ix_files_thumbnail
 	ON files (thumbnail_generated)

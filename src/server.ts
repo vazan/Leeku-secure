@@ -4963,12 +4963,14 @@ function startThumbnailScan(): void {
           AND f.client_secret_hash IS NULL AND f.size_bytes<=@maxBytes
           AND (f.expires_at IS NULL OR f.expires_at > CURRENT_TIMESTAMP)
           AND f.thumbnail_preview IS NULL
+          AND COALESCE(f.thumbnail_excluded, FALSE) = FALSE
         UNION
         SELECT f.id FROM files f
         WHERE f.mime_type LIKE 'image/%' AND f.status='Available' AND f.deleted_at IS NULL
           AND f.client_secret_hash IS NULL AND f.size_bytes<=@maxBytes
           AND (f.expires_at IS NULL OR f.expires_at > CURRENT_TIMESTAMP)
           AND f.thumbnail_generated IS NULL
+          AND COALESCE(f.thumbnail_excluded, FALSE) = FALSE
         UNION
         SELECT f.id FROM files f
         WHERE f.mime_type LIKE 'image/%' AND f.status='Available' AND f.deleted_at IS NULL
@@ -4976,6 +4978,7 @@ function startThumbnailScan(): void {
           AND (f.expires_at IS NULL OR f.expires_at > CURRENT_TIMESTAMP)
           AND f.thumbnail_generated IS NOT NULL
           AND f.thumbnail_generated < to_timestamp(@cutoffSeconds)
+          AND COALESCE(f.thumbnail_excluded, FALSE) = FALSE
       `);
       let stored = 0;
       let failed = 0;
@@ -4990,6 +4993,17 @@ function startThumbnailScan(): void {
         } catch (err) {
           failed++;
           console.error(`[thumbnail-scan] Failed to generate thumbnail for file ${file.id}:`, err instanceof Error ? err.message : String(err));
+          // Permanently exclude corrupted/unprocessable files so the scan stops
+          // retrying them every cycle. Excluded files can be un-excluded manually
+          // (SET thumbnail_excluded = FALSE) if the underlying data is ever repaired.
+          const exclReq = await getRequest();
+          exclReq.input('fid', sql.UniqueIdentifier, file.id);
+          try {
+            await exclReq.query('UPDATE files SET thumbnail_excluded = TRUE WHERE id = @fid');
+            console.warn(`[thumbnail-scan] Marked ${file.id} as thumbnail_excluded (permanently skip).`);
+          } catch (exclErr: any) {
+            console.error(`[thumbnail-scan] Failed to mark ${file.id} as thumbnail_excluded:`, exclErr instanceof Error ? exclErr.message : String(exclErr));
+          }
         }
       }
       console.log(`[thumbnail-scan] Stored: ${stored}; failed: ${failed}.`);
@@ -5020,6 +5034,15 @@ async function ensureOptionalFileSecretColumns(): Promise<void> {
   await addIv.query('ALTER TABLE files ADD COLUMN IF NOT EXISTS client_crypto_iv BYTEA');
   const addIterations = await getRequest();
   await addIterations.query('ALTER TABLE files ADD COLUMN IF NOT EXISTS client_crypto_iterations INTEGER');
+}
+
+async function ensureOptionalThumbnailColumns(): Promise<void> {
+  const addPreview = await getRequest();
+  await addPreview.query('ALTER TABLE files ADD COLUMN IF NOT EXISTS thumbnail_preview BYTEA');
+  const addGenerated = await getRequest();
+  await addGenerated.query('ALTER TABLE files ADD COLUMN IF NOT EXISTS thumbnail_generated TIMESTAMPTZ');
+  const addExcluded = await getRequest();
+  await addExcluded.query('ALTER TABLE files ADD COLUMN IF NOT EXISTS thumbnail_excluded BOOLEAN NOT NULL DEFAULT FALSE');
 }
 
 async function ensureOptionalShareLinkColumns(): Promise<void> {
@@ -5198,6 +5221,7 @@ async function bootstrap() {
 
   // 2b. Lightweight schema migration for optional user-provided file secrets.
   await ensureOptionalFileSecretColumns();
+  await ensureOptionalThumbnailColumns();
   await ensureOptionalShareLinkColumns();
   await ensureFileFolderSchema();
   await ensureFolderShareLinkSchema();
