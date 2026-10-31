@@ -13,6 +13,7 @@
 - API surface: [API-REFERENCE](../01-Technical/API-REFERENCE.md)
 - Canonical API contract: [API-CONTRACT-CANONICAL](../01-Technical/API-CONTRACT-CANONICAL.md)
 - Operations: [OPERATIONS-GUIDE](../02-Non-Technical/OPERATIONS-GUIDE.md)
+- Competitive comparison: [COMPETITIVE-COMPARISON-GOOGLE-DRIVE-MEGA](../02-Non-Technical/COMPETITIVE-COMPARISON-GOOGLE-DRIVE-MEGA.md)
 - Risk status: [RISK-REGISTER](../04-Risk-And-Corrections/RISK-REGISTER.md)
 - Security posture: [SECURITY-POSTURE](../04-Risk-And-Corrections/SECURITY-POSTURE.md)
 - Security changelog: [SECURITY-CHANGELOG](../04-Risk-And-Corrections/SECURITY-CHANGELOG.md)

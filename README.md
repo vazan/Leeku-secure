@@ -111,6 +111,7 @@ See [Documentation/SQL/README.md](Documentation/SQL/README.md) for schema select
 ### 📊 Non-Technical Documentation
 - **Executive Summary:** [EXECUTIVE-SUMMARY.md](Documentation/02-Non-Technical/EXECUTIVE-SUMMARY.md) — High-level platform overview for stakeholders
 - **Operations Guide:** [OPERATIONS-GUIDE.md](Documentation/02-Non-Technical/OPERATIONS-GUIDE.md) — Daily ops procedures and monitoring
+- **Competitive Comparison:** [COMPETITIVE-COMPARISON-GOOGLE-DRIVE-MEGA.md](Documentation/02-Non-Technical/COMPETITIVE-COMPARISON-GOOGLE-DRIVE-MEGA.md) — Feature comparison vs Google Drive & Mega.nz with gap analysis
 
 ### 👨‍💻 Developer Resources
 | Document | Purpose |
