@@ -44,6 +44,7 @@ export interface FileMetadata {
   preview_available: boolean;
   preview_max_bytes: number;
   created_at: string;
+  deleted_at?: string | null; // Set when file is moved to Trash
 }
 
 export interface FileFolder {

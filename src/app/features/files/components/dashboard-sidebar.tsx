@@ -3,7 +3,7 @@ import { Folder, FolderOpen, ChevronRight, ChevronDown, LogOut } from "lucide-re
 import type { User, FileFolder } from "@/app/shared/types";
 import { useMemo, useState, useEffect } from "react";
 
-export type DashboardView = "home" | "files" | "shared" | "settings" | "admin";
+export type DashboardView = "home" | "files" | "shared" | "settings" | "admin" | "trash";
 export type DashboardNavItem = [DashboardView, ReactNode, string];
 
 function formatBytes(bytes: number) {

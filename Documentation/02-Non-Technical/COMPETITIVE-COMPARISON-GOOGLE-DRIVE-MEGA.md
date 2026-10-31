@@ -29,15 +29,15 @@ However, it **lacks several consumer-facing features** that both Google Drive an
 | File upload | ✅ Resumable.js chunked uploads | ✅ Drag & drop, multi-file | ✅ Drag & drop, multi-file | All three support chunked/resumable uploads |
 | Folder hierarchy | ✅ Nested folders | ✅ Nested folders + shared drive | ✅ Nested folders | Parity |
 | Folder rename | ✅ | ✅ | ✅ | Parity |
-| Folder delete | ✅ | ✅ (with soft delete / trash) | ✅ (trash) | Leeku uses hard delete with 90-day archive |
+| Folder delete | ✅ | ✅ (with soft delete / trash) | ✅ (trash) | Leeku uses soft delete with 90-day trash retention |
 | File preview (text/CSV) | ✅ Up to 5 MB | ✅ Google Docs/Sheets/Slides preview | ✅ Text preview | Leeku limited to text/CSV; both competitors support rich previews |
 | Image preview | ⚠️ Thumbnail generation only | ✅ Full inline preview | ✅ Full inline preview | **GAP: Add full-image preview** |
 | Video preview | ⚠️ Only via public share embed (Discord/Reddit) | ✅ Native player in Drive UI | ✅ Native player in web UI | **GAP: Add in-app video player** |
-| Audio preview | ❌ | ✅ | ✅ | **GAP** |
+| Audio preview | ✅ Native in-app `<audio>` player | ✅ | ✅ | Parity |
 | PDF preview | ❌ | ✅ | ✅ | **GAP** |
 | Search | ❌ Frontend text input only (client-side filter) | ✅ Full-text indexed search | ✅ Full-text search | **GAP: Add indexed server-side search** |
 | File versioning / history | ❌ | ✅ (Drive retains versions of Google Docs & uploaded files for 30 days) | ⚠️ (basic) | **GAP: Add file version history** |
-| Trash / Recycle bin | ⚠️ Soft delete with 90-day archive | ✅ Full trash UI | ✅ Trash folder | Partial parity |
+| Trash / Recycle bin | ✅ Full trash UI (restore / permanent delete, 90-day retention) | ✅ Full trash UI | ✅ Trash folder | Parity |
 | Thumbnail generation | ✅ Background job | ✅ Automatic | ✅ Automatic | Parity (images) |
 | File TTL / auto-expiry | ✅ | ❌ | ⚠️ | Leeku advantage |
 | Storage quota tiers | ✅ Configurable quotas | ✅ (by plan) | ✅ (by plan) | Parity |
@@ -117,7 +117,7 @@ However, it **lacks several consumer-facing features** that both Google Drive an
 | # | Gap | Impact | Suggested Solution | Effort |
 |---|---|---|---|---|
 | 1 | **Two-Factor Authentication (2FA)** | Mega & Google both offer TOTP/security keys; lack of 2FA is a significant security gap for a "secure" file vault | Add TOTP (RFC 6238) or WebAuthn; add a `2fa_secret` column, generate QR code on setup, verify on login | M |
-| 2 | **Rich File Preview (images, video, audio, PDF)** | Currently images only show thumbnails; videos only via public embeds; PDFs unsupported — competitors offer full inline preview | Use browser-native `<img>`, `<video>`, `<audio>`, `<iframe>` for PDF; add MIME-aware preview components | M |
+| 2 | **Rich File Preview (images, video, audio, PDF)** | Images/videos/audio now preview inline; PDFs still unsupported — competitors offer full inline preview | Use browser-native `<iframe>`/PDF.js for PDF preview | M |
 | 3 | **Server-side Full-Text Search** | Currently only client-side filter of loaded files — doesn't scale | Add SQL Server full-text-indexed search on decrypted filenames/metadata; background indexing job | L |
 | 4 | **Mobile Responsive Web App** | Competitors have native apps; current React UI is desktop-primary | Improve responsive layout, mobile navigation, touch support | M |
 
@@ -127,7 +127,7 @@ However, it **lacks several consumer-facing features** that both Google Drive an
 |---|---|---|---|---|
 | 5 | **Granular Sharing Permissions** | Only coarse "share or block"; competitors allow view/edit/comment roles | Add `permission_level` column to share_links; map to view/comment/edit for folders & files | M |
 | 6 | **File Version History** | No way to revert a modified file; competitors keep 30+ days | Track file revisions with `file_versions` table; allow download/restore of previous versions | L |
-| 7 | **Trash / Recycle Bin UI** | Soft-delete exists (90-day archive) but no user-facing trash interface | Build a "Trash" view in dashboard; add restore/empty actions | M |
+| 7 | ~~Trash / Recycle Bin UI~~ ✅ **Implemented** | Soft-delete with 90-day retention now has a full trash UI (restore / permanent delete) | DONE | — |
 | 8 | **In-App Notifications** | No way to alert users about shares, quotas, or system messages | Add a notifications table + polling or SSE; surface in dashboard bell | M |
 | 9 | **File Comments / Activity Feed** | Collaboration limited to sharing; no per-file discussion or history | Add comments table + activity log per file | M |
 | 10 | **Share Link Expiry UI** | Expiry exists but not surfaced as a send-to-self calendar reminder | Polish share dialog to show countdown, reminder integration | S |
@@ -164,13 +164,13 @@ Understanding where we already win helps prioritize roadmap investments:
 
 ### Immediate (0–3 months)
 1. **2FA** — highest-value security improvement, matches competitors
-2. **Rich file preview** — image/video/audio/PDF inline preview in dashboard
+2. **PDF preview** — image/video/audio inline preview now done; add PDF support
 3. **Mobile responsive Web UI** — support mobile browsers
 
 ### Short-term (3–6 months)
 4. **Granular share permissions** (view/comment/edit)
 5. **File version history**
-6. **Trash UI**
+6. ~~**Trash UI**~~ ✅ **Implemented** — trash with restore + 90-day purge in place
 7. **Server-side search index**
 
 ### Long-term (6–12 months)

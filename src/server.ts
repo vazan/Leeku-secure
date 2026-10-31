@@ -786,6 +786,7 @@ interface FileRow {
   thumbnail_preview?: Buffer | null;
   thumbnail_generated?: Date | string | null;
   expires_at: Date | null; created_at: Date;
+  deleted_at?: Date | string | null; // Set when file is moved to Trash
 }
 
 interface FolderRow {
@@ -870,6 +871,9 @@ function mapFileRow(row: FileRow, ownerUsername: string): FileMetadata {
     preview_available: !!previewKind && row.status !== 'Blocked' && Number(row.size_bytes) <= TEXT_PREVIEW_MAX_BYTES,
     preview_max_bytes: TEXT_PREVIEW_MAX_BYTES,
     created_at:     row.created_at.toISOString(),
+    deleted_at:     row.deleted_at
+      ? (row.deleted_at instanceof Date ? row.deleted_at : new Date(row.deleted_at)).toISOString()
+      : null,
   };
 }
 
@@ -2085,6 +2089,7 @@ app.get('/api/files', authenticateUser as express.RequestHandler, async (req: Au
           FROM files f
           LEFT JOIN file_folders ff ON f.folder_id=ff.id
           WHERE f.owner_user_id=@ownerId AND COALESCE(f.status,'Available')!='Expired'
+            AND f.deleted_at IS NULL
             AND (
               @includeSystem=1 OR NOT EXISTS (
                 SELECT 1
@@ -2116,7 +2121,7 @@ app.get('/api/files', authenticateUser as express.RequestHandler, async (req: Au
                 status, checksum_sha256, scan_result, scan_message,
                 is_encrypted, leeku_vibe, ttl_hours,
                 expires_at, created_at
-        FROM files WHERE owner_user_id=@ownerId AND COALESCE(status,'Available')!='Expired'
+        FROM files WHERE owner_user_id=@ownerId AND COALESCE(status,'Available')!='Expired' AND deleted_at IS NULL
          ORDER BY created_at DESC`
       );
     }
@@ -3256,7 +3261,7 @@ app.post('/api/files/:id/delete', authenticateUser as express.RequestHandler, as
     const fileResult = await fileReq.query<FileRow>(
       `SELECT id,owner_user_id,original_name_encrypted,original_name_iv,original_name_auth_tag,
               stored_path,size_bytes,status,mime_type,encrypted_size_bytes,checksum_sha256,
-              scan_result,scan_message,is_encrypted,leeku_vibe,ttl_hours,expires_at,created_at
+              scan_result,scan_message,is_encrypted,leeku_vibe,ttl_hours,expires_at,created_at,deleted_at
        FROM files WHERE id=@id`
     );
     if (!fileResult.recordset.length) return res.status(404).json({ error: 'File not found.' });
@@ -3265,32 +3270,39 @@ app.post('/api/files/:id/delete', authenticateUser as express.RequestHandler, as
       return res.status(403).json({ error: 'You do not have permission to delete this file.' });
     if (await isDesktopUpdateFile(fileId) && req.user!.role !== 'Admin')
       return res.status(403).json({ error: 'Administrator access is required for desktop update artifacts.' });
+    if (file.deleted_at)
+      return res.status(409).json({ error: 'This file is already in the trash.' });
 
     const originalName = decryptColumn(file.original_name_encrypted, file.original_name_iv, file.original_name_auth_tag);
-    const vaultPath = path.join(FILE_VAULT, file.stored_path);
-    try {
-      await fs.promises.unlink(vaultPath);
-    } catch (err) {
-      console.error(`[DELETE FILE] Failed to delete vault file ${file.id} (${file.stored_path}):`, err);
-    }
 
-    const delReq = await getRequest();
-    delReq.input('id', sql.UniqueIdentifier, fileId);
-    await delReq.query('DELETE FROM files WHERE id=@id');
+    // Soft delete: mark the file as deleted (moves it to Trash), keeping the vault file on disk
+    const softDelReq = await getRequest();
+    softDelReq.input('id', sql.UniqueIdentifier, fileId);
+    await softDelReq.query(
+      `UPDATE files SET deleted_at=SYSDATETIMEOFFSET() WHERE id=@id AND deleted_at IS NULL`
+    );
+
+    // Deactivate any share links for this file (they should no longer be active)
+    const deactivateSharesReq = await getRequest();
+    deactivateSharesReq.input('id', sql.UniqueIdentifier, fileId);
+    await deactivateSharesReq.query(
+      `UPDATE share_links SET is_active=0 WHERE file_id=@id`
+    );
 
     if (file.status === 'Available') {
       const sReq = await getRequest();
       sReq.input('sz', sql.BigInt, file.size_bytes); sReq.input('uid', sql.UniqueIdentifier, file.owner_user_id);
+      // Storage is released from the user's quota since the file will be purged after 90 days
       await sReq.query('UPDATE users SET storage_used_bytes=CASE WHEN storage_used_bytes-@sz<0 THEN 0 ELSE storage_used_bytes-@sz END WHERE id=@uid');
     }
 
-    await logSystemEvent(req.userId!, req.user!.username, 'Delete', 'File', fileId, req, `Deleted "${originalName}".`);
-    res.json({ success: true, message: 'File deleted from vault.' });
+    await logSystemEvent(req.userId!, req.user!.username, 'Delete', 'File', fileId, req, `Moved "${originalName}" to trash.`);
+    res.json({ success: true, message: 'File moved to trash.' });
   } catch (err) {
     console.error('[DELETE /api/files/:id]', err);
     // Only send response if headers haven't been sent yet
     if (!res.headersSent) {
-      res.status(500).json({ error: 'Failed to delete file.' });
+      res.status(500).json({ error: 'Failed to move file to trash.' });
     }
   }
 });
@@ -3325,7 +3337,7 @@ app.post('/api/files/delete', authenticateUser as express.RequestHandler, async 
     const fileQuery = `
       SELECT id, owner_user_id, original_name_encrypted, original_name_iv, original_name_auth_tag,
              stored_path, size_bytes, status, mime_type, encrypted_size_bytes, checksum_sha256,
-             scan_result, scan_message, is_encrypted, leeku_vibe, ttl_hours, expires_at, created_at
+             scan_result, scan_message, is_encrypted, leeku_vibe, ttl_hours, expires_at, created_at, deleted_at
       FROM files 
       WHERE id IN (${fileIds.map((_, i) => `@fileId${i}`).join(', ')})
     `;
@@ -3347,26 +3359,27 @@ app.post('/api/files/delete', authenticateUser as express.RequestHandler, async 
       }
     }
     
-    // Process each file deletion
+    // Process each file deletion (soft delete - move to trash)
     const deletedFiles: string[] = [];
     const failedFiles: { id: string; error: string }[] = [];
     
     for (const file of files) {
       try {
         const originalName = decryptColumn(file.original_name_encrypted, file.original_name_iv, file.original_name_auth_tag);
-        const vaultPath = path.join(FILE_VAULT, file.stored_path);
         
-        // Delete vault file
-        try {
-          await fs.promises.unlink(vaultPath);
-        } catch (err) {
-          console.error(`[BULK DELETE FILE] Failed to delete vault file ${file.id} (${file.stored_path}):`, err);
-        }
+        // Soft delete: mark file as deleted (moves to trash), keep vault file on disk
+        const softDelReq = await getRequest();
+        softDelReq.input('id', sql.UniqueIdentifier, file.id);
+        await softDelReq.query(
+          `UPDATE files SET deleted_at=SYSDATETIMEOFFSET() WHERE id=@id AND deleted_at IS NULL`
+        );
         
-        // Delete from database
-        const delReq = await getRequest();
-        delReq.input('id', sql.UniqueIdentifier, file.id);
-        await delReq.query('DELETE FROM files WHERE id=@id');
+        // Deactivate any share links for this file
+        const deactivateSharesReq = await getRequest();
+        deactivateSharesReq.input('id', sql.UniqueIdentifier, file.id);
+        await deactivateSharesReq.query(
+          `UPDATE share_links SET is_active=0 WHERE file_id=@id`
+        );
         
         // Update user storage
         if (file.status === 'Available') {
@@ -3377,7 +3390,7 @@ app.post('/api/files/delete', authenticateUser as express.RequestHandler, async 
         }
         
         // Log the deletion
-        await logSystemEvent(req.userId!, req.user!.username, 'Delete', 'File', file.id, req, `Deleted \"${originalName}\".`);
+        await logSystemEvent(req.userId!, req.user!.username, 'Delete', 'File', file.id, req, `Moved \"${originalName}\" to trash.`);
         
         deletedFiles.push(file.id);
       } catch (err) {
@@ -3398,8 +3411,8 @@ app.post('/api/files/delete', authenticateUser as express.RequestHandler, async 
     return res.json({ 
       success: true, 
       message: successCount === files.length 
-        ? `Successfully deleted ${successCount} file${successCount === 1 ? '' : 's'}.`
-        : `Deleted ${successCount} file${successCount === 1 ? '' : 's'}, but ${failedFiles.length} failed.`,
+        ? `Successfully moved ${successCount} file${successCount === 1 ? '' : 's'} to trash.`
+        : `Moved ${successCount} file${successCount === 1 ? '' : 's'} to trash, but ${failedFiles.length} failed.`,
       deletedFiles,
       failedFiles
     });
@@ -3408,6 +3421,128 @@ app.post('/api/files/delete', authenticateUser as express.RequestHandler, async 
     if (!res.headersSent) {
       res.status(500).json({ error: 'Failed to process bulk delete request.' });
     }
+  }
+});
+
+// ──────────────────────────────────────────────────────────────
+// API: Files — Trash bin
+// ──────────────────────────────────────────────────────────────
+
+// GET /api/files/trash - List trashed (soft-deleted) files for the current user
+app.get('/api/files/trash', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  try {
+    const request = await getRequest();
+    request.input('ownerId', sql.UniqueIdentifier, req.userId!);
+    const result = await request.query<FileRow>(
+      `SELECT id, owner_user_id,
+              folder_id, folder_name,
+              original_name_encrypted, original_name_iv, original_name_auth_tag,
+              stored_path, mime_type, size_bytes, encrypted_size_bytes,
+              status, checksum_sha256, scan_result, scan_message,
+              is_encrypted, leeku_vibe, ttl_hours,
+              client_secret_hash,
+              expires_at, created_at, deleted_at
+      FROM (
+        SELECT f.*, ff.name AS folder_name
+        FROM files f
+        LEFT JOIN file_folders ff ON f.folder_id=ff.id
+        WHERE f.owner_user_id=@ownerId AND f.deleted_at IS NOT NULL
+      ) files
+       ORDER BY deleted_at DESC`
+    );
+    res.json({ files: result.recordset.map(r => mapFileRow(r, req.user!.username)) });
+  } catch (err) { console.error('[GET /api/files/trash]', err); res.status(500).json({ error: 'Failed to load trash.' }); }
+});
+
+// POST /api/files/:id/restore - Restore a trashed file back to its folder
+app.post('/api/files/:id/restore', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  const fileId = getSingleParam(req.params.id);
+  if (await checkMaintenanceMode('delete', req, res)) return;
+  try {
+    const fileReq = await getRequest();
+    fileReq.input('id', sql.UniqueIdentifier, fileId);
+    const fileResult = await fileReq.query<FileRow>(
+      `SELECT id,owner_user_id,original_name_encrypted,original_name_iv,original_name_auth_tag,
+              stored_path,size_bytes,status,mime_type,encrypted_size_bytes,checksum_sha256,
+              is_encrypted,leeku_vibe,ttl_hours,expires_at,created_at,deleted_at
+       FROM files WHERE id=@id`
+    );
+    if (!fileResult.recordset.length) return res.status(404).json({ error: 'File not found.' });
+    const file = fileResult.recordset[0];
+    if (file.owner_user_id !== req.userId && req.user!.role !== 'Admin')
+      return res.status(403).json({ error: 'You do not have permission to restore this file.' });
+    if (await isDesktopUpdateFile(fileId) && req.user!.role !== 'Admin')
+      return res.status(403).json({ error: 'Administrator access is required for desktop update artifacts.' });
+    if (!file.deleted_at)
+      return res.status(409).json({ error: 'This file is not in the trash.' });
+
+    const originalName = decryptColumn(file.original_name_encrypted, file.original_name_iv, file.original_name_auth_tag);
+
+    // Restore: clear the deleted_at marker
+    const restoreReq = await getRequest();
+    restoreReq.input('id', sql.UniqueIdentifier, fileId);
+    await restoreReq.query(
+      `UPDATE files SET deleted_at=NULL WHERE id=@id`
+    );
+
+    // Restore storage usage if file is Available
+    if (file.status === 'Available') {
+      const sReq = await getRequest();
+      sReq.input('sz', sql.BigInt, file.size_bytes);
+      sReq.input('uid', sql.UniqueIdentifier, file.owner_user_id);
+      await sReq.query('UPDATE users SET storage_used_bytes=storage_used_bytes+@sz WHERE id=@uid');
+    }
+
+    await logSystemEvent(req.userId!, req.user!.username, 'Delete', 'File', fileId, req, `Restored "${originalName}" from trash.`);
+    res.json({ success: true, message: 'File restored from trash.' });
+  } catch (err) {
+    console.error('[POST /api/files/:id/restore]', err);
+    if (!res.headersSent) res.status(500).json({ error: 'Failed to restore file.' });
+  }
+});
+
+// POST /api/files/:id/delete-permanent - Permanently delete a trashed file
+app.post('/api/files/:id/delete-permanent', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  const fileId = getSingleParam(req.params.id);
+  if (await checkMaintenanceMode('delete', req, res)) return;
+  try {
+    const fileReq = await getRequest();
+    fileReq.input('id', sql.UniqueIdentifier, fileId);
+    const fileResult = await fileReq.query<FileRow>(
+      `SELECT id,owner_user_id,original_name_encrypted,original_name_iv,original_name_auth_tag,
+              stored_path,size_bytes,status,mime_type,encrypted_size_bytes,checksum_sha256,
+              is_encrypted,leeku_vibe,ttl_hours,expires_at,created_at,deleted_at
+       FROM files WHERE id=@id`
+    );
+    if (!fileResult.recordset.length) return res.status(404).json({ error: 'File not found.' });
+    const file = fileResult.recordset[0];
+    if (file.owner_user_id !== req.userId && req.user!.role !== 'Admin')
+      return res.status(403).json({ error: 'You do not have permission to delete this file.' });
+    if (await isDesktopUpdateFile(fileId) && req.user!.role !== 'Admin')
+      return res.status(403).json({ error: 'Administrator access is required for desktop update artifacts.' });
+    if (!file.deleted_at)
+      return res.status(409).json({ error: 'File must be in the trash to permanently delete it.' });
+
+    const originalName = decryptColumn(file.original_name_encrypted, file.original_name_iv, file.original_name_auth_tag);
+    const vaultPath = path.join(FILE_VAULT, file.stored_path);
+
+    // Physically delete the vault file
+    try {
+      await fs.promises.unlink(vaultPath);
+    } catch (err) {
+      console.error(`[PERM DELETE] Failed to delete vault file ${file.id} (${file.stored_path}):`, err);
+    }
+
+    // Permanently delete from DB (cascades to keys and share links)
+    const delReq = await getRequest();
+    delReq.input('id', sql.UniqueIdentifier, fileId);
+    await delReq.query('DELETE FROM files WHERE id=@id');
+
+    await logSystemEvent(req.userId!, req.user!.username, 'Delete', 'File', fileId, req, `Permanently deleted "${originalName}".`);
+    res.json({ success: true, message: 'File permanently deleted.' });
+  } catch (err) {
+    console.error('[POST /api/files/:id/delete-permanent]', err);
+    if (!res.headersSent) res.status(500).json({ error: 'Failed to permanently delete file.' });
   }
 });
 
@@ -3445,7 +3580,7 @@ app.get('/api/files/:id/preview', authenticateUser as express.RequestHandler, as
 
     const originalName = decryptColumn(file.original_name_encrypted, file.original_name_iv, file.original_name_auth_tag);
     const textPreviewKind = getTextPreviewKind(originalName, file.mime_type || '');
-    const mediaPreviewable = file.mime_type.startsWith('image/') || file.mime_type.startsWith('video/');
+    const mediaPreviewable = file.mime_type.startsWith('image/') || file.mime_type.startsWith('video/') || file.mime_type.startsWith('audio/');
     if (!textPreviewKind && !mediaPreviewable)
       return res.status(415).json({ error: 'Preview is not available for this file type.' });
     if (textPreviewKind && Number(file.size_bytes || 0) > TEXT_PREVIEW_MAX_BYTES)
@@ -5055,6 +5190,81 @@ async function logExpiredFile(file: ExpiredFileRecord): Promise<void> {
 }
 
 // ──────────────────────────────────────────────────────────────
+// Trash purge job — permanently deletes files that have been in
+// the trash (soft-deleted via deleted_at) for TRASH_RETENTION_DAYS.
+// ──────────────────────────────────────────────────────────────
+
+export const TRASH_RETENTION_DAYS = parseInt(process.env.TRASH_RETENTION_DAYS || '90', 10);
+
+let trashPurgeTimer: ReturnType<typeof setInterval> | null = null;
+
+export function startTrashPurge(intervalMs: number = 60 * 60_000): void {
+  if (trashPurgeTimer) return;
+  trashPurgeTimer = setInterval(() => {
+    runTrashPurgeCycle().catch((err) => {
+      console.error('[trash-purge] Unhandled error in purge cycle:', err);
+    });
+  }, intervalMs);
+  console.log(`[trash-purge] Service started. Files in trash for >${TRASH_RETENTION_DAYS} days will be permanently deleted.`);
+}
+
+export function stopTrashPurge(): void {
+  if (trashPurgeTimer) {
+    clearInterval(trashPurgeTimer);
+    trashPurgeTimer = null;
+    console.log('[trash-purge] Service stopped.');
+  }
+}
+
+interface TrashedFileRow {
+  id: string; stored_path: string; owner_user_id: string;
+  original_name_encrypted: Buffer; original_name_iv: Buffer; original_name_auth_tag: Buffer;
+  deleted_at: Date; size_bytes: number;
+}
+
+async function runTrashPurgeCycle(): Promise<void> {
+  const retentionMs = TRASH_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+  const cutoff = new Date(Date.now() - retentionMs);
+
+  const req = await getRequest();
+  req.input('cutoff', sql.DateTimeOffset, cutoff);
+  const result = await req.query<TrashedFileRow>(
+    `SELECT id,stored_path,owner_user_id,original_name_encrypted,original_name_iv,original_name_auth_tag,deleted_at,size_bytes
+     FROM files WHERE deleted_at IS NOT NULL AND deleted_at<=@cutoff`
+  );
+
+  for (const file of result.recordset) {
+    const vaultPath = path.join(FILE_VAULT, file.stored_path);
+    try {
+      if (fs.existsSync(vaultPath)) fs.unlinkSync(vaultPath);
+    } catch (err) {
+      console.error(`[trash-purge] Failed to remove vault file ${file.id}:`, err);
+    }
+
+    const delReq = await getRequest();
+    delReq.input('id', sql.UniqueIdentifier, file.id);
+    await delReq.query('DELETE FROM files WHERE id=@id');
+
+    const originalName = decryptColumn(file.original_name_encrypted, file.original_name_iv, file.original_name_auth_tag);
+    const logReq = await getRequest();
+    logReq.input('uid', sql.UniqueIdentifier, file.owner_user_id);
+    logReq.input('usr', sql.NVarChar(200), 'System');
+    logReq.input('et',  sql.NVarChar(20),  'Delete');
+    logReq.input('tt',  sql.NVarChar(50),  'File');
+    logReq.input('tid', sql.NVarChar(100), file.id);
+    logReq.input('ip',  sql.NVarChar(45),  '127.0.0.1');
+    logReq.input('msg', sql.NVarChar(sql.MAX), `File "${originalName}" permanently deleted from trash after ${TRASH_RETENTION_DAYS} day retention.`);
+    await logReq.query('INSERT INTO system_logs (user_id,username_snapshot,event_type,target_type,target_id,ip_address,message) VALUES (@uid,@usr,@et,@tt,@tid,@ip,@msg)');
+
+    console.log(`[trash-purge] Purged trashed file ${file.id} (${originalName}).`);
+  }
+
+  if (result.recordset.length > 0) {
+    console.log(`[trash-purge] Purged ${result.recordset.length} trashed file(s).`);
+  }
+}
+
+// ──────────────────────────────────────────────────────────────
 // Thumbnail background scan job
 // ──────────────────────────────────────────────────────────────
 
@@ -5452,6 +5662,17 @@ async function ensureFileFolderSchema(): Promise<void> {
   }
 }
 
+async function ensureFileDeletedAtColumn(): Promise<void> {
+  const request = await getRequest();
+  await request.query(`
+    IF OBJECT_ID('dbo.files', 'U') IS NOT NULL
+    BEGIN
+      IF COL_LENGTH('dbo.files', 'deleted_at') IS NULL
+        ALTER TABLE dbo.files ADD deleted_at DATETIMEOFFSET(7) NULL;
+    END
+  `);
+}
+
 async function bootstrap() {
   // 1. Validate production requirements and master encryption key
   validateProductionConfig();
@@ -5465,6 +5686,7 @@ async function bootstrap() {
   await ensureOptionalFileSecretColumns();
   await ensureOptionalShareLinkColumns();
   await ensureFileFolderSchema();
+  await ensureFileDeletedAtColumn();
 
   app.use('/api/health', createHealthRouter(FILE_VAULT, NODE_ENV === 'production'));
 
@@ -5491,6 +5713,9 @@ async function bootstrap() {
 
   // 6. Start expiry cleanup
   startExpiryCleanup(getExpiredFiles, markFilesExpired, logExpiredFile);
+
+  // 6a. Start trash purge (permanently deletes files past retention in trash)
+  startTrashPurge();
 
   // 6b. Clean up stale download temp files from previous crashes
   cleanupStaleTempFiles(UPLOAD_TEMP);

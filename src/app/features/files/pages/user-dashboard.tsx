@@ -5,6 +5,7 @@ import {
   CalendarDays,
   Copy,
   Eye,
+  FileVolume2,
   Folder,
   FolderPlus,
   LayoutGrid,
@@ -14,6 +15,7 @@ import {
   LogOut,
   MoreHorizontal,
   Play,
+  RotateCcw,
   Search,
   Settings,
   Share2,
@@ -180,6 +182,7 @@ const dashboardViews: DashboardView[] = [
   "shared",
   "settings",
   "admin",
+  "trash",
 ];
 
 function getSavedDashboardView(user: User): DashboardView {
@@ -229,6 +232,12 @@ function fileKind(file: FileMetadata) {
         fileName.endsWith(".mov") || fileName.endsWith(".wmv") || fileName.endsWith(".webm")) {
       return "Video";
     }
+    // Check for audio extensions
+    if (fileName.endsWith(".mp3") || fileName.endsWith(".wav") || fileName.endsWith(".ogg") ||
+        fileName.endsWith(".oga") || fileName.endsWith(".m4a") || fileName.endsWith(".aac") ||
+        fileName.endsWith(".flac") || fileName.endsWith(".opus") || fileName.endsWith(".wma")) {
+      return "Audio";
+    }
     // Check for PDF
     if (fileName.endsWith(".pdf")) {
       return "PDF";
@@ -242,6 +251,7 @@ function fileKind(file: FileMetadata) {
   
   if (normalizedMimeType.includes("image")) return "Image";
   if (normalizedMimeType.includes("video")) return "Video";
+  if (normalizedMimeType.includes("audio")) return "Audio";
   if (normalizedMimeType.includes("pdf")) return "PDF";
   if (normalizedMimeType.includes("zip") || normalizedMimeType.includes("compressed"))
     return "Archive";
@@ -264,10 +274,16 @@ function supportsExternalPreview(file: FileMetadata) {
         fileName.endsWith(".mov") || fileName.endsWith(".wmv") || fileName.endsWith(".webm")) {
       return true;
     }
+    if (fileName.endsWith(".mp3") || fileName.endsWith(".wav") || fileName.endsWith(".ogg") ||
+        fileName.endsWith(".m4a") || fileName.endsWith(".aac") || fileName.endsWith(".flac") ||
+        fileName.endsWith(".opus")) {
+      return true;
+    }
   }
   
   return (
-    normalizedMimeType.startsWith("image/") || normalizedMimeType.startsWith("video/")
+    normalizedMimeType.startsWith("image/") || normalizedMimeType.startsWith("video/") ||
+    normalizedMimeType.startsWith("audio/")
   );
 }
 
@@ -304,6 +320,24 @@ function isImageFile(file: FileMetadata) {
   return normalizedMimeType.startsWith("image/");
 }
 
+function isAudioFile(file: FileMetadata) {
+  const normalizedMimeType = (file.mime_type || "").trim().toLowerCase();
+  
+  // Handle common incorrect MIME types
+  if (normalizedMimeType === "document" || normalizedMimeType === "application/octet-stream") {
+    // Check file extension as fallback
+    const fileName = file.original_name.toLowerCase();
+    if (fileName.endsWith(".mp3") || fileName.endsWith(".wav") || fileName.endsWith(".ogg") ||
+        fileName.endsWith(".oga") || fileName.endsWith(".m4a") || fileName.endsWith(".aac") ||
+        fileName.endsWith(".flac") || fileName.endsWith(".opus") || fileName.endsWith(".wma") ||
+        fileName.endsWith(".mid") || fileName.endsWith(".midi")) {
+      return true;
+    }
+  }
+  
+  return normalizedMimeType.startsWith("audio/");
+}
+
 function pad2(value: number) {
   return String(value).padStart(2, "0");
 }
@@ -337,6 +371,8 @@ export default function UserDashboard({
   );
   const [files, setFiles] = useState<FileMetadata[]>([]);
   const [filesLoading, setFilesLoading] = useState(false);
+  const [trashFiles, setTrashFiles] = useState<FileMetadata[]>([]);
+  const [trashLoading, setTrashLoading] = useState(false);
   const [folders, setFolders] = useState<FileFolder[]>([]);
   const [foldersLoaded, setFoldersLoaded] = useState(false);
   const [foldersLoading, setFoldersLoading] = useState(false);
@@ -359,6 +395,7 @@ export default function UserDashboard({
   const [shareFolder, setShareFolder] = useState<FileFolder | null>(null);
   const [videoFile, setVideoFile] = useState<FileMetadata | null>(null);
   const [imageFile, setImageFile] = useState<FileMetadata | null>(null);
+  const [audioFile, setAudioFile] = useState<FileMetadata | null>(null);
   const [textPreviewFile, setTextPreviewFile] = useState<FileMetadata | null>(null);
   const [moveFile, setMoveFile] = useState<FileMetadata | null>(null);
   const [moveTargetFolderId, setMoveTargetFolderId] = useState("");
@@ -564,6 +601,22 @@ export default function UserDashboard({
     }
   };
 
+  const loadTrash = async () => {
+    setTrashLoading(true);
+    try {
+      const response = await fetch("/api/files/trash?_t=" + Date.now(), {
+        headers: authHeaders(token),
+      });
+      if (response.ok) {
+        setTrashFiles((await response.json()).files || []);
+      } else {
+        notifyError("Could not load trash.");
+      }
+    } finally {
+      setTrashLoading(false);
+    }
+  };
+
   const loadAdmin = async () => {
     if (user.role !== "Admin") return;
     const headers = authHeaders(token);
@@ -590,6 +643,13 @@ export default function UserDashboard({
     loadFilesAndLinks().catch(() => notifyError("Could not refresh your files."));
     loadAdmin().catch(() => notifyError("Could not refresh admin data."));
   }, []);
+
+  useEffect(() => {
+    if (view === "trash") {
+      loadTrash().catch(() => notifyError("Could not refresh trash."));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [view]);
 
   useEffect(() => {
     localStorage.setItem(`dashboard-view:${user.id}`, view);
@@ -1296,7 +1356,7 @@ export default function UserDashboard({
 
   const deleteFile = async (file: FileMetadata) => {
     if (
-      !window.confirm(`Delete "${file.original_name}"? This cannot be undone.`)
+      !window.confirm(`Move "${file.original_name}" to trash?`)
     )
       return;
     const response = await fetch(`/api/files/${file.id}/delete`, {
@@ -1304,8 +1364,38 @@ export default function UserDashboard({
       headers: authHeaders(token),
     });
     if (response.ok) {
-      notify("File deleted.");
+      notify("File moved to trash.");
       await loadFilesAndLinks();
+      onTriggerRefreshUser();
+    } else notifyError("Could not delete the file.");
+  };
+
+  const restoreFile = async (file: FileMetadata) => {
+    const response = await fetch(`/api/files/${file.id}/restore`, {
+      method: "POST",
+      headers: authHeaders(token),
+    });
+    if (response.ok) {
+      notify("File restored.");
+      await loadTrash();
+      await loadFilesAndLinks();
+    } else notifyError("Could not restore the file.");
+  };
+
+  const deletePermanently = async (file: FileMetadata) => {
+    if (
+      !window.confirm(
+        `Permanently delete "${file.original_name}"? This cannot be undone.`
+      )
+    )
+      return;
+    const response = await fetch(`/api/files/${file.id}/delete-permanent`, {
+      method: "POST",
+      headers: authHeaders(token),
+    });
+    if (response.ok) {
+      notify("File permanently deleted.");
+      await loadTrash();
       onTriggerRefreshUser();
     } else notifyError("Could not delete the file.");
   };
@@ -1839,6 +1929,7 @@ export default function UserDashboard({
     ["home", <LayoutGrid className="h-4 w-4" />, "Home"],
     ["files", <Folder className="h-4 w-4" />, "All files"],
     ["shared", <Share2 className="h-4 w-4" />, "Shared"],
+    ["trash", <Trash2 className="h-4 w-4" />, "Trash"],
     ["settings", <Settings className="h-4 w-4" />, "Settings"],
   ];
   if (user.role === "Admin")
@@ -2242,10 +2333,14 @@ export default function UserDashboard({
                         </div>
                       </div>
                       <div className="mt-4 grid w-full min-w-0 gap-2 min-[380px]:grid-cols-2">
-                        {(file.preview_available || isVideoFile(file) || isImageFile(file)) && (
+                        {(file.preview_available || isVideoFile(file) || isImageFile(file) || isAudioFile(file)) && (
                           <FileActionButton
-                            label={isVideoFile(file) ? "Watch" : isImageFile(file) ? "Preview" : "Preview"}
+                            label={isVideoFile(file) ? "Watch" : isAudioFile(file) ? "Listen" : "Preview"}
                             onClick={() => {
+                              if (isAudioFile(file)) {
+                                setAudioFile(file);
+                                return;
+                              }
                               if (isVideoFile(file)) {
                                 setVideoFile(file);
                                 return;
@@ -2259,6 +2354,8 @@ export default function UserDashboard({
                           >
                             {isVideoFile(file) ? (
                               <Play className="h-3.5 w-3.5" />
+                            ) : isAudioFile(file) ? (
+                              <FileVolume2 className="h-3.5 w-3.5" />
                             ) : (
                               <Eye className="h-3.5 w-3.5" />
                             )}
@@ -2346,10 +2443,14 @@ export default function UserDashboard({
                         </td>
                         <td className="w-48 px-2 py-3">
                           <div className="flex w-44 justify-end gap-1">
-                            {(file.preview_available || isVideoFile(file) || isImageFile(file)) && (
+                            {(file.preview_available || isVideoFile(file) || isImageFile(file) || isAudioFile(file)) && (
                               <IconButton
-                                label={isVideoFile(file) ? "Watch" : isImageFile(file) ? "Preview" : "Preview"}
+                                label={isVideoFile(file) ? "Watch" : isAudioFile(file) ? "Listen" : "Preview"}
                                 onClick={() => {
+                                  if (isAudioFile(file)) {
+                                    setAudioFile(file);
+                                    return;
+                                  }
                                   if (isVideoFile(file)) {
                                     setVideoFile(file);
                                     return;
@@ -2363,6 +2464,8 @@ export default function UserDashboard({
                               >
                                 {isVideoFile(file) ? (
                                   <Play className="h-4 w-4" />
+                                ) : isAudioFile(file) ? (
+                                  <FileVolume2 className="h-4 w-4" />
                                 ) : (
                                   <Eye className="h-4 w-4" />
                                 )}
@@ -2399,6 +2502,72 @@ export default function UserDashboard({
                   </tbody>
                 </table>
               </div>
+              )}
+            </section>
+          )}
+
+          {view === "trash" && (
+            <section className="mx-auto w-full min-w-0 max-w-5xl overflow-x-hidden">
+              <div className="mb-6 text-center">
+                <h1 className="text-2xl font-semibold tracking-[-0.03em]">
+                  Trash
+                </h1>
+                <p className="mt-1 text-sm text-[var(--text-muted)]">
+                  Files here are kept for 90 days before being permanently deleted.
+                </p>
+              </div>
+              {trashLoading ? (
+                <div className="flex items-center justify-center gap-2 py-16 text-[var(--text-muted)]">
+                  <div className="h-5 w-5 animate-spin rounded-full border-2 border-[var(--border-subtle)] border-t-[var(--accent-linear)]" />
+                  Loading trash...
+                </div>
+              ) : trashFiles.length === 0 ? (
+                <div className="flex flex-col items-center py-20 text-center">
+                  <Trash2 className="mb-3 h-12 w-12 text-[var(--text-faint)]" />
+                  <p className="text-[var(--text-secondary)]">Trash is empty.</p>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {trashFiles.map((file) => (
+                    <div
+                      key={file.id}
+                      className="flex items-center gap-3 rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] p-3 shadow-[var(--shadow-hairline)]"
+                    >
+                      <FileThumbnail
+                        file={file}
+                        token={token}
+                        className="h-12 w-12 shrink-0 rounded-lg"
+                        iconClassName="h-6 w-6"
+                        showTypeBadge={false}
+                      />
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate text-sm font-medium">{file.original_name}</p>
+                        <p className="mt-0.5 text-xs text-[var(--text-muted)]">
+                          Deleted {file.deleted_at ? new Date(file.deleted_at).toLocaleDateString() : ""}
+                          {file.folder_id ? " · from folder" : ""}
+                        </p>
+                      </div>
+                      <div className="flex shrink-0 items-center gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => restoreFile(file)}
+                          className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--border-subtle)] px-3 py-2 text-xs font-medium text-[var(--success-linear)] hover:bg-[color-mix(in_srgb,var(--success-linear)_12%,transparent)]"
+                        >
+                          <RotateCcw className="h-3.5 w-3.5" />
+                          Restore
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => deletePermanently(file)}
+                          className="inline-flex items-center gap-1.5 rounded-lg border border-[color-mix(in_srgb,var(--error-linear)_42%,transparent)] px-3 py-2 text-xs font-medium text-[var(--error-linear)] hover:bg-[color-mix(in_srgb,var(--error-linear)_12%,transparent)]"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                          Delete
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
               )}
             </section>
           )}
@@ -2732,6 +2901,9 @@ export default function UserDashboard({
       )}
       {imageFile && (
         <ImagePreviewDialog file={imageFile} onClose={() => setImageFile(null)} />
+      )}
+      {audioFile && (
+        <AudioPreviewDialog file={audioFile} onClose={() => setAudioFile(null)} />
       )}
       {textPreviewFile && (
         <TextPreviewDialog
@@ -3368,6 +3540,57 @@ function ImagePreviewDialog({
           src={`/api/files/${file.id}/preview`}
           alt={file.original_name}
           className="max-h-full max-w-full object-contain"
+        />
+      </div>
+    </div>
+  );
+}
+
+function AudioPreviewDialog({
+  file,
+  onClose,
+}: {
+  file: FileMetadata;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", closeOnEscape);
+    return () => document.removeEventListener("keydown", closeOnEscape);
+  }, [onClose]);
+
+  return (
+    <div
+      className="fixed inset-0 z-[60] flex flex-col bg-black/95 p-4 backdrop-blur-md"
+      onPointerDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      <div className="mb-3 flex items-center justify-between gap-4 text-white">
+        <p className="min-w-0 truncate text-sm font-medium">{file.original_name}</p>
+        <button
+          type="button"
+          aria-label="Close audio preview"
+          onClick={onClose}
+          className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-white/10 hover:bg-white/20"
+        >
+          <X className="h-4 w-4" />
+        </button>
+      </div>
+      <div className="flex min-h-0 flex-1 flex-col items-center justify-center">
+        <FileTypeIcon
+          fileName={file.original_name}
+          mimeType={file.mime_type}
+          className="mb-4 h-16 w-16 text-white/80"
+          showBadge={false}
+        />
+        <audio
+          src={`/api/files/${file.id}/preview`}
+          controls
+          autoPlay
+          className="w-full max-w-xl"
         />
       </div>
     </div>
