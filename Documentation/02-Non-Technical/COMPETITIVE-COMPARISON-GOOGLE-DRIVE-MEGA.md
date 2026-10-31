@@ -126,7 +126,7 @@ However, it **lacks several consumer-facing features** that both Google Drive an
 | # | Gap | Impact | Suggested Solution | Effort |
 |---|---|---|---|---|
 | 5 | **Granular Sharing Permissions** | Only coarse "share or block"; competitors allow view/edit/comment roles | Add `permission_level` column to share_links; map to view/comment/edit for folders & files | M |
-| 6 | **File Version History** | No way to revert a modified file; competitors keep 30+ days | Track file revisions with `file_versions` table; allow download/restore of previous versions | L |
+| 6 | **File Version History** | No way to revert a modified file; competitors keep 30+ days | Track file revisions with `file_versions` table; allow download/restore of previous versions. **✅ Assessed FEASIBLE** — see `01-Technical/FILE-VERSION-HISTORY-FEASIBILITY.md` (old-key storage confirmed compatible with the zero-knowledge key-wrapping design) | L |
 | 7 | ~~Trash / Recycle Bin UI~~ ✅ **Implemented** | Soft-delete with 90-day retention now has a full trash UI (restore / permanent delete) | DONE | — |
 | 8 | **In-App Notifications** | No way to alert users about shares, quotas, or system messages | Add a notifications table + polling or SSE; surface in dashboard bell | M |
 | 9 | **File Comments / Activity Feed** | Collaboration limited to sharing; no per-file discussion or history | Add comments table + activity log per file | M |
@@ -169,7 +169,7 @@ Understanding where we already win helps prioritize roadmap investments:
 
 ### Short-term (3–6 months)
 4. **Granular share permissions** (view/comment/edit)
-5. **File version history**
+5. **File version history** — ✅ feasibility assessed (2026-10-31) → see `01-Technical/FILE-VERSION-HISTORY-FEASIBILITY.md`; proceed to migration + implementation
 6. ~~**Trash UI**~~ ✅ **Implemented** — trash with restore + 90-day purge in place
 7. **Server-side search index**
 
