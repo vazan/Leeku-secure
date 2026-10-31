@@ -18,6 +18,8 @@ Classe : CRITICAL — DB migration (public schema contract) + new routes in `src
 | `src/server.ts` | Upload pipeline version-instead logic; 4 new version endpoints; share `version_id` |
 | `src/app/shared/types/index.ts` | `version_count?` on `FileMetadata`; new `FileVersion` interface |
 | `src/app/features/files/pages/user-dashboard.tsx` | Full §3.4 UI: versions drawer, per-version quota/total, restore/share/preview wiring, version-pinned ShareDialog hint |
+| `scripts/backfill-file-hashes.ts` (+ `package.json` script) | One-time backfill: populate `files.file_name_hash` for pre-migration rows (NULL hash) so same-name versioning works for all existing files |
+| `src/server.ts` | Upload same-name detection fallback for pre-migration rows with NULL hash (bounded scan by decrypted name) |
 
 ## Contrats publics impactés
 OUI (schema):
@@ -69,6 +71,15 @@ BACKEND debt (follow-up, session owner decisions #1–#3 scoped frontend-only):
 FRONTEND debt (documented in code comments):
 - Preview of archived versions shows a notice ("Preview is only available for the current version right now.")
   awaiting the backend per-version preview endpoint.
+
+PRE-EXISTING-FILE GAP (found in validation) — fixed:
+- Files created before the versioning migration have `file_name_hash = NULL` and cannot be versioned by the
+  indexed same-name lookup (the DB can't HMAC an encrypted name). Previously this silently created a duplicate
+  row. Fixed two ways:
+  1. Runtime fallback in upload detection (scans ≤20 same-folder NULL-hash rows, matches by decrypted name,
+     heals the hash) — `src/server.ts`.
+  2. One-time backfill `scripts/backfill-file-hashes.ts` (`npm run backfill:file-hashes`) that rehashes all
+     active NULL-hash rows server-side.
 
 ## Validation
 Build: ✅ (`tsc --noEmit`; `vite build` ✓ 494ms; esbuild server bundle OK)  Lint: ✅  Type-check: ✅

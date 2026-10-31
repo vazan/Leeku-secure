@@ -50,6 +50,12 @@ FOLLOW-UP (debt, not in plan steps):
 - No per-version preview / per-version share backend endpoints yet — UI previews only the current version and
   pins `version_id` on the existing share-create endpoint (owner decision #3 rendered the drawer; backend
   follow-up remains).
+- Pre-existing files (before the migration) have `file_name_hash = NULL` (DB can't HMAC an encrypted name),
+  so the indexed same-name lookup on upload can never match them — re-uploading a changed copy created a
+  duplicate row instead of a version. ADDRESSED: (a) runtime fallback in `src/server.ts` scans ≤20
+  same-folder NULL-hash rows and matches by decrypted name, healing the hash; (b) one-time backfill
+  `scripts/backfill-file-hashes.ts` (`npm run backfill:file-hashes`) rehashes all active NULL-hash rows.
+  Run the backfill to converge all pre-existing rows onto the fast indexed path.
 
 ### Rollback
 - SQL: `DROP TABLE dbo.file_version_keys; DROP TABLE dbo.file_versions; ALTER TABLE dbo.files DROP COLUMN current_version_id, file_name_hash; ALTER TABLE dbo.share_links DROP COLUMN version_id;`
