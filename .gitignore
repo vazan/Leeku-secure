@@ -7,3 +7,9 @@ coverage/
 .env*
 !.env.example
 vault/
+.forgeagent
+.opencode
+.patchwork
+.github
+.agents
+AGENTS.md
