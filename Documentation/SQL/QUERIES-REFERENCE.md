@@ -166,6 +166,31 @@ SET deleted_at = SYSDATETIMEOFFSET()
 WHERE id = @fileId AND owner_user_id = @userId;
 ```
 
+### 16a. List trashed files (recycle bin)
+```sql
+SELECT id, owner_user_id,
+       original_name_encrypted, original_name_iv, original_name_auth_tag,
+       stored_path, mime_type, size_bytes, encrypted_size_bytes,
+       status, checksum_sha256, is_encrypted, scan_result, scan_message, scanned_at,
+       leeku_vibe, ttl_hours, expires_at, deleted_at, created_at
+FROM files
+WHERE owner_user_id = @userId AND deleted_at IS NOT NULL
+ORDER BY deleted_at DESC;
+```
+
+### 16b. Restore a trashed file (recycle bin)
+```sql
+UPDATE files
+SET deleted_at = NULL
+WHERE id = @fileId AND owner_user_id = @userId AND deleted_at IS NOT NULL;
+```
+
+### 16c. Permanently delete a trashed file (recycle bin)
+```sql
+DELETE FROM files
+WHERE id = @fileId AND owner_user_id = @userId AND deleted_at IS NOT NULL;
+```
+
 ### 17. Hard delete file (permanent removal)
 ```sql
 DELETE FROM files 

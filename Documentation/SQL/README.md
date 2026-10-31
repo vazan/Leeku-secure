@@ -40,6 +40,25 @@ sqlcmd -S your-sql-server -d LeekuSecure -U sa -P <password> -i 2026-07-25-mssql
 
 ---
 
+### 0b. `2026-10-31-add-deleted-at-column.sql` - Trash / Recycle Bin Support
+**Purpose:** Adds the `files.deleted_at` column that powers soft-delete / Trash. Files moved to trash are marked with `deleted_at` (instead of being hard-deleted) and purged after `TRASH_RETENTION_DAYS` (default 90).
+
+**Applies/ensures:**
+- `files.deleted_at` `DATETIMEOFFSET(7) NULL` column
+- Safe for existing deployments created before the Trash feature
+
+**How to run:**
+```powershell
+sqlcmd -S your-sql-server -d LeekuSecure -U sa -P <password> -i 2026-10-31-add-deleted-at-column.sql
+```
+
+**When to run:**
+- Existing databases whose `files` table predates the Trash / recycle bin feature.
+- `production_schema.sql` already includes the column for fresh installs.
+- Safe to rerun (idempotent — column check is guarded by `COL_LENGTH`).
+
+---
+
 ### 1. `production_schema.sql` - **Single Source of Truth** ⭐ **RECOMMENDED**
 **Purpose:** Complete, production-ready database schema in a single file.
 
@@ -349,6 +368,8 @@ If you have an older database schema:
 6. **Validate:** Run verification queries to confirm
 
 See `VALIDATION.md` (if available) for detailed migration steps.
+
+**Trash / Recycle Bin:** If your existing `files` table predates the Trash feature, run `2026-10-31-add-deleted-at-column.sql` to add the `deleted_at` column. Fresh installs get it automatically via `production_schema.sql`.
 
 ---
 
