@@ -4910,10 +4910,22 @@ function generateFileThumbnail(fileId: string): Promise<Buffer | null> {
           FROM files f INNER JOIN file_encryption_keys k ON k.file_id=f.id
           WHERE f.id=@id AND f.status='Available' AND f.deleted_at IS NULL
             AND (f.expires_at IS NULL OR f.expires_at>CURRENT_TIMESTAMP)
-            AND f.client_secret_hash IS NULL AND f.mime_type LIKE 'image/%' AND f.size_bytes<=@maxBytes`);
+            AND f.client_secret_hash IS NULL AND f.mime_type LIKE 'image/%' AND f.size_bytes<=@maxBytes
+            AND COALESCE(f.thumbnail_excluded, FALSE) = FALSE`);
       const file = result.recordset[0];
       if (!file) {
-        console.warn(`[generateFileThumbnail] No file found for ID: ${fileId}`);
+        // No eligible row: the file either doesn't exist, isn't an eligible
+        // image, or was permanently excluded after a failed generation.
+        const exclCheck = await getRequest();
+        exclCheck.input('cid', sql.UniqueIdentifier, fileId);
+        const exclResult = await exclCheck.query<{ thumbnail_excluded: boolean | null }>(
+          'SELECT thumbnail_excluded FROM files WHERE id = @cid'
+        );
+        if (exclResult.recordset[0]?.thumbnail_excluded) {
+          // console.warn(`[generateFileThumbnail] File ${fileId} is thumbnail_excluded (permanently skipped).`);
+        } else {
+          console.warn(`[generateFileThumbnail] No file found for ID: ${fileId}`);
+        }
         return null;
       }
     const vaultPath = path.resolve(FILE_VAULT, file.stored_path);
