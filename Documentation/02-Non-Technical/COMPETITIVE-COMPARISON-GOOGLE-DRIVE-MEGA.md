@@ -73,7 +73,6 @@ However, it **lacks several consumer-facing features** that both Google Drive an
 | 2FA / MFA | ❌ | ✅ (TOTP/security keys) | ✅ (TOTP) | **GAP: Add Two-Factor Authentication** (critical) |
 | Session management | ✅ (revoke sessions, IP/UA tracking) | ✅ (Google account sessions) | ✅ | Parity |
 | Malware scanning | ✅ Bitdefender | ⚠️ (limited) | ✅ | Leeku advantage |
-| AI scan summaries | ⚠️ Optional Gemini integration | ❌ | ❌ | Leeku advantage |
 | File-level client-side secret | ✅ Optional PBKDF2 layer | ❌ | ⚠️ | Leeku advantage |
 | Account deletion (two-step) | ✅ | ✅ | ✅ | Parity |
 | Password reset (email) | ✅ | ✅ | ✅ | Parity |
@@ -86,10 +85,10 @@ However, it **lacks several consumer-facing features** that both Google Drive an
 
 | Feature | Leeku Secure | Google Drive | Mega.nz | Notes |
 |---|---|---|---|---|
-| Desktop app | ⚠️ (desktop-updates route for deployment) | ✅ (Drive for desktop) | ✅ (MEGA Desktop) | **GAP: Build a native desktop client** (Leeku has an app ecosystem but limited) |
+| Desktop app | ✅ (Leeku-desktop side project) | ✅ (Drive for desktop) | ✅ (MEGA Desktop)
 | Mobile app (iOS/Android) | ❌ | ✅ | ✅ | **GAP: Build mobile apps** |
 | Offline access | ❌ | ✅ (Drive for desktop + mobile offline) | ✅ (desktop sync) | **GAP** |
-| File syncing (automatic) | ❌ | ✅ | ✅ (MEGA Sync) | **GAP: Add folder sync client** |
+| File syncing (automatic) | ✅ (Leeku-desktop side project)| ✅ | ✅ (MEGA Sync) | **GAP: Add folder sync client** |
 | Browser extension | ❌ | ✅ (via Drive) | ✅ (MEGA extension) | **GAP** |
 | Command-line tool | ⚠️ | ✅ (gcloud CLI) | ✅ (MEGA CMD) | Parity |
 
@@ -136,7 +135,7 @@ However, it **lacks several consumer-facing features** that both Google Drive an
 
 | # | Gap | Impact | Suggested Solution | Effort |
 |---|---|---|---|---|
-| 11 | Native Desktop Client | Desktop-updates route exists but no packaged installer UX | Package Electron/Tauri app using existing desktop-updates distribution | XL |
+| 11 | ~~Native Desktop Client~~  ✅ **Implemented** | Desktop-updates route exists but no packaged installer UX | Package Electron/Tauri app using existing desktop-updates distribution | XL |
 | 12 | Mobile Apps | No iOS/Android apps | React Native / Capacitor wrapper over web app | XL |
 | 13 | Offline / Sync Client | No local sync | Add desktop sync folder mirroring (like Mega Sync) | XL |
 | 14 | Browser Extension | Competitors offer quick-access extensions | Chrome/Firefox extension hitting API | M |
