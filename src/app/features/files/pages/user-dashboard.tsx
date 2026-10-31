@@ -2771,34 +2771,36 @@ export default function UserDashboard({
                       {trashFiles.map((file) => (
                         <div
                           key={file.id}
-                          className="flex items-center gap-3 rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] p-3 shadow-[var(--shadow-hairline)]"
+                          className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] p-3 shadow-[var(--shadow-hairline)]"
                         >
-                          <FileThumbnail
-                            file={file}
-                            token={token}
-                            className="h-12 w-12 shrink-0 rounded-lg"
-                            iconClassName="h-6 w-6"
-                            showTypeBadge={false}
-                          />
-                          <div className="min-w-0 flex-1">
-                            <div className="flex items-center gap-2">
-                              <p className="truncate text-sm font-medium">{file.original_name}</p>
-                              {file.version_count != null && (
-                                <span className="inline-flex flex-none items-center rounded-full border border-[var(--border-subtle)] bg-[var(--bg-muted)] px-2 py-0.5 text-[11px] font-medium text-[var(--text-muted)]">
-                                  Version {file.version_count}
-                                </span>
-                              )}
+                          <div className="flex min-w-0 items-center gap-3">
+                            <FileThumbnail
+                              file={file}
+                              token={token}
+                              className="h-12 w-12 shrink-0 rounded-lg"
+                              iconClassName="h-6 w-6"
+                              showTypeBadge={false}
+                            />
+                            <div className="min-w-0 flex-1">
+                              <div className="flex items-center gap-2">
+                                <p className="truncate text-sm font-medium">{file.original_name}</p>
+                                {file.version_count != null && (
+                                  <span className="inline-flex flex-none items-center rounded-full border border-[var(--border-subtle)] bg-[var(--bg-muted)] px-2 py-0.5 text-[11px] font-medium text-[var(--text-muted)]">
+                                    Version {file.version_count}
+                                  </span>
+                                )}
+                              </div>
+                              <p className="mt-0.5 truncate text-xs text-[var(--text-muted)]">
+                                Deleted {file.deleted_at ? new Date(file.deleted_at).toLocaleDateString() : ""}
+                                {file.folder_id ? " · from folder" : ""}
+                              </p>
                             </div>
-                            <p className="mt-0.5 text-xs text-[var(--text-muted)]">
-                              Deleted {file.deleted_at ? new Date(file.deleted_at).toLocaleDateString() : ""}
-                              {file.folder_id ? " · from folder" : ""}
-                            </p>
                           </div>
-                          <div className="flex shrink-0 items-center gap-1.5">
+                          <div className="mt-3 flex shrink-0 items-center gap-1.5 sm:mt-0">
                             <button
                               type="button"
                               onClick={() => restoreFile(file)}
-                              className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--border-subtle)] px-3 py-2 text-xs font-medium text-[var(--success-linear)] hover:bg-[color-mix(in_srgb,var(--success-linear)_12%,transparent)]"
+                              className="inline-flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-[var(--border-subtle)] px-3 py-2 text-xs font-medium text-[var(--success-linear)] hover:bg-[color-mix(in_srgb,var(--success-linear)_12%,transparent)] sm:flex-none"
                             >
                               <RotateCcw className="h-3.5 w-3.5" />
                               Restore
@@ -2806,7 +2808,7 @@ export default function UserDashboard({
                             <button
                               type="button"
                               onClick={() => deletePermanently(file)}
-                              className="inline-flex items-center gap-1.5 rounded-lg border border-[color-mix(in_srgb,var(--error-linear)_42%,transparent)] px-3 py-2 text-xs font-medium text-[var(--error-linear)] hover:bg-[color-mix(in_srgb,var(--error-linear)_12%,transparent)]"
+                              className="inline-flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-[color-mix(in_srgb,var(--error-linear)_42%,transparent)] px-3 py-2 text-xs font-medium text-[var(--error-linear)] hover:bg-[color-mix(in_srgb,var(--error-linear)_12%,transparent)] sm:flex-none"
                             >
                               <Trash2 className="h-3.5 w-3.5" />
                               Delete
@@ -2827,38 +2829,40 @@ export default function UserDashboard({
                         {trashVersions.map((version) => (
                           <div
                             key={version.id}
-                            className="flex items-center gap-3 rounded-xl border border-dashed border-[var(--border-subtle)] bg-[var(--bg-panel)] p-3 shadow-[var(--shadow-hairline)]"
+                            className="rounded-xl border border-dashed border-[var(--border-subtle)] bg-[var(--bg-panel)] p-3 shadow-[var(--shadow-hairline)]"
                           >
-                            <div className="grid h-12 w-12 shrink-0 place-items-center rounded-lg bg-[var(--bg-muted)] text-[var(--text-muted)]">
-                              <Layers className="h-6 w-6" />
-                            </div>
-                            <div className="min-w-0 flex-1">
-                              <div className="flex items-center gap-2">
-                                <p className="truncate text-sm font-medium">
-                                  {version.original_name}
-                                </p>
-                                <span className="inline-flex flex-none items-center rounded-full border border-[var(--border-subtle)] bg-[var(--bg-muted)] px-2 py-0.5 text-[11px] font-medium text-[var(--text-muted)]">
-                                  v{version.version_no}
-                                </span>
-                                <span className="inline-flex flex-none items-center rounded-full bg-[color-mix(in_srgb,var(--text-muted)_15%,transparent)] px-2 py-0.5 text-[10px] font-semibold text-[var(--text-muted)]">
-                                  VERSION IN TRASH
-                                </span>
+                            <div className="flex min-w-0 items-center gap-3">
+                              <div className="grid h-12 w-12 shrink-0 place-items-center rounded-lg bg-[var(--bg-muted)] text-[var(--text-muted)]">
+                                <Layers className="h-6 w-6" />
                               </div>
-                              <p className="mt-0.5 text-xs text-[var(--text-muted)]">
-                                {version.file_name ? `of "${version.file_name}" · ` : ""}
-                                {formatBytes(version.size_bytes)} · Deleted{" "}
-                                {version.deleted_at
-                                  ? new Date(version.deleted_at).toLocaleDateString()
-                                  : ""}
-                              </p>
+                              <div className="min-w-0 flex-1">
+                                <div className="flex items-center gap-2">
+                                  <p className="truncate text-sm font-medium">
+                                    {version.original_name}
+                                  </p>
+                                  <span className="inline-flex flex-none items-center rounded-full border border-[var(--border-subtle)] bg-[var(--bg-muted)] px-2 py-0.5 text-[11px] font-medium text-[var(--text-muted)]">
+                                    v{version.version_no}
+                                  </span>
+                                  <span className="inline-flex flex-none items-center rounded-full bg-[color-mix(in_srgb,var(--text-muted)_15%,transparent)] px-2 py-0.5 text-[10px] font-semibold text-[var(--text-muted)]">
+                                    VERSION IN TRASH
+                                  </span>
+                                </div>
+                                <p className="mt-0.5 truncate text-xs text-[var(--text-muted)]">
+                                  {version.file_name ? `of "${version.file_name}" · ` : ""}
+                                  {formatBytes(version.size_bytes)} · Deleted{" "}
+                                  {version.deleted_at
+                                    ? new Date(version.deleted_at).toLocaleDateString()
+                                    : ""}
+                                </p>
+                              </div>
                             </div>
-                            <div className="flex shrink-0 items-center gap-1.5">
+                            <div className="mt-3 flex shrink-0 items-center gap-1.5 sm:mt-0">
                               <button
                                 type="button"
                                 onClick={() =>
                                   version.file_id && restoreVersionFromTrash(version.file_id, version)
                                 }
-                                className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--border-subtle)] px-3 py-2 text-xs font-medium text-[var(--success-linear)] hover:bg-[color-mix(in_srgb,var(--success-linear)_12%,transparent)]"
+                                className="inline-flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-[var(--border-subtle)] px-3 py-2 text-xs font-medium text-[var(--success-linear)] hover:bg-[color-mix(in_srgb,var(--success-linear)_12%,transparent)] sm:flex-none"
                               >
                                 <RotateCcw className="h-3.5 w-3.5" />
                                 Restore
@@ -2868,7 +2872,7 @@ export default function UserDashboard({
                                 onClick={() =>
                                   version.file_id && permanentDeleteVersion(version.file_id, version)
                                 }
-                                className="inline-flex items-center gap-1.5 rounded-lg border border-[color-mix(in_srgb,var(--error-linear)_42%,transparent)] px-3 py-2 text-xs font-medium text-[var(--error-linear)] hover:bg-[color-mix(in_srgb,var(--error-linear)_12%,transparent)]"
+                                className="inline-flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-[color-mix(in_srgb,var(--error-linear)_42%,transparent)] px-3 py-2 text-xs font-medium text-[var(--error-linear)] hover:bg-[color-mix(in_srgb,var(--error-linear)_12%,transparent)] sm:flex-none"
                               >
                                 <Trash2 className="h-3.5 w-3.5" />
                                 Delete
