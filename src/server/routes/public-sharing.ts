@@ -30,6 +30,19 @@ interface ShareRow {
   allow_decrypted_external_preview: boolean;
 }
 
+// ── Version-aware share resolution joins ──────────────────────
+// A share link targets the CURRENT version when `share_links.version_id` IS NULL,
+// or a specific archival version when it's set. These LEFT JOINs bring in the
+// archived `file_versions` / `file_version_keys` (when pinned) alongside the
+// current `files` / `file_encryption_keys`. Every consumer COALESCEs the version
+// columns OVER the current ones, so the same SELECT shape serves both cases.
+// The owner still comes from the logical file (`files f`), so `users` joins stay
+// stable.
+const SHARE_VERSION_JOINS = `
+         LEFT JOIN file_versions v ON sl.version_id IS NOT NULL AND sl.version_id = v.id
+         LEFT JOIN file_version_keys vk ON vk.version_id = v.id
+         LEFT JOIN file_encryption_keys k ON sl.version_id IS NULL AND f.id = k.file_id`;
+
 type DownloadPreparationPhase = 'decrypting' | 'verifying' | 'finalizing' | 'ready' | 'error';
 
 interface PublicDownloadSession {
@@ -428,12 +441,14 @@ const buildPromise = (async () => {
         owner_username_encrypted: Buffer; owner_username_iv: Buffer; owner_username_auth_tag: Buffer;
       }>(
         `SELECT sl.id,u.id AS owner_user_id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.allow_external_preview,sl.allow_decrypted_external_preview,
-                f.status AS file_status,f.leeku_vibe,f.mime_type,f.size_bytes,f.created_at AS file_created_at,f.stored_path,f.client_secret_hash,
-                f.original_name_encrypted,f.original_name_iv,f.original_name_auth_tag,
+                COALESCE(v.status,f.status) AS file_status,f.leeku_vibe,COALESCE(v.mime_type,f.mime_type) AS mime_type,COALESCE(v.size_bytes,f.size_bytes) AS size_bytes,COALESCE(v.created_at,f.created_at) AS file_created_at,COALESCE(v.stored_path,f.stored_path) AS stored_path,
+                COALESCE(v.client_secret_hash,f.client_secret_hash) AS client_secret_hash,
+                COALESCE(v.original_name_encrypted,f.original_name_encrypted) AS original_name_encrypted,COALESCE(v.original_name_iv,f.original_name_iv) AS original_name_iv,COALESCE(v.original_name_auth_tag,f.original_name_auth_tag) AS original_name_auth_tag,
                 u.username_encrypted AS owner_username_encrypted,u.username_iv AS owner_username_iv,u.username_auth_tag AS owner_username_auth_tag
          FROM share_links sl
          INNER JOIN files f ON sl.file_id=f.id
          INNER JOIN users u ON f.owner_user_id=u.id
+         ${SHARE_VERSION_JOINS}
          WHERE sl.public_token=@tok`
       );
       const row = result.recordset[0];
@@ -491,13 +506,13 @@ const buildPromise = (async () => {
         encrypted_key: Buffer; key_iv: Buffer; key_auth_tag: Buffer; file_iv: Buffer; file_auth_tag: Buffer;
       }>(
         `SELECT sl.id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.allow_external_preview,
-                f.id AS file_id_join,f.status AS file_status,f.stored_path,f.mime_type,f.size_bytes,f.checksum_sha256,
-                f.client_secret_hash,f.client_crypto_salt,f.client_crypto_iv,f.client_crypto_iterations,
-                f.original_name_encrypted,f.original_name_iv,f.original_name_auth_tag,
-                k.encrypted_key,k.key_iv,k.key_auth_tag,k.file_iv,k.file_auth_tag
+                COALESCE(v.id,f.id) AS file_id_join,COALESCE(v.status,f.status) AS file_status,COALESCE(v.stored_path,f.stored_path) AS stored_path,COALESCE(v.mime_type,f.mime_type) AS mime_type,COALESCE(v.size_bytes,f.size_bytes) AS size_bytes,COALESCE(v.checksum_sha256,f.checksum_sha256) AS checksum_sha256,
+                COALESCE(v.client_secret_hash,f.client_secret_hash) AS client_secret_hash,COALESCE(v.client_crypto_salt,f.client_crypto_salt) AS client_crypto_salt,COALESCE(v.client_crypto_iv,f.client_crypto_iv) AS client_crypto_iv,COALESCE(v.client_crypto_iterations,f.client_crypto_iterations) AS client_crypto_iterations,
+                COALESCE(v.original_name_encrypted,f.original_name_encrypted) AS original_name_encrypted,COALESCE(v.original_name_iv,f.original_name_iv) AS original_name_iv,COALESCE(v.original_name_auth_tag,f.original_name_auth_tag) AS original_name_auth_tag,
+                COALESCE(vk.encrypted_key,k.encrypted_key) AS encrypted_key,COALESCE(vk.key_iv,k.key_iv) AS key_iv,COALESCE(vk.key_auth_tag,k.key_auth_tag) AS key_auth_tag,COALESCE(vk.file_iv,k.file_iv) AS file_iv,COALESCE(vk.file_auth_tag,k.file_auth_tag) AS file_auth_tag
          FROM share_links sl
          INNER JOIN files f ON sl.file_id=f.id
-         INNER JOIN file_encryption_keys k ON f.id=k.file_id
+         ${SHARE_VERSION_JOINS}
          WHERE sl.public_token=@tok`,
       );
       const row = result.recordset[0];
@@ -609,12 +624,13 @@ const buildPromise = (async () => {
       owner_username_encrypted: Buffer; owner_username_iv: Buffer; owner_username_auth_tag: Buffer;
     }>(
       `SELECT sl.id,u.id AS owner_user_id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.allow_external_preview,
-              f.status AS file_status,f.mime_type,f.size_bytes,f.created_at AS file_created_at,f.stored_path,
-              f.original_name_encrypted,f.original_name_iv,f.original_name_auth_tag,
+              COALESCE(v.status,f.status) AS file_status,COALESCE(v.mime_type,f.mime_type) AS mime_type,COALESCE(v.size_bytes,f.size_bytes) AS size_bytes,COALESCE(v.created_at,f.created_at) AS file_created_at,COALESCE(v.stored_path,f.stored_path) AS stored_path,
+              COALESCE(v.original_name_encrypted,f.original_name_encrypted) AS original_name_encrypted,COALESCE(v.original_name_iv,f.original_name_iv) AS original_name_iv,COALESCE(v.original_name_auth_tag,f.original_name_auth_tag) AS original_name_auth_tag,
               u.username_encrypted AS owner_username_encrypted,u.username_iv AS owner_username_iv,u.username_auth_tag AS owner_username_auth_tag
        FROM share_links sl
        INNER JOIN files f ON sl.file_id=f.id
        INNER JOIN users u ON f.owner_user_id=u.id
+       ${SHARE_VERSION_JOINS}
        WHERE sl.public_token=@tok`
     );
     const row = result.recordset[0];
@@ -746,13 +762,13 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
         encrypted_key: Buffer; key_iv: Buffer; key_auth_tag: Buffer; file_iv: Buffer; file_auth_tag: Buffer;
       }>(
         `SELECT sl.id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.allow_external_preview,
-          f.id AS file_id_join,f.status AS file_status,f.stored_path,f.mime_type,f.size_bytes,f.encrypted_size_bytes,f.checksum_sha256,
-                f.client_secret_hash,f.client_crypto_salt,f.client_crypto_iv,f.client_crypto_iterations,
-                f.original_name_encrypted,f.original_name_iv,f.original_name_auth_tag,
-                k.encrypted_key,k.key_iv,k.key_auth_tag,k.file_iv,k.file_auth_tag
+          COALESCE(v.id,f.id) AS file_id_join,COALESCE(v.status,f.status) AS file_status,COALESCE(v.stored_path,f.stored_path) AS stored_path,COALESCE(v.mime_type,f.mime_type) AS mime_type,COALESCE(v.size_bytes,f.size_bytes) AS size_bytes,COALESCE(v.encrypted_size_bytes,f.encrypted_size_bytes) AS encrypted_size_bytes,COALESCE(v.checksum_sha256,f.checksum_sha256) AS checksum_sha256,
+                COALESCE(v.client_secret_hash,f.client_secret_hash) AS client_secret_hash,COALESCE(v.client_crypto_salt,f.client_crypto_salt) AS client_crypto_salt,COALESCE(v.client_crypto_iv,f.client_crypto_iv) AS client_crypto_iv,COALESCE(v.client_crypto_iterations,f.client_crypto_iterations) AS client_crypto_iterations,
+                COALESCE(v.original_name_encrypted,f.original_name_encrypted) AS original_name_encrypted,COALESCE(v.original_name_iv,f.original_name_iv) AS original_name_iv,COALESCE(v.original_name_auth_tag,f.original_name_auth_tag) AS original_name_auth_tag,
+                COALESCE(vk.encrypted_key,k.encrypted_key) AS encrypted_key,COALESCE(vk.key_iv,k.key_iv) AS key_iv,COALESCE(vk.key_auth_tag,k.key_auth_tag) AS key_auth_tag,COALESCE(vk.file_iv,k.file_iv) AS file_iv,COALESCE(vk.file_auth_tag,k.file_auth_tag) AS file_auth_tag
          FROM share_links sl
          INNER JOIN files f ON sl.file_id=f.id
-         INNER JOIN file_encryption_keys k ON f.id=k.file_id
+         ${SHARE_VERSION_JOINS}
          WHERE sl.public_token=@tok`
       );
       const row = result.recordset[0];
@@ -989,15 +1005,15 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
       }>(
         `SELECT sl.id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.allow_external_preview,sl.allow_decrypted_external_preview,
                 u.id AS owner_user_id,
-                f.id AS file_id_join,f.status AS file_status,f.stored_path,f.mime_type,f.size_bytes,f.checksum_sha256,
-                f.client_secret_hash,
-                f.original_name_encrypted,f.original_name_iv,f.original_name_auth_tag,
+                COALESCE(v.id,f.id) AS file_id_join,COALESCE(v.status,f.status) AS file_status,COALESCE(v.stored_path,f.stored_path) AS stored_path,COALESCE(v.mime_type,f.mime_type) AS mime_type,COALESCE(v.size_bytes,f.size_bytes) AS size_bytes,COALESCE(v.checksum_sha256,f.checksum_sha256) AS checksum_sha256,
+                COALESCE(v.client_secret_hash,f.client_secret_hash) AS client_secret_hash,
+                COALESCE(v.original_name_encrypted,f.original_name_encrypted) AS original_name_encrypted,COALESCE(v.original_name_iv,f.original_name_iv) AS original_name_iv,COALESCE(v.original_name_auth_tag,f.original_name_auth_tag) AS original_name_auth_tag,
                 u.username_encrypted AS owner_username_encrypted,u.username_iv AS owner_username_iv,u.username_auth_tag AS owner_username_auth_tag,
-                k.encrypted_key,k.key_iv,k.key_auth_tag,k.file_iv,k.file_auth_tag
+                COALESCE(vk.encrypted_key,k.encrypted_key) AS encrypted_key,COALESCE(vk.key_iv,k.key_iv) AS key_iv,COALESCE(vk.key_auth_tag,k.key_auth_tag) AS key_auth_tag,COALESCE(vk.file_iv,k.file_iv) AS file_iv,COALESCE(vk.file_auth_tag,k.file_auth_tag) AS file_auth_tag
          FROM share_links sl
          INNER JOIN files f ON sl.file_id=f.id
          INNER JOIN users u ON f.owner_user_id=u.id
-         INNER JOIN file_encryption_keys k ON f.id=k.file_id
+         ${SHARE_VERSION_JOINS}
          WHERE sl.public_token=@tok`
       );
       const row = result.recordset[0];

@@ -20,6 +20,7 @@ Classe : CRITICAL — DB migration (public schema contract) + new routes in `src
 | `src/app/features/files/pages/user-dashboard.tsx` | Full §3.4 UI: versions drawer, per-version quota/total, restore/share/preview wiring, version-pinned ShareDialog hint |
 | `scripts/backfill-file-hashes.ts` (+ `package.json` script) | One-time backfill: populate `files.file_name_hash` for pre-migration rows (NULL hash) so same-name versioning works for all existing files |
 | `src/server.ts` | Upload same-name detection fallback for pre-migration rows with NULL hash (bounded scan by decrypted name) |
+| `src/server/routes/public-sharing.ts` | Version-aware public share resolution: metadata, preview, download, OG, and embed honor `share_links.version_id` (COALESCE archived version over current) |
 
 ## Contrats publics impactés
 OUI (schema):
@@ -58,15 +59,21 @@ Regressão: existing SELECTs on `files`/`share_links` without the new columns ar
 Compat: MSSQL-only; PostgreSQL parity deferred.
 
 ## Dette observée
-MAJOR — Public share resolution (`public-sharing.ts`, `public-folder-sharing.ts`, `desktop-updates.ts`)
-does not yet honor `share_links.version_id`; a pinned share link still resolves to the current version's
-blob. Wiring the join/pin is a follow-up (out of the enumerated plan steps that are scoped to server.ts +
-migration). Also `mapShareRow`/`ShareRow` do not surface `version_id` in the API response.
+RESOLVED (this session) — Public share resolution now honors `share_links.version_id` in
+`src/server/routes/public-sharing.ts`: the metadata, text-preview, download, OpenGraph, and external
+media-embed handlers resolve a pinned share to the archived `file_versions` / `file_version_keys` row
+(COALESCE over the current `files` / `file_encryption_keys` when `version_id IS NULL`). Guards (Blocked,
+secret-key, password, expiry, download-limit) all apply to the resolved version's own data. `desktop-updates.ts`
+needs no change (no `share_links` versioning); `public-folder-sharing.ts` shares folders, not versions.
+
+REMAINING — `mapShareRow`/`ShareRow` do not surface `version_id` in the authenticated API response (the value
+already round-trips into share-create). Minor; the version id is not needed to resolve the share downstream.
 
 BACKEND debt (follow-up, session owner decisions #1–#3 scoped frontend-only):
-- No per-version preview / per-version share backend endpoints exist yet — the UI only previews the
-  current version and pins `version_id` on the existing share-create endpoint.
-- The `version_id` pinned on a share link is stored but not yet resolved server-side (see public-share debt).
+- The archived-version text preview still goes through the generic share preview endpoint (no dedicated
+  per-version preview route exists), which now correctly resolves the pinned version's bytes.
+- A share pinned to a version that is later deleted degrades gracefully to the current version (LEFT JOIN
+  yields NULL) rather than 404ing.
 
 FRONTEND debt (documented in code comments):
 - Preview of archived versions shows a notice ("Preview is only available for the current version right now.")
@@ -112,7 +119,8 @@ Surfaces / cas-limites / risques:
 
 ## Handoff QaEngineer
 Validation: type-check ✅; server bundle ✅; vite build ✅; test:desktop-updates ✅ (2/2). CRITICAL approval state:
-N/A (pre-approved start, resumed here). Remaining functional debt: public share resolution + ShareRow `version_id`
-surfacing + per-version preview/share backend endpoints. Recommend running the migration against a disposable MSSQL
-instance, a manual end-to-end upload→version→restore smoke, and a browser pass of the dashboard versions drawer
-before production deploy.
+N/A (pre-approved start, resumed here). Per-version share resolution implemented in `public-sharing.ts`.
+Remaining minor debt: ShareRow `version_id` surfacing; archived preview + share-backend endpoints. Recommend
+running the migration against a disposable MSSQL instance, a manual end-to-end upload→version→restore→share-
+version smoke (verify a shared v-N link downloads the v-N blob/name), and a browser pass of the dashboard
+versions drawer before production deploy.
