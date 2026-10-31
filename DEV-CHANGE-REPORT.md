@@ -232,3 +232,47 @@ Remaining minor debt: ShareRow `version_id` surfacing; archived preview + share-
 running the migration against a disposable MSSQL instance, a manual end-to-end upload→version→restore→share-
 version smoke (verify a shared v-N link downloads the v-N blob/name), and a browser pass of the dashboard
 versions drawer before production deploy.
+
+---
+
+# BUGFIX — "Version not found." when downloading the current version
+
+## Intention
+Fix the "Version not found." error when a user clicks **Download** on the **current version**
+(e.g. v7, the file itself) inside the Versions drawer under "All Files".
+
+## Changement
+Classe : STANDARD — single-route backend fix in `src/server.ts`; no schema or contract changes.
+
+## Root cause
+`GET /api/files/:id/versions` synthesizes the **current** version entry with `id = file.id`, because in
+Model B the current version lives in the `files` table (not `file_versions`). The Download button posts
+`/api/files/:id/versions/<version.id>/download` with `version.id === file.id`, but that endpoint ONLY
+queries `file_versions WHERE id=@vid AND file_id=@fid`. Since the current version has no `file_versions`
+row, the lookup returns empty → HTTP 404 **"Version not found."** Preview works because the Preview button
+is only rendered for the current version and reuses `/api/files/:id/preview`, which reads the `files`
+table.
+
+## Fichiers
+| Fichier | Raison |
+|---|---|
+| `src/server.ts` (`GET /api/files/:id/versions/:versionId/download`) | When `versionId === fileId`, stream the current version from the `files` blob + `file_encryption_keys` (mirrors the existing `/api/files/:id/download` handler: decrypt → checksum → secret-key → stream). Archived versions keep the existing `file_versions` path. |
+
+## Contrats publics impactés
+NON — same URL, same auth, same response shape.
+
+## Validation
+Build: ✅ (`tsc --noEmit`; esbuild server bundle OK)  Lint: ✅  Type-check: ✅
+Smoke: ⚠SKIPPED (no reachable MSSQL harness in this environment).
+
+## Handoff TestEngineer — targeted regression
+1. Open Versions drawer for a file with ≥1 version. Click **Download** on the CURRENT version
+   (badge "CURRENT") → must stream the current blob+name, not 404 "Version not found.".
+2. Click **Download** on an archived (non-current) version → still downloads correctly (unchanged path).
+3. Current version guarded with a secret key → secret prompt enforced; wrong key → 403 "Incorrect secret key."
+4. Current version `Blocked` → 410 "Blocked files cannot be downloaded."
+5. Owner vs Admin auth on the current-version download → unchanged (owner or Admin only).
+6. Trashed version download → still 410 (unchanged).
+
+## Handoff QaEngineer
+Manual browser smoke recommended for the 6 cases above on the feature branch before merge.

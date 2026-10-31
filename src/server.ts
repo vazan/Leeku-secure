@@ -4225,6 +4225,82 @@ app.get('/api/files/:id/versions/:versionId/download', authenticateUser as expre
     if (owner !== req.userId && req.user!.role !== 'Admin')
       { cleanupTemp(); return res.status(403).json({ error: 'You do not have permission to download this file.' }); }
 
+    // The versions list synthesizes the CURRENT version with id = file.id (it lives in
+    // `files`, not `file_versions`). Route a download of the current version to the
+    // `files` blob so it doesn't 404 "Version not found." against the archive table.
+    if (versionId === fileId) {
+      const curReq = await getRequest();
+      curReq.input('id', sql.UniqueIdentifier, fileId);
+      const curRes = await curReq.query<FileRow>(
+        `SELECT id,owner_user_id,original_name_encrypted,original_name_iv,original_name_auth_tag,
+                stored_path,size_bytes,status,mime_type,encrypted_size_bytes,checksum_sha256,
+                scan_result,scan_message,is_encrypted,leeku_vibe,ttl_hours,
+                client_secret_hash,client_crypto_salt,client_crypto_iv,client_crypto_iterations,
+                expires_at,created_at
+         FROM files WHERE id=@id`
+      );
+      if (!curRes.recordset.length) { cleanupTemp(); return res.status(404).json({ error: 'File not found.' }); }
+      const current = curRes.recordset[0];
+      if (current.status === 'Blocked')
+        { cleanupTemp(); return res.status(410).json({ error: 'Blocked files cannot be downloaded.' }); }
+
+      const vaultPath = path.join(FILE_VAULT, current.stored_path);
+      if (!fs.existsSync(vaultPath)) { cleanupTemp(); return res.status(410).json({ error: 'Vault file not found.' }); }
+
+      const curKeyReq = await getRequest();
+      curKeyReq.input('fid', sql.UniqueIdentifier, fileId);
+      const curKeyRes = await curKeyReq.query<{
+        encrypted_key: Buffer; key_iv: Buffer; key_auth_tag: Buffer; file_iv: Buffer; file_auth_tag: Buffer;
+      }>('SELECT encrypted_key,key_iv,key_auth_tag,file_iv,file_auth_tag FROM file_encryption_keys WHERE file_id=@fid');
+      if (!curKeyRes.recordset.length) { cleanupTemp(); return res.status(500).json({ error: 'Encryption key not found.' }); }
+      const curKey = curKeyRes.recordset[0];
+      const fileKey = unwrapKey(curKey.encrypted_key, curKey.key_iv, curKey.key_auth_tag);
+
+      const secretHeaderRaw2 = req.headers['x-file-secret'];
+      const providedSecret2 = Array.isArray(secretHeaderRaw2)
+        ? String(secretHeaderRaw2[0] || '').trim()
+        : String(secretHeaderRaw2 || '').trim();
+      if (current.client_secret_hash) {
+        if (!providedSecret2) { cleanupTemp(); return res.status(403).json({ error: 'This version requires a secret key to download.' }); }
+        if (!(await verifyFileSecret(providedSecret2, current.client_secret_hash)))
+          { cleanupTemp(); return res.status(403).json({ error: 'Incorrect secret key.' }); }
+      }
+
+      tempPath = buildUniqueTempFilePath(UPLOAD_TEMP, 'leeku-ver', versionId);
+      registerTempFile(tempPath);
+
+      const hash2 = crypto.createHash('sha256');
+      await decryptFileStream(vaultPath, tempPath, fileKey, curKey.file_iv, curKey.file_auth_tag, undefined, hash2);
+      if (tempFileCleaned) return;
+      if (hash2.digest('hex') !== current.checksum_sha256)
+        { cleanupTemp(); return res.status(500).json({ error: 'File integrity check failed.' }); }
+
+      if (current.client_secret_hash) {
+        if (!current.client_crypto_salt || !current.client_crypto_iv || !current.client_crypto_iterations)
+          { cleanupTemp(); return res.status(500).json({ error: 'Secret-key metadata is missing for this version.' }); }
+        try {
+          await decryptClientProtectedFileInPlace(tempPath, providedSecret2, current.client_crypto_salt, current.client_crypto_iv, current.client_crypto_iterations);
+        } catch { cleanupTemp(); return res.status(403).json({ error: 'Incorrect secret key.' }); }
+      }
+
+      const currentName = decryptColumn(current.original_name_encrypted, current.original_name_iv, current.original_name_auth_tag);
+      const safeName = currentName.replace(/\"/g, '\\"');
+      const currentStat = fs.statSync(tempPath);
+
+      res.setHeader('Content-Type', current.mime_type || 'application/octet-stream');
+      res.setHeader('Content-Disposition', `attachment; filename="${safeName}"`);
+      res.setHeader('Content-Length', currentStat.size.toString());
+      await logSystemEvent(req.userId!, req.user!.username, 'Download', 'File', fileId, req, `Download of "${currentName}" (current version).`);
+
+      const readStream = fs.createReadStream(tempPath);
+      readStream.pipe(res);
+      readStream.on('end',   cleanupTemp);
+      readStream.on('error', cleanupTemp);
+      res.on('finish',       cleanupTemp);
+      res.on('close',        cleanupTemp);
+      return;
+    }
+
     const verReq = await getRequest();
     verReq.input('vid', sql.UniqueIdentifier, versionId);
     verReq.input('fid', sql.UniqueIdentifier, fileId);
