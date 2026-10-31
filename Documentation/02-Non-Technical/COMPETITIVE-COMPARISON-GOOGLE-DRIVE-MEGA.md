@@ -36,7 +36,7 @@ However, it **lacks several consumer-facing features** that both Google Drive an
 | Audio preview | ✅ Native in-app `<audio>` player | ✅ | ✅ | Parity |
 | PDF preview | ❌ | ✅ | ✅ | **GAP** |
 | Search | ❌ Frontend text input only (client-side filter) | ✅ Full-text indexed search | ✅ Full-text search | **GAP: Add indexed server-side search** |
-| File versioning / history | ❌ | ✅ (Drive retains versions of Google Docs & uploaded files for 30 days) | ⚠️ (basic) | **GAP: Add file version history** |
+| File versioning / history | ✅ Unlimited version history (upload same name → new version, download/restore/delete per version) | ✅ (Drive retains versions of Google Docs & uploaded files for 30 days) | ⚠️ (basic) | Leeku advantage: versions retained indefinitely vs Drive's 30-day window |
 | Trash / Recycle bin | ✅ Full trash UI (restore / permanent delete, 90-day retention) | ✅ Full trash UI | ✅ Trash folder | Parity |
 | Thumbnail generation | ✅ Background job | ✅ Automatic | ✅ Automatic | Parity (images) |
 | File TTL / auto-expiry | ✅ | ❌ | ⚠️ | Leeku advantage |
@@ -126,7 +126,7 @@ However, it **lacks several consumer-facing features** that both Google Drive an
 | # | Gap | Impact | Suggested Solution | Effort |
 |---|---|---|---|---|
 | 5 | **Granular Sharing Permissions** | Only coarse "share or block"; competitors allow view/edit/comment roles | Add `permission_level` column to share_links; map to view/comment/edit for folders & files | M |
-| 6 | **File Version History** | No way to revert a modified file; competitors keep 30+ days | Track file revisions with `file_versions` table; allow download/restore of previous versions. **✅ Assessed FEASIBLE** — see `01-Technical/FILE-VERSION-HISTORY-FEASIBILITY.md` (old-key storage confirmed compatible with the zero-knowledge key-wrapping design) | L |
+| 6 | ~~File Version History~~ ✅ **Implemented** | Uploading same name into same folder now creates a version instead of a duplicate; versions drawer lists current + archived with download/restore/delete, per-version share pinning, and a soft-delete version trash | DONE | — |
 | 7 | ~~Trash / Recycle Bin UI~~ ✅ **Implemented** | Soft-delete with 90-day retention now has a full trash UI (restore / permanent delete) | DONE | — |
 | 8 | **In-App Notifications** | No way to alert users about shares, quotas, or system messages | Add a notifications table + polling or SSE; surface in dashboard bell | M |
 | 9 | **File Comments / Activity Feed** | Collaboration limited to sharing; no per-file discussion or history | Add comments table + activity log per file | M |
@@ -155,6 +155,7 @@ Understanding where we already win helps prioritize roadmap investments:
 | **Per-file AES-256-GCM with master HKDF wrapping** | Stronger key isolation than Mega's AES-128 default |
 | **Bitdefender AV scanning with fail-closed** | Malware is blocked *before* storage; Google does no pre-upload AV |
 | **Public share link controls** | Password + expiry + download cap + video embed is richer than either competitor |
+| **Unlimited file versioning** | Versions retained indefinitely with per-version download/restore and share pinning — Drive offers only a 30-day window |
 | **Admin health/ops controls** | Maintenance mode, system health stats, IIS W3C logs, desktop update distribution is self-hosted-ops-specific |
 | **Self-hosting / data sovereignty** | Full control over infra, keys, and compliance (matters for MSPs/enterprise) |
 
@@ -169,7 +170,7 @@ Understanding where we already win helps prioritize roadmap investments:
 
 ### Short-term (3–6 months)
 4. **Granular share permissions** (view/comment/edit)
-5. **File version history** — ✅ feasibility assessed (2026-10-31) → see `01-Technical/FILE-VERSION-HISTORY-FEASIBILITY.md`; proceed to migration + implementation
+5. ~~**File version history**~~ ✅ **Implemented** — same-name uploads create versions; full versions drawer with download / restore / delete, per-version share pinning, and version trash
 6. ~~**Trash UI**~~ ✅ **Implemented** — trash with restore + 90-day purge in place
 7. **Server-side search index**
 
