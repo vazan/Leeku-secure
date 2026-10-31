@@ -4221,7 +4221,7 @@ function ShareDialog(props: {
 
   return (
     <div
-      className="fixed inset-0 z-50 grid place-items-center bg-black/60 backdrop-blur-sm p-4"
+      className="fixed inset-0 z-[70] grid place-items-center bg-black/60 backdrop-blur-sm p-4"
       onPointerDown={(event) => {
         if (event.target === event.currentTarget) props.onClose();
       }}
