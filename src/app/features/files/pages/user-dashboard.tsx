@@ -10,6 +10,7 @@ import {
   FolderPlus,
   History,
   LayoutGrid,
+  Layers,
   Link2,
   Loader2,
   Lock,
@@ -374,6 +375,7 @@ export default function UserDashboard({
   const [files, setFiles] = useState<FileMetadata[]>([]);
   const [filesLoading, setFilesLoading] = useState(false);
   const [trashFiles, setTrashFiles] = useState<FileMetadata[]>([]);
+  const [trashVersions, setTrashVersions] = useState<FileVersion[]>([]); // soft-deleted versions across the user's files (Trash tab)
   const [trashLoading, setTrashLoading] = useState(false);
   const [folders, setFolders] = useState<FileFolder[]>([]);
   const [foldersLoaded, setFoldersLoaded] = useState(false);
@@ -617,7 +619,9 @@ export default function UserDashboard({
         headers: authHeaders(token),
       });
       if (response.ok) {
-        setTrashFiles((await response.json()).files || []);
+        const payload = await response.json();
+        setTrashFiles(payload.files || []);
+        setTrashVersions(payload.trashedVersions || []);
       } else {
         notifyError("Could not load trash.");
       }
@@ -1407,6 +1411,41 @@ export default function UserDashboard({
       await loadTrash();
       onTriggerRefreshUser();
     } else notifyError("Could not delete the file.");
+  };
+
+  // Restore a soft-deleted archived version from the version trash (Trash tab or
+  // versions drawer) back into the active versions list.
+  const restoreVersionFromTrash = async (fileId: string, version: FileVersion) => {
+    const response = await fetch(
+      `/api/files/${fileId}/versions/${version.id}/restore-trashed`,
+      { method: "POST", headers: authHeaders(token) },
+    );
+    const data = await response.json();
+    if (response.ok) {
+      notify(data?.message || "Version restored from trash.");
+      await loadTrash();
+      await loadFilesAndLinks();
+    } else notifyError(data?.error || "Could not restore this version.");
+  };
+
+  // Permanently delete a soft-deleted archived version from the version trash.
+  const permanentDeleteVersion = async (fileId: string, version: FileVersion) => {
+    if (
+      !window.confirm(
+        `Permanently delete version ${version.version_no} of "${version.original_name}"? This cannot be undone.`
+      )
+    )
+      return;
+    const response = await fetch(
+      `/api/files/${fileId}/versions/${version.id}/delete-permanent`,
+      { method: "POST", headers: authHeaders(token) },
+    );
+    const data = await response.json();
+    if (response.ok) {
+      notify(data?.message || "Version permanently deleted.");
+      await loadTrash();
+      await loadFilesAndLinks();
+    } else notifyError(data?.error || "Could not delete this version.");
   };
 
   const createFolder = async () => {
@@ -2708,7 +2747,7 @@ export default function UserDashboard({
                   Trash
                 </h1>
                 <p className="mt-1 text-sm text-[var(--text-muted)]">
-                  Files here are kept for 90 days before being permanently deleted.
+                  Files and versions here are kept for 90 days before being permanently deleted.
                 </p>
               </div>
               {trashLoading ? (
@@ -2716,59 +2755,126 @@ export default function UserDashboard({
                   <div className="h-5 w-5 animate-spin rounded-full border-2 border-[var(--border-subtle)] border-t-[var(--accent-linear)]" />
                   Loading trash...
                 </div>
-              ) : trashFiles.length === 0 ? (
+              ) : trashFiles.length === 0 && trashVersions.length === 0 ? (
                 <div className="flex flex-col items-center py-20 text-center">
                   <Trash2 className="mb-3 h-12 w-12 text-[var(--text-faint)]" />
                   <p className="text-[var(--text-secondary)]">Trash is empty.</p>
                 </div>
               ) : (
-                <div className="space-y-3">
-                  {trashFiles.map((file) => (
-                    <div
-                      key={file.id}
-                      className="flex items-center gap-3 rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] p-3 shadow-[var(--shadow-hairline)]"
-                    >
-                      <FileThumbnail
-                        file={file}
-                        token={token}
-                        className="h-12 w-12 shrink-0 rounded-lg"
-                        iconClassName="h-6 w-6"
-                        showTypeBadge={false}
-                      />
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-center gap-2">
-                          <p className="truncate text-sm font-medium">{file.original_name}</p>
-                          {file.version_count != null && (
-                            <span className="inline-flex flex-none items-center rounded-full border border-[var(--border-subtle)] bg-[var(--bg-muted)] px-2 py-0.5 text-[11px] font-medium text-[var(--text-muted)]">
-                              Version {file.version_count}
-                            </span>
-                          )}
+                <div className="space-y-5">
+                  {trashFiles.length > 0 && (
+                    <div className="space-y-3">
+                      {trashFiles.map((file) => (
+                        <div
+                          key={file.id}
+                          className="flex items-center gap-3 rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] p-3 shadow-[var(--shadow-hairline)]"
+                        >
+                          <FileThumbnail
+                            file={file}
+                            token={token}
+                            className="h-12 w-12 shrink-0 rounded-lg"
+                            iconClassName="h-6 w-6"
+                            showTypeBadge={false}
+                          />
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-center gap-2">
+                              <p className="truncate text-sm font-medium">{file.original_name}</p>
+                              {file.version_count != null && (
+                                <span className="inline-flex flex-none items-center rounded-full border border-[var(--border-subtle)] bg-[var(--bg-muted)] px-2 py-0.5 text-[11px] font-medium text-[var(--text-muted)]">
+                                  Version {file.version_count}
+                                </span>
+                              )}
+                            </div>
+                            <p className="mt-0.5 text-xs text-[var(--text-muted)]">
+                              Deleted {file.deleted_at ? new Date(file.deleted_at).toLocaleDateString() : ""}
+                              {file.folder_id ? " · from folder" : ""}
+                            </p>
+                          </div>
+                          <div className="flex shrink-0 items-center gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() => restoreFile(file)}
+                              className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--border-subtle)] px-3 py-2 text-xs font-medium text-[var(--success-linear)] hover:bg-[color-mix(in_srgb,var(--success-linear)_12%,transparent)]"
+                            >
+                              <RotateCcw className="h-3.5 w-3.5" />
+                              Restore
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => deletePermanently(file)}
+                              className="inline-flex items-center gap-1.5 rounded-lg border border-[color-mix(in_srgb,var(--error-linear)_42%,transparent)] px-3 py-2 text-xs font-medium text-[var(--error-linear)] hover:bg-[color-mix(in_srgb,var(--error-linear)_12%,transparent)]"
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                              Delete
+                            </button>
+                          </div>
                         </div>
-                        <p className="mt-0.5 text-xs text-[var(--text-muted)]">
-                          Deleted {file.deleted_at ? new Date(file.deleted_at).toLocaleDateString() : ""}
-                          {file.folder_id ? " · from folder" : ""}
-                        </p>
-                      </div>
-                      <div className="flex shrink-0 items-center gap-1.5">
-                        <button
-                          type="button"
-                          onClick={() => restoreFile(file)}
-                          className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--border-subtle)] px-3 py-2 text-xs font-medium text-[var(--success-linear)] hover:bg-[color-mix(in_srgb,var(--success-linear)_12%,transparent)]"
-                        >
-                          <RotateCcw className="h-3.5 w-3.5" />
-                          Restore
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => deletePermanently(file)}
-                          className="inline-flex items-center gap-1.5 rounded-lg border border-[color-mix(in_srgb,var(--error-linear)_42%,transparent)] px-3 py-2 text-xs font-medium text-[var(--error-linear)] hover:bg-[color-mix(in_srgb,var(--error-linear)_12%,transparent)]"
-                        >
-                          <Trash2 className="h-3.5 w-3.5" />
-                          Delete
-                        </button>
+                      ))}
+                    </div>
+                  )}
+
+                  {trashVersions.length > 0 && (
+                    <div>
+                      <h3 className="mb-2 flex items-center gap-2 text-sm font-semibold text-[var(--text-secondary)]">
+                        <Layers className="h-4 w-4 text-[var(--text-muted)]" />
+                        Deleted versions ({trashVersions.length})
+                      </h3>
+                      <div className="space-y-3">
+                        {trashVersions.map((version) => (
+                          <div
+                            key={version.id}
+                            className="flex items-center gap-3 rounded-xl border border-dashed border-[var(--border-subtle)] bg-[var(--bg-panel)] p-3 shadow-[var(--shadow-hairline)]"
+                          >
+                            <div className="grid h-12 w-12 shrink-0 place-items-center rounded-lg bg-[var(--bg-muted)] text-[var(--text-muted)]">
+                              <Layers className="h-6 w-6" />
+                            </div>
+                            <div className="min-w-0 flex-1">
+                              <div className="flex items-center gap-2">
+                                <p className="truncate text-sm font-medium">
+                                  {version.original_name}
+                                </p>
+                                <span className="inline-flex flex-none items-center rounded-full border border-[var(--border-subtle)] bg-[var(--bg-muted)] px-2 py-0.5 text-[11px] font-medium text-[var(--text-muted)]">
+                                  v{version.version_no}
+                                </span>
+                                <span className="inline-flex flex-none items-center rounded-full bg-[color-mix(in_srgb,var(--text-muted)_15%,transparent)] px-2 py-0.5 text-[10px] font-semibold text-[var(--text-muted)]">
+                                  VERSION IN TRASH
+                                </span>
+                              </div>
+                              <p className="mt-0.5 text-xs text-[var(--text-muted)]">
+                                {version.file_name ? `of "${version.file_name}" · ` : ""}
+                                {formatBytes(version.size_bytes)} · Deleted{" "}
+                                {version.deleted_at
+                                  ? new Date(version.deleted_at).toLocaleDateString()
+                                  : ""}
+                              </p>
+                            </div>
+                            <div className="flex shrink-0 items-center gap-1.5">
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  version.file_id && restoreVersionFromTrash(version.file_id, version)
+                                }
+                                className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--border-subtle)] px-3 py-2 text-xs font-medium text-[var(--success-linear)] hover:bg-[color-mix(in_srgb,var(--success-linear)_12%,transparent)]"
+                              >
+                                <RotateCcw className="h-3.5 w-3.5" />
+                                Restore
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  version.file_id && permanentDeleteVersion(version.file_id, version)
+                                }
+                                className="inline-flex items-center gap-1.5 rounded-lg border border-[color-mix(in_srgb,var(--error-linear)_42%,transparent)] px-3 py-2 text-xs font-medium text-[var(--error-linear)] hover:bg-[color-mix(in_srgb,var(--error-linear)_12%,transparent)]"
+                              >
+                                <Trash2 className="h-3.5 w-3.5" />
+                                Delete
+                              </button>
+                            </div>
+                          </div>
+                        ))}
                       </div>
                     </div>
-                  ))}
+                  )}
                 </div>
               )}
             </section>

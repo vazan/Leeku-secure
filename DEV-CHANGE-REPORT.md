@@ -152,8 +152,35 @@ VERSION SOFT-DELETE + TRASH (owner decision, current task):
   delete / trash purge — only the current `files.stored_path` blob is unlinked. The soft-delete task does
   not change this; documented here for awareness.
 
+TRASH TAB SHOWS SOFT-DELETED VERSIONS (owner decision, follow-up):
+- The side-nav **Trash** tab now shows not only soft-deleted *files* but also soft-deleted archived
+  *versions* (rows with `file_versions.deleted_at IS NOT NULL`), each with Restore and Delete (permanent)
+  actions — so a version like v6 that was moved to the version trash from the Versions drawer is
+  recoverable or permanently purgable from the Trash tab too.
+- Backend:
+  - `GET /api/files/trash` now returns `{ files, trashedVersions }`. `trashedVersions` lists the user's
+    soft-deleted archived versions joined to `files` for owner scoping, each carrying `id`, `file_id`,
+    `version_no`, decrypted `original_name` and parent `file_name`, `size_bytes`, `mime_type`, `status`,
+    `created_at`, `deleted_at`.
+  - NEW `POST /api/files/:id/versions/:versionId/delete-permanent` — hard-deletes a trashed archived
+    version: unlinks the vault blob, deletes the row (`file_version_keys` cascades). Keeps the 409
+    share-ref guard (unshare before permanently deleting) so no pinned link silently breaks. Returns 404
+    if the version isn't trashed.
+  - An owner scoping/consistency note: version trash is conflated with the file-level Trash retention
+    copy — a soft-deleted version carries `deleted_at` but is NOT auto-purged by the 90-day trash purge
+    job (that job only hard-deletes `files` rows), so versions must be purged manually from the Trash tab
+    or restored. Documented as a follow-up debt.
+- Frontend (`user-dashboard.tsx`, `src/app/shared/types/index.ts`):
+  - `FileVersion` gains optional `file_id` and `file_name` (parent context, present only in the Trash tab).
+  - New state `trashVersions`; `loadTrash()` reads `payload.trashedVersions`.
+  - Trash tab renders a "Deleted versions (N)" section below the files list (dashed border, `Layers` icon,
+    `vN` + "VERSION IN TRASH" badges, parent file name, size, deleted date) with **Restore**
+    (`restoreVersionFromTrash` → `/restore-trashed`) and **Delete** (`permanentDeleteVersion` →
+    `/delete-permanent`) actions. Empty-trash and loading states now account for versions.
+  - "Trash is empty." only when both file and version trash are empty.
+
 ## Validation
-Build: ✅ (`tsc --noEmit`; `vite build` ✓ 483ms; esbuild server bundle OK)  Lint: ✅  Type-check: ✅
+Build: ✅ (`tsc --noEmit`; `vite build` ✓ 494ms; esbuild server bundle OK)  Lint: ✅  Type-check: ✅
 Smoke: ⚠SKIPPED (no reachable MSSQL/sqlcmd harness in this environment; existing test
 `tests/desktop-updates-path.test.ts` passes 2/2)
 
@@ -188,6 +215,15 @@ Surfaces / cas-limites / risques:
 15. Soft-delete + share guard: deleting a shared version still refuses with 409 until unshared; after unshare,
    soft-delete works.
 16. Migration re-run is a no-op for section "6b" (`deleted_at`/`deleted_by` COL_LENGTH guards).
+17. Trash tab: after soft-deleting an archived version (e.g. v6), it appears in the Trash tab's
+   "Deleted versions" section with Restore and Delete actions, including the parent file name.
+18. Restore-from-Trash-tab: restoring a trashed version from the Trash tab clears `deleted_at`; it no
+   longer shows in the Trash tab and reappears in the file's Versions drawer; a share pinned to it resolves
+   again.
+19. Permanent-delete-from-Trash-tab: `POST .../delete-permanent` unlinks the blob, drops the row, and the
+   version leaves the Trash tab; deleting a still-shared version still refuses with 409.
+20. Trash tab empty-state/loading correctly accounts for both files and versions; "Trash is empty." only
+   when both lists are empty.
 
 ## Handoff QaEngineer
 Validation: type-check ✅; server bundle ✅; vite build ✅; test:desktop-updates ✅ (2/2). CRITICAL approval state:

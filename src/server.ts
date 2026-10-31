@@ -3633,7 +3633,9 @@ app.post('/api/files/delete', authenticateUser as express.RequestHandler, async 
 // API: Files — Trash bin
 // ──────────────────────────────────────────────────────────────
 
-// GET /api/files/trash - List trashed (soft-deleted) files for the current user
+// GET /api/files/trash - List trashed (soft-deleted) files for the current user,
+// plus any archived versions of their files that were soft-deleted (moved to the
+// version trash). Both can be recovered (restore) or permanently purged.
 app.get('/api/files/trash', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
   try {
     const request = await getRequest();
@@ -3655,7 +3657,43 @@ app.get('/api/files/trash', authenticateUser as express.RequestHandler, async (r
       ) files
        ORDER BY deleted_at DESC`
     );
-    res.json({ files: result.recordset.map(r => mapFileRow(r, req.user!.username)) });
+
+    // Soft-deleted archived versions of the user's files (version trash). Each row
+    // also carries the parent file's encrypted name so the Trash list can label it.
+    const verReq = await getRequest();
+    verReq.input('ownerId', sql.UniqueIdentifier, req.userId!);
+    const verRes = await verReq.query<FileVersionRow & { file_name_encrypted: Buffer; file_name_iv: Buffer; file_name_auth_tag: Buffer }>(
+      `SELECT v.id, v.file_id, v.version_no,
+              v.original_name_encrypted, v.original_name_iv, v.original_name_auth_tag,
+              v.stored_path, v.mime_type, v.size_bytes, v.encrypted_size_bytes,
+              v.status, v.checksum_sha256, v.scan_result, v.scan_message,
+              v.is_encrypted, v.client_secret_hash, v.client_crypto_salt, v.client_crypto_iv, v.client_crypto_iterations,
+              v.created_at, v.deleted_at, v.deleted_by,
+              f.original_name_encrypted AS file_name_encrypted,
+              f.original_name_iv AS file_name_iv,
+              f.original_name_auth_tag AS file_name_auth_tag
+       FROM file_versions v
+       INNER JOIN files f ON f.id = v.file_id
+       WHERE f.owner_user_id=@ownerId AND v.deleted_at IS NOT NULL
+       ORDER BY v.deleted_at DESC`
+    );
+
+    const trashedVersions = verRes.recordset.map((v) => ({
+      id: v.id,
+      file_id: v.file_id,
+      version_no: v.version_no,
+      original_name: decryptColumn(v.original_name_encrypted, v.original_name_iv, v.original_name_auth_tag),
+      file_name: decryptColumn(v.file_name_encrypted, v.file_name_iv, v.file_name_auth_tag),
+      size_bytes: v.size_bytes,
+      mime_type: v.mime_type,
+      status: v.status,
+      created_at: v.created_at,
+      deleted_at: v.deleted_at
+        ? (v.deleted_at instanceof Date ? v.deleted_at : new Date(v.deleted_at)).toISOString()
+        : null,
+    }));
+
+    res.json({ files: result.recordset.map(r => mapFileRow(r, req.user!.username)), trashedVersions });
   } catch (err) { console.error('[GET /api/files/trash]', err); res.status(500).json({ error: 'Failed to load trash.' }); }
 });
 
@@ -4531,6 +4569,64 @@ app.post('/api/files/:id/versions/:versionId/restore-trashed', authenticateUser 
   } catch (err) {
     console.error('[POST /api/files/:id/versions/:versionId/restore-trashed]', err);
     if (!res.headersSent) res.status(500).json({ error: 'Failed to restore version.' });
+  }
+});
+
+// POST /api/files/:id/versions/:versionId/delete-permanent — permanently delete an
+// archived version that is in the version trash (hard delete: unlink the vault blob,
+// drop the row; file_version_keys cascades). A trashed version that is still shared
+// is refused (409, unshare first) so no pinned link silently breaks.
+app.post('/api/files/:id/versions/:versionId/delete-permanent', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  const fileId = getSingleParam(req.params.id);
+  const versionId = getSingleParam(req.params.versionId);
+  if (!UUID_PATTERN.test(fileId) || !UUID_PATTERN.test(versionId))
+    return res.status(400).json({ error: 'Invalid id.' });
+  try {
+    const ownerReq = await getRequest();
+    ownerReq.input('id', sql.UniqueIdentifier, fileId);
+    const ownerRes = await ownerReq.query<{ owner_user_id: string }>('SELECT owner_user_id FROM files WHERE id=@id');
+    if (!ownerRes.recordset.length) return res.status(404).json({ error: 'File not found.' });
+    if (ownerRes.recordset[0].owner_user_id !== req.userId && req.user!.role !== 'Admin')
+      return res.status(403).json({ error: 'You do not have permission to delete this file.' });
+
+    const verReq = await getRequest();
+    verReq.input('vid', sql.UniqueIdentifier, versionId);
+    verReq.input('fid', sql.UniqueIdentifier, fileId);
+    const verRes = await verReq.query<{ id: string; stored_path: string }>(
+      `SELECT id,stored_path FROM file_versions WHERE id=@vid AND file_id=@fid AND deleted_at IS NOT NULL`
+    );
+    if (!verRes.recordset.length) return res.status(404).json({ error: 'Trashed version not found.' });
+    const version = verRes.recordset[0];
+
+    // Refuse if still referenced by a shared link (FK_share_links_version).
+    const shareRefReq = await getRequest();
+    shareRefReq.input('vid', sql.UniqueIdentifier, versionId);
+    const shareRefRes = await shareRefReq.query<{ cnt: number }>(
+      `SELECT COUNT(*) AS cnt FROM share_links WHERE version_id=@vid`
+    );
+    if (Number(shareRefRes.recordset[0]?.cnt ?? 0) > 0) {
+      return res.status(409).json({
+        error: 'This version is currently shared and cannot be permanently deleted. Unshare it first.',
+      });
+    }
+
+    // Physically delete the vault blob (row delete cascades to file_version_keys).
+    try {
+      const vaultPath = path.join(FILE_VAULT, version.stored_path);
+      if (fs.existsSync(vaultPath)) await fs.promises.unlink(vaultPath);
+    } catch (err) {
+      console.error(`[DEL VERSION PERMANENT] Failed to delete vault file ${version.stored_path}:`, err);
+    }
+
+    const delReq = await getRequest();
+    delReq.input('vid', sql.UniqueIdentifier, versionId);
+    await delReq.query('DELETE FROM file_versions WHERE id=@vid');
+
+    await logSystemEvent(req.userId!, req.user!.username, 'Delete', 'FileVersion', versionId, req, 'Permanently deleted an archived file version from trash.');
+    res.json({ success: true, message: 'Version permanently deleted.' });
+  } catch (err) {
+    console.error('[POST /api/files/:id/versions/:versionId/delete-permanent]', err);
+    if (!res.headersSent) res.status(500).json({ error: 'Failed to delete version.' });
   }
 });
 

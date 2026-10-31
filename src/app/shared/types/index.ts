@@ -69,6 +69,10 @@ export interface FileVersion {
   status: string;
   created_at: string;
   deleted_at?: string | null; // set when the version is in the version trash
+  // Present when the version appears in the Trash tab (soft-deleted versions across
+  // the user's files); identifies the parent file.
+  file_id?: string;
+  file_name?: string;
 }
 
 export interface AdminFileFolder extends FileFolder {
