@@ -3644,7 +3644,7 @@ app.get('/api/files/trash', authenticateUser as express.RequestHandler, async (r
               status, checksum_sha256, scan_result, scan_message,
               is_encrypted, leeku_vibe, ttl_hours,
               client_secret_hash,
-              expires_at, created_at, deleted_at
+              expires_at, created_at, deleted_at, version_count
       FROM (
         SELECT f.*, ff.name AS folder_name
         FROM files f

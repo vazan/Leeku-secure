@@ -2708,7 +2708,14 @@ export default function UserDashboard({
                         showTypeBadge={false}
                       />
                       <div className="min-w-0 flex-1">
-                        <p className="truncate text-sm font-medium">{file.original_name}</p>
+                        <div className="flex items-center gap-2">
+                          <p className="truncate text-sm font-medium">{file.original_name}</p>
+                          {file.version_count != null && (
+                            <span className="inline-flex flex-none items-center rounded-full border border-[var(--border-subtle)] bg-[var(--bg-muted)] px-2 py-0.5 text-[11px] font-medium text-[var(--text-muted)]">
+                              Version {file.version_count}
+                            </span>
+                          )}
+                        </div>
                         <p className="mt-0.5 text-xs text-[var(--text-muted)]">
                           Deleted {file.deleted_at ? new Date(file.deleted_at).toLocaleDateString() : ""}
                           {file.folder_id ? " · from folder" : ""}

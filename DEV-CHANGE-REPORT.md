@@ -53,6 +53,8 @@ Scoped per owner decisions #1–#3: dashboard-only (no extra backend endpoints),
 - **Public share page**: shows a "Version N" badge next to the file name (from new `version_no` field on
   `GET /api/public/share/:token` — the archived version's `version_no`, or the current `files.version_count`
   when not pinned). The OpenGraph metadata (Discord/social embeds) also includes "· Version N".
+- **Trash view**: each soft-deleted file card shows a "Version N" badge (the current version number in trash,
+  from `files.version_count`, now included in `GET /api/files/trash`).
 
 ## Risques
 Perf: new `IX_files_owner_name_hash` index covers same-name detection (HMAC-SHA256 hex, CHAR(64)).
