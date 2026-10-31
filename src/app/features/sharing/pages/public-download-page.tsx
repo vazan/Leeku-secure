@@ -25,6 +25,7 @@ interface PublicDownloadPageProps {
 }
 interface PublicFileMeta {
   file_name: string;
+  version_no?: number | null;
   mime_type: string;
   size: number;
   created_at: string;
@@ -433,9 +434,16 @@ export default function PublicDownloadPage({
               />
             </div>
             <div className="min-w-0 flex-1">
-              <h1 className="break-all text-xl font-semibold leading-snug">
-                {meta.file_name}
-              </h1>
+              <div className="flex flex-wrap items-center gap-2">
+                <h1 className="break-all text-xl font-semibold leading-snug">
+                  {meta.file_name}
+                </h1>
+                {meta.version_no != null && (
+                  <span className="inline-flex flex-none items-center rounded-full border border-[var(--border-subtle)] bg-[var(--bg-muted)] px-2.5 py-0.5 text-xs font-medium text-[var(--text-muted)]">
+                    Version {meta.version_no}
+                  </span>
+                )}
+              </div>
               <p className="mt-1 text-sm text-[var(--text-muted)]">
                 {formatBytes(meta.size)} · Shared by {meta.uploader}
               </p>

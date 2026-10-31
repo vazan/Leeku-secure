@@ -33,6 +33,8 @@ OUI (schema):
   - `POST /api/files/:id/versions/:versionId/restore`
   - `DELETE /api/files/:id/versions/:versionId`
 - `POST /api/files/:id/share` — optional body `version_id` (pinned archive version) on INSERT/UPDATE.
+- `GET /api/public/share/:token` response — adds `version_no` (resolved version's `version_no`, or
+  `files.version_count` for the current version).
 - No change to `GET`/`POST` upload shapes; `files`+`file_encryption_keys` joins unchanged for current version.
 
 ## UI (Frontend, feature branch `feat/file-version-history-mssql`)
@@ -48,6 +50,9 @@ Scoped per owner decisions #1–#3: dashboard-only (no extra backend endpoints),
   share-create request; current version = `version_id` NULL), Preview (current version only → reuses
   existing audio/video/image/text handlers; archived shows a notice).
 - **ShareDialog**: shows a "Sharing pinned version vN" hint when a version is pinned.
+- **Public share page**: shows a "Version N" badge next to the file name (from new `version_no` field on
+  `GET /api/public/share/:token` — the archived version's `version_no`, or the current `files.version_count`
+  when not pinned). The OpenGraph metadata (Discord/social embeds) also includes "· Version N".
 
 ## Risques
 Perf: new `IX_files_owner_name_hash` index covers same-name detection (HMAC-SHA256 hex, CHAR(64)).

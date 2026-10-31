@@ -452,13 +452,14 @@ const buildPromise = (async () => {
       const request = await getRequest(); request.input('tok', sql.Char(32), getSingleParam(req.params.token));
       const result = await request.query<ShareRow & {
         pinned_version_id: string | null; resolved_version_id: string | null;
-        file_status: string; leeku_vibe: string|null; mime_type: string;
+        version_no: number | null; file_status: string; leeku_vibe: string|null; mime_type: string;
         size_bytes: number; file_created_at: Date; stored_path: string;
         client_secret_hash: string | null;
         original_name_encrypted: Buffer; original_name_iv: Buffer; original_name_auth_tag: Buffer;
         owner_username_encrypted: Buffer; owner_username_iv: Buffer; owner_username_auth_tag: Buffer;
       }>(
         `SELECT sl.id,sl.version_id AS pinned_version_id,v.id AS resolved_version_id,u.id AS owner_user_id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.allow_external_preview,sl.allow_decrypted_external_preview,
+                COALESCE(v.version_no,f.version_count) AS version_no,
                 COALESCE(v.status,f.status) AS file_status,f.leeku_vibe,COALESCE(v.mime_type,f.mime_type) AS mime_type,COALESCE(v.size_bytes,f.size_bytes) AS size_bytes,COALESCE(v.created_at,f.created_at) AS file_created_at,COALESCE(v.stored_path,f.stored_path) AS stored_path,
                 COALESCE(v.client_secret_hash,f.client_secret_hash) AS client_secret_hash,
                 COALESCE(v.original_name_encrypted,f.original_name_encrypted) AS original_name_encrypted,COALESCE(v.original_name_iv,f.original_name_iv) AS original_name_iv,COALESCE(v.original_name_auth_tag,f.original_name_auth_tag) AS original_name_auth_tag,
@@ -482,6 +483,7 @@ const buildPromise = (async () => {
       res.json({
         token: row.public_token,
         file_name: fileName,
+        version_no: row.version_no ?? null,
         mime_type: row.mime_type,
         size: row.size_bytes,
         created_at: row.file_created_at?.toISOString(),
@@ -640,12 +642,13 @@ const buildPromise = (async () => {
     request.input('tok', sql.Char(32), token);
     const result = await request.query<ShareRow & {
       pinned_version_id: string | null; resolved_version_id: string | null;
-      file_status: string; mime_type: string;
+      version_no: number | null; file_status: string; mime_type: string;
       size_bytes: number; file_created_at: Date; stored_path: string;
       original_name_encrypted: Buffer; original_name_iv: Buffer; original_name_auth_tag: Buffer;
       owner_username_encrypted: Buffer; owner_username_iv: Buffer; owner_username_auth_tag: Buffer;
     }>(
       `SELECT sl.id,sl.version_id AS pinned_version_id,v.id AS resolved_version_id,u.id AS owner_user_id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.allow_external_preview,
+              COALESCE(v.version_no,f.version_count) AS version_no,
               COALESCE(v.status,f.status) AS file_status,COALESCE(v.mime_type,f.mime_type) AS mime_type,COALESCE(v.size_bytes,f.size_bytes) AS size_bytes,COALESCE(v.created_at,f.created_at) AS file_created_at,COALESCE(v.stored_path,f.stored_path) AS stored_path,
               COALESCE(v.original_name_encrypted,f.original_name_encrypted) AS original_name_encrypted,COALESCE(v.original_name_iv,f.original_name_iv) AS original_name_iv,COALESCE(v.original_name_auth_tag,f.original_name_auth_tag) AS original_name_auth_tag,
               u.username_encrypted AS owner_username_encrypted,u.username_iv AS owner_username_iv,u.username_auth_tag AS owner_username_auth_tag
@@ -687,7 +690,8 @@ const buildPromise = (async () => {
     const ogImageUrl = profileImageUrl || resolveOgImageUrl(baseUrl);
     const safeOgImageUrl = ogImageUrl ? esc(ogImageUrl) : null;
     const ogTitle = `${safeFileName} - Shared by ${safeUploader}`;
-    const ogDescription = `${safeFileName} · ${sizeLabel} · Shared by ${safeUploader}`;
+    const versionLabel = row.version_no != null ? ` · Version ${row.version_no}` : '';
+    const ogDescription = `${safeFileName}${versionLabel} · ${sizeLabel} · Shared by ${safeUploader}`;
     const ua = String(req.get('user-agent') || '').toLowerCase();
     const isCrawlerUa =
       ua.includes('facebookexternalhit') ||
