@@ -4,6 +4,7 @@ import {
   Check,
   Download,
   Eye,
+  FileQuestion,
   Loader2,
   Lock,
 } from "lucide-react";
@@ -373,7 +374,31 @@ export default function PublicDownloadPage({
         <Loader2 className="h-5 w-5 animate-spin text-[var(--text-muted)]" />
       </div>
     );
-  if (!meta) return <ErrorScreen code={404} onGoBack={onGoHome} />;
+  // When the metadata fetch fails (e.g. the pinned version was deleted and the
+  // server returned a specific 410 message), surface that exact reason instead
+  // of the generic "expired or moved" 404 screen.
+  if (!meta) {
+    if (error) {
+      return (
+        <div className="grid min-h-[70vh] place-items-center px-5">
+          <div className="max-w-md text-center">
+            <div className="mx-auto grid h-16 w-16 place-items-center rounded-xl bg-[var(--bg-muted)]">
+              <FileQuestion className="h-6 w-6 text-[var(--text-muted)]" />
+            </div>
+            <h1 className="mt-5 text-2xl font-semibold">{error}</h1>
+            <button
+              onClick={onGoHome}
+              className="mx-auto mt-6 flex items-center gap-2 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-panel)] px-4 py-2.5 text-sm font-medium"
+            >
+              <ArrowLeft className="h-4 w-4" />
+              Go back
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return <ErrorScreen code={404} onGoBack={onGoHome} />;
+  }
 
   return (
     <div className="min-h-screen bg-[var(--bg-primary)] px-5 py-6">

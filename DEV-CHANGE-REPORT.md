@@ -72,12 +72,35 @@ already round-trips into share-create). Minor; the version id is not needed to r
 BACKEND debt (follow-up, session owner decisions #1–#3 scoped frontend-only):
 - The archived-version text preview still goes through the generic share preview endpoint (no dedicated
   per-version preview route exists), which now correctly resolves the pinned version's bytes.
-- A share pinned to a version that is later deleted degrades gracefully to the current version (LEFT JOIN
-  yields NULL) rather than 404ing.
+- A share pinned to a version that is later deleted returns 410 "This shared file version is no longer
+  available." across metadata, preview, download, OG, and embed handlers (the version-missing guard) rather
+  than silently serving the current version or 404ing without explanation.
 
 FRONTEND debt (documented in code comments):
 - Preview of archived versions shows a notice ("Preview is only available for the current version right now.")
   awaiting the backend per-version preview endpoint.
+
+DELETE-FLOW FK BLOCKER (found in validation) — fixed:
+- `FK_share_links_version` (`share_links.version_id → file_versions.id`) was created with NO ON DELETE action.
+  Reproducer (user-confirmed): share version 4 of a file, then attempt to permanently delete the file —
+  `DELETE FROM files` cascades into `file_versions`, but a share row still pinned to version 4 violates the
+  NO-ACTION FK, so the delete was blocked and the file/version were left in a broken half-deleted state
+  (the shared link reported the generic "link may have expired or the file may have moved"). The user could
+  only delete the file after manually removing the v4 share link.
+- FIXED across all delete paths — single soft delete (`POST /api/files/:id/delete`), bulk soft delete
+  (`POST /api/files/delete`), permanent delete (`POST /api/files/:id/delete-permanent`), folder delete with
+  `delete_files` (user + admin), and the `runTrashPurgeCycle()` job — by explicitly removing share rows
+  (`DELETE FROM share_links WHERE file_id=@id`, or batched by file_id for the folder-delete paths) so no
+  version_id pins survive to block the file_versions cascade during the hard delete. Soft delete now drops
+  share rows entirely (rather than only setting `is_active=0`). `FK_share_links_files` is ON DELETE CASCADE;
+  the extra version FK was what blocked the version cascade-stack.
+
+FRONTEND ERROR-DISPLAY FIX (public share page) — added:
+- `public-download-page.tsx` previously rendered the generic `ErrorScreen code={404}` ("The link may have
+  expired or the file may have moved.") whenever the metadata fetch failed (`!meta`), because the `if (!meta)`
+  check ran before the `{error && …}` render — hiding the server's specific message. Now, when the metadata
+  fetch fails, an explicit error branch renders the exact returned message (e.g. 410 "This shared file version
+  is no longer available.") with a Go back action before falling back to the generic 404 screen.
 
 PRE-EXISTING-FILE GAP (found in validation) — fixed:
 - Files created before the versioning migration have `file_name_hash = NULL` and cannot be versioned by the

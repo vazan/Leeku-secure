@@ -2363,6 +2363,17 @@ app.post('/api/file-folders/:id/delete', authenticateUser as express.RequestHand
           .reduce((total, file) => total + BigInt(Number(file.size_bytes || 0)), 0n);
         totalStorageToRemove += storageForThisBatch;
         
+        // Remove share links for this batch's files BEFORE deleting them so no
+        // version_id pin blocks the file_versions cascade (FK_share_links_version
+        // is NO ACTION). Guarded to the batch so we only touch this batch.
+        if (files.length > 0) {
+          const delSharesReq = await getRequest();
+          files.forEach((file, idx) => delSharesReq.input(`fid${idx}`, sql.UniqueIdentifier, file.id));
+          await delSharesReq.query(
+            `DELETE FROM share_links WHERE file_id IN (${files.map((_, idx) => `@fid${idx}`).join(', ')})`
+          );
+        }
+        
         // Delete database records in batch
         const deleteReq = await getRequest();
         deleteReq.input('folderId', sql.UniqueIdentifier, folderId);
@@ -3475,12 +3486,12 @@ app.post('/api/files/:id/delete', authenticateUser as express.RequestHandler, as
       `UPDATE files SET deleted_at=SYSDATETIMEOFFSET() WHERE id=@id AND deleted_at IS NULL`
     );
 
-    // Deactivate any share links for this file (they should no longer be active)
-    const deactivateSharesReq = await getRequest();
-    deactivateSharesReq.input('id', sql.UniqueIdentifier, fileId);
-    await deactivateSharesReq.query(
-      `UPDATE share_links SET is_active=0 WHERE file_id=@id`
-    );
+    // Remove share links for this file entirely. They are gone with the file:
+    // keeping them (even deactivated) leaves version_id pins that can later
+    // block the hard delete via FK_share_links_version (NO ACTION).
+    const removeSharesReq = await getRequest();
+    removeSharesReq.input('id', sql.UniqueIdentifier, fileId);
+    await removeSharesReq.query('DELETE FROM share_links WHERE file_id=@id');
 
     if (file.status === 'Available') {
       const sReq = await getRequest();
@@ -3567,12 +3578,11 @@ app.post('/api/files/delete', authenticateUser as express.RequestHandler, async 
           `UPDATE files SET deleted_at=SYSDATETIMEOFFSET() WHERE id=@id AND deleted_at IS NULL`
         );
         
-        // Deactivate any share links for this file
-        const deactivateSharesReq = await getRequest();
-        deactivateSharesReq.input('id', sql.UniqueIdentifier, file.id);
-        await deactivateSharesReq.query(
-          `UPDATE share_links SET is_active=0 WHERE file_id=@id`
-        );
+        // Remove share links for this file (gone with the file; also drops any
+        // version_id pins that would block the later hard delete).
+        const removeSharesReq = await getRequest();
+        removeSharesReq.input('id', sql.UniqueIdentifier, file.id);
+        await removeSharesReq.query('DELETE FROM share_links WHERE file_id=@id');
         
         // Update user storage
         if (file.status === 'Available') {
@@ -3726,7 +3736,16 @@ app.post('/api/files/:id/delete-permanent', authenticateUser as express.RequestH
       console.error(`[PERM DELETE] Failed to delete vault file ${file.id} (${file.stored_path}):`, err);
     }
 
-    // Permanently delete from DB (cascades to keys and share links)
+    // Remove share links for this file explicitly BEFORE deleting the file.
+    // FK_share_links_files cascades them anyway, but FK_share_links_version
+    // (version_id -> file_versions, NO ACTION) can block the cascade when a
+    // share is pinned to one of this file's archived versions. Deleting the
+    // share rows first guarantees the file_versions cascade succeeds.
+    const delSharesReq = await getRequest();
+    delSharesReq.input('id', sql.UniqueIdentifier, fileId);
+    await delSharesReq.query('DELETE FROM share_links WHERE file_id=@id');
+
+    // Permanently delete from DB (cascades to keys and versions)
     const delReq = await getRequest();
     delReq.input('id', sql.UniqueIdentifier, fileId);
     await delReq.query('DELETE FROM files WHERE id=@id');
@@ -4391,6 +4410,13 @@ app.post('/api/files/:id/versions/:versionId/restore', authenticateUser as expre
        VALUES (@fid,@encK,@kIv,@kTag,@fIv,@fTag,'AES-256-GCM',SYSDATETIMEOFFSET())`
     );
 
+    // 4b) Any share link pinned to this version should now resolve to the CURRENT
+    // version (which this restore just made it). Repoint so the DELETE of the
+    // archived row below doesn't trip FK_share_links_version.
+    const repointSharesReq = await getRequest();
+    repointSharesReq.input('vid', sql.UniqueIdentifier, versionId);
+    await repointSharesReq.query('UPDATE share_links SET version_id=NULL WHERE version_id=@vid');
+
     // 5) Remove the archived row that was just restored (its key row was already moved).
     const delVerReq = await getRequest();
     delVerReq.input('vid', sql.UniqueIdentifier, versionId);
@@ -4427,6 +4453,21 @@ app.delete('/api/files/:id/versions/:versionId', authenticateUser as express.Req
     );
     if (!verRes.recordset.length) return res.status(404).json({ error: 'Version not found.' });
     const version = verRes.recordset[0];
+
+    // Refuse to delete a version that is still referenced by a shared link
+    // (FK_share_links_version). The owner must unshare it first; this preserves
+    // the guarantee that a public link pinned to a deleted version reports
+    // "no longer available" rather than silently resolving elsewhere.
+    const shareRefReq = await getRequest();
+    shareRefReq.input('vid', sql.UniqueIdentifier, versionId);
+    const shareRefRes = await shareRefReq.query<{ cnt: number }>(
+      `SELECT COUNT(*) AS cnt FROM share_links WHERE version_id=@vid`
+    );
+    if (Number(shareRefRes.recordset[0]?.cnt ?? 0) > 0) {
+      return res.status(409).json({
+        error: 'This version is currently shared and cannot be deleted. Unshare it before deleting.',
+      });
+    }
 
     // Physically delete the vault blob (row delete cascades to file_version_keys).
     try {
@@ -5472,6 +5513,17 @@ app.post('/api/admin/file-folders/:id/delete', authenticateUser as express.Reque
           .reduce((total, file) => total + BigInt(Number(file.size_bytes || 0)), 0n);
         totalStorageToRemove += storageForThisBatch;
         
+        // Remove share links for this batch's files BEFORE deleting them so no
+        // version_id pin blocks the file_versions cascade (FK_share_links_version
+        // is NO ACTION). Guarded to the batch so we only touch this batch.
+        if (files.length > 0) {
+          const delSharesReq = await getRequest();
+          files.forEach((file, idx) => delSharesReq.input(`fid${idx}`, sql.UniqueIdentifier, file.id));
+          await delSharesReq.query(
+            `DELETE FROM share_links WHERE file_id IN (${files.map((_, idx) => `@fid${idx}`).join(', ')})`
+          );
+        }
+        
         // Delete database records in batch
         const deleteReq = await getRequest();
         deleteReq.input('folderId', sql.UniqueIdentifier, folderId);
@@ -5832,6 +5884,12 @@ async function runTrashPurgeCycle(): Promise<void> {
     } catch (err) {
       console.error(`[trash-purge] Failed to remove vault file ${file.id}:`, err);
     }
+
+    // Remove share links first (see permanent delete) so FK_share_links_version
+    // does not block the cascade that deletes this file's archived versions.
+    const delSharesReq = await getRequest();
+    delSharesReq.input('id', sql.UniqueIdentifier, file.id);
+    await delSharesReq.query('DELETE FROM share_links WHERE file_id=@id');
 
     const delReq = await getRequest();
     delReq.input('id', sql.UniqueIdentifier, file.id);

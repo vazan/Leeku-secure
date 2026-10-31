@@ -68,6 +68,23 @@ function getSingleParam(value: string | string[] | undefined): string {
   return value ?? '';
 }
 
+/**
+ * Returns true when the share's pinned version resolved; otherwise sends a 410
+ * and returns false. A share link pinned to `version_id` whose archived row no
+ * longer exists (e.g. the version was deleted) must NOT silently fall back to
+ * the current version — it should report the version as unavailable.
+ */
+function versionResolvedOrRespond(
+  row: { pinned_version_id?: string | null; resolved_version_id?: string | null },
+  res: express.Response
+): boolean {
+  if (row.pinned_version_id && !row.resolved_version_id) {
+    res.status(410).json({ error: 'This shared file version is no longer available.' });
+    return false;
+  }
+  return true;
+}
+
 function parseSingleByteRange(rangeHeader: string, fileSize: number): { start: number; end: number } | null {
   const normalized = rangeHeader.trim();
   if (!normalized.toLowerCase().startsWith('bytes=')) return null;
@@ -434,13 +451,14 @@ const buildPromise = (async () => {
     try {
       const request = await getRequest(); request.input('tok', sql.Char(32), getSingleParam(req.params.token));
       const result = await request.query<ShareRow & {
+        pinned_version_id: string | null; resolved_version_id: string | null;
         file_status: string; leeku_vibe: string|null; mime_type: string;
         size_bytes: number; file_created_at: Date; stored_path: string;
         client_secret_hash: string | null;
         original_name_encrypted: Buffer; original_name_iv: Buffer; original_name_auth_tag: Buffer;
         owner_username_encrypted: Buffer; owner_username_iv: Buffer; owner_username_auth_tag: Buffer;
       }>(
-        `SELECT sl.id,u.id AS owner_user_id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.allow_external_preview,sl.allow_decrypted_external_preview,
+        `SELECT sl.id,sl.version_id AS pinned_version_id,v.id AS resolved_version_id,u.id AS owner_user_id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.allow_external_preview,sl.allow_decrypted_external_preview,
                 COALESCE(v.status,f.status) AS file_status,f.leeku_vibe,COALESCE(v.mime_type,f.mime_type) AS mime_type,COALESCE(v.size_bytes,f.size_bytes) AS size_bytes,COALESCE(v.created_at,f.created_at) AS file_created_at,COALESCE(v.stored_path,f.stored_path) AS stored_path,
                 COALESCE(v.client_secret_hash,f.client_secret_hash) AS client_secret_hash,
                 COALESCE(v.original_name_encrypted,f.original_name_encrypted) AS original_name_encrypted,COALESCE(v.original_name_iv,f.original_name_iv) AS original_name_iv,COALESCE(v.original_name_auth_tag,f.original_name_auth_tag) AS original_name_auth_tag,
@@ -453,6 +471,7 @@ const buildPromise = (async () => {
       );
       const row = result.recordset[0];
       if (!row) return res.status(404).json({ error: 'Share link not found.' });
+      if (!versionResolvedOrRespond(row, res)) return;
       if (!row.is_active) return res.status(404).json({ error: 'Share link inactive.' });
       if (row.file_status === 'Blocked') return res.status(410).json({ error: 'File has been blocked.' });
       if (row.expires_at && new Date(row.expires_at) < new Date()) return res.status(410).json({ error: 'Share link has expired.' });
@@ -499,13 +518,14 @@ const buildPromise = (async () => {
       const request = await getRequest();
       request.input('tok', sql.Char(32), token);
       const result = await request.query<ShareRow & {
+        pinned_version_id: string | null; resolved_version_id: string | null;
         file_status: string; stored_path: string; mime_type: string; size_bytes: number;
         client_secret_hash: string | null; client_crypto_salt: Buffer | null; client_crypto_iv: Buffer | null; client_crypto_iterations: number | null;
         original_name_encrypted: Buffer; original_name_iv: Buffer; original_name_auth_tag: Buffer;
         checksum_sha256: string; file_id_join: string;
         encrypted_key: Buffer; key_iv: Buffer; key_auth_tag: Buffer; file_iv: Buffer; file_auth_tag: Buffer;
       }>(
-        `SELECT sl.id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.allow_external_preview,
+        `SELECT sl.id,sl.version_id AS pinned_version_id,v.id AS resolved_version_id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.allow_external_preview,
                 COALESCE(v.id,f.id) AS file_id_join,COALESCE(v.status,f.status) AS file_status,COALESCE(v.stored_path,f.stored_path) AS stored_path,COALESCE(v.mime_type,f.mime_type) AS mime_type,COALESCE(v.size_bytes,f.size_bytes) AS size_bytes,COALESCE(v.checksum_sha256,f.checksum_sha256) AS checksum_sha256,
                 COALESCE(v.client_secret_hash,f.client_secret_hash) AS client_secret_hash,COALESCE(v.client_crypto_salt,f.client_crypto_salt) AS client_crypto_salt,COALESCE(v.client_crypto_iv,f.client_crypto_iv) AS client_crypto_iv,COALESCE(v.client_crypto_iterations,f.client_crypto_iterations) AS client_crypto_iterations,
                 COALESCE(v.original_name_encrypted,f.original_name_encrypted) AS original_name_encrypted,COALESCE(v.original_name_iv,f.original_name_iv) AS original_name_iv,COALESCE(v.original_name_auth_tag,f.original_name_auth_tag) AS original_name_auth_tag,
@@ -521,6 +541,7 @@ const buildPromise = (async () => {
       if (row.file_status === 'Blocked') return res.status(410).json({ error: 'File has been blocked.' });
       if (row.expires_at && new Date(row.expires_at) < new Date()) return res.status(410).json({ error: 'Link expired.' });
       if (row.max_downloads && row.download_count >= row.max_downloads) return res.status(410).json({ error: 'Download limit reached.' });
+      if (!versionResolvedOrRespond(row, res)) return;
 
       const originalName = decryptColumn(row.original_name_encrypted, row.original_name_iv, row.original_name_auth_tag);
       const previewKind = getTextPreviewKind(originalName, row.mime_type || '');
@@ -618,12 +639,13 @@ const buildPromise = (async () => {
     const request = await getRequest();
     request.input('tok', sql.Char(32), token);
     const result = await request.query<ShareRow & {
+      pinned_version_id: string | null; resolved_version_id: string | null;
       file_status: string; mime_type: string;
       size_bytes: number; file_created_at: Date; stored_path: string;
       original_name_encrypted: Buffer; original_name_iv: Buffer; original_name_auth_tag: Buffer;
       owner_username_encrypted: Buffer; owner_username_iv: Buffer; owner_username_auth_tag: Buffer;
     }>(
-      `SELECT sl.id,u.id AS owner_user_id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.allow_external_preview,
+      `SELECT sl.id,sl.version_id AS pinned_version_id,v.id AS resolved_version_id,u.id AS owner_user_id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.allow_external_preview,
               COALESCE(v.status,f.status) AS file_status,COALESCE(v.mime_type,f.mime_type) AS mime_type,COALESCE(v.size_bytes,f.size_bytes) AS size_bytes,COALESCE(v.created_at,f.created_at) AS file_created_at,COALESCE(v.stored_path,f.stored_path) AS stored_path,
               COALESCE(v.original_name_encrypted,f.original_name_encrypted) AS original_name_encrypted,COALESCE(v.original_name_iv,f.original_name_iv) AS original_name_iv,COALESCE(v.original_name_auth_tag,f.original_name_auth_tag) AS original_name_auth_tag,
               u.username_encrypted AS owner_username_encrypted,u.username_iv AS owner_username_iv,u.username_auth_tag AS owner_username_auth_tag
@@ -635,6 +657,10 @@ const buildPromise = (async () => {
     );
     const row = result.recordset[0];
     if (!row) { res.status(404).type('html').send(ogErrorHtml('Not Found')); return; }
+    if (!versionResolvedOrRespond(row, res)) {
+      res.status(410).type('html').send(ogErrorHtml('This shared file version is no longer available.'));
+      return;
+    }
     if (!row.is_active) { res.status(404).type('html').send(ogErrorHtml('Not Found')); return; }
     if (row.file_status === 'Blocked') { res.status(410).type('html').send(ogErrorHtml('Unavailable')); return; }
     if (row.expires_at && new Date(row.expires_at) < new Date()) { res.status(410).type('html').send(ogErrorHtml('Expired')); return; }
@@ -754,6 +780,7 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
     try {
       const request = await getRequest(); request.input('tok', sql.Char(32), token);
       const result = await request.query<ShareRow & {
+        pinned_version_id: string | null; resolved_version_id: string | null;
         file_status: string; stored_path: string;
         size_bytes: number; encrypted_size_bytes: number | null;
         client_secret_hash: string | null; client_crypto_salt: Buffer | null; client_crypto_iv: Buffer | null; client_crypto_iterations: number | null;
@@ -761,7 +788,7 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
         mime_type: string; checksum_sha256: string; file_id_join: string;
         encrypted_key: Buffer; key_iv: Buffer; key_auth_tag: Buffer; file_iv: Buffer; file_auth_tag: Buffer;
       }>(
-        `SELECT sl.id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.allow_external_preview,
+        `SELECT sl.id,sl.version_id AS pinned_version_id,v.id AS resolved_version_id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.allow_external_preview,
           COALESCE(v.id,f.id) AS file_id_join,COALESCE(v.status,f.status) AS file_status,COALESCE(v.stored_path,f.stored_path) AS stored_path,COALESCE(v.mime_type,f.mime_type) AS mime_type,COALESCE(v.size_bytes,f.size_bytes) AS size_bytes,COALESCE(v.encrypted_size_bytes,f.encrypted_size_bytes) AS encrypted_size_bytes,COALESCE(v.checksum_sha256,f.checksum_sha256) AS checksum_sha256,
                 COALESCE(v.client_secret_hash,f.client_secret_hash) AS client_secret_hash,COALESCE(v.client_crypto_salt,f.client_crypto_salt) AS client_crypto_salt,COALESCE(v.client_crypto_iv,f.client_crypto_iv) AS client_crypto_iv,COALESCE(v.client_crypto_iterations,f.client_crypto_iterations) AS client_crypto_iterations,
                 COALESCE(v.original_name_encrypted,f.original_name_encrypted) AS original_name_encrypted,COALESCE(v.original_name_iv,f.original_name_iv) AS original_name_iv,COALESCE(v.original_name_auth_tag,f.original_name_auth_tag) AS original_name_auth_tag,
@@ -777,6 +804,7 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
       if (row.file_status === 'Blocked') return res.status(410).json({ error: 'File has been blocked.' });
       if (row.expires_at && new Date(row.expires_at) < new Date()) return res.status(410).json({ error: 'Link expired.' });
       if (row.max_downloads && row.download_count >= row.max_downloads) return res.status(410).json({ error: 'Download limit reached.' });
+      if (!versionResolvedOrRespond(row, res)) return;
       if (row.password_hash && (!password || !(await verifySharePassword(password, row.password_hash)))) {
         return res.status(403).json({ error: password ? 'Incorrect vault password.' : 'Password required.' });
       }
@@ -995,6 +1023,7 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
       const request = await getRequest();
       request.input('tok', sql.Char(32), token);
       const result = await request.query<ShareRow & {
+        pinned_version_id: string | null; resolved_version_id: string | null;
         file_status: string; stored_path: string;
         client_secret_hash: string | null;
         original_name_encrypted: Buffer; original_name_iv: Buffer; original_name_auth_tag: Buffer;
@@ -1003,7 +1032,7 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
         mime_type: string; size_bytes: number; checksum_sha256: string; file_id_join: string;
         encrypted_key: Buffer; key_iv: Buffer; key_auth_tag: Buffer; file_iv: Buffer; file_auth_tag: Buffer;
       }>(
-        `SELECT sl.id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.allow_external_preview,sl.allow_decrypted_external_preview,
+        `SELECT sl.id,sl.version_id AS pinned_version_id,v.id AS resolved_version_id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.allow_external_preview,sl.allow_decrypted_external_preview,
                 u.id AS owner_user_id,
                 COALESCE(v.id,f.id) AS file_id_join,COALESCE(v.status,f.status) AS file_status,COALESCE(v.stored_path,f.stored_path) AS stored_path,COALESCE(v.mime_type,f.mime_type) AS mime_type,COALESCE(v.size_bytes,f.size_bytes) AS size_bytes,COALESCE(v.checksum_sha256,f.checksum_sha256) AS checksum_sha256,
                 COALESCE(v.client_secret_hash,f.client_secret_hash) AS client_secret_hash,
@@ -1019,6 +1048,7 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
       const row = result.recordset[0];
       if (!row) return res.status(404).json({ error: 'Share link not found.' });
       if (!row.is_active) return res.status(404).json({ error: 'Share link inactive.' });
+      if (!versionResolvedOrRespond(row, res)) return;
       if (!row.allow_external_preview) {
         return res.status(403).json({ error: 'External preview is not enabled for this share link.' });
       }
