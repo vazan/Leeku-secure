@@ -166,6 +166,34 @@ END
 GO
 
 -- ──────────────────────────────────────────────────────────────
+-- 6b. file_versions.deleted_at / deleted_by — soft-delete support.
+--      When an archived version is deleted (moved to the version trash), its blob
+--      and wrapped key are KEPT on disk/DB and only `deleted_at` is stamped. The
+--      version can be restored (clears deleted_at) or permanently purged later.
+-- ──────────────────────────────────────────────────────────────
+IF COL_LENGTH('dbo.file_versions', 'deleted_at') IS NULL
+BEGIN
+    ALTER TABLE dbo.file_versions ADD deleted_at DATETIMEOFFSET(7) NULL;
+    PRINT 'Added file_versions.deleted_at column';
+END
+ELSE
+BEGIN
+    PRINT 'file_versions.deleted_at column already exists';
+END
+GO
+
+IF COL_LENGTH('dbo.file_versions', 'deleted_by') IS NULL
+BEGIN
+    ALTER TABLE dbo.file_versions ADD deleted_by UNIQUEIDENTIFIER NULL;
+    PRINT 'Added file_versions.deleted_by column';
+END
+ELSE
+BEGIN
+    PRINT 'file_versions.deleted_by column already exists';
+END
+GO
+
+-- ──────────────────────────────────────────────────────────────
 -- 7. Index for same-name same-folder detection
 -- ──────────────────────────────────────────────────────────────
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_files_owner_name_hash' AND object_id=OBJECT_ID('dbo.files'))

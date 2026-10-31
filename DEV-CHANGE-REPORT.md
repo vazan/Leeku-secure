@@ -118,8 +118,42 @@ PRE-EXISTING-FILE GAP (found in validation) — fixed:
   2. One-time backfill `scripts/backfill-file-hashes.ts` (`npm run backfill:file-hashes`) that rehashes all
      active NULL-hash rows server-side.
 
+VERSION SOFT-DELETE + TRASH (owner decision, current task):
+- Deleting an archived version is now a **soft delete**: it stamps `file_versions.deleted_at`/`deleted_by`
+  (keeps the vault blob and the `file_version_keys` wrapped key) instead of unlinking the blob and hard-
+  deleting the row. The version moves into a "Trash" section in the Versions drawer and can be restored.
+- Migration section "6b" adds `file_versions.deleted_at DATETIMEOFFSET(7) NULL` and
+  `file_versions.deleted_by UNIQUEIDENTIFIER NULL` (idempotent `IF COL_LENGTH(...) IS NULL` guards).
+- Backend:
+  - `DELETE /api/files/:id/versions/:versionId` → `UPDATE file_versions SET deleted_at=SYSDATETIMEOFFSET(),
+    deleted_by=@by WHERE id=@vid AND deleted_at IS NULL`. Keeps the 409 share-ref guard ("refuse until
+    unshared" — owner decision); response `{ success, message: 'Version moved to trash.' }`.
+  - NEW `POST /api/files/:id/versions/:versionId/restore-trashed` clears `deleted_at`/`deleted_by` and
+    returns the restored `version_no`.
+  - `GET /api/files/:id/versions` now returns `{ versions, trashed, current_id }` — `versions` only rows
+    with `deleted_at IS NULL` (current + active archived), `trashed` the soft-deleted ones; each object
+    carries `deleted_at` (ISO string or null).
+  - `GET .../download` returns 410 if the version is trashed ("must be restored before download").
+  - `src/server/routes/public-sharing.ts` `SHARE_VERSION_JOINS` adds `AND v.deleted_at IS NULL`, so a
+    share pinned to a trashed version resolves to 410 "This shared file version is no longer available."
+  - `POST .../restore` (promote-to-current) is unchanged: the promoted row is hard-deleted at the end of
+    the transaction and shares are repointed, so it behaves correctly even if called directly on a trashed
+    row. The UI does not expose Promote for trashed versions (they only get "Restore" from version trash).
+- Frontend (`user-dashboard.tsx`, `src/app/shared/types/index.ts`):
+  - `FileVersion` gains `deleted_at?: string | null`.
+  - `openVersions` resets + reads back `data.trashed`.
+  - `deleteVersion` confirmation/success copy → "trash"; reloads via `openVersions(file)`.
+  - NEW `restoreTrashedVersion` POSTs `/restore-trashed` then reloads.
+  - `VersionsDialog` receives `trashed` + `onRestoreTrashed`; renders a "Trash (N)" section listing
+    trashed versions with a dashed border, an "IN TRASH" badge, and a Restore button. Trashed versions do
+    not appear in the active list, so Promote/Delete/Share/Download are not offered for them from the
+    active list (Download of a trashed version is server-410'd anyway).
+- Leak note (pre-existing, out of scope): archived-version blobs are not cleaned up on file permanent
+  delete / trash purge — only the current `files.stored_path` blob is unlinked. The soft-delete task does
+  not change this; documented here for awareness.
+
 ## Validation
-Build: ✅ (`tsc --noEmit`; `vite build` ✓ 494ms; esbuild server bundle OK)  Lint: ✅  Type-check: ✅
+Build: ✅ (`tsc --noEmit`; `vite build` ✓ 483ms; esbuild server bundle OK)  Lint: ✅  Type-check: ✅
 Smoke: ⚠SKIPPED (no reachable MSSQL/sqlcmd harness in this environment; existing test
 `tests/desktop-updates-path.test.ts` passes 2/2)
 
@@ -146,6 +180,14 @@ Surfaces / cas-limites / risques:
 11. Restore from UI: after restore the drawer refreshes (`openVersions`) and the moved version gets a fresh version_no
    (no UNIQUE collision across repeated restore cycles).
 12. Preview: current version opens the existing previewer; archived shows the notification notice.
+13. Soft-delete: DELETE on an archived version keeps the vault blob + `file_version_keys` row)Skip, sets `deleted_at`,
+   and the drawer's "Trash (N)" section shows the version with a Restore button; download of that version
+   returns 410.
+14. Restore-from-trash: `POST /restore-trashed` clears `deleted_at`/`deleted_by`; the version reappears in the
+   active list; a share link pinned to it resolves again (no longer 410).
+15. Soft-delete + share guard: deleting a shared version still refuses with 409 until unshared; after unshare,
+   soft-delete works.
+16. Migration re-run is a no-op for section "6b" (`deleted_at`/`deleted_by` COL_LENGTH guards).
 
 ## Handoff QaEngineer
 Validation: type-check ✅; server bundle ✅; vite build ✅; test:desktop-updates ✅ (2/2). CRITICAL approval state:

@@ -39,7 +39,7 @@ interface ShareRow {
 // The owner still comes from the logical file (`files f`), so `users` joins stay
 // stable.
 const SHARE_VERSION_JOINS = `
-         LEFT JOIN file_versions v ON sl.version_id IS NOT NULL AND sl.version_id = v.id
+         LEFT JOIN file_versions v ON sl.version_id IS NOT NULL AND sl.version_id = v.id AND v.deleted_at IS NULL
          LEFT JOIN file_version_keys vk ON vk.version_id = v.id
          LEFT JOIN file_encryption_keys k ON sl.version_id IS NULL AND f.id = k.file_id`;
 

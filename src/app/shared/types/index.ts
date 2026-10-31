@@ -68,6 +68,7 @@ export interface FileVersion {
   mime_type: string;
   status: string;
   created_at: string;
+  deleted_at?: string | null; // set when the version is in the version trash
 }
 
 export interface AdminFileFolder extends FileFolder {

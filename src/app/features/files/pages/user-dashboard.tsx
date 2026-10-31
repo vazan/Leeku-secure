@@ -416,6 +416,7 @@ export default function UserDashboard({
   const [shareUrl, setShareUrl] = useState("");
   const [versionsFile, setVersionsFile] = useState<FileMetadata | null>(null);
   const [versions, setVersions] = useState<FileVersion[]>([]);
+  const [trashedVersions, setTrashedVersions] = useState<FileVersion[]>([]);
   const [versionsLoading, setVersionsLoading] = useState(false);
   const [versionsBusyId, setVersionsBusyId] = useState<string | null>(null);
   const [shareVersionId, setShareVersionId] = useState<string | null>(null);
@@ -1654,6 +1655,7 @@ export default function UserDashboard({
   const openVersions = async (file: FileMetadata) => {
     setVersionsFile(file);
     setVersions([]);
+    setTrashedVersions([]);
     setVersionsLoading(true);
     try {
       const response = await fetch(`/api/files/${file.id}/versions`, {
@@ -1670,8 +1672,9 @@ export default function UserDashboard({
         notifyError(message);
         return;
       }
-      const data = (await response.json()) as { versions: FileVersion[] };
+      const data = (await response.json()) as { versions: FileVersion[]; trashed?: FileVersion[] };
       setVersions(data.versions || []);
+      setTrashedVersions(data.trashed || []);
     } catch (error) {
       console.error("[versions] Failed to load versions.", error);
       notifyError("Could not load versions.");
@@ -1749,7 +1752,7 @@ export default function UserDashboard({
   };
 
   const deleteVersion = async (file: FileMetadata, version: FileVersion) => {
-    if (!window.confirm(`Permanently delete version ${version.version_no} of "${version.original_name}"?`)) return;
+    if (!window.confirm(`Move version ${version.version_no} of "${version.original_name}" to trash?`)) return;
     setVersionsBusyId(version.id);
     try {
       const response = await fetch(
@@ -1761,12 +1764,37 @@ export default function UserDashboard({
         notifyError(data?.error || "Could not delete this version.");
         return;
       }
-      notify(data?.message || "Version deleted.");
-      setVersions((current) => current.filter((v) => v.id !== version.id));
+      notify(data?.message || "Version moved to trash.");
+      await openVersions(file);
       await loadFilesAndLinks();
     } catch (error) {
       console.error("[versions] Delete failed.", error);
       notifyError("Could not delete this version.");
+    } finally {
+      setVersionsBusyId(null);
+    }
+  };
+
+  // Restore a soft-deleted archived version from the version trash back into the
+  // active versions list (clears its deleted_at marker).
+  const restoreTrashedVersion = async (file: FileMetadata, version: FileVersion) => {
+    setVersionsBusyId(version.id);
+    try {
+      const response = await fetch(
+        `/api/files/${file.id}/versions/${version.id}/restore-trashed`,
+        { method: "POST", headers: authHeaders(token) },
+      );
+      const data = await response.json();
+      if (!response.ok) {
+        notifyError(data?.error || "Could not restore this version.");
+        return;
+      }
+      notify(data?.message || "Version restored from trash.");
+      await openVersions(file);
+      await loadFilesAndLinks();
+    } catch (error) {
+      console.error("[versions] Restore-trashed failed.", error);
+      notifyError("Could not restore this version.");
     } finally {
       setVersionsBusyId(null);
     }
@@ -3105,11 +3133,13 @@ export default function UserDashboard({
         <VersionsDialog
           file={versionsFile}
           versions={versions}
+          trashed={trashedVersions}
           loading={versionsLoading}
           busyId={versionsBusyId}
           onDownload={(version) => downloadVersion(versionsFile, version)}
           onRestore={(version) => restoreVersion(versionsFile, version)}
           onDelete={(version) => deleteVersion(versionsFile, version)}
+          onRestoreTrashed={(version) => restoreTrashedVersion(versionsFile, version)}
           onShare={(version) => openShareForVersion(versionsFile, version)}
           onPreview={(version) => previewVersion(version)}
           onClose={() => setVersionsFile(null)}
@@ -3123,26 +3153,32 @@ export default function UserDashboard({
 // Versions drawer — lists all versions of a logical file (current + archived).
 // Full §3.4 UI: current badge, per-version size, running total (owner #1),
 // download / preview / restore / delete / per-version share (owner #2).
+// Soft-deleted archived versions appear in a "Trash" section below the active
+// list and can be restored from there (owner decision: soft-delete + restore).
 // ──────────────────────────────────────────────────────────────
 function VersionsDialog({
   file,
   versions,
+  trashed,
   loading,
   busyId,
   onDownload,
   onRestore,
   onDelete,
+  onRestoreTrashed,
   onShare,
   onPreview,
   onClose,
 }: {
   file: FileMetadata;
   versions: FileVersion[];
+  trashed: FileVersion[];
   loading: boolean;
   busyId: string | null;
   onDownload: (version: FileVersion) => void;
   onRestore: (version: FileVersion) => void;
   onDelete: (version: FileVersion) => void;
+  onRestoreTrashed: (version: FileVersion) => void;
   onShare: (version: FileVersion) => void;
   onPreview: (version: FileVersion) => void;
   onClose: () => void;
@@ -3177,9 +3213,9 @@ function VersionsDialog({
             <p className="mt-1 text-sm text-[var(--text-muted)]">
               {loading
                 ? "Loading versions..."
-                : versions.length === 0
-                  ? "No version history."
-                  : `${versions.length} version${versions.length === 1 ? "" : "s"} · ${formatBytes(totalBytes)} total`}
+                : `${versions.length} version${versions.length === 1 ? "" : "s"} · ${formatBytes(totalBytes)} total${
+                    trashed.length > 0 ? ` · ${trashed.length} in trash` : ""
+                  }`}
             </p>
           </div>
           <button
@@ -3278,6 +3314,53 @@ function VersionsDialog({
                 </div>
               );
             })}
+          </div>
+        )}
+
+        {!loading && trashed.length > 0 && (
+          <div className="mt-5">
+            <div className="flex items-center gap-2">
+              <Trash2 className="h-4 w-4 text-[var(--text-muted)]" />
+              <h3 className="text-sm font-semibold text-[var(--text-secondary)]">
+                Trash ({trashed.length})
+              </h3>
+            </div>
+            <div className="mt-2 max-h-[30vh] space-y-2 overflow-y-auto pr-1">
+              {[...trashed]
+                .sort((a, b) => b.version_no - a.version_no)
+                .map((version) => {
+                  const busy = busyId === version.id;
+                  return (
+                    <div
+                      key={version.id}
+                      className="rounded-lg border border-dashed border-[var(--border-subtle)] bg-[var(--bg-elevated)] p-3 opacity-90"
+                    >
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="text-sm font-medium">v{version.version_no}</span>
+                        <span className="rounded-full bg-[color-mix(in_srgb,var(--text-muted)_15%,transparent)] px-2 py-0.5 text-[10px] font-semibold text-[var(--text-muted)]">
+                          IN TRASH
+                        </span>
+                        <span className="ml-auto text-xs text-[var(--text-muted)]">
+                          {formatBytes(version.size_bytes)} ·{" "}
+                          {new Date(version.created_at).toLocaleDateString()}
+                        </span>
+                      </div>
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        <button
+                          type="button"
+                          disabled={busy}
+                          onClick={() => onRestoreTrashed(version)}
+                          className="flex h-9 items-center gap-1.5 rounded-lg border border-[var(--border-subtle)] px-2.5 text-xs font-medium text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] disabled:opacity-60"
+                        >
+                          <RotateCcw className="h-3.5 w-3.5" />
+                          Restore
+                        </button>
+                        {busy && <Loader2 className="h-4 w-4 animate-spin text-[var(--text-muted)]" />}
+                      </div>
+                    </div>
+                  );
+                })}
+            </div>
           </div>
         )}
       </div>

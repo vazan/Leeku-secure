@@ -801,6 +801,8 @@ interface FileVersionRow {
   is_encrypted: boolean; client_secret_hash: string | null;
   client_crypto_salt: Buffer | null; client_crypto_iv: Buffer | null; client_crypto_iterations: number | null;
   created_at: Date;
+  deleted_at?: Date | string | null;  // soft-delete marker (version trash)
+  deleted_by?: string | null;
 }
 
 interface FolderRow {
@@ -4115,11 +4117,28 @@ app.get('/api/files/:id/versions', authenticateUser as express.RequestHandler, a
     const verRes = await verReq.query<FileVersionRow>(
       `SELECT id,file_id,version_no,original_name_encrypted,original_name_iv,original_name_auth_tag,
               stored_path,mime_type,size_bytes,encrypted_size_bytes,status,checksum_sha256,
-              scan_result,scan_message,is_encrypted,client_secret_hash,client_crypto_salt,client_crypto_iv,client_crypto_iterations,created_at
+              scan_result,scan_message,is_encrypted,client_secret_hash,client_crypto_salt,client_crypto_iv,client_crypto_iterations,created_at,
+              deleted_at,deleted_by
        FROM file_versions WHERE file_id=@fid ORDER BY version_no ASC`
     );
 
     const currentName = decryptColumn(cur.original_name_encrypted, cur.original_name_iv, cur.original_name_auth_tag);
+    const mapVersion = (v: FileVersionRow) => ({
+      id: v.id,
+      version_no: v.version_no,
+      is_current: false,
+      original_name: decryptColumn(v.original_name_encrypted, v.original_name_iv, v.original_name_auth_tag),
+      size_bytes: v.size_bytes,
+      mime_type: v.mime_type,
+      status: v.status,
+      created_at: v.created_at,
+      deleted_at: v.deleted_at
+        ? (v.deleted_at instanceof Date ? v.deleted_at : new Date(v.deleted_at)).toISOString()
+        : null,
+    });
+    const active = verRes.recordset.filter((v) => !v.deleted_at).map(mapVersion);
+    const trashed = verRes.recordset.filter((v) => !!v.deleted_at).map(mapVersion);
+
     const versions = [
       {
         id: cur.id,
@@ -4130,20 +4149,13 @@ app.get('/api/files/:id/versions', authenticateUser as express.RequestHandler, a
         mime_type: cur.mime_type,
         status: cur.status,
         created_at: cur.created_at,
+        deleted_at: null,
       },
-      ...verRes.recordset.map((v) => ({
-        id: v.id,
-        version_no: v.version_no,
-        is_current: false,
-        original_name: decryptColumn(v.original_name_encrypted, v.original_name_iv, v.original_name_auth_tag),
-        size_bytes: v.size_bytes,
-        mime_type: v.mime_type,
-        status: v.status,
-        created_at: v.created_at,
-      })),
-    ].sort((a, b) => b.version_no - a.version_no);
+      ...active,
+    ].sort((a, b) => Number(b.version_no) - Number(a.version_no));
+    const trashedSorted = [...trashed].sort((a, b) => b.version_no - a.version_no);
 
-    res.json({ versions, current_id: cur.id });
+    res.json({ versions, trashed: trashedSorted, current_id: cur.id });
   } catch (err) {
     console.error('[GET /api/files/:id/versions]', err);
     res.status(500).json({ error: 'Failed to list file versions.' });
@@ -4181,11 +4193,12 @@ app.get('/api/files/:id/versions/:versionId/download', authenticateUser as expre
     const verRes = await verReq.query<FileVersionRow>(
       `SELECT id,file_id,version_no,original_name_encrypted,original_name_iv,original_name_auth_tag,
               stored_path,mime_type,size_bytes,encrypted_size_bytes,status,checksum_sha256,
-              scan_result,scan_message,is_encrypted,client_secret_hash,client_crypto_salt,client_crypto_iv,client_crypto_iterations,created_at
+              scan_result,scan_message,is_encrypted,client_secret_hash,client_crypto_salt,client_crypto_iv,client_crypto_iterations,created_at,deleted_at
        FROM file_versions WHERE id=@vid AND file_id=@fid`
     );
     if (!verRes.recordset.length) { cleanupTemp(); return res.status(404).json({ error: 'Version not found.' }); }
     const version = verRes.recordset[0];
+    if (version.deleted_at) { cleanupTemp(); return res.status(410).json({ error: 'This version is in the trash and must be restored before download.' }); }
     if (version.status === 'Blocked')
       { cleanupTemp(); return res.status(410).json({ error: 'Blocked versions cannot be downloaded.' }); }
 
@@ -4469,23 +4482,55 @@ app.delete('/api/files/:id/versions/:versionId', authenticateUser as express.Req
       });
     }
 
-    // Physically delete the vault blob (row delete cascades to file_version_keys).
-    try {
-      const vaultPath = path.join(FILE_VAULT, version.stored_path);
-      if (fs.existsSync(vaultPath)) await fs.promises.unlink(vaultPath);
-    } catch (err) {
-      console.error(`[DEL VERSION] Failed to delete vault file ${version.stored_path}:`, err);
-    }
+    // Soft delete: stamp deleted_at (and deleted_by) but KEEP the vault blob and
+    // the file_version_keys row so the version can be restored from the version
+    // trash. The DB row is not removed; only its visibility is.
+    const softDelReq = await getRequest();
+    softDelReq.input('vid', sql.UniqueIdentifier, versionId);
+    softDelReq.input('by', sql.UniqueIdentifier, req.userId || null);
+    await softDelReq.query(
+      `UPDATE file_versions SET deleted_at=SYSDATETIMEOFFSET(), deleted_by=@by
+       WHERE id=@vid AND deleted_at IS NULL`
+    );
 
-    const delReq = await getRequest();
-    delReq.input('vid', sql.UniqueIdentifier, versionId);
-    await delReq.query('DELETE FROM file_versions WHERE id=@vid');
-
-    await logSystemEvent(req.userId!, req.user!.username, 'Delete', 'FileVersion', versionId, req, 'Deleted an archived file version.');
-    res.json({ success: true, message: 'Version deleted.' });
+    await logSystemEvent(req.userId!, req.user!.username, 'Delete', 'FileVersion', versionId, req, 'Moved an archived file version to the version trash.');
+    res.json({ success: true, message: 'Version moved to trash.' });
   } catch (err) {
     console.error('[DELETE /api/files/:id/versions/:versionId]', err);
     if (!res.headersSent) res.status(500).json({ error: 'Failed to delete version.' });
+  }
+});
+
+// POST /api/files/:id/versions/:versionId/restore-trashed — restore a soft-deleted
+// archived version (clear its deleted_at marker) so it shows up again in the list.
+app.post('/api/files/:id/versions/:versionId/restore-trashed', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  const fileId = getSingleParam(req.params.id);
+  const versionId = getSingleParam(req.params.versionId);
+  if (!UUID_PATTERN.test(fileId) || !UUID_PATTERN.test(versionId))
+    return res.status(400).json({ error: 'Invalid id.' });
+  try {
+    const ownerReq = await getRequest();
+    ownerReq.input('id', sql.UniqueIdentifier, fileId);
+    const ownerRes = await ownerReq.query<{ owner_user_id: string }>('SELECT owner_user_id FROM files WHERE id=@id');
+    if (!ownerRes.recordset.length) return res.status(404).json({ error: 'File not found.' });
+    if (ownerRes.recordset[0].owner_user_id !== req.userId && req.user!.role !== 'Admin')
+      return res.status(403).json({ error: 'You do not have permission to modify this file.' });
+
+    const updReq = await getRequest();
+    updReq.input('vid', sql.UniqueIdentifier, versionId);
+    updReq.input('fid', sql.UniqueIdentifier, fileId);
+    const updRes = await updReq.query<{ version_no: number }>(
+      `UPDATE file_versions
+       SET deleted_at=NULL, deleted_by=NULL
+       OUTPUT INSERTED.version_no
+       WHERE id=@vid AND file_id=@fid AND deleted_at IS NOT NULL`
+    );
+    if (!updRes.recordset.length) return res.status(404).json({ error: 'Trashed version not found.' });
+    await logSystemEvent(req.userId!, req.user!.username, 'Delete', 'FileVersion', versionId, req, 'Restored an archived file version from trash.');
+    res.json({ success: true, message: 'Version restored from trash.', version_no: updRes.recordset[0].version_no });
+  } catch (err) {
+    console.error('[POST /api/files/:id/versions/:versionId/restore-trashed]', err);
+    if (!res.headersSent) res.status(500).json({ error: 'Failed to restore version.' });
   }
 });
 
