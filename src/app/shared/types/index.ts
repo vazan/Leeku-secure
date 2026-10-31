@@ -45,6 +45,7 @@ export interface FileMetadata {
   preview_max_bytes: number;
   created_at: string;
   deleted_at?: string | null; // Set when file is moved to Trash
+  version_count?: number;      // Total versions (current + archived); undefined if backend is pre-feature
 }
 
 export interface FileFolder {
@@ -55,6 +56,23 @@ export interface FileFolder {
   file_count: number;
   created_at: string;
   updated_at: string;
+}
+
+/** A single version of a logical file (current or archived). */
+export interface FileVersion {
+  id: string;
+  version_no: number;
+  is_current: boolean;
+  original_name: string;
+  size_bytes: number;
+  mime_type: string;
+  status: string;
+  created_at: string;
+  deleted_at?: string | null; // set when the version is in the version trash
+  // Present when the version appears in the Trash tab (soft-deleted versions across
+  // the user's files); identifies the parent file.
+  file_id?: string;
+  file_name?: string;
 }
 
 export interface AdminFileFolder extends FileFolder {

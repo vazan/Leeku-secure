@@ -11,7 +11,8 @@
     "start": "cross-env NODE_ENV=production node dist/server.cjs",
     "clean": "rimraf dist",
     "test:desktop-updates": "tsx --test tests/desktop-updates-path.test.ts",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "backfill:file-hashes": "tsx scripts/backfill-file-hashes.ts"
   },
   "dependencies": {
     "@azure/msal-node": "^7.1.1",

@@ -8,7 +8,9 @@ import {
   FileVolume2,
   Folder,
   FolderPlus,
+  History,
   LayoutGrid,
+  Layers,
   Link2,
   Loader2,
   Lock,
@@ -37,6 +39,7 @@ import type {
   AdminFileFolder,
   FileFolder,
   FileMetadata,
+  FileVersion,
   FolderShareLink,
   Quota,
   ShareLink,
@@ -372,6 +375,7 @@ export default function UserDashboard({
   const [files, setFiles] = useState<FileMetadata[]>([]);
   const [filesLoading, setFilesLoading] = useState(false);
   const [trashFiles, setTrashFiles] = useState<FileMetadata[]>([]);
+  const [trashVersions, setTrashVersions] = useState<FileVersion[]>([]); // soft-deleted versions across the user's files (Trash tab)
   const [trashLoading, setTrashLoading] = useState(false);
   const [folders, setFolders] = useState<FileFolder[]>([]);
   const [foldersLoaded, setFoldersLoaded] = useState(false);
@@ -412,6 +416,13 @@ export default function UserDashboard({
     null,
   );
   const [shareUrl, setShareUrl] = useState("");
+  const [versionsFile, setVersionsFile] = useState<FileMetadata | null>(null);
+  const [versions, setVersions] = useState<FileVersion[]>([]);
+  const [trashedVersions, setTrashedVersions] = useState<FileVersion[]>([]);
+  const [versionsLoading, setVersionsLoading] = useState(false);
+  const [versionsBusyId, setVersionsBusyId] = useState<string | null>(null);
+  const [shareVersionId, setShareVersionId] = useState<string | null>(null);
+  const [shareVersionLabel, setShareVersionLabel] = useState<string | null>(null);
   const [folderSharePassword, setFolderSharePassword] = useState("");
   const [folderShareExpires, setFolderShareExpires] = useState("");
   const [folderShareUrl, setFolderShareUrl] = useState("");
@@ -608,7 +619,9 @@ export default function UserDashboard({
         headers: authHeaders(token),
       });
       if (response.ok) {
-        setTrashFiles((await response.json()).files || []);
+        const payload = await response.json();
+        setTrashFiles(payload.files || []);
+        setTrashVersions(payload.trashedVersions || []);
       } else {
         notifyError("Could not load trash.");
       }
@@ -1400,6 +1413,41 @@ export default function UserDashboard({
     } else notifyError("Could not delete the file.");
   };
 
+  // Restore a soft-deleted archived version from the version trash (Trash tab or
+  // versions drawer) back into the active versions list.
+  const restoreVersionFromTrash = async (fileId: string, version: FileVersion) => {
+    const response = await fetch(
+      `/api/files/${fileId}/versions/${version.id}/restore-trashed`,
+      { method: "POST", headers: authHeaders(token) },
+    );
+    const data = await response.json();
+    if (response.ok) {
+      notify(data?.message || "Version restored from trash.");
+      await loadTrash();
+      await loadFilesAndLinks();
+    } else notifyError(data?.error || "Could not restore this version.");
+  };
+
+  // Permanently delete a soft-deleted archived version from the version trash.
+  const permanentDeleteVersion = async (fileId: string, version: FileVersion) => {
+    if (
+      !window.confirm(
+        `Permanently delete version ${version.version_no} of "${version.original_name}"? This cannot be undone.`
+      )
+    )
+      return;
+    const response = await fetch(
+      `/api/files/${fileId}/versions/${version.id}/delete-permanent`,
+      { method: "POST", headers: authHeaders(token) },
+    );
+    const data = await response.json();
+    if (response.ok) {
+      notify(data?.message || "Version permanently deleted.");
+      await loadTrash();
+      await loadFilesAndLinks();
+    } else notifyError(data?.error || "Could not delete this version.");
+  };
+
   const createFolder = async () => {
     if (activeFolderDepth >= 5) {
       notifyError("Maximum folder depth is 5.");
@@ -1620,6 +1668,8 @@ export default function UserDashboard({
       !exceedsVideoEmbedSizeLimit(file);
     const allowExternalPreview = allowDecryptedExternalPreview;
     setShareFile(file);
+    setShareVersionId(null);
+    setShareVersionLabel(null);
     setSharePassword("");
     setShareExpires(existing?.expires_at?.substring(0, 16) || "");
     setShareMaxDownloads(
@@ -1639,6 +1689,176 @@ export default function UserDashboard({
           )
         : "",
     );
+  };
+
+  const openVersions = async (file: FileMetadata) => {
+    setVersionsFile(file);
+    setVersions([]);
+    setTrashedVersions([]);
+    setVersionsLoading(true);
+    try {
+      const response = await fetch(`/api/files/${file.id}/versions`, {
+        headers: authHeaders(token),
+      });
+      if (!response.ok) {
+        let message = "Could not load versions.";
+        try {
+          const payload = await response.json();
+          message = payload?.error || message;
+        } catch {
+          // keep generic
+        }
+        notifyError(message);
+        return;
+      }
+      const data = (await response.json()) as { versions: FileVersion[]; trashed?: FileVersion[] };
+      setVersions(data.versions || []);
+      setTrashedVersions(data.trashed || []);
+    } catch (error) {
+      console.error("[versions] Failed to load versions.", error);
+      notifyError("Could not load versions.");
+    } finally {
+      setVersionsLoading(false);
+    }
+  };
+
+  const downloadVersion = async (file: FileMetadata, version: FileVersion) => {
+    const secretKey = file.has_user_secret
+      ? window.prompt(`Enter the secret key to download "${version.original_name}"`)?.trim() || ""
+      : "";
+    if (file.has_user_secret && !secretKey) {
+      notifyError("Download cancelled. This version requires its secret key.");
+      return;
+    }
+    try {
+      const headers: Record<string, string> = { ...authHeaders(token) };
+      if (secretKey) headers["X-File-Secret"] = secretKey;
+      const response = await fetch(
+        `/api/files/${file.id}/versions/${version.id}/download`,
+        { headers },
+      );
+      if (!response.ok) {
+        let message = "Could not download this version.";
+        try {
+          const payload = await response.json();
+          message = payload?.error || message;
+        } catch {
+          // keep generic
+        }
+        notifyError(message);
+        return;
+      }
+      const blob = await response.blob();
+      const objectUrl = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = objectUrl;
+      anchor.download = version.original_name;
+      anchor.style.display = "none";
+      document.body.appendChild(anchor);
+      anchor.click();
+      document.body.removeChild(anchor);
+      URL.revokeObjectURL(objectUrl);
+      notify("Version downloaded.");
+    } catch (error) {
+      console.error("[versions] Download failed.", error);
+      notifyError("Could not download this version.");
+    }
+  };
+
+  const restoreVersion = async (file: FileMetadata, version: FileVersion) => {
+    if (!window.confirm(`Restore "${version.original_name}" to version ${version.version_no}?`)) return;
+    setVersionsBusyId(version.id);
+    try {
+      const response = await fetch(
+        `/api/files/${file.id}/versions/${version.id}/restore`,
+        { method: "POST", headers: authHeaders(token) },
+      );
+      const data = await response.json();
+      if (!response.ok) {
+        notifyError(data?.error || "Could not restore this version.");
+        return;
+      }
+      notify(data?.message || "Version restored.");
+      // Refetch the drawer so it reflects the new current version.
+      await openVersions(file);
+      await loadFilesAndLinks();
+    } catch (error) {
+      console.error("[versions] Restore failed.", error);
+      notifyError("Could not restore this version.");
+    } finally {
+      setVersionsBusyId(null);
+    }
+  };
+
+  const deleteVersion = async (file: FileMetadata, version: FileVersion) => {
+    if (!window.confirm(`Move version ${version.version_no} of "${version.original_name}" to trash?`)) return;
+    setVersionsBusyId(version.id);
+    try {
+      const response = await fetch(
+        `/api/files/${file.id}/versions/${version.id}`,
+        { method: "DELETE", headers: authHeaders(token) },
+      );
+      const data = await response.json();
+      if (!response.ok) {
+        notifyError(data?.error || "Could not delete this version.");
+        return;
+      }
+      notify(data?.message || "Version moved to trash.");
+      await openVersions(file);
+      await loadFilesAndLinks();
+    } catch (error) {
+      console.error("[versions] Delete failed.", error);
+      notifyError("Could not delete this version.");
+    } finally {
+      setVersionsBusyId(null);
+    }
+  };
+
+  // Restore a soft-deleted archived version from the version trash back into the
+  // active versions list (clears its deleted_at marker).
+  const restoreTrashedVersion = async (file: FileMetadata, version: FileVersion) => {
+    setVersionsBusyId(version.id);
+    try {
+      const response = await fetch(
+        `/api/files/${file.id}/versions/${version.id}/restore-trashed`,
+        { method: "POST", headers: authHeaders(token) },
+      );
+      const data = await response.json();
+      if (!response.ok) {
+        notifyError(data?.error || "Could not restore this version.");
+        return;
+      }
+      notify(data?.message || "Version restored from trash.");
+      await openVersions(file);
+      await loadFilesAndLinks();
+    } catch (error) {
+      console.error("[versions] Restore-trashed failed.", error);
+      notifyError("Could not restore this version.");
+    } finally {
+      setVersionsBusyId(null);
+    }
+  };
+
+  // Owner decision #2 — sharing is per-version: pin the selected version on the share link.
+  const openShareForVersion = async (file: FileMetadata, version: FileVersion) => {
+    await openShare(file); // resets shareVersionId/shareVersionLabel
+    // Set the pin AFTER openShare so it wins the batched state update.
+    setShareVersionId(version.is_current ? null : version.id);
+    setShareVersionLabel(version.is_current ? null : `v${version.version_no}`);
+  };
+
+  // Owner decision #3 — preview of the CURRENT version reuses the existing handlers;
+  // archived versions have no server preview endpoint yet (backend follow-up).
+  const previewVersion = (version: FileVersion) => {
+    if (!versionsFile) return;
+    if (!version.is_current) {
+      notify("Preview is only available for the current version right now.");
+      return;
+    }
+    if (isAudioFile(versionsFile)) { setAudioFile(versionsFile); return; }
+    if (isVideoFile(versionsFile)) { setVideoFile(versionsFile); return; }
+    if (isImageFile(versionsFile)) { setImageFile(versionsFile); return; }
+    setTextPreviewFile(versionsFile);
   };
 
   const openFolderShare = (folder: FileFolder) => {
@@ -1712,6 +1932,7 @@ export default function UserDashboard({
           allow_external_preview: enableDecryptedExternalPreview,
           allow_decrypted_external_preview: enableDecryptedExternalPreview,
           is_active: true,
+          version_id: shareVersionId || undefined,
         }),
       });
       const data = await response.json();
@@ -2166,6 +2387,7 @@ export default function UserDashboard({
                       onDownload={() => downloadFile(file)}
                       onOpenVideo={() => setVideoFile(file)}
                       onShare={() => openShare(file)}
+                      onVersions={() => openVersions(file)}
                       onDelete={() => deleteFile(file)}
                     />
                   ))}
@@ -2373,6 +2595,14 @@ export default function UserDashboard({
                         >
                           <Share2 className="h-3.5 w-3.5" />
                         </FileActionButton>
+                        {typeof file.version_count === "number" && file.version_count > 1 && (
+                          <FileActionButton
+                            label="Versions"
+                            onClick={() => openVersions(file)}
+                          >
+                            <History className="h-3.5 w-3.5" />
+                          </FileActionButton>
+                        )}
                         <FileActionButton
                           label="Delete"
                           destructive
@@ -2403,7 +2633,7 @@ export default function UserDashboard({
                       <th className="hidden w-28 px-3 py-3 font-medium lg:table-cell">
                         Added
                       </th>
-                      <th className="hidden w-48 px-3 py-3 font-medium lg:table-cell">
+                      <th className="hidden w-60 px-3 py-3 font-medium lg:table-cell">
                         Actions
                       </th>
                     </tr>
@@ -2441,8 +2671,8 @@ export default function UserDashboard({
                         <td className="hidden w-28 px-3 py-3 text-[var(--text-muted)] lg:table-cell">
                           {new Date(file.created_at).toLocaleDateString()}
                         </td>
-                        <td className="w-48 px-2 py-3">
-                          <div className="flex w-44 justify-end gap-1">
+                        <td className="w-60 px-2 py-3">
+                          <div className="flex w-56 justify-end gap-1">
                             {(file.preview_available || isVideoFile(file) || isImageFile(file) || isAudioFile(file)) && (
                               <IconButton
                                 label={isVideoFile(file) ? "Watch" : isAudioFile(file) ? "Listen" : "Preview"}
@@ -2483,6 +2713,14 @@ export default function UserDashboard({
                             >
                               <Share2 className="h-4 w-4" />
                             </IconButton>
+                            {typeof file.version_count === "number" && file.version_count > 1 && (
+                              <IconButton
+                                label="Versions"
+                                onClick={() => openVersions(file)}
+                              >
+                                <History className="h-4 w-4" />
+                              </IconButton>
+                            )}
                             <IconButton
                               label="Move to folder"
                               onClick={() => openMoveDialog(file)}
@@ -2513,7 +2751,7 @@ export default function UserDashboard({
                   Trash
                 </h1>
                 <p className="mt-1 text-sm text-[var(--text-muted)]">
-                  Files here are kept for 90 days before being permanently deleted.
+                  Files and versions here are kept for 90 days before being permanently deleted.
                 </p>
               </div>
               {trashLoading ? (
@@ -2521,52 +2759,126 @@ export default function UserDashboard({
                   <div className="h-5 w-5 animate-spin rounded-full border-2 border-[var(--border-subtle)] border-t-[var(--accent-linear)]" />
                   Loading trash...
                 </div>
-              ) : trashFiles.length === 0 ? (
+              ) : trashFiles.length === 0 && trashVersions.length === 0 ? (
                 <div className="flex flex-col items-center py-20 text-center">
                   <Trash2 className="mb-3 h-12 w-12 text-[var(--text-faint)]" />
                   <p className="text-[var(--text-secondary)]">Trash is empty.</p>
                 </div>
               ) : (
-                <div className="space-y-3">
-                  {trashFiles.map((file) => (
-                    <div
-                      key={file.id}
-                      className="flex items-center gap-3 rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] p-3 shadow-[var(--shadow-hairline)]"
-                    >
-                      <FileThumbnail
-                        file={file}
-                        token={token}
-                        className="h-12 w-12 shrink-0 rounded-lg"
-                        iconClassName="h-6 w-6"
-                        showTypeBadge={false}
-                      />
-                      <div className="min-w-0 flex-1">
-                        <p className="truncate text-sm font-medium">{file.original_name}</p>
-                        <p className="mt-0.5 text-xs text-[var(--text-muted)]">
-                          Deleted {file.deleted_at ? new Date(file.deleted_at).toLocaleDateString() : ""}
-                          {file.folder_id ? " · from folder" : ""}
-                        </p>
-                      </div>
-                      <div className="flex shrink-0 items-center gap-1.5">
-                        <button
-                          type="button"
-                          onClick={() => restoreFile(file)}
-                          className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--border-subtle)] px-3 py-2 text-xs font-medium text-[var(--success-linear)] hover:bg-[color-mix(in_srgb,var(--success-linear)_12%,transparent)]"
+                <div className="space-y-5">
+                  {trashFiles.length > 0 && (
+                    <div className="space-y-3">
+                      {trashFiles.map((file) => (
+                        <div
+                          key={file.id}
+                          className="flex items-center gap-3 rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] p-3 shadow-[var(--shadow-hairline)]"
                         >
-                          <RotateCcw className="h-3.5 w-3.5" />
-                          Restore
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => deletePermanently(file)}
-                          className="inline-flex items-center gap-1.5 rounded-lg border border-[color-mix(in_srgb,var(--error-linear)_42%,transparent)] px-3 py-2 text-xs font-medium text-[var(--error-linear)] hover:bg-[color-mix(in_srgb,var(--error-linear)_12%,transparent)]"
-                        >
-                          <Trash2 className="h-3.5 w-3.5" />
-                          Delete
-                        </button>
+                          <FileThumbnail
+                            file={file}
+                            token={token}
+                            className="h-12 w-12 shrink-0 rounded-lg"
+                            iconClassName="h-6 w-6"
+                            showTypeBadge={false}
+                          />
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-center gap-2">
+                              <p className="truncate text-sm font-medium">{file.original_name}</p>
+                              {file.version_count != null && (
+                                <span className="inline-flex flex-none items-center rounded-full border border-[var(--border-subtle)] bg-[var(--bg-muted)] px-2 py-0.5 text-[11px] font-medium text-[var(--text-muted)]">
+                                  Version {file.version_count}
+                                </span>
+                              )}
+                            </div>
+                            <p className="mt-0.5 text-xs text-[var(--text-muted)]">
+                              Deleted {file.deleted_at ? new Date(file.deleted_at).toLocaleDateString() : ""}
+                              {file.folder_id ? " · from folder" : ""}
+                            </p>
+                          </div>
+                          <div className="flex shrink-0 items-center gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() => restoreFile(file)}
+                              className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--border-subtle)] px-3 py-2 text-xs font-medium text-[var(--success-linear)] hover:bg-[color-mix(in_srgb,var(--success-linear)_12%,transparent)]"
+                            >
+                              <RotateCcw className="h-3.5 w-3.5" />
+                              Restore
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => deletePermanently(file)}
+                              className="inline-flex items-center gap-1.5 rounded-lg border border-[color-mix(in_srgb,var(--error-linear)_42%,transparent)] px-3 py-2 text-xs font-medium text-[var(--error-linear)] hover:bg-[color-mix(in_srgb,var(--error-linear)_12%,transparent)]"
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                              Delete
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {trashVersions.length > 0 && (
+                    <div>
+                      <h3 className="mb-2 flex items-center gap-2 text-sm font-semibold text-[var(--text-secondary)]">
+                        <Layers className="h-4 w-4 text-[var(--text-muted)]" />
+                        Deleted versions ({trashVersions.length})
+                      </h3>
+                      <div className="space-y-3">
+                        {trashVersions.map((version) => (
+                          <div
+                            key={version.id}
+                            className="flex items-center gap-3 rounded-xl border border-dashed border-[var(--border-subtle)] bg-[var(--bg-panel)] p-3 shadow-[var(--shadow-hairline)]"
+                          >
+                            <div className="grid h-12 w-12 shrink-0 place-items-center rounded-lg bg-[var(--bg-muted)] text-[var(--text-muted)]">
+                              <Layers className="h-6 w-6" />
+                            </div>
+                            <div className="min-w-0 flex-1">
+                              <div className="flex items-center gap-2">
+                                <p className="truncate text-sm font-medium">
+                                  {version.original_name}
+                                </p>
+                                <span className="inline-flex flex-none items-center rounded-full border border-[var(--border-subtle)] bg-[var(--bg-muted)] px-2 py-0.5 text-[11px] font-medium text-[var(--text-muted)]">
+                                  v{version.version_no}
+                                </span>
+                                <span className="inline-flex flex-none items-center rounded-full bg-[color-mix(in_srgb,var(--text-muted)_15%,transparent)] px-2 py-0.5 text-[10px] font-semibold text-[var(--text-muted)]">
+                                  VERSION IN TRASH
+                                </span>
+                              </div>
+                              <p className="mt-0.5 text-xs text-[var(--text-muted)]">
+                                {version.file_name ? `of "${version.file_name}" · ` : ""}
+                                {formatBytes(version.size_bytes)} · Deleted{" "}
+                                {version.deleted_at
+                                  ? new Date(version.deleted_at).toLocaleDateString()
+                                  : ""}
+                              </p>
+                            </div>
+                            <div className="flex shrink-0 items-center gap-1.5">
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  version.file_id && restoreVersionFromTrash(version.file_id, version)
+                                }
+                                className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--border-subtle)] px-3 py-2 text-xs font-medium text-[var(--success-linear)] hover:bg-[color-mix(in_srgb,var(--success-linear)_12%,transparent)]"
+                              >
+                                <RotateCcw className="h-3.5 w-3.5" />
+                                Restore
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  version.file_id && permanentDeleteVersion(version.file_id, version)
+                                }
+                                className="inline-flex items-center gap-1.5 rounded-lg border border-[color-mix(in_srgb,var(--error-linear)_42%,transparent)] px-3 py-2 text-xs font-medium text-[var(--error-linear)] hover:bg-[color-mix(in_srgb,var(--error-linear)_12%,transparent)]"
+                              >
+                                <Trash2 className="h-3.5 w-3.5" />
+                                Delete
+                              </button>
+                            </div>
+                          </div>
+                        ))}
                       </div>
                     </div>
-                  ))}
+                  )}
                 </div>
               )}
             </section>
@@ -2856,6 +3168,7 @@ export default function UserDashboard({
       {shareFile && (
         <ShareDialog
           file={shareFile}
+          versionLabel={shareVersionLabel}
           password={sharePassword}
           expires={shareExpires}
           maxDownloads={shareMaxDownloads}
@@ -2926,6 +3239,241 @@ export default function UserDashboard({
           onConfirm={submitMoveDialog}
         />
       )}
+      {versionsFile && (
+        <VersionsDialog
+          file={versionsFile}
+          versions={versions}
+          trashed={trashedVersions}
+          loading={versionsLoading}
+          busyId={versionsBusyId}
+          onDownload={(version) => downloadVersion(versionsFile, version)}
+          onRestore={(version) => restoreVersion(versionsFile, version)}
+          onDelete={(version) => deleteVersion(versionsFile, version)}
+          onRestoreTrashed={(version) => restoreTrashedVersion(versionsFile, version)}
+          onShare={(version) => openShareForVersion(versionsFile, version)}
+          onPreview={(version) => previewVersion(version)}
+          onClose={() => setVersionsFile(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+// ──────────────────────────────────────────────────────────────
+// Versions drawer — lists all versions of a logical file (current + archived).
+// Full §3.4 UI: current badge, per-version size, running total (owner #1),
+// download / preview / restore / delete / per-version share (owner #2).
+// Soft-deleted archived versions appear in a "Trash" section below the active
+// list and can be restored from there (owner decision: soft-delete + restore).
+// ──────────────────────────────────────────────────────────────
+function VersionsDialog({
+  file,
+  versions,
+  trashed,
+  loading,
+  busyId,
+  onDownload,
+  onRestore,
+  onDelete,
+  onRestoreTrashed,
+  onShare,
+  onPreview,
+  onClose,
+}: {
+  file: FileMetadata;
+  versions: FileVersion[];
+  trashed: FileVersion[];
+  loading: boolean;
+  busyId: string | null;
+  onDownload: (version: FileVersion) => void;
+  onRestore: (version: FileVersion) => void;
+  onDelete: (version: FileVersion) => void;
+  onRestoreTrashed: (version: FileVersion) => void;
+  onShare: (version: FileVersion) => void;
+  onPreview: (version: FileVersion) => void;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", closeOnEscape);
+    return () => document.removeEventListener("keydown", closeOnEscape);
+  }, [onClose]);
+
+  const sorted = [...versions].sort((a, b) => b.version_no - a.version_no);
+  const totalBytes = versions.reduce((sum, v) => sum + (v.size_bytes || 0), 0);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 grid place-items-center bg-black/60 backdrop-blur-sm p-4"
+      onPointerDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        className="w-full max-w-xl rounded-2xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] p-6 shadow-[var(--shadow-panel)]"
+        onPointerDown={(event) => event.stopPropagation()}
+      >
+        <div className="flex items-start justify-between">
+          <div>
+            <h2 className="text-lg font-semibold">Versions of {file.original_name}</h2>
+            <p className="mt-1 text-sm text-[var(--text-muted)]">
+              {loading
+                ? "Loading versions..."
+                : `${versions.length} version${versions.length === 1 ? "" : "s"} · ${formatBytes(totalBytes)} total${
+                    trashed.length > 0 ? ` · ${trashed.length} in trash` : ""
+                  }`}
+            </p>
+          </div>
+          <button
+            onClick={onClose}
+            className="rounded-md p-2 hover:bg-[var(--bg-hover)]"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        {loading ? (
+          <div className="mt-6 flex items-center justify-center gap-2 py-6 text-sm text-[var(--text-muted)]">
+            <Loader2 className="h-4 w-4 animate-spin" />
+            Loading versions…
+          </div>
+        ) : (
+          <div className="mt-5 max-h-[60vh] space-y-2 overflow-y-auto pr-1">
+            {sorted.map((version) => {
+              const busy = busyId === version.id;
+              return (
+                <div
+                  key={version.id}
+                  className="rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-elevated)] p-3"
+                >
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="text-sm font-medium">v{version.version_no}</span>
+                    {version.is_current && (
+                      <span className="rounded-full bg-[color-mix(in_srgb,var(--accent-linear)_15%,transparent)] px-2 py-0.5 text-[10px] font-semibold text-[var(--text-secondary)]">
+                        CURRENT
+                      </span>
+                    )}
+                    {version.status === "Blocked" && (
+                      <span className="rounded-full bg-[color-mix(in_srgb,var(--error-linear)_12%,transparent)] px-2 py-0.5 text-[10px] font-semibold text-[var(--error-linear)]">
+                        BLOCKED
+                      </span>
+                    )}
+                    <span className="ml-auto text-xs text-[var(--text-muted)]">
+                      {formatBytes(version.size_bytes)} ·{" "}
+                      {new Date(version.created_at).toLocaleDateString()}
+                    </span>
+                  </div>
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    {version.is_current && (
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => onPreview(version)}
+                        className="flex h-9 items-center gap-1.5 rounded-lg border border-[var(--border-subtle)] px-2.5 text-xs font-medium text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] disabled:opacity-60"
+                      >
+                        <Eye className="h-3.5 w-3.5" />
+                        Preview
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => onDownload(version)}
+                      className="flex h-9 items-center gap-1.5 rounded-lg border border-[var(--border-subtle)] px-2.5 text-xs font-medium text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] disabled:opacity-60"
+                    >
+                      <ArrowDownToLine className="h-3.5 w-3.5" />
+                      Download
+                    </button>
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => onShare(version)}
+                      className="flex h-9 items-center gap-1.5 rounded-lg border border-[var(--border-subtle)] px-2.5 text-xs font-medium text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] disabled:opacity-60"
+                    >
+                      <Share2 className="h-3.5 w-3.5" />
+                      Share
+                    </button>
+                    {!version.is_current && version.status !== "Blocked" && (
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => onRestore(version)}
+                        className="flex h-9 items-center gap-1.5 rounded-lg border border-[var(--border-subtle)] px-2.5 text-xs font-medium text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] disabled:opacity-60"
+                      >
+                        <RotateCcw className="h-3.5 w-3.5" />
+                        Restore
+                      </button>
+                    )}
+                    {!version.is_current && (
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => onDelete(version)}
+                        className="flex h-9 items-center gap-1.5 rounded-lg border border-[color-mix(in_srgb,var(--error-linear)_42%,transparent)] px-2.5 text-xs font-medium text-[var(--error-linear)] hover:bg-[color-mix(in_srgb,var(--error-linear)_12%,transparent)] disabled:opacity-60"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                        Delete
+                      </button>
+                    )}
+                    {busy && <Loader2 className="h-4 w-4 animate-spin text-[var(--text-muted)]" />}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {!loading && trashed.length > 0 && (
+          <div className="mt-5">
+            <div className="flex items-center gap-2">
+              <Trash2 className="h-4 w-4 text-[var(--text-muted)]" />
+              <h3 className="text-sm font-semibold text-[var(--text-secondary)]">
+                Trash ({trashed.length})
+              </h3>
+            </div>
+            <div className="mt-2 max-h-[30vh] space-y-2 overflow-y-auto pr-1">
+              {[...trashed]
+                .sort((a, b) => b.version_no - a.version_no)
+                .map((version) => {
+                  const busy = busyId === version.id;
+                  return (
+                    <div
+                      key={version.id}
+                      className="rounded-lg border border-dashed border-[var(--border-subtle)] bg-[var(--bg-elevated)] p-3 opacity-90"
+                    >
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="text-sm font-medium">v{version.version_no}</span>
+                        <span className="rounded-full bg-[color-mix(in_srgb,var(--text-muted)_15%,transparent)] px-2 py-0.5 text-[10px] font-semibold text-[var(--text-muted)]">
+                          IN TRASH
+                        </span>
+                        <span className="ml-auto text-xs text-[var(--text-muted)]">
+                          {formatBytes(version.size_bytes)} ·{" "}
+                          {new Date(version.created_at).toLocaleDateString()}
+                        </span>
+                      </div>
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        <button
+                          type="button"
+                          disabled={busy}
+                          onClick={() => onRestoreTrashed(version)}
+                          className="flex h-9 items-center gap-1.5 rounded-lg border border-[var(--border-subtle)] px-2.5 text-xs font-medium text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] disabled:opacity-60"
+                        >
+                          <RotateCcw className="h-3.5 w-3.5" />
+                          Restore
+                        </button>
+                        {busy && <Loader2 className="h-4 w-4 animate-spin text-[var(--text-muted)]" />}
+                      </div>
+                    </div>
+                  );
+                })}
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -3327,6 +3875,7 @@ function FileCard({
   onDownload,
   onOpenVideo,
   onShare,
+  onVersions,
   onDelete,
 }: {
   file: FileMetadata;
@@ -3334,6 +3883,7 @@ function FileCard({
   onDownload: () => void;
   onOpenVideo: () => void;
   onShare: () => void;
+  onVersions: () => void;
   onDelete: () => void;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
@@ -3398,6 +3948,21 @@ function FileCard({
                 <Share2 className="h-3.5 w-3.5" />
                 Share
               </button>
+              {typeof file.version_count === "number" && file.version_count > 1 && (
+                <button
+                  onClick={() => {
+                    setMenuOpen(false);
+                    onVersions();
+                  }}
+                  className="flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-[var(--bg-hover)]"
+                >
+                  <History className="h-3.5 w-3.5" />
+                  Versions
+                  <span className="ml-auto rounded-full bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[10px] text-[var(--text-secondary)]">
+                    {file.version_count}
+                  </span>
+                </button>
+              )}
               <button
                 onClick={() => {
                   setMenuOpen(false);
@@ -3813,6 +4378,7 @@ function FolderShareDialog(props: {
 
 function ShareDialog(props: {
   file: FileMetadata;
+  versionLabel: string | null;
   password: string;
   expires: string;
   maxDownloads: string;
@@ -3855,7 +4421,7 @@ function ShareDialog(props: {
 
   return (
     <div
-      className="fixed inset-0 z-50 grid place-items-center bg-black/60 backdrop-blur-sm p-4"
+      className="fixed inset-0 z-[70] grid place-items-center bg-black/60 backdrop-blur-sm p-4"
       onPointerDown={(event) => {
         if (event.target === event.currentTarget) props.onClose();
       }}
@@ -3874,6 +4440,11 @@ function ShareDialog(props: {
             <p className="mt-1 text-sm text-[var(--text-muted)]">
               Choose how long the link should stay useful.
             </p>
+            {props.versionLabel && (
+              <p className="mt-1 rounded-md bg-[color-mix(in_srgb,var(--accent-linear)_10%,transparent)] px-2 py-1 text-xs font-medium text-[var(--text-secondary)]">
+                Sharing pinned version {props.versionLabel}
+              </p>
+            )}
           </div>
           <button
             onClick={props.onClose}
