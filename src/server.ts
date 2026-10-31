@@ -3156,7 +3156,45 @@ app.post(
            AND deleted_at IS NULL
            AND COALESCE(status,'Available')!='Expired'`
       );
-      const existingFile: FileRow | undefined = existingRes.recordset[0];
+      let existingFile: FileRow | undefined = existingRes.recordset[0];
+
+      // ── Fallback for pre-migration rows ─────────────────────────
+      // POURQUOI : rows created before the versioning migration were never
+      // backfilled with a `file_name_hash` (the DB cannot derive the HMAC of
+      // an encrypted name), so the indexed hash lookup above can never match
+      // them and they would silently become a brand-new version-1 row instead
+      // of being versioned. To let versioning work for such files, fall back
+      // to a bounded same-folder scan: decrypt candidate names (≤20) and
+      // compare case-insensitively + trimmed. Once routed into the
+      // version-instead path below, the UPDATE sets file_name_hash, healing it.
+      if (!existingFile) {
+        const fbReq = await getRequest();
+        fbReq.input('ownerId',  sql.UniqueIdentifier, req.userId!);
+        fbReq.input('folderId', sql.UniqueIdentifier, uploadFolder?.id || null);
+        const fbRes = await fbReq.query<FileRow>(
+          `SELECT TOP 20 id, owner_user_id, folder_id, original_name_encrypted, original_name_iv, original_name_auth_tag,
+                  stored_path, mime_type, size_bytes, encrypted_size_bytes, status, checksum_sha256,
+                  scan_result, scan_message, is_encrypted, leeku_vibe, ttl_hours,
+                  client_secret_hash, client_crypto_salt, client_crypto_iv, client_crypto_iterations,
+                  expires_at, created_at, deleted_at, version_count
+           FROM files
+           WHERE owner_user_id=@ownerId
+             AND ((@folderId IS NULL AND folder_id IS NULL) OR folder_id=@folderId)
+             AND file_name_hash IS NULL
+             AND deleted_at IS NULL
+             AND COALESCE(status,'Available')!='Expired'`
+        );
+        const normalizedUploadName = original_name.toLowerCase().trim();
+        for (const cand of fbRes.recordset) {
+          try {
+            const candName = decryptColumn(cand.original_name_encrypted, cand.original_name_iv, cand.original_name_auth_tag);
+            if (candName.toLowerCase().trim() === normalizedUploadName) {
+              existingFile = cand;
+              break;
+            }
+          } catch { /* skip row we cannot decrypt */ }
+        }
+      }
 
       let newFile: FileRow;
 
