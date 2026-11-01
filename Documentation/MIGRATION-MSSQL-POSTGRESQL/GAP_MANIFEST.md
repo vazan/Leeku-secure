@@ -1,6 +1,6 @@
 # GAP_MANIFEST — Migration MSSQL → PostgreSQL (soft-deletion & file versioning)
 
-> DocHub / DocScout | date: 2026-11-01 (Milestones A-D DONE & validated on dev incl. incidental fixes 0a7abf9/ee62ac0/f469a1e/0244620; docs G-26 DONE)
+> DocHub / DocScout | date: 2026-11-01 (ALL 28 gaps DONE — Milestones A-E incl. docs G-26 and tests G-27/G-28)
 > Priority: P1 = blocks the feature, P2 = required, P3 = hygiene.
 > Status legend: OPEN / PLAN / DONE
 
@@ -54,12 +54,14 @@
 
 | # | Gap | Priority | Status | Owner |
 |---|---|---|---|---|
-| G-27 | No versioning/trash tests on postgresql branch → add regression coverage | P2 | OPEN | QA/TestEngineer |
-| G-28 | `translateQuery` unit tests for any new conversion (RETURNING/NEWID/pagination) | P2 | OPEN | QA/TestEngineer |
+| G-27 | No versioning/trash tests on postgresql branch → add regression coverage | P2 | DONE (tests/trash-purge.test.ts — purge cycle, retention, failure isolation; npm `test:trash-purge`) | QA/TestEngineer |
+| G-28 | `translateQuery` unit tests for any new conversion (RETURNING/NEWID/pagination) | P2 | DONE (tests/translate-query-versioning.test.ts — CAST(@x AS uuid), RETURNING pass-through, versioning/trash queries; npm `test:translate-query-versioning`) | QA/TestEngineer |
 
 ## Summary
 - **Total gaps: 28** (P1: 17, P2: 11).
-- **Completed: 26/28** — Section A (schema, 9), Section B (backend, 10), Section C (frontend: G-20..G-23), and D items G-24/G-25/G-26 are DONE and validated on the dev environment (Milestones A, B, C, D + docs).
-- **Remaining: 2** — tests G-27/G-28.
+- **Completed: 28/28** — ALL gaps are DONE and validated (schema, backend, frontend,
+  scripts/config, docs, and tests). The migration is feature-complete on `postgresql`.
+- **Remaining: 0**. Recommended execution order A → B → D → C → E has been followed; the
+  schema remains the hard dependency for the code and all layers are now landed.
 - **Recommended execution order**: A (schema DDL) → B (backend) → D (scripts/config)
   → C (frontend) → E (tests). The schema is the hard dependency for everything else.

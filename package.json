@@ -13,6 +13,8 @@
     "test:desktop-updates": "tsx --test tests/desktop-updates-path.test.ts",
     "test:database": "tsx --test tests/database.test.ts",
     "test:encryption": "tsx --test tests/encryption.test.ts",
+    "test:trash-purge": "tsx --test tests/trash-purge.test.ts",
+    "test:translate-query-versioning": "tsx --test tests/translate-query-versioning.test.ts",
     "backfill:file-hashes": "tsx scripts/backfill-file-hashes.ts",
     "lint": "tsc --noEmit"
   },
