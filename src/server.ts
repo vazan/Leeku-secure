@@ -2102,13 +2102,14 @@ app.get('/api/files', authenticateUser as express.RequestHandler, async (req: Au
                 stored_path, mime_type, size_bytes, encrypted_size_bytes,
                 status, checksum_sha256, scan_result, scan_message,
                 is_encrypted, leeku_vibe, ttl_hours,
-                client_secret_hash,
+                client_secret_hash, version_count,
                 expires_at, created_at
         FROM (
           SELECT f.*, ff.name AS folder_name
           FROM files f
           LEFT JOIN file_folders ff ON f.folder_id=ff.id
           WHERE f.owner_user_id=@ownerId AND COALESCE(f.status,'Available')!='Expired'
+            AND f.deleted_at IS NULL
             AND (
               @includeSystem=TRUE OR NOT EXISTS (
                 SELECT 1
@@ -2139,8 +2140,9 @@ app.get('/api/files', authenticateUser as express.RequestHandler, async (req: Au
                 stored_path, mime_type, size_bytes, encrypted_size_bytes,
                 status, checksum_sha256, scan_result, scan_message,
                 is_encrypted, leeku_vibe, ttl_hours,
+                NULL AS version_count,
                 expires_at, created_at
-        FROM files WHERE owner_user_id=@ownerId AND COALESCE(status,'Available')!='Expired'
+        FROM files WHERE owner_user_id=@ownerId AND COALESCE(status,'Available')!='Expired' AND deleted_at IS NULL
          ORDER BY created_at DESC`
       );
     }
