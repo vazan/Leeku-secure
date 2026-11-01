@@ -73,6 +73,13 @@ const TextFilePreview = React.lazy(
   () => import("@/app/shared/components/common/text-file-preview"),
 );
 
+// Number of files rendered at once in the "All Files" / folder listing before
+// the user clicks "Show more". Rendering every file at once (the root view can
+// hold tens of thousands) creates an enormous DOM and stalls the page, so we
+// window the list and reveal additional files on demand.
+const INITIAL_VISIBLE_FILES = 100;
+const VISIBLE_FILES_PAGE = 200;
+
 interface UserDashboardProps {
   user: User;
   token: string;
@@ -374,6 +381,12 @@ export default function UserDashboard({
   );
   const [files, setFiles] = useState<FileMetadata[]>([]);
   const [filesLoading, setFilesLoading] = useState(false);
+  // IDs of files the user has selected for mass actions (e.g. bulk soft-delete).
+  const [selectedFileIds, setSelectedFileIds] = useState<string[]>([]);
+  const [bulkDeleteFiles, setBulkDeleteFiles] = useState<FileMetadata[]>([]);
+  const [bulkDeleting, setBulkDeleting] = useState(false);
+  // Trash retention (days) as configured by TRASH_RETENTION_DAYS on the server.
+  const [trashRetentionDays, setTrashRetentionDays] = useState<number | null>(null);
   const [trashFiles, setTrashFiles] = useState<FileMetadata[]>([]);
   const [trashVersions, setTrashVersions] = useState<FileVersion[]>([]); // soft-deleted versions across the user's files (Trash tab)
   const [trashLoading, setTrashLoading] = useState(false);
@@ -389,6 +402,7 @@ export default function UserDashboard({
   const [logs, setLogs] = useState<SystemLog[]>([]);
   const [stats, setStats] = useState<SystemStats | null>(null);
   const [search, setSearch] = useState("");
+  const [visibleLimit, setVisibleLimit] = useState(INITIAL_VISIBLE_FILES);
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [uploadSecretKey, setUploadSecretKey] = useState("");
@@ -581,7 +595,11 @@ export default function UserDashboard({
         fetch("/api/sharing/links?_t=" + Date.now(), { headers: authHeaders(token) }),
       ]);
       if (filesResponse.ok) {
-        setFiles((await filesResponse.json()).files || []);
+        const filePayload = await filesResponse.json();
+        setFiles(filePayload.files || []);
+        if (typeof filePayload.trash_retention_days === "number") {
+          setTrashRetentionDays(filePayload.trash_retention_days);
+        }
       } else {
         let message = "Could not load your files.";
         try {
@@ -631,42 +649,67 @@ export default function UserDashboard({
     }
   };
 
-  const loadAdmin = async () => {
+  const loadAdminCore = async () => {
     if (user.role !== "Admin") return;
     const headers = authHeaders(token);
-    const [usersResponse, filesResponse, foldersResponse, logsResponse, statsResponse] =
-      await Promise.all([
-        fetch("/api/admin/users?_t=" + Date.now(), { headers }),
-        fetch("/api/admin/files?_t=" + Date.now(), { headers }),
-        fetch("/api/admin/file-folders?_t=" + Date.now(), { headers }),
-        fetch("/api/admin/logs?_t=" + Date.now(), { headers }),
-        fetch("/api/stats?_t=" + Date.now()),
-      ]);
+    const [usersResponse, logsResponse, statsResponse] = await Promise.all([
+      fetch("/api/admin/users?_t=" + Date.now(), { headers }),
+      fetch("/api/admin/logs?_t=" + Date.now(), { headers }),
+      fetch("/api/stats?_t=" + Date.now()),
+    ]);
     if (usersResponse.ok)
       setAdminUsers((await usersResponse.json()).users || []);
+    if (logsResponse.ok) setLogs((await logsResponse.json()).logs || []);
+    if (statsResponse.ok) setStats(await statsResponse.json());
+  };
+
+  // The admin-wide file & folder datasets are large (every file across all
+  // users plus every folder). Loading them on dashboard mount is expensive
+  // even when the admin never opens the Files tab, so they are fetched
+  // lazily only when the admin view becomes active.
+  const loadAdminFiles = async () => {
+    if (user.role !== "Admin") return;
+    const headers = authHeaders(token);
+    const [filesResponse, foldersResponse] = await Promise.all([
+      fetch("/api/admin/files?_t=" + Date.now(), { headers }),
+      fetch("/api/admin/file-folders?_t=" + Date.now(), { headers }),
+    ]);
     if (filesResponse.ok)
       setAdminFiles((await filesResponse.json()).files || []);
     if (foldersResponse.ok)
       setAdminFolders((await foldersResponse.json()).folders || []);
-    if (logsResponse.ok) setLogs((await logsResponse.json()).logs || []);
-    if (statsResponse.ok) setStats(await statsResponse.json());
+  };
+
+  const loadAdmin = async () => {
+    await Promise.all([loadAdminCore(), loadAdminFiles()]);
   };
 
   useEffect(() => {
     loadFolders().catch(() => notifyError("Could not refresh folders."));
     loadFilesAndLinks().catch(() => notifyError("Could not refresh your files."));
-    loadAdmin().catch(() => notifyError("Could not refresh admin data."));
+    // Only load the lightweight admin datasets (users, logs, stats) eagerly.
+    // The large admin-wide files/folders datasets load lazily when the admin
+    // view is opened (see the view effect below).
+    loadAdminCore().catch(() => notifyError("Could not refresh admin data."));
   }, []);
 
   useEffect(() => {
     if (view === "trash") {
       loadTrash().catch(() => notifyError("Could not refresh trash."));
     }
+    if (view === "admin" && user.role === "Admin") {
+      loadAdminFiles().catch(() => notifyError("Could not refresh admin data."));
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [view]);
 
   useEffect(() => {
     localStorage.setItem(`dashboard-view:${user.id}`, view);
+    // Drop any in-progress file selection when navigating away from the file list.
+    if (view !== "files") {
+      setSelectedFileIds([]);
+      setBulkDeleteFiles([]);
+    }
   }, [user.id, view]);
 
   useEffect(() => {
@@ -705,6 +748,25 @@ export default function UserDashboard({
       file.original_name.toLowerCase().includes(normalizedSearch),
     );
   }, [currentFolderFiles, normalizedSearch]);
+
+  // Windowed slice actually rendered in the list, so we don't build a DOM
+  // node for every file at once. The full counts are still shown in the header.
+  const paginatedFiles = useMemo(
+    () => visibleFiles.slice(0, visibleLimit),
+    [visibleFiles, visibleLimit],
+  );
+
+  // Reset the window whenever the result set changes (new load, folder
+  // navigation, or a search), so the user starts seeing results from the top.
+  useEffect(() => {
+    setVisibleLimit(INITIAL_VISIBLE_FILES);
+  }, [activeFolderId, files, search]);
+
+  // When navigating into a different folder (or the file list reloads), clear
+  // the in-progress multi-selection — the selected IDs may no longer be visible.
+  useEffect(() => {
+    setSelectedFileIds([]);
+  }, [activeFolderId, files]);
 
   const visibleFolders = useMemo(() => {
     const toPathParts = (folder: FileFolder) => {
@@ -1382,6 +1444,55 @@ export default function UserDashboard({
       await loadFilesAndLinks();
       onTriggerRefreshUser();
     } else notifyError("Could not delete the file.");
+  };
+
+  // Toggle a file in the mass-selection set (click to select / click again to deselect).
+  const toggleFileSelection = (file: FileMetadata) => {
+    setSelectedFileIds((ids) =>
+      ids.includes(file.id)
+        ? ids.filter((id) => id !== file.id)
+        : [...ids, file.id],
+    );
+  };
+
+  const clearFileSelection = () => setSelectedFileIds([]);
+
+  // Open the bulk-delete confirmation dialog listing the currently selected files.
+  const openBulkDeleteConfirm = () => {
+    const selected = files.filter((f) => selectedFileIds.includes(f.id));
+    if (selected.length === 0) {
+      notifyError("Those files are no longer available. Please refresh your file list.");
+      return;
+    }
+    setBulkDeleteFiles(selected);
+  };
+
+  // Soft-delete all the files listed in the confirmation dialog via the bulk endpoint.
+  const confirmBulkDelete = async () => {
+    if (bulkDeleting) return;
+    if (bulkDeleteFiles.length === 0) return;
+    setBulkDeleting(true);
+    try {
+      const response = await fetch(`/api/files/delete`, {
+        method: "POST",
+        headers: { ...authHeaders(token), "Content-Type": "application/json" },
+        body: JSON.stringify({ file_ids: bulkDeleteFiles.map((f) => f.id) }),
+      });
+      const data = await response.json();
+      if (response.ok) {
+        notify(data?.message || `${bulkDeleteFiles.length} file${bulkDeleteFiles.length === 1 ? "" : "s"} moved to trash.`);
+        setBulkDeleteFiles([]);
+        clearFileSelection();
+        await loadFilesAndLinks();
+        onTriggerRefreshUser();
+      } else {
+        notifyError(data?.error || "Could not delete the selected files.");
+      }
+    } catch {
+      notifyError("Could not delete the selected files.");
+    } finally {
+      setBulkDeleting(false);
+    }
   };
 
   const restoreFile = async (file: FileMetadata) => {
@@ -2479,7 +2590,7 @@ export default function UserDashboard({
               </div>
 
               {visibleFolders.length > 0 && (
-                <div className="mb-6 grid w-full min-w-0 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                <div className="mb-6 grid w-full min-w-0 gap-3 sm:grid-cols-2 lg:hidden">
                   {visibleFolders.map((folder) => (
                     <button
                       key={folder.id}
@@ -2524,18 +2635,41 @@ export default function UserDashboard({
                 </div>
               ) : (
                 <div className="grid w-full min-w-0 gap-3 sm:hidden">
-                  {visibleFiles.map((file) => (
+                  {paginatedFiles.map((file) => {
+                    const isSelected = selectedFileIds.includes(file.id);
+                    return (
                     <div
                       key={file.id}
-                      className="w-full min-w-0 overflow-hidden rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] p-3 shadow-[var(--shadow-hairline)]"
+                      onClick={() => toggleFileSelection(file)}
+                      role="button"
+                      tabIndex={0}
+                      aria-pressed={isSelected}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter" || event.key === " ") {
+                          event.preventDefault();
+                          toggleFileSelection(file);
+                        }
+                      }}
+                      className={`w-full min-w-0 overflow-hidden rounded-xl border bg-[var(--bg-panel)] p-3 shadow-[var(--shadow-hairline)] ${
+                        isSelected
+                          ? "border-[var(--accent-linear)] ring-1 ring-[var(--accent-linear)]/40"
+                          : "border-[var(--border-subtle)]"
+                      }`}
                     >
                       <div className="flex min-w-0 items-start gap-3">
-                        <FileThumbnail
-                          file={file}
-                          token={token}
-                          className="h-11 w-11 rounded-lg"
-                          iconClassName="h-5 w-5"
-                        />
+                        <div className="relative shrink-0">
+                          <FileThumbnail
+                            file={file}
+                            token={token}
+                            className="h-11 w-11 rounded-lg"
+                            iconClassName="h-5 w-5"
+                          />
+                          {isSelected && (
+                            <span className="absolute -right-1 -top-1 grid h-5 w-5 place-items-center rounded-full bg-[var(--accent-linear)] text-[10px] font-bold text-[var(--accent-contrast)]">
+                              ✓
+                            </span>
+                          )}
+                        </div>
                         <div className="min-w-0 flex-1">
                           <p className="flex min-w-0 items-start gap-1 text-sm font-medium leading-5">
                             <span className="truncate">{file.original_name}</span>
@@ -2557,7 +2691,8 @@ export default function UserDashboard({
                         {(file.preview_available || isVideoFile(file) || isImageFile(file) || isAudioFile(file)) && (
                           <FileActionButton
                             label={isVideoFile(file) ? "Watch" : isAudioFile(file) ? "Listen" : "Preview"}
-                            onClick={() => {
+                            onClick={(event: React.MouseEvent) => {
+                              event.stopPropagation();
                               if (isAudioFile(file)) {
                                 setAudioFile(file);
                                 return;
@@ -2584,20 +2719,29 @@ export default function UserDashboard({
                         )}
                         <FileActionButton
                           label="Download"
-                          onClick={() => downloadFile(file)}
+                          onClick={(event: React.MouseEvent) => {
+                            event.stopPropagation();
+                            downloadFile(file);
+                          }}
                         >
                           <ArrowDownToLine className="h-3.5 w-3.5" />
                         </FileActionButton>
                         <FileActionButton
                           label="Share"
-                          onClick={() => openShare(file)}
+                          onClick={(event: React.MouseEvent) => {
+                            event.stopPropagation();
+                            openShare(file);
+                          }}
                         >
                           <Share2 className="h-3.5 w-3.5" />
                         </FileActionButton>
                         {typeof file.version_count === "number" && file.version_count > 1 && (
                           <FileActionButton
                             label="Versions"
-                            onClick={() => openVersions(file)}
+                            onClick={(event: React.MouseEvent) => {
+                              event.stopPropagation();
+                              openVersions(file);
+                            }}
                           >
                             <History className="h-3.5 w-3.5" />
                           </FileActionButton>
@@ -2605,16 +2749,23 @@ export default function UserDashboard({
                         <FileActionButton
                           label="Delete"
                           destructive
-                          onClick={() => deleteFile(file)}
+                          onClick={(event: React.MouseEvent) => {
+                            event.stopPropagation();
+                            deleteFile(file);
+                          }}
                         >
                           <Trash2 className="h-3.5 w-3.5" />
                         </FileActionButton>
                       </div>
                       <MoveFileSelect
-                        onMove={() => openMoveDialog(file)}
+                        onMove={(event: React.MouseEvent) => {
+                          event.stopPropagation();
+                          openMoveDialog(file);
+                        }}
                       />
                     </div>
-                  ))}
+                    );
+                  })}
                 </div>
               )}
               {visibleFiles.length > 0 && (
@@ -2622,6 +2773,9 @@ export default function UserDashboard({
                 <table className="w-full table-fixed text-left text-sm">
                   <thead className="border-b border-[var(--border-subtle)] bg-[var(--bg-muted)] text-xs text-[var(--text-muted)]">
                     <tr>
+                      <th className="w-10 px-3 py-3 font-medium">
+                        <span className="sr-only">Select</span>
+                      </th>
                       <th className="px-4 py-3 font-medium">Name</th>
                       <th className="hidden w-24 px-3 py-3 font-medium md:table-cell">
                         Type
@@ -2638,8 +2792,28 @@ export default function UserDashboard({
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-[var(--border-subtle)]">
-                    {visibleFiles.map((file) => (
-                      <tr key={file.id} className="hover:bg-[var(--bg-muted)]">
+                    {paginatedFiles.map((file) => {
+                      const isSelected = selectedFileIds.includes(file.id);
+                      return (
+                      <tr
+                        key={file.id}
+                        onClick={() => toggleFileSelection(file)}
+                        className={`cursor-pointer ${
+                          isSelected
+                            ? "bg-[color-mix(in_srgb,var(--accent-linear)_8%,transparent)]"
+                            : "hover:bg-[var(--bg-muted)]"
+                        }`}
+                      >
+                        <td className="w-10 px-3 py-3">
+                          <input
+                            type="checkbox"
+                            checked={isSelected}
+                            onChange={() => toggleFileSelection(file)}
+                            onClick={(event) => event.stopPropagation()}
+                            aria-label={`Select ${file.original_name}`}
+                            className="h-4 w-4 cursor-pointer accent-[var(--accent-linear)]"
+                          />
+                        </td>
                         <td className="min-w-0 px-4 py-3">
                           <div className="flex min-w-0 items-center gap-3">
                             <FileThumbnail
@@ -2675,7 +2849,8 @@ export default function UserDashboard({
                             {(file.preview_available || isVideoFile(file) || isImageFile(file) || isAudioFile(file)) && (
                               <IconButton
                                 label={isVideoFile(file) ? "Watch" : isAudioFile(file) ? "Listen" : "Preview"}
-                                onClick={() => {
+                                onClick={(event) => {
+                                  event.stopPropagation();
                                   if (isAudioFile(file)) {
                                     setAudioFile(file);
                                     return;
@@ -2702,43 +2877,95 @@ export default function UserDashboard({
                             )}
                             <IconButton
                               label="Download"
-                              onClick={() => downloadFile(file)}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                downloadFile(file);
+                              }}
                             >
                               <ArrowDownToLine className="h-4 w-4" />
                             </IconButton>
                             <IconButton
                               label="Share"
-                              onClick={() => openShare(file)}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                openShare(file);
+                              }}
                             >
                               <Share2 className="h-4 w-4" />
                             </IconButton>
                             {typeof file.version_count === "number" && file.version_count > 1 && (
                               <IconButton
                                 label="Versions"
-                                onClick={() => openVersions(file)}
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  openVersions(file);
+                                }}
                               >
                                 <History className="h-4 w-4" />
                               </IconButton>
                             )}
                             <IconButton
                               label="Move to folder"
-                              onClick={() => openMoveDialog(file)}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                openMoveDialog(file);
+                              }}
                             >
                               <Folder className="h-4 w-4" />
                             </IconButton>
                             <IconButton
                               label="Delete"
-                              onClick={() => deleteFile(file)}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                deleteFile(file);
+                              }}
                             >
                               <Trash2 className="h-4 w-4" />
                             </IconButton>
                           </div>
                         </td>
                       </tr>
-                    ))}
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
+              )}
+
+              {!filesLoading && paginatedFiles.length < visibleFiles.length && (
+                <div className="mt-6 flex justify-center">
+                  <button
+                    type="button"
+                    onClick={() => setVisibleLimit((limit) => limit + VISIBLE_FILES_PAGE)}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--border-subtle)] px-4 py-2 text-sm font-medium text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]"
+                  >
+                    Show more
+                    <span className="text-xs text-[var(--text-faint)]">
+                      ({visibleFiles.length - paginatedFiles.length} remaining)
+                    </span>
+                  </button>
+                </div>
+              )}
+
+              {/* Floating action button for the current multi-selection, bottom-right of the list. */}
+              {selectedFileIds.length > 0 && (
+                <div className="fixed bottom-6 right-6 z-40 flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={clearFileSelection}
+                    className="rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-panel)] px-3 py-2 text-xs font-medium text-[var(--text-muted)] shadow-[var(--shadow-panel)] hover:bg-[var(--bg-hover)]"
+                  >
+                    Clear ({selectedFileIds.length})
+                  </button>
+                  <button
+                    type="button"
+                    onClick={openBulkDeleteConfirm}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-[color-mix(in_srgb,var(--error-linear)_42%,transparent)] bg-[var(--bg-panel)] px-3 py-2 text-xs font-semibold text-[var(--error-linear)] shadow-[var(--shadow-panel)] hover:bg-[color-mix(in_srgb,var(--error-linear)_12%,transparent)]"
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                    Delete Selected?
+                  </button>
+                </div>
               )}
             </section>
           )}
@@ -2750,7 +2977,9 @@ export default function UserDashboard({
                   Trash
                 </h1>
                 <p className="mt-1 text-sm text-[var(--text-muted)]">
-                  Files and versions here are kept for 90 days before being permanently deleted.
+                  {trashRetentionDays != null
+                    ? `Files and versions here are kept for ${trashRetentionDays} day${trashRetentionDays === 1 ? "" : "s"} before being permanently deleted.`
+                    : "Files and versions here can be recovered from Trash until permanently deleted."}
                 </p>
               </div>
               {trashLoading ? (
@@ -3258,6 +3487,18 @@ export default function UserDashboard({
           onClose={() => setVersionsFile(null)}
         />
       )}
+      {bulkDeleteFiles.length > 0 && (
+        <BulkDeleteDialog
+          files={bulkDeleteFiles}
+          token={token}
+          retentionDays={trashRetentionDays}
+          deleting={bulkDeleting}
+          onConfirm={confirmBulkDelete}
+          onClose={() => {
+            if (!bulkDeleting) setBulkDeleteFiles([]);
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -3480,7 +3721,7 @@ function IconButton({
   children,
 }: {
   label: string;
-  onClick: () => void;
+  onClick: (event: React.MouseEvent) => void;
   children: React.ReactNode;
 }) {
   return (
@@ -3503,7 +3744,7 @@ function FileActionButton({
 }: {
   label: string;
   destructive?: boolean;
-  onClick: () => void;
+  onClick: (event: React.MouseEvent) => void;
   children: React.ReactNode;
 }) {
   return (
@@ -3525,7 +3766,7 @@ function FileActionButton({
 function MoveFileSelect({
   onMove,
 }: {
-  onMove: () => void;
+  onMove: (event: React.MouseEvent) => void;
 }) {
   return (
     <button
@@ -3666,6 +3907,114 @@ function MoveFileDialog({
   );
 }
 
+// Confirmation dialog shown when the user asks to soft-delete several files at
+// once (mass selection). Lists every selected file and explains that they are
+// moved to the Trash (recoverable for the configured retention period).
+function BulkDeleteDialog({
+  files,
+  token,
+  retentionDays,
+  deleting,
+  onConfirm,
+  onClose,
+}: {
+  files: FileMetadata[];
+  token: string;
+  retentionDays: number | null;
+  deleting: boolean;
+  onConfirm: () => void;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !deleting) onClose();
+    };
+    document.addEventListener("keydown", closeOnEscape);
+    return () => document.removeEventListener("keydown", closeOnEscape);
+  }, [onClose, deleting]);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 grid place-items-center bg-black/60 p-4 backdrop-blur-sm"
+      onPointerDown={(event) => {
+        if (event.target === event.currentTarget && !deleting) onClose();
+      }}
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="bulk-delete-title"
+        className="w-full max-w-xl rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] p-5 shadow-[var(--shadow-panel)]"
+        onPointerDown={(event) => event.stopPropagation()}
+      >
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <h2 id="bulk-delete-title" className="text-base font-semibold">
+              Delete {files.length} selected file{files.length === 1 ? "" : "s"}?
+            </h2>
+            <p className="mt-1 text-xs text-[var(--text-muted)]">
+              The file{files.length === 1 ? "" : "s"} below will be moved to Trash
+              {retentionDays != null
+                ? ` and kept there for ${retentionDays} day${retentionDays === 1 ? "" : "s"} before being permanently deleted.`
+                : " and can be recovered from Trash until permanently deleted."}
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={deleting}
+            className="rounded-md p-2 hover:bg-[var(--bg-hover)] disabled:opacity-60"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        <div className="mt-4 max-h-64 overflow-y-auto rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-muted)]">
+          <ul className="divide-y divide-[var(--border-subtle)]">
+            {files.map((file) => (
+              <li key={file.id} className="flex items-center gap-2 px-3 py-2">
+                <FileThumbnail
+                  file={file}
+                  token={token}
+                  className="h-8 w-8 shrink-0 rounded"
+                  iconClassName="h-3.5 w-3.5"
+                  showTypeBadge={false}
+                />
+                <span className="min-w-0 flex-1 truncate text-sm">
+                  {file.original_name}
+                </span>
+                <span className="shrink-0 text-xs text-[var(--text-muted)]">
+                  {formatBytes(file.size)}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+
+        <div className="mt-5 flex justify-end gap-2">
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={deleting}
+            className="rounded-lg border border-[var(--border-subtle)] px-3 py-2 text-sm text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] disabled:opacity-60"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={onConfirm}
+            disabled={deleting}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-[color-mix(in_srgb,var(--error-linear)_42%,transparent)] bg-[color-mix(in_srgb,var(--error-linear)_12%,transparent)] px-3 py-2 text-sm font-medium text-[var(--error-linear)] hover:bg-[color-mix(in_srgb,var(--error-linear)_18%,transparent)] disabled:opacity-60"
+          >
+            <Trash2 className="h-3.5 w-3.5" />
+            {deleting ? "Moving to Trash..." : `Move ${files.length} to Trash`}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function ProfileAvatar({
   user,
   version,
@@ -3718,15 +4067,55 @@ function FileThumbnail({
   const [playing, setPlaying] = useState(false);
   const [hovering, setHovering] = useState(false);
   const videoRef = React.useRef<HTMLVideoElement>(null);
+  const containerRef = React.useRef<HTMLDivElement | null>(null);
   const isImage = file.mime_type.startsWith("image/");
   const isVideo = file.mime_type.startsWith("video/");
   const isPreviewable = isImage || isVideo;
+
+  const loadThumbnailStarted = React.useRef(false);
 
   useEffect(() => {
     setPreviewUrl(null);
     setFailed(false);
     setPlaying(false);
     if (!isPreviewable) return undefined;
+
+    // Only fetch the thumbnail once the element is near the viewport.
+    // Rendering the "All Files" root can produce thousands of cards, and
+    // fetching a thumbnail for each one at once saturates the server and
+    // stalls the page. Loading lazily as the user scrolls keeps the burst
+    // proportional to what is actually visible.
+    const el = containerRef.current;
+    if (!el || typeof IntersectionObserver === "undefined") {
+      // No element yet, or very old browser without IntersectionObserver:
+      // load the thumbnail immediately.
+      void loadThumbnail();
+      return undefined;
+    }
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (entry.isIntersecting) {
+            void loadThumbnail();
+            observer.disconnect();
+            break;
+          }
+        }
+      },
+      // Start loading slightly before the card scrolls into view.
+      { rootMargin: "300px 0px" },
+    );
+    observer.observe(el);
+
+    return () => {
+      observer.disconnect();
+    };
+  }, [file.id, isImage, isPreviewable, token]);
+
+  const loadThumbnail = () => {
+    if (loadThumbnailStarted.current) return;
+    loadThumbnailStarted.current = true;
 
     const controller = new AbortController();
     let objectUrl: string | null = null;
@@ -3757,7 +4146,7 @@ function FileThumbnail({
       controller.abort();
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [file.id, isImage, isPreviewable, token]);
+  };
 
   const playVideo = async () => {
     const video = videoRef.current;
@@ -3786,6 +4175,7 @@ function FileThumbnail({
 
   return (
     <div
+      ref={containerRef}
       role={isVideo && interactiveVideo && onOpenVideo ? "button" : undefined}
       tabIndex={isVideo && interactiveVideo && onOpenVideo ? 0 : undefined}
       aria-label={isVideo && interactiveVideo && onOpenVideo ? `Play ${file.original_name}` : undefined}
