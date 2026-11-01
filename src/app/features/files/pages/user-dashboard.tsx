@@ -5,6 +5,7 @@ import {
   CalendarDays,
   Copy,
   Eye,
+  FileVolume2,
   Folder,
   FolderPlus,
   History,
@@ -234,6 +235,12 @@ function fileKind(file: FileMetadata) {
         fileName.endsWith(".mov") || fileName.endsWith(".wmv") || fileName.endsWith(".webm")) {
       return "Video";
     }
+    // Check for audio extensions
+    if (fileName.endsWith(".mp3") || fileName.endsWith(".wav") || fileName.endsWith(".ogg") ||
+        fileName.endsWith(".oga") || fileName.endsWith(".m4a") || fileName.endsWith(".aac") ||
+        fileName.endsWith(".flac") || fileName.endsWith(".opus") || fileName.endsWith(".wma")) {
+      return "Audio";
+    }
     // Check for PDF
     if (fileName.endsWith(".pdf")) {
       return "PDF";
@@ -247,6 +254,7 @@ function fileKind(file: FileMetadata) {
   
   if (normalizedMimeType.includes("image")) return "Image";
   if (normalizedMimeType.includes("video")) return "Video";
+  if (normalizedMimeType.includes("audio")) return "Audio";
   if (normalizedMimeType.includes("pdf")) return "PDF";
   if (normalizedMimeType.includes("zip") || normalizedMimeType.includes("compressed"))
     return "Archive";
@@ -269,10 +277,16 @@ function supportsExternalPreview(file: FileMetadata) {
         fileName.endsWith(".mov") || fileName.endsWith(".wmv") || fileName.endsWith(".webm")) {
       return true;
     }
+    if (fileName.endsWith(".mp3") || fileName.endsWith(".wav") || fileName.endsWith(".ogg") ||
+        fileName.endsWith(".m4a") || fileName.endsWith(".aac") || fileName.endsWith(".flac") ||
+        fileName.endsWith(".opus")) {
+      return true;
+    }
   }
 
   return (
-    normalizedMimeType.startsWith("image/") || normalizedMimeType.startsWith("video/")
+    normalizedMimeType.startsWith("image/") || normalizedMimeType.startsWith("video/") ||
+    normalizedMimeType.startsWith("audio/")
   );
 }
 
@@ -311,6 +325,24 @@ function isImageFile(file: FileMetadata) {
   }
   
   return normalizedMimeType.startsWith("image/");
+}
+
+function isAudioFile(file: FileMetadata) {
+  const normalizedMimeType = (file.mime_type || "").trim().toLowerCase();
+  
+  // Handle common incorrect MIME types
+  if (normalizedMimeType === "document" || normalizedMimeType === "application/octet-stream") {
+    // Check file extension as fallback
+    const fileName = file.original_name.toLowerCase();
+    if (fileName.endsWith(".mp3") || fileName.endsWith(".wav") || fileName.endsWith(".ogg") ||
+        fileName.endsWith(".oga") || fileName.endsWith(".m4a") || fileName.endsWith(".aac") ||
+        fileName.endsWith(".flac") || fileName.endsWith(".opus") || fileName.endsWith(".wma") ||
+        fileName.endsWith(".mid") || fileName.endsWith(".midi")) {
+      return true;
+    }
+  }
+  
+  return normalizedMimeType.startsWith("audio/");
 }
 
 function toLocalDateTimeValue(date: Date) {
@@ -367,6 +399,7 @@ export default function UserDashboard({
   const [shareFolder, setShareFolder] = useState<FileFolder | null>(null);
   const [videoFile, setVideoFile] = useState<FileMetadata | null>(null);
   const [imageFile, setImageFile] = useState<FileMetadata | null>(null);
+  const [audioFile, setAudioFile] = useState<FileMetadata | null>(null);
   const [textPreviewFile, setTextPreviewFile] = useState<FileMetadata | null>(null);
   const [moveFile, setMoveFile] = useState<FileMetadata | null>(null);
   const [moveTargetFolderId, setMoveTargetFolderId] = useState("");
@@ -2521,10 +2554,14 @@ export default function UserDashboard({
                         </div>
                       </div>
                       <div className="mt-4 grid w-full min-w-0 gap-2 min-[380px]:grid-cols-2">
-                        {(file.preview_available || isVideoFile(file) || isImageFile(file)) && (
+                        {(file.preview_available || isVideoFile(file) || isImageFile(file) || isAudioFile(file)) && (
                           <FileActionButton
-                            label={isVideoFile(file) ? "Watch" : isImageFile(file) ? "Preview" : "Preview"}
+                            label={isVideoFile(file) ? "Watch" : isAudioFile(file) ? "Listen" : "Preview"}
                             onClick={() => {
+                              if (isAudioFile(file)) {
+                                setAudioFile(file);
+                                return;
+                              }
                               if (isVideoFile(file)) {
                                 setVideoFile(file);
                                 return;
@@ -2538,6 +2575,8 @@ export default function UserDashboard({
                           >
                             {isVideoFile(file) ? (
                               <Play className="h-3.5 w-3.5" />
+                            ) : isAudioFile(file) ? (
+                              <FileVolume2 className="h-3.5 w-3.5" />
                             ) : (
                               <Eye className="h-3.5 w-3.5" />
                             )}
@@ -2633,10 +2672,14 @@ export default function UserDashboard({
                         </td>
                         <td className="w-60 px-2 py-3">
                           <div className="flex w-56 justify-end gap-1">
-                            {(file.preview_available || isVideoFile(file) || isImageFile(file)) && (
+                            {(file.preview_available || isVideoFile(file) || isImageFile(file) || isAudioFile(file)) && (
                               <IconButton
-                                label={isVideoFile(file) ? "Watch" : isImageFile(file) ? "Preview" : "Preview"}
+                                label={isVideoFile(file) ? "Watch" : isAudioFile(file) ? "Listen" : "Preview"}
                                 onClick={() => {
+                                  if (isAudioFile(file)) {
+                                    setAudioFile(file);
+                                    return;
+                                  }
                                   if (isVideoFile(file)) {
                                     setVideoFile(file);
                                     return;
@@ -2650,6 +2693,8 @@ export default function UserDashboard({
                               >
                                 {isVideoFile(file) ? (
                                   <Play className="h-4 w-4" />
+                                ) : isAudioFile(file) ? (
+                                  <FileVolume2 className="h-4 w-4" />
                                 ) : (
                                   <Eye className="h-4 w-4" />
                                 )}
@@ -3172,6 +3217,9 @@ export default function UserDashboard({
       )}
       {imageFile && (
         <ImagePreviewDialog file={imageFile} onClose={() => setImageFile(null)} />
+      )}
+      {audioFile && (
+        <AudioPreviewDialog file={audioFile} onClose={() => setAudioFile(null)} />
       )}
       {textPreviewFile && (
         <TextPreviewDialog
@@ -4052,6 +4100,57 @@ function ImagePreviewDialog({
           src={`/api/files/${file.id}/preview`}
           alt={file.original_name}
           className="max-h-full max-w-full object-contain"
+        />
+      </div>
+    </div>
+  );
+}
+
+function AudioPreviewDialog({
+  file,
+  onClose,
+}: {
+  file: FileMetadata;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", closeOnEscape);
+    return () => document.removeEventListener("keydown", closeOnEscape);
+  }, [onClose]);
+
+  return (
+    <div
+      className="fixed inset-0 z-[60] flex flex-col bg-black/95 p-4 backdrop-blur-md"
+      onPointerDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      <div className="mb-3 flex items-center justify-between gap-4 text-white">
+        <p className="min-w-0 truncate text-sm font-medium">{file.original_name}</p>
+        <button
+          type="button"
+          aria-label="Close audio preview"
+          onClick={onClose}
+          className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-white/10 hover:bg-white/20"
+        >
+          <X className="h-4 w-4" />
+        </button>
+      </div>
+      <div className="flex min-h-0 flex-1 flex-col items-center justify-center">
+        <FileTypeIcon
+          fileName={file.original_name}
+          mimeType={file.mime_type}
+          className="mb-4 h-16 w-16 text-white/80"
+          showBadge={false}
+        />
+        <audio
+          src={`/api/files/${file.id}/preview`}
+          controls
+          autoPlay
+          className="w-full max-w-xl"
         />
       </div>
     </div>
