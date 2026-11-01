@@ -2593,7 +2593,7 @@ export default function UserDashboard({
                       <th className="hidden w-28 px-3 py-3 font-medium lg:table-cell">
                         Added
                       </th>
-                      <th className="hidden w-48 px-3 py-3 font-medium lg:table-cell">
+                      <th className="hidden w-60 px-3 py-3 font-medium lg:table-cell">
                         Actions
                       </th>
                     </tr>
@@ -2631,8 +2631,8 @@ export default function UserDashboard({
                         <td className="hidden w-28 px-3 py-3 text-[var(--text-muted)] lg:table-cell">
                           {new Date(file.created_at).toLocaleDateString()}
                         </td>
-                        <td className="w-48 px-2 py-3">
-                          <div className="flex w-44 justify-end gap-1">
+                        <td className="w-60 px-2 py-3">
+                          <div className="flex w-56 justify-end gap-1">
                             {(file.preview_available || isVideoFile(file) || isImageFile(file)) && (
                               <IconButton
                                 label={isVideoFile(file) ? "Watch" : isImageFile(file) ? "Preview" : "Preview"}
