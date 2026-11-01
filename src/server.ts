@@ -33,7 +33,7 @@ import {
   hashFileSecret, verifyFileSecret, decryptClientProtectedPayload, encryptClientProtectedFileInPlace, decryptClientProtectedFileInPlace,
   generateSecureToken, validateEncryptionConfig,
 } from './server/utils/encryption.js';
-import { scanFileBuffer, scanFilePath, heuristicPreScan } from './server/utils/scanner.js';
+import { scanFileBuffer, scanFilePath, heuristicPreScan, type ScanResult } from './server/utils/scanner.js';
 import {
   detectProfilePictureMime,
   getLatestProfilePictureFile,
@@ -119,8 +119,13 @@ const HTTP_KEEP_ALIVE_TIMEOUT_MS = parseNonNegativeIntEnv('HTTP_KEEP_ALIVE_TIMEO
 const HTTP_SOCKET_TIMEOUT_MS = parseNonNegativeIntEnv('HTTP_SOCKET_TIMEOUT_MS', 0);
 const UNC_SHARE_HEALTHCHECK_INTERVAL_MS = parseNonNegativeIntEnv('UNC_SHARE_HEALTHCHECK_INTERVAL_MS', 5 * 60_000);
 const VIDEO_EMBED_MAX_SIZE_BYTES = 950 * 1024 * 1024;
-const ALLOW_UNSCANNED_UPLOADS_IN_DEVELOPMENT =
+const allowUnscannedUploadsInDevelopment =
   NODE_ENV === 'development' && process.env.ALLOW_UNSCANNED_UPLOADS_IN_DEVELOPMENT !== 'false';
+// POURQUOI : admins may opt out of Bitdefender scanning in ANY environment
+// (including production) via ALLOW_UNSCANNED_UPLOADS=true. The legacy
+// development-only var keeps its historical default for local dev.
+const ALLOW_UNSCANNED_UPLOADS =
+  allowUnscannedUploadsInDevelopment || process.env.ALLOW_UNSCANNED_UPLOADS === 'true';
 
 if (!process.env.UPLOAD_TEMP_PATH) {
   console.warn(`[server] UPLOAD_TEMP_PATH is not set. Upload temp files will use fallback path: ${UPLOAD_TEMP}`);
@@ -3030,23 +3035,45 @@ app.post(
       }
 
       // ── Bitdefender scan (reads the temp file directly from disk) ──
-      currentStage = 'bitdefender_scan';
-      sendUploadProgress({
-        type: 'processing',
-        phase: 'Scanning file',
-        loaded: 50,
-        total: processingTotal,
-      });
-      const scanResult = await scanFilePath(tempFilePath, size);
-      sendUploadProgress({
-        type: 'processing',
-        phase: 'Scan complete',
-        loaded: 250,
-        total: processingTotal,
-      });
-      console.info('[upload] Scan completed.', { userId: user.id, originalName: original_name, scanStatus: scanResult.status, scanDurationMs: scanResult.scanDurationMs });
-      const acceptedWithoutScanner =
-        scanResult.status === 'Unavailable' && ALLOW_UNSCANNED_UPLOADS_IN_DEVELOPMENT;
+      // POURQUOI : when the admin disabled Bitdefender scanning via
+      // ALLOW_UNSCANNED_UPLOADS, skip the CLI entirely (fail-open) instead of
+      // running it and only accepting an "Unavailable" result. Local dev keeps
+      // running the scan when a CLI is present; the bypass only matters when
+      // scanning is disabled or the scanner is absent.
+      let scanResult: ScanResult;
+      let acceptedWithoutScanner = false;
+      if (ALLOW_UNSCANNED_UPLOADS) {
+        acceptedWithoutScanner = true;
+        scanResult = {
+          clean:          true,
+          status:         'Clean',
+          threats:        [],
+          message:        'Bitdefender scanning disabled via ALLOW_UNSCANNED_UPLOADS.',
+          scanDurationMs: 0,
+        };
+        console.warn('[upload] Bitdefender scanning disabled via env; skipping scan.', {
+          userId: user.id,
+          originalName: original_name,
+        });
+      } else {
+        currentStage = 'bitdefender_scan';
+        sendUploadProgress({
+          type: 'processing',
+          phase: 'Scanning file',
+          loaded: 50,
+          total: processingTotal,
+        });
+        scanResult = await scanFilePath(tempFilePath, size);
+        sendUploadProgress({
+          type: 'processing',
+          phase: 'Scan complete',
+          loaded: 250,
+          total: processingTotal,
+        });
+        console.info('[upload] Scan completed.', { userId: user.id, originalName: original_name, scanStatus: scanResult.status, scanDurationMs: scanResult.scanDurationMs });
+        acceptedWithoutScanner =
+          scanResult.status === 'Unavailable' && ALLOW_UNSCANNED_UPLOADS;
+      }
 
       if (!scanResult.clean && !acceptedWithoutScanner) {
         console.warn('[upload] Rejected by Bitdefender scan.', { userId: user.id, originalName: original_name, scanStatus: scanResult.status });
@@ -3054,15 +3081,9 @@ app.post(
         await logSystemEvent(user.id, user.username, 'Scan', 'File', 'rejected', req, `AV block: "${original_name}" — ${scanResult.message}`);
         return finishUploadError(422, vibe || scanResult.message);
       }
-      if (acceptedWithoutScanner) {
-        console.warn('[upload] Bitdefender unavailable; accepting upload because NODE_ENV=development.', {
-          userId: user.id,
-          originalName: original_name,
-        });
-      }
       const persistedScanResult = acceptedWithoutScanner ? 'Clean' : scanResult.status;
       const persistedScanMessage = acceptedWithoutScanner
-        ? `Development bypass: Bitdefender scanner unavailable; file was not scanned. ${scanResult.message}`
+        ? 'Bypass: Bitdefender scanning disabled; file was not scanned (ALLOW_UNSCANNED_UPLOADS enabled).'
         : scanResult.message;
 
       // Verify and correct MIME type based on file content
