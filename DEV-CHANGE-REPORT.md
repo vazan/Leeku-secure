@@ -1445,3 +1445,60 @@ Validation status
 
 Approval trail
 - Not required (STANDARD change).
+---
+
+agent: DevEngineer | date: 2026-11-01 | model: dev-engineer
+plan: /memories/session/dev-plan.md
+---
+
+Intent
+Port the audio playback feature from the `mssql` branch commit
+`aebf9d6973dbbd4e62ce30d5dee1440107a31eb4` ("initial implementation of
+soft-deletion & audio playback") onto the `postgresql` migration branch. Only the
+audio playback part — soft-deletion/trash was already migrated.
+
+Change class
+STANDARD — no schema change, no new dependency; extends the inline preview
+allowlist and adds a frontend audio preview dialog.
+
+Files changed
+- src/server.ts:
+  - `/api/files/:id/preview`: extended `mediaPreviewable` to also accept
+    `audio/*` MIME types, so audio files can be streamed inline (this is what the
+    browser `<audio>` element consumes).
+- src/app/features/files/pages/user-dashboard.tsx:
+  - Added `FileVolume2` icon import.
+  - `fileKind()`: returns "Audio" for audio extensions (mp3/wav/ogg/oga/m4a/aac/
+    flac/opus/wma) and for `audio/` MIME types.
+  - `supportsExternalPreview()`: audio extensions + `audio/` MIME supported.
+  - New `isAudioFile()` helper (extension + MIME fallback, mirrors `isImageFile`).
+  - New `audioFile` state and a "Listen" action on both the card grid and the
+    table rows, rendering `FileVolume2` and opening `AudioPreviewDialog`.
+  - New `AudioPreviewDialog` component (black overlay, file icon, native
+    `<audio controls autoPlay>` streaming `/api/files/:id/preview`), rendered
+    when `audioFile` is set.
+
+Public contracts impacted
+- No API contract shape change.
+- `GET /api/files/:id/preview` now returns `206`/stream for `audio/*` MIME types
+  (previously `415`). Authorization and secret-key guards unchanged.
+
+Validation status
+- Type-check: PASSED (`npm run lint` → `tsc --noEmit`, exit 0)
+- Build: PASSED (`npm run build`, exit 0; only pre-existing `import.meta`
+  esbuild warning, unrelated)
+
+Handoff TestEngineer
+- Exercise preview of an `.mp3`/`.wav`/`.m4a` audio file: "Listen" button appears,
+  `AudioPreviewDialog` plays, Escape/backdrop close works.
+- Verify secret-protected audio files are still rejected inline with the secret
+  guard (a user with the secret should still be able to stream — confirm the
+  secret is supplied on the preview stream).
+- Verify the Listen button is NOT shown for non-audio files.
+
+Handoff QaEngineer
+- Confirm audio playback on both card view and table view, and that unsupported
+  audio codecs show the browser's native player error rather than breaking the UI.
+
+Approval trail
+- Not required (STANDARD change).
