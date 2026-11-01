@@ -79,6 +79,10 @@ const TextFilePreview = React.lazy(
 // window the list and reveal additional files on demand.
 const INITIAL_VISIBLE_FILES = 100;
 const VISIBLE_FILES_PAGE = 200;
+// Server-side page size for GET /api/files (M-3). Kept small enough that a page
+// of decrypted metadata is light; matches INITIAL_VISIBLE_FILES so the first
+// page renders immediately without a local "Show more" window shrink.
+const FILES_SERVER_PAGE = 100;
 
 interface UserDashboardProps {
   user: User;
@@ -381,6 +385,15 @@ export default function UserDashboard({
   );
   const [files, setFiles] = useState<FileMetadata[]>([]);
   const [filesLoading, setFilesLoading] = useState(false);
+  // Server-side pagination (M-3): the endpoint returns a bounded page plus the
+  // total for the current scope (folder). `filesTotal` drives the header count
+  // and `filesHasMore` the "Show more" button, so the client never holds the
+  // full file set in memory.
+  const [filesTotal, setFilesTotal] = useState(0);
+  const [filesHasMore, setFilesHasMore] = useState(false);
+  // Account-wide file count (returned by GET /api/files) used for the quota
+  // display, which must reflect the whole account and not just the loaded page.
+  const [accountFileCount, setAccountFileCount] = useState(0);
   // IDs of files the user has selected for mass actions (e.g. bulk soft-delete).
   const [selectedFileIds, setSelectedFileIds] = useState<string[]>([]);
   const [bulkDeleteFiles, setBulkDeleteFiles] = useState<FileMetadata[]>([]);
@@ -467,7 +480,9 @@ export default function UserDashboard({
     quotas.find((quota) => quota.id === user.quota_id) || quotas[0];
   const storageLimit = activeQuota?.storage_limit_bytes || 1;
   const maxFiles = activeQuota?.max_files || 0;
-  const filesLeft = Math.max(maxFiles - files.length, 0);
+  // Account-wide file count from the server (M-3) — `files` only holds the
+  // currently loaded page and would under-report quota usage.
+  const filesLeft = Math.max(maxFiles - (accountFileCount || files.length), 0);
   const folderById = useMemo(
     () => new Map(folders.map((folder) => [folder.id, folder] as const)),
     [folders],
@@ -587,16 +602,30 @@ export default function UserDashboard({
     }
   };
 
+  // Fetch the first server-side page (section/page) of files for the active
+  // folder scope, together with sharing links. Server capping the payload is
+  // what M-3 is about: the client holds only the current folder's current page
+  // instead of the whole account's file set.
   const loadFilesAndLinks = async () => {
     setFilesLoading(true);
     try {
+      const scope = activeFolderId ? `&folder_id=${encodeURIComponent(activeFolderId)}` : "";
       const [filesResponse, linksResponse] = await Promise.all([
-        fetch("/api/files?_t=" + Date.now(), { headers: authHeaders(token) }),
+        fetch(`/api/files?_t=${Date.now()}&limit=${FILES_SERVER_PAGE}&offset=0${scope}`, {
+          headers: authHeaders(token),
+        }),
         fetch("/api/sharing/links?_t=" + Date.now(), { headers: authHeaders(token) }),
       ]);
       if (filesResponse.ok) {
         const filePayload = await filesResponse.json();
         setFiles(filePayload.files || []);
+        setFilesTotal(typeof filePayload.total === "number" ? filePayload.total : (filePayload.files || []).length);
+        setFilesHasMore(!!filePayload.has_more);
+        if (typeof filePayload.account_file_count === "number") {
+          setAccountFileCount(filePayload.account_file_count);
+        }
+        // A freshly loaded scope starts at the top of the (rendered) window.
+        setVisibleLimit(INITIAL_VISIBLE_FILES);
         if (typeof filePayload.trash_retention_days === "number") {
           setTrashRetentionDays(filePayload.trash_retention_days);
         }
@@ -624,6 +653,39 @@ export default function UserDashboard({
           // Keep generic message when response is not JSON.
         }
         notifyError(message);
+      }
+    } finally {
+      setFilesLoading(false);
+    }
+  };
+
+  // Append the next server-side page of the current folder scope. Only invoked
+  // via the "Show more" button while the server reports more rows available.
+  const loadMoreFiles = async () => {
+    if (filesLoading) return;
+    setFilesLoading(true);
+    try {
+      const scope = activeFolderId ? `&folder_id=${encodeURIComponent(activeFolderId)}` : "";
+      const response = await fetch(
+        `/api/files?_t=${Date.now()}&limit=${FILES_SERVER_PAGE}&offset=${files.length}${scope}`,
+        { headers: authHeaders(token) },
+      );
+      if (response.ok) {
+        const payload = await response.json();
+        const nextPage = payload.files || [];
+        setFiles((current) => {
+          const seen = new Set(current.map((f) => f.id));
+          return [...current, ...nextPage.filter((f: FileMetadata) => !seen.has(f.id))];
+        });
+        setFilesTotal(typeof payload.total === "number" ? payload.total : files.length + nextPage.length);
+        setFilesHasMore(!!payload.has_more);
+        if (typeof payload.account_file_count === "number") {
+          setAccountFileCount(payload.account_file_count);
+        }
+        // Grow the local render window so the newly appended rows become visible.
+        setVisibleLimit((limit) => limit + nextPage.length);
+      } else {
+        notifyError("Could not load more files.");
       }
     } finally {
       setFilesLoading(false);
@@ -685,12 +747,21 @@ export default function UserDashboard({
 
   useEffect(() => {
     loadFolders().catch(() => notifyError("Could not refresh folders."));
-    loadFilesAndLinks().catch(() => notifyError("Could not refresh your files."));
+    // Files+links are loaded by the activeFolderId effect below (which also
+    // runs on mount), so the initial root scope is fetched exactly once.
     // Only load the lightweight admin datasets (users, logs, stats) eagerly.
     // The large admin-wide files/folders datasets load lazily when the admin
     // view is opened (see the view effect below).
     loadAdminCore().catch(() => notifyError("Could not refresh admin data."));
   }, []);
+
+  // M-3: reload the first server-side page whenever the folder scope changes
+  // (folder navigation happens entirely through setActiveFolderId). On mount it
+  // performs the initial root fetch; afterwards it refetches per folder.
+  useEffect(() => {
+    loadFilesAndLinks().catch(() => notifyError("Could not refresh your files."));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeFolderId]);
 
   useEffect(() => {
     if (view === "trash") {
@@ -755,17 +826,20 @@ export default function UserDashboard({
     [visibleFiles, visibleLimit],
   );
 
-  // Reset the window whenever the result set changes (new load, folder
-  // navigation, or a search), so the user starts seeing results from the top.
+  // Reset the render window when the scope or search changes so results start
+  // from the top. Paged appends (loadMoreFiles) grow the window instead — the
+  // window must NOT reset on every `files` change or appended pages would be
+  // hidden again (M-3 server-side pagination).
   useEffect(() => {
     setVisibleLimit(INITIAL_VISIBLE_FILES);
-  }, [activeFolderId, files, search]);
+  }, [activeFolderId, search]);
 
-  // When navigating into a different folder (or the file list reloads), clear
-  // the in-progress multi-selection — the selected IDs may no longer be visible.
+  // When navigating into a different folder, clear the in-progress
+  // multi-selection — the selected IDs may no longer be visible. Depends only
+  // on the scope so that paged appends (loadMoreFiles) do not clear a selection.
   useEffect(() => {
     setSelectedFileIds([]);
-  }, [activeFolderId, files]);
+  }, [activeFolderId]);
 
   const visibleFolders = useMemo(() => {
     const toPathParts = (folder: FileFolder) => {
@@ -1694,7 +1768,7 @@ export default function UserDashboard({
           : "Folder deleted."
         );
         setActiveFolderId(folder.parent_folder_id || null);
-        await loadFilesAndLinks();
+        // The [activeFolderId] effect refetches the new folder's first page.
         await loadFolders(true);
         onTriggerRefreshUser();
       } else {
@@ -2521,7 +2595,10 @@ export default function UserDashboard({
                     </span>
                   ) : (
                     <>
-                      {currentFolderFiles.length} file{currentFolderFiles.length === 1 ? "" : "s"} {activeFolder ? "in this folder" : "in All Files root"}.
+                      {/* filesTotal is the server-side total for the active
+                          folder scope (M-3); fall back to the loaded set when
+                          the total is unavailable. */}
+                      {(filesTotal > 0 ? filesTotal : currentFolderFiles.length)} file{(filesTotal > 0 ? filesTotal : currentFolderFiles.length) === 1 ? "" : "s"} {activeFolder ? "in this folder" : "in All Files root"}.
                       {normalizedSearch && (
                         <>
                           {" "}
@@ -2933,16 +3010,24 @@ export default function UserDashboard({
               </div>
               )}
 
-              {!filesLoading && paginatedFiles.length < visibleFiles.length && (
+              {!filesLoading && (filesHasMore || paginatedFiles.length < visibleFiles.length) && (
                 <div className="mt-6 flex justify-center">
                   <button
                     type="button"
-                    onClick={() => setVisibleLimit((limit) => limit + VISIBLE_FILES_PAGE)}
+                    onClick={() => {
+                      // Prefer loading the next server page when one exists (M-3);
+                      // otherwise reveal any remaining locally-rendered matches
+                      // (e.g. a filtered search result already fully loaded).
+                      if (filesHasMore) void loadMoreFiles();
+                      else setVisibleLimit((limit) => limit + VISIBLE_FILES_PAGE);
+                    }}
                     className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--border-subtle)] px-4 py-2 text-sm font-medium text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]"
                   >
                     Show more
                     <span className="text-xs text-[var(--text-faint)]">
-                      ({visibleFiles.length - paginatedFiles.length} remaining)
+                      {filesHasMore
+                        ? `(${Math.max(filesTotal - files.length, 0)} remaining)`
+                        : `(${visibleFiles.length - paginatedFiles.length} remaining)`}
                     </span>
                   </button>
                 </div>

@@ -65,6 +65,7 @@ import { cleanupPublicShareDecryptedPreviewFiles, createPublicSharingRouter } fr
 import { createPublicFolderSharingRouter } from './server/routes/public-folder-sharing.js';
 import { createMaintenanceModeRouter } from './server/routes/maintenance-mode.js';
 import { createDesktopUpdatesRouter, SYSTEM_UPDATE_FOLDER_NAME } from './server/routes/desktop-updates.js';
+import { mergeChunks } from './server/merge-chunks.js';
 import { validateProductionConfig } from './server/utils/production.js';
 import { getTextPreviewKind, TEXT_PREVIEW_MAX_BYTES } from './server/utils/text-preview.js';
 import type { AdminFileFolder, Quota, User, FileMetadata, FileFolder, FolderShareLink, ShareLink, SystemLog, SystemStats } from './app/shared/types/index.js';
@@ -1173,11 +1174,13 @@ async function authenticateUser(
   try {
     const request = await getRequest();
     request.input('id', sql.UniqueIdentifier, payload.sub);
+    // POURQUOI : the per-request COUNT(*) over `files` was an aggregation cost on
+    // every authenticated call (list, download-prepare, status polling, ...).
+    // `files_used` is not consumed by the frontend, so it is omitted here.
     const result = await request.query<UserRow>(
       `SELECT id, email_encrypted, email_iv, email_auth_tag,
               username_encrypted, username_iv, username_auth_tag,
               role, quota_id, storage_used_bytes, status, created_at,
-              (SELECT COUNT(*) FROM files WHERE owner_user_id = users.id AND status = 'Available') AS files_used,
               failed_login_count, locked_until
        FROM users WHERE id = @id AND status = 'Active'`
     );
@@ -2081,13 +2084,28 @@ a{display:inline-block;background:#FF007F;color:#fff;padding:12px 28px;font-weig
 
 app.get('/api/files', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
   try {
+    // ── Server-side pagination (M-3) ───────────────────────────
+    // Bound the payload returned to the client. The dashboard loads pages via
+    // limit/offset and can scope by folder_id + search; total/has_more let it
+    // render accurate counts and a "Show more" button without holding every
+    // file in memory.
+    const rawLimit  = parseInt(String(req.query.limit ?? ''), 10);
+    const rawOffset = parseInt(String(req.query.offset ?? ''), 10);
+    const limit     = Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), 500) : 200;
+    const offset    = Number.isFinite(rawOffset) ? Math.max(rawOffset, 0) : 0;
+    let folderId   = normalizeNullableFolderId(req.query.folder_id);
+    if (folderId === undefined) folderId = null;
+
     const request = await getRequest();
     request.input('ownerId', sql.UniqueIdentifier, req.userId!);
     request.input('includeSystem', sql.Bit, req.user?.role === 'Admin' && req.query.include_system === '1' ? 1 : 0);
     request.input('systemFolderName', sql.NVarChar(120), SYSTEM_UPDATE_FOLDER_NAME);
+    request.input('folderId', sql.UniqueIdentifier, folderId);
+    request.input('limit', sql.Int, limit);
+    request.input('offset', sql.Int, offset);
     let result;
     try {
-      result = await request.query<FileRow>(
+      result = await request.query<FileRow & { total_count: number }>(
         `SELECT id, owner_user_id,
                 folder_id, folder_name,
                 original_name_encrypted, original_name_iv, original_name_auth_tag,
@@ -2095,7 +2113,8 @@ app.get('/api/files', authenticateUser as express.RequestHandler, async (req: Au
                 status, checksum_sha256, scan_result, scan_message,
                 is_encrypted, leeku_vibe, ttl_hours,
                 client_secret_hash, version_count,
-                expires_at, created_at
+                expires_at, created_at,
+                COUNT(*) OVER() AS total_count
         FROM (
           SELECT f.*, ff.name AS folder_name
           FROM files f
@@ -2114,8 +2133,10 @@ app.get('/api/files', authenticateUser as express.RequestHandler, async (req: Au
                   )
               )
             )
+            AND (f.folder_id=@folderId OR (@folderId IS NULL AND f.folder_id IS NULL))
         ) files
-         ORDER BY created_at DESC`
+         ORDER BY created_at DESC
+         OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY`
       );
     } catch (queryErr: any) {
       const isMissingSecretColumn =
@@ -2125,7 +2146,7 @@ app.get('/api/files', authenticateUser as express.RequestHandler, async (req: Au
       if (!isMissingSecretColumn) throw queryErr;
 
       console.warn('[GET /api/files] client_secret_hash column missing, using legacy query fallback.');
-      result = await request.query<FileRow>(
+      result = await request.query<FileRow & { total_count: number }>(
         `SELECT id, owner_user_id,
                 NULL AS folder_id, NULL AS folder_name,
                 original_name_encrypted, original_name_iv, original_name_auth_tag,
@@ -2133,12 +2154,40 @@ app.get('/api/files', authenticateUser as express.RequestHandler, async (req: Au
                 status, checksum_sha256, scan_result, scan_message,
                 is_encrypted, leeku_vibe, ttl_hours,
                 NULL AS version_count,
-                expires_at, created_at
+                expires_at, created_at,
+                COUNT(*) OVER() AS total_count
         FROM files WHERE owner_user_id=@ownerId AND COALESCE(status,'Available')!='Expired' AND deleted_at IS NULL
-         ORDER BY created_at DESC`
+          AND (folder_id=@folderId OR (@folderId IS NULL AND folder_id IS NULL))
+         ORDER BY created_at DESC
+         OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY`
       );
     }
-    res.json({ files: result.recordset.map(r => mapFileRow(r, req.user!.username)), trash_retention_days: TRASH_RETENTION_DAYS });
+    // COUNT(*) OVER() carries the server-side total across the whole filtered
+    // result set. When the fetched window is empty, no row is returned, so the
+    // total falls back to (offset + rows_returned) so `has_more` stays false.
+    const totalCount = result.recordset.length > 0
+      ? Number(result.recordset[0].total_count || 0)
+      : offset + result.recordset.length;
+    const files = result.recordset.map(r => mapFileRow(r, req.user!.username));
+
+    // Account-wide file count (not folder-scoped) so the client can show an
+    // accurate quota count without holding the whole file list in memory.
+    // This is a single COUNT per list load (not per authenticated request).
+    const accountReq = await getRequest();
+    accountReq.input('ownerId', sql.UniqueIdentifier, req.userId!);
+    const accountRes = await accountReq.query<{ account_file_count: number }>(
+      `SELECT COUNT(*) AS account_file_count FROM files
+       WHERE owner_user_id=@ownerId AND status='Available' AND deleted_at IS NULL`
+    );
+    const accountFileCount = Number(accountRes.recordset[0]?.account_file_count || 0);
+
+    res.json({
+      files,
+      total: totalCount,
+      has_more: offset + files.length < totalCount,
+      account_file_count: accountFileCount,
+      trash_retention_days: TRASH_RETENTION_DAYS,
+    });
   } catch (err) { console.error('[GET /api/files]', err); res.status(500).json({ error: 'Failed to load files.' }); }
 });
 
@@ -2654,35 +2703,10 @@ function countReceivedChunks(identifier: string): number {
 }
 
 /**
- * Merge all chunks (1 … totalChunks) into a single temporary file.
- * Cleans up the chunk directory afterwards.
- * Returns the path to the merged file.
+ * Resumable chunk merging (H-1) is implemented in ./server/merge-chunks.ts so
+ * it can be unit-tested in isolation; it is imported into this module and used
+ * at the conclusion of a resumable upload.
  */
-function mergeChunks(identifier: string, totalChunks: number): string {
-  const dir = chunkDir(identifier);
-  const mergedPath = path.join(UPLOAD_TEMP, `merged_${identifier}`);
-
-  const fdOut = fs.openSync(mergedPath, 'w');
-  try {
-    for (let i = 1; i <= totalChunks; i++) {
-      const cp = path.join(dir, String(i));
-      if (!fs.existsSync(cp)) {
-        throw new Error(`Missing chunk ${i} of ${totalChunks} for identifier "${identifier}".`);
-      }
-      const data = fs.readFileSync(cp);
-      fs.writeSync(fdOut, data);
-      fs.unlinkSync(cp); // clean up chunk after appending
-    }
-  } finally {
-    fs.closeSync(fdOut);
-  }
-
-  // Remove empty chunk directory
-  try { fs.rmdirSync(dir); } catch { /* best effort */ }
-
-  return mergedPath;
-}
-
 /**
  * Middleware: forwards to chunk multer for Resumable.js uploads,
  * or to regular multer for direct (non-resumable) uploads.
@@ -2837,7 +2861,7 @@ app.post(
 
       let mergedPath: string;
       try {
-        mergedPath = mergeChunks(identifier, totalChunks);
+        mergedPath = await mergeChunks(identifier, totalChunks);
       } catch (mergeErr) {
         console.error('[upload] Failed to merge chunks.', {
           userId: req.user!.id,
