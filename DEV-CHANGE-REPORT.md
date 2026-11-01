@@ -4,61 +4,39 @@ plan: /memories/session/dev-plan.md
 ---
 
 ## Intention
-Add a mass-delete option on the user's "All files" dashboard: click to select multiple
-files (visual highlight), then a bottom-right "Delete Selected?" button opens a confirmation
-dialog listing the files and soft-deletes them via the existing bulk endpoint.
+On desktop ("All files" view), folders should appear only in the side navigation
+menu, not duplicated in the main content area. Mobile behaviour is unchanged.
 
 ## Changement
-Classe : STANDARD — Frontend-only UI feature. The backend bulk soft-delete endpoint
-(`POST /api/files/delete`) already existed and is reused unchanged.
+Classe : TRIVIAL — single className edit, frontend-only, no logic change.
 
 ## Fichiers
 | Fichier | Raison |
 |---|---|
-| `src/app/features/files/pages/user-dashboard.tsx` | Selection state, click-to-toggle on mobile cards & desktop table rows, visual highlight, floating action button, `BulkDeleteDialog` component, closing logic on navigation |
+| `src/app/features/files/pages/user-dashboard.tsx` | Hide the folder cards grid in the main "All files" section on `lg+` screens by switching `lg:grid-cols-3` → `lg:hidden`. The sidebar (which already renders the folder tree) is visible from `lg+`, so desktop keeps folders only in the sidebar. On mobile (< `lg`) the grid still renders as before. |
 
 ## Contrats publics impactés
-NON (schema unchanged; no new HTTP routes; the existing `POST /api/files/delete` contract
-is reused as-is).
+NON (no schema, route, or API change).
 
 ## Risques
-Perf : None measurable — selection is stored as `string[]` and checked per row with a
-constant-time `includes` (list length ≤ visible window).
-Sécu : Files remain on the owner's vault disk; soft-delete only. Ownership is re-validated
-server-side by the existing endpoint.
-Régression : `IconButton` / `FileActionButton` / `MoveFileSelect` prop types widened from
-`() => void` to `(event: React.MouseEvent) => void` — existing callers still compile because
-`() => void` is assignable to the wider signature. Build verified.
-Compat : The 100-file server cap for bulk delete surfaces as a clear toast message if the
-user selects more.
+Perf : None (removes DOM on desktop; mobile unchanged).
+Sécu : None.
+Régression : Only affects the `visibleFolders` cards grid in the "files" view on `lg+`. The active-folder file listings and "New folder" flow are untouched.
+Compat : `lg:hidden` is an existing Tailwind utility already used in the same file (header select at line ~2292).
 
 ## Dette observée
-MINOR — `src/server.ts` bulk endpoint already existed but had no client wiring until now.
-Also, selection >100 files is only caught server-side; no client-side cap.
+AUCUNE
 
 ## Validation
-Build: ✅  Lint: ✅  Type-check: ✅  Smoke: ⚠ (run CI tests) — `npm run test:desktop-updates` passes (2/2).
+Build: ✅  Lint: ✅ (`tsc --noEmit`)  Type-check: ✅  Smoke: ✅ (`npm run test:desktop-updates` 2/2 pass)
 
 ## Approbation CRITICAL
-N/A
+N/A (TRIVIAL)
 
 ## Handoff TestEngineer
-- Surfaces à tester :
-  1. Mobile card grid (`sm:hidden`): click card → highlight + checkmark; click again → deselect.
-  2. Desktop table (`sm:block`): click row → highlight + checkbox; click again → deselect.
-  3. Floating "Delete Selected?" button bottom-right, hidden when selection is empty.
-  4. "Clear (N)" button clears selection.
-  5. Confirmation dialog lists all selected files (name + size + thumbnail); Cancel / X / Esc / click-outside close.
-  6. Confirm soft-delete moves files to Trash; success toast; list reloads.
-  7. >100 selected → server 400 → clear toast with server error message.
-  8. Navigation away from Files view or into another folder clears the selection.
-- Cas limites : empty selection (button hidden), selection empty in dialog (error toast),
-  deletion in progress (dialog can't close, double-submit blocked by `bulkDeleting`),
-  files no longer available (error toast with refresh hint).
-- Risques non couverts : performance with thousands of visible files (selection stored
-  in flat array, lookup O(n) per row) — acceptable at current pagination window sizes.
+- Verify on desktop (`lg+` breakpoint, sidebar visible): opening "All files" shows no folder cards in the main section; folders are navigable only via sidebar tree.
+- Verify on mobile (< `lg`, sidebar hidden): folder cards still render in the main section and navigation via them still works.
+- Verify search/`visibleFolders` logic still populates the sidebar folder tree correctly.
 
 ## Handoff QaEngineer
-- Validation : build/lint/type-check ✅ (`npm run lint`, `npm run build`).
-- Feature branch : none created — working tree on `mssql` branch was modified directly.
-- No CRITICAL approval needed (STANDARD).
+Frontend-only trivial className change; build/lint/type-check pass; no contract impact. No CRITICAL approval required.
