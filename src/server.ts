@@ -109,6 +109,7 @@ const JWT_EXPIRY         = parseInt(process.env.JWT_ACCESS_EXPIRY_SECONDS || '90
 const REFRESH_EXPIRY     = parseInt(process.env.JWT_REFRESH_EXPIRY_SECONDS || '604800', 10);
 const JWT_ISSUER         = process.env.JWT_ISSUER   || APP_URL;
 const JWT_AUDIENCE       = process.env.JWT_AUDIENCE || 'leeku-secure-api';
+export const TRASH_RETENTION_DAYS = parseInt(process.env.TRASH_RETENTION_DAYS || '90', 10);
 const SESSION_COOKIE_NAME = process.env.SESSION_COOKIE_NAME || 'leeku_session';
 const REFRESH_COOKIE_NAME = process.env.REFRESH_COOKIE_NAME || 'leeku_refresh';
 const CSRF_COOKIE_NAME    = process.env.CSRF_COOKIE_NAME || 'leeku_csrf';
@@ -2137,7 +2138,7 @@ app.get('/api/files', authenticateUser as express.RequestHandler, async (req: Au
          ORDER BY created_at DESC`
       );
     }
-    res.json({ files: result.recordset.map(r => mapFileRow(r, req.user!.username)) });
+    res.json({ files: result.recordset.map(r => mapFileRow(r, req.user!.username)), trash_retention_days: TRASH_RETENTION_DAYS });
   } catch (err) { console.error('[GET /api/files]', err); res.status(500).json({ error: 'Failed to load files.' }); }
 });
 
@@ -6049,8 +6050,6 @@ async function logExpiredFile(file: ExpiredFileRecord): Promise<void> {
 // Trash purge job — permanently deletes files that have been in
 // the trash (soft-deleted via deleted_at) for TRASH_RETENTION_DAYS.
 // ──────────────────────────────────────────────────────────────
-
-export const TRASH_RETENTION_DAYS = parseInt(process.env.TRASH_RETENTION_DAYS || '90', 10);
 
 let trashPurgeTimer: ReturnType<typeof setInterval> | null = null;
 
