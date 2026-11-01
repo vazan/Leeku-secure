@@ -81,18 +81,33 @@ function getMasterKey(): Buffer {
 /**
  * Derives a deterministic 256-bit sub-key from the master key using
  * HKDF-SHA256. Each purpose string produces an independent sub-key.
+ *
+ * The derivation is deterministic and identical for a given purpose and
+ * master key, so results are memoized. This is called once per row when
+ * listing many files (e.g. decryptColumn during GET /api/files), and
+ * re-deriving the HKDF key for every file is a significant per-file CPU
+ * cost that blocks the event loop at scale. Callers must treat the
+ * returned Buffer as read-only (both Node's createCipheriv/createHmac
+ * treat the key as immutable).
  */
+const subKeyCache = new Map<string, Buffer>();
+
 function deriveSubKey(purpose: string): Buffer {
+  const cached = subKeyCache.get(purpose);
+  if (cached) return cached;
   const master = getMasterKey();
   // hkdfSync returns an ArrayBuffer; convert to Buffer
-  const derived = crypto.hkdfSync(
-    'sha256',
-    master,
-    Buffer.alloc(32),   // zero-filled salt (master key already has full entropy)
-    Buffer.from(purpose, 'utf8'),
-    KEY_LENGTH
+  const derived = Buffer.from(
+    crypto.hkdfSync(
+      'sha256',
+      master,
+      Buffer.alloc(32),   // zero-filled salt (master key already has full entropy)
+      Buffer.from(purpose, 'utf8'),
+      KEY_LENGTH
+    )
   );
-  return Buffer.from(derived);
+  subKeyCache.set(purpose, derived);
+  return derived;
 }
 
 // ──────────────────────────────────────────────────────────────

@@ -73,6 +73,13 @@ const TextFilePreview = React.lazy(
   () => import("@/app/shared/components/common/text-file-preview"),
 );
 
+// Number of files rendered at once in the "All Files" / folder listing before
+// the user clicks "Show more". Rendering every file at once (the root view can
+// hold tens of thousands) creates an enormous DOM and stalls the page, so we
+// window the list and reveal additional files on demand.
+const INITIAL_VISIBLE_FILES = 100;
+const VISIBLE_FILES_PAGE = 200;
+
 interface UserDashboardProps {
   user: User;
   token: string;
@@ -389,6 +396,7 @@ export default function UserDashboard({
   const [logs, setLogs] = useState<SystemLog[]>([]);
   const [stats, setStats] = useState<SystemStats | null>(null);
   const [search, setSearch] = useState("");
+  const [visibleLimit, setVisibleLimit] = useState(INITIAL_VISIBLE_FILES);
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [uploadSecretKey, setUploadSecretKey] = useState("");
@@ -704,6 +712,19 @@ export default function UserDashboard({
       file.original_name.toLowerCase().includes(normalizedSearch),
     );
   }, [currentFolderFiles, normalizedSearch]);
+
+  // Windowed slice actually rendered in the list, so we don't build a DOM
+  // node for every file at once. The full counts are still shown in the header.
+  const paginatedFiles = useMemo(
+    () => visibleFiles.slice(0, visibleLimit),
+    [visibleFiles, visibleLimit],
+  );
+
+  // Reset the window whenever the result set changes (new load, folder
+  // navigation, or a search), so the user starts seeing results from the top.
+  useEffect(() => {
+    setVisibleLimit(INITIAL_VISIBLE_FILES);
+  }, [activeFolderId, files, search]);
 
   const visibleFolders = useMemo(() => {
     const toPathParts = (folder: FileFolder) => {
@@ -2525,7 +2546,7 @@ export default function UserDashboard({
                 </div>
               ) : (
                 <div className="grid w-full min-w-0 gap-3 sm:hidden">
-                  {visibleFiles.map((file) => (
+                  {paginatedFiles.map((file) => (
                     <div
                       key={file.id}
                       className="w-full min-w-0 overflow-hidden rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] p-3 shadow-[var(--shadow-hairline)]"
@@ -2639,7 +2660,7 @@ export default function UserDashboard({
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-[var(--border-subtle)]">
-                    {visibleFiles.map((file) => (
+                    {paginatedFiles.map((file) => (
                       <tr key={file.id} className="hover:bg-[var(--bg-muted)]">
                         <td className="min-w-0 px-4 py-3">
                           <div className="flex min-w-0 items-center gap-3">
@@ -2740,6 +2761,21 @@ export default function UserDashboard({
                   </tbody>
                 </table>
               </div>
+              )}
+
+              {!filesLoading && paginatedFiles.length < visibleFiles.length && (
+                <div className="mt-6 flex justify-center">
+                  <button
+                    type="button"
+                    onClick={() => setVisibleLimit((limit) => limit + VISIBLE_FILES_PAGE)}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--border-subtle)] px-4 py-2 text-sm font-medium text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]"
+                  >
+                    Show more
+                    <span className="text-xs text-[var(--text-faint)]">
+                      ({visibleFiles.length - paginatedFiles.length} remaining)
+                    </span>
+                  </button>
+                </div>
               )}
             </section>
           )}
@@ -3726,15 +3762,55 @@ function FileThumbnail({
   const [playing, setPlaying] = useState(false);
   const [hovering, setHovering] = useState(false);
   const videoRef = React.useRef<HTMLVideoElement>(null);
+  const containerRef = React.useRef<HTMLDivElement | null>(null);
   const isImage = file.mime_type.startsWith("image/");
   const isVideo = file.mime_type.startsWith("video/");
   const isPreviewable = isImage || isVideo;
+
+  const loadThumbnailStarted = React.useRef(false);
 
   useEffect(() => {
     setPreviewUrl(null);
     setFailed(false);
     setPlaying(false);
     if (!isPreviewable) return undefined;
+
+    // Only fetch the thumbnail once the element is near the viewport.
+    // Rendering the "All Files" root can produce thousands of cards, and
+    // fetching a thumbnail for each one at once saturates the server and
+    // stalls the page. Loading lazily as the user scrolls keeps the burst
+    // proportional to what is actually visible.
+    const el = containerRef.current;
+    if (!el || typeof IntersectionObserver === "undefined") {
+      // No element yet, or very old browser without IntersectionObserver:
+      // load the thumbnail immediately.
+      void loadThumbnail();
+      return undefined;
+    }
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (entry.isIntersecting) {
+            void loadThumbnail();
+            observer.disconnect();
+            break;
+          }
+        }
+      },
+      // Start loading slightly before the card scrolls into view.
+      { rootMargin: "300px 0px" },
+    );
+    observer.observe(el);
+
+    return () => {
+      observer.disconnect();
+    };
+  }, [file.id, isPreviewable, token]);
+
+  const loadThumbnail = () => {
+    if (loadThumbnailStarted.current) return;
+    loadThumbnailStarted.current = true;
 
     const controller = new AbortController();
     let objectUrl: string | null = null;
@@ -3765,7 +3841,7 @@ function FileThumbnail({
       controller.abort();
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [file.id, isPreviewable, token]);
+  };
 
   const playVideo = async () => {
     const video = videoRef.current;
@@ -3794,6 +3870,7 @@ function FileThumbnail({
 
   return (
     <div
+      ref={containerRef}
       role={isVideo && interactiveVideo && onOpenVideo ? "button" : undefined}
       tabIndex={isVideo && interactiveVideo && onOpenVideo ? 0 : undefined}
       aria-label={isVideo && interactiveVideo && onOpenVideo ? `Play ${file.original_name}` : undefined}
