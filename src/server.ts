@@ -1046,7 +1046,7 @@ async function findExistingFolderConflict(
             created_at, updated_at
      FROM file_folders
      WHERE owner_user_id=@ownerId
-       AND ((@parentFolderId IS NULL AND parent_folder_id IS NULL) OR parent_folder_id=@parentFolderId)
+       AND ((CAST(@parentFolderId AS uuid) IS NULL AND parent_folder_id IS NULL) OR parent_folder_id=CAST(@parentFolderId AS uuid))
        AND name=@name
      ORDER BY updated_at DESC
      LIMIT 1`
@@ -3089,7 +3089,7 @@ app.post(
                   expires_at, created_at, deleted_at, version_count
            FROM files
            WHERE owner_user_id=@ownerId
-             AND ((@folderId IS NULL AND folder_id IS NULL) OR folder_id=@folderId)
+             AND ((CAST(@folderId AS uuid) IS NULL AND folder_id IS NULL) OR folder_id=CAST(@folderId AS uuid))
              AND file_name_hash=@nameHash
              AND deleted_at IS NULL
              AND COALESCE(status,'Available')!='Expired'`
@@ -3112,7 +3112,7 @@ app.post(
                     expires_at, created_at, deleted_at, version_count
              FROM files
              WHERE owner_user_id=@ownerId
-               AND ((@folderId IS NULL AND folder_id IS NULL) OR folder_id=@folderId)
+               AND ((CAST(@folderId AS uuid) IS NULL AND folder_id IS NULL) OR folder_id=CAST(@folderId AS uuid))
                AND file_name_hash IS NULL
                AND deleted_at IS NULL
                AND COALESCE(status,'Available')!='Expired'
