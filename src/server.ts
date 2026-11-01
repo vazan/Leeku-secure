@@ -48,6 +48,10 @@ import {
   computeExpiresAt, isValidTtl,
   type ExpiredFileRecord,
 } from './server/utils/expiry-cleanup.js';
+import {
+  startTrashPurge, stopTrashPurge, TRASH_RETENTION_DAYS,
+  type TrashedFileRecord,
+} from './server/utils/trash-purge.js';
 import { sendVerificationEmail, sendAccountDeletionEmail, sendQuotaChangeRequestEmail, validateMxRecord, verifySmtpConnection } from './server/utils/email.js';
 import multer from 'multer';
 import os from 'os';
@@ -789,6 +793,19 @@ interface FileRow {
   client_crypto_iv?: Buffer | null;
   client_crypto_iterations?: number | null;
   expires_at: Date | null; created_at: Date;
+  deleted_at?: Date | null;          // Set when the file is in the Trash
+  version_count?: number;            // Total versions (current + archived)
+  file_name_hash?: string | null;    // HMAC of normalized filename (same-name detection)
+}
+
+interface FileVersionRow {
+  id: string; file_id: string; version_no: number;
+  original_name_encrypted: Buffer; original_name_iv: Buffer; original_name_auth_tag: Buffer;
+  stored_path: string; mime_type: string; size_bytes: number; encrypted_size_bytes: number;
+  status: string; checksum_sha256: string; scan_result: string | null; scan_message: string | null;
+  is_encrypted: boolean; client_secret_hash: string | null;
+  client_crypto_salt: Buffer | null; client_crypto_iv: Buffer | null; client_crypto_iterations: number | null;
+  created_at: Date; deleted_at?: Date | null; deleted_by?: string | null;
 }
 
 interface FolderRow {
@@ -873,6 +890,8 @@ function mapFileRow(row: FileRow, ownerUsername: string): FileMetadata {
     preview_available: !!previewKind && row.status !== 'Blocked' && Number(row.size_bytes) <= TEXT_PREVIEW_MAX_BYTES,
     preview_max_bytes: TEXT_PREVIEW_MAX_BYTES,
     created_at:     row.created_at.toISOString(),
+    deleted_at:     row.deleted_at ? new Date(row.deleted_at).toISOString() : null,
+    version_count:  row.version_count ?? undefined,
   };
 }
 
@@ -3045,49 +3064,220 @@ app.post(
         loaded: 940,
         total: processingTotal,
       });
-      const fileReq = await getRequest();
-      fileReq.input('ownerId', sql.UniqueIdentifier, req.userId!);
-      fileReq.input('nEnc',   sql.VarBinary(2048), encName.ciphertext);
-      fileReq.input('nIv',    sql.VarBinary(16),   encName.iv);
-      fileReq.input('nTag',   sql.VarBinary(16),   encName.authTag);
-      fileReq.input('spath',  sql.NVarChar(1000),  vaultFileName);
-      fileReq.input('mime',   sql.NVarChar(255),   verifiedMimeType);
-      fileReq.input('sz',     sql.BigInt,          size);
-      fileReq.input('esz',    sql.BigInt,          encryptResult.encryptedSize);
-      fileReq.input('chk',    sql.Char(64),        encryptResult.checksum);
-      fileReq.input('scan',   sql.NVarChar(20),    persistedScanResult);
-      fileReq.input('smsg',   sql.NVarChar(sql.MAX), persistedScanMessage);
-      fileReq.input('vibe',   sql.NVarChar(500),   leekuVibe);
-      fileReq.input('ttl',    sql.Int,             ttlH);
-      fileReq.input('exp',    sql.DateTimeOffset,  expiresAt);
-      fileReq.input('clientSecretHash', sql.NVarChar(512), uploadSecretHash);
-      fileReq.input('clientCryptoSalt', sql.VarBinary(32), uploadSecretSalt);
-      fileReq.input('clientCryptoIv',   sql.VarBinary(16), uploadSecretIv);
-      fileReq.input('clientCryptoIterations', sql.Int, uploadSecretIterations);
-       fileReq.input('folderId', sql.UniqueIdentifier, uploadFolder?.id || null);
 
-      const fileResult = await fileReq.query<FileRow>(
-        `INSERT INTO files (
-         owner_user_id, folder_id, original_name_encrypted, original_name_iv, original_name_auth_tag,
-           stored_path, mime_type, size_bytes, encrypted_size_bytes,
-           checksum_sha256, scan_result, scan_message, scanned_at,
-           leeku_vibe, ttl_hours,
-           client_secret_hash, client_crypto_salt, client_crypto_iv, client_crypto_iterations,
-           expires_at, is_encrypted
-         )
-        VALUES (@ownerId,@folderId,@nEnc,@nIv,@nTag, @spath,@mime,@sz,@esz, @chk,@scan,@smsg,SYSDATETIMEOFFSET(), @vibe,@ttl,
-                 @clientSecretHash,@clientCryptoSalt,@clientCryptoIv,@clientCryptoIterations,
-                 @exp,TRUE)
-        RETURNING id,owner_user_id,folder_id,
-          original_name_encrypted,original_name_iv,original_name_auth_tag,
-          stored_path,mime_type,size_bytes,encrypted_size_bytes,status,checksum_sha256,scan_result,scan_message,
-          is_encrypted,leeku_vibe,ttl_hours,
-          client_secret_hash,client_crypto_salt,client_crypto_iv,client_crypto_iterations,
-          expires_at,created_at`
-      );
-      const newFile = fileResult.recordset[0];
-                newFile.folder_name = uploadFolder?.name || null;
-      console.info('[upload] File record inserted.', { userId: user.id, originalName: original_name, fileId: newFile.id });
+      // ── Same-name / same-folder version detection ──────────────
+      // If an active file with the same normalized name already lives in this
+      // folder, this upload becomes a NEW VERSION of that logical file: the
+      // previous current blob is archived to file_versions/file_version_keys
+      // and the `files` row is updated in place. Otherwise a brand-new
+      // `files` row (version 1) is inserted.
+      const nameHash = hashColumnForLookup(original_name.trim?.() ?? original_name);
+      let existingFile: FileRow | undefined;
+
+      {
+        const existingReq = await getRequest();
+        existingReq.input('ownerId',  sql.UniqueIdentifier, req.userId!);
+        existingReq.input('folderId', sql.UniqueIdentifier, uploadFolder?.id || null);
+        existingReq.input('nameHash', sql.Char(64), nameHash);
+        const existingRes = await existingReq.query<FileRow>(
+          `SELECT id, owner_user_id, folder_id, original_name_encrypted, original_name_iv, original_name_auth_tag,
+                  stored_path, mime_type, size_bytes, encrypted_size_bytes, status, checksum_sha256,
+                  scan_result, scan_message, is_encrypted, leeku_vibe, ttl_hours,
+                  client_secret_hash, client_crypto_salt, client_crypto_iv, client_crypto_iterations,
+                  expires_at, created_at, deleted_at, version_count
+           FROM files
+           WHERE owner_user_id=@ownerId
+             AND ((@folderId IS NULL AND folder_id IS NULL) OR folder_id=@folderId)
+             AND file_name_hash=@nameHash
+             AND deleted_at IS NULL
+             AND COALESCE(status,'Available')!='Expired'`
+        );
+        existingFile = existingRes.recordset[0];
+
+        // Fallback for pre-migration rows (NULL file_name_hash): the DB cannot
+        // derive the HMAC of an encrypted name, so scan ≤20 same-folder rows,
+        // decrypt and compare case-insensitively. Once routed into the
+        // version-instead path, the UPDATE heals file_name_hash.
+        if (!existingFile) {
+          const fbReq = await getRequest();
+          fbReq.input('ownerId',  sql.UniqueIdentifier, req.userId!);
+          fbReq.input('folderId', sql.UniqueIdentifier, uploadFolder?.id || null);
+          const fbRes = await fbReq.query<FileRow>(
+            `SELECT id, owner_user_id, folder_id, original_name_encrypted, original_name_iv, original_name_auth_tag,
+                    stored_path, mime_type, size_bytes, encrypted_size_bytes, status, checksum_sha256,
+                    scan_result, scan_message, is_encrypted, leeku_vibe, ttl_hours,
+                    client_secret_hash, client_crypto_salt, client_crypto_iv, client_crypto_iterations,
+                    expires_at, created_at, deleted_at, version_count
+             FROM files
+             WHERE owner_user_id=@ownerId
+               AND ((@folderId IS NULL AND folder_id IS NULL) OR folder_id=@folderId)
+               AND file_name_hash IS NULL
+               AND deleted_at IS NULL
+               AND COALESCE(status,'Available')!='Expired'
+             LIMIT 1 OFFSET 0`
+          );
+          const normalizedUploadName = original_name.toLowerCase().trim();
+          for (const cand of fbRes.recordset) {
+            try {
+              const candName = decryptColumn(cand.original_name_encrypted, cand.original_name_iv, cand.original_name_auth_tag);
+              if (candName.toLowerCase().trim() === normalizedUploadName) {
+                existingFile = cand;
+                break;
+              }
+            } catch { /* skip row we cannot decrypt */ }
+          }
+        }
+      }
+
+      let newFile: FileRow;
+
+      if (existingFile) {
+        // ── Version-instead: archive the current version, then update `files`. ──
+        const prevKeyReq = await getRequest();
+        prevKeyReq.input('fid', sql.UniqueIdentifier, existingFile.id);
+        const prevKeyRes = await prevKeyReq.query<{ encrypted_key: Buffer; key_iv: Buffer; key_auth_tag: Buffer; file_iv: Buffer; file_auth_tag: Buffer }>(
+          'SELECT encrypted_key,key_iv,key_auth_tag,file_iv,file_auth_tag FROM file_encryption_keys WHERE file_id=@fid'
+        );
+        const prevKey = prevKeyRes.recordset[0];
+        if (!prevKey) return finishUploadError(500, 'Previous version encryption key missing.');
+
+        // 1) Archive previous current version blob -> file_versions.
+        currentStage = 'archive_previous_version';
+        const archiveId = crypto.randomUUID();
+        const archiveReq = await getRequest();
+        archiveReq.input('archiveId', sql.UniqueIdentifier, archiveId);
+        archiveReq.input('fileId',    sql.UniqueIdentifier, existingFile.id);
+        archiveReq.input('versionNo', sql.Int, existingFile.version_count ?? 1);
+        archiveReq.input('nEnc',  sql.VarBinary(2048), existingFile.original_name_encrypted);
+        archiveReq.input('nIv',   sql.VarBinary(16),   existingFile.original_name_iv);
+        archiveReq.input('nTag',  sql.VarBinary(16),   existingFile.original_name_auth_tag);
+        archiveReq.input('spath', sql.NVarChar(1000),  existingFile.stored_path);
+        archiveReq.input('mime',  sql.NVarChar(255),   existingFile.mime_type);
+        archiveReq.input('sz',    sql.BigInt,          existingFile.size_bytes);
+        archiveReq.input('esz',   sql.BigInt,          existingFile.encrypted_size_bytes);
+        archiveReq.input('chk',   sql.Char(64),        existingFile.checksum_sha256);
+        archiveReq.input('scan',  sql.NVarChar(20),    existingFile.scan_result);
+        archiveReq.input('smsg',  sql.NVarChar(sql.MAX), existingFile.scan_message);
+        archiveReq.input('isEnc', sql.Bit,             existingFile.is_encrypted ? 1 : 0);
+        archiveReq.input('secH',  sql.NVarChar(512),   existingFile.client_secret_hash);
+        archiveReq.input('secS',  sql.VarBinary(32),   existingFile.client_crypto_salt);
+        archiveReq.input('secI',  sql.VarBinary(16),   existingFile.client_crypto_iv);
+        archiveReq.input('secIt', sql.Int,             existingFile.client_crypto_iterations);
+        await archiveReq.query(
+          `INSERT INTO file_versions
+            (id,file_id,version_no,original_name_encrypted,original_name_iv,original_name_auth_tag,
+             stored_path,mime_type,size_bytes,encrypted_size_bytes,status,checksum_sha256,
+             scan_result,scan_message,is_encrypted,client_secret_hash,client_crypto_salt,client_crypto_iv,client_crypto_iterations,created_at)
+           VALUES (@archiveId,@fileId,@versionNo,@nEnc,@nIv,@nTag,@spath,@mime,@sz,@esz,'Available',@chk,@scan,@smsg,@isEnc,@secH,@secS,@secI,@secIt,SYSDATETIMEOFFSET())`
+        );
+
+        // 2) Move previous wrapped key -> file_version_keys.
+        const mvKeyReq = await getRequest();
+        mvKeyReq.input('archiveId', sql.UniqueIdentifier, archiveId);
+        mvKeyReq.input('encK',  sql.VarBinary(64),  prevKey.encrypted_key);
+        mvKeyReq.input('kIv',   sql.VarBinary(16),  prevKey.key_iv);
+        mvKeyReq.input('kTag',  sql.VarBinary(16),  prevKey.key_auth_tag);
+        mvKeyReq.input('fIv',   sql.VarBinary(16),  prevKey.file_iv);
+        mvKeyReq.input('fTag',  sql.VarBinary(16),  prevKey.file_auth_tag);
+        await mvKeyReq.query(
+          `INSERT INTO file_version_keys (version_id,encrypted_key,key_iv,key_auth_tag,file_iv,file_auth_tag,algorithm,created_at)
+           VALUES (@archiveId,@encK,@kIv,@kTag,@fIv,@fTag,'AES-256-GCM',SYSDATETIMEOFFSET())`
+        );
+
+        // 3) Remove the old current key row so the new current key is written below.
+        const delKeyReq = await getRequest();
+        delKeyReq.input('fid', sql.UniqueIdentifier, existingFile.id);
+        await delKeyReq.query('DELETE FROM file_encryption_keys WHERE file_id=@fid');
+
+        // 4) Update `files` to the new current version (same logical file id).
+        currentStage = 'update_current_version';
+        const updReq = await getRequest();
+        updReq.input('fid',   sql.UniqueIdentifier, existingFile.id);
+        updReq.input('spath', sql.NVarChar(1000),  vaultFileName);
+        updReq.input('mime',  sql.NVarChar(255),   verifiedMimeType);
+        updReq.input('sz',    sql.BigInt,          size);
+        updReq.input('esz',   sql.BigInt,          encryptResult.encryptedSize);
+        updReq.input('chk',   sql.Char(64),        encryptResult.checksum);
+        updReq.input('scan',  sql.NVarChar(20),    persistedScanResult);
+        updReq.input('smsg',  sql.NVarChar(sql.MAX), persistedScanMessage);
+        updReq.input('vibe',  sql.NVarChar(500),   leekuVibe);
+        updReq.input('ttl',   sql.Int,             ttlH);
+        updReq.input('exp',   sql.DateTimeOffset,  expiresAt);
+        updReq.input('secH',  sql.NVarChar(512),   uploadSecretHash);
+        updReq.input('secS',  sql.VarBinary(32),   uploadSecretSalt);
+        updReq.input('secI',  sql.VarBinary(16),   uploadSecretIv);
+        updReq.input('secIt', sql.Int,             uploadSecretIterations);
+        updReq.input('nameHash', sql.Char(64),     nameHash);
+        const updRes = await updReq.query<FileRow>(
+          `UPDATE files SET
+             stored_path=@spath, mime_type=@mime, size_bytes=@sz, encrypted_size_bytes=@esz,
+             checksum_sha256=@chk, scan_result=@scan, scan_message=@smsg,
+             leeku_vibe=@vibe, ttl_hours=@ttl, expires_at=@exp,
+             client_secret_hash=@secH, client_crypto_salt=@secS, client_crypto_iv=@secI, client_crypto_iterations=@secIt,
+             file_name_hash=@nameHash, version_count=version_count+1, current_version_id=NULL,
+             status='Available', deleted_at=NULL
+           WHERE id=@fid
+           RETURNING id,owner_user_id,folder_id,
+             original_name_encrypted,original_name_iv,original_name_auth_tag,
+             stored_path,mime_type,size_bytes,encrypted_size_bytes,
+             status,checksum_sha256,scan_result,scan_message,
+             is_encrypted,leeku_vibe,ttl_hours,
+             client_secret_hash,client_crypto_salt,client_crypto_iv,client_crypto_iterations,
+             expires_at,created_at,version_count`
+        );
+        newFile = updRes.recordset[0];
+        newFile.folder_name = uploadFolder?.name || null;
+        console.info('[upload] File version added.', {
+          userId: user.id, originalName: original_name, fileId: newFile.id,
+          versionNo: (existingFile.version_count ?? 1) + 1,
+        });
+      } else {
+        // ── Brand-new logical file => insert version 1. ──
+        const fileReq = await getRequest();
+        fileReq.input('ownerId', sql.UniqueIdentifier, req.userId!);
+        fileReq.input('nEnc',   sql.VarBinary(2048), encName.ciphertext);
+        fileReq.input('nIv',    sql.VarBinary(16),   encName.iv);
+        fileReq.input('nTag',   sql.VarBinary(16),   encName.authTag);
+        fileReq.input('spath',  sql.NVarChar(1000),  vaultFileName);
+        fileReq.input('mime',   sql.NVarChar(255),   verifiedMimeType);
+        fileReq.input('sz',     sql.BigInt,          size);
+        fileReq.input('esz',    sql.BigInt,          encryptResult.encryptedSize);
+        fileReq.input('chk',    sql.Char(64),        encryptResult.checksum);
+        fileReq.input('scan',   sql.NVarChar(20),    persistedScanResult);
+        fileReq.input('smsg',   sql.NVarChar(sql.MAX), persistedScanMessage);
+        fileReq.input('vibe',   sql.NVarChar(500),   leekuVibe);
+        fileReq.input('ttl',    sql.Int,             ttlH);
+        fileReq.input('exp',    sql.DateTimeOffset,  expiresAt);
+        fileReq.input('clientSecretHash', sql.NVarChar(512), uploadSecretHash);
+        fileReq.input('clientCryptoSalt', sql.VarBinary(32), uploadSecretSalt);
+        fileReq.input('clientCryptoIv',   sql.VarBinary(16), uploadSecretIv);
+        fileReq.input('clientCryptoIterations', sql.Int, uploadSecretIterations);
+        fileReq.input('folderId', sql.UniqueIdentifier, uploadFolder?.id || null);
+        fileReq.input('nameHash', sql.Char(64), nameHash);
+
+        const fileResult = await fileReq.query<FileRow>(
+          `INSERT INTO files (
+           owner_user_id, folder_id, original_name_encrypted, original_name_iv, original_name_auth_tag,
+             stored_path, mime_type, size_bytes, encrypted_size_bytes,
+             checksum_sha256, scan_result, scan_message, scanned_at,
+             leeku_vibe, ttl_hours,
+             client_secret_hash, client_crypto_salt, client_crypto_iv, client_crypto_iterations,
+             expires_at, is_encrypted, file_name_hash
+           )
+          VALUES (@ownerId,@folderId,@nEnc,@nIv,@nTag, @spath,@mime,@sz,@esz, @chk,@scan,@smsg,SYSDATETIMEOFFSET(), @vibe,@ttl,
+                   @clientSecretHash,@clientCryptoSalt,@clientCryptoIv,@clientCryptoIterations,
+                   @exp,TRUE,@nameHash)
+          RETURNING id,owner_user_id,folder_id,
+            original_name_encrypted,original_name_iv,original_name_auth_tag,
+            stored_path,mime_type,size_bytes,encrypted_size_bytes,status,checksum_sha256,scan_result,scan_message,
+            is_encrypted,leeku_vibe,ttl_hours,
+            client_secret_hash,client_crypto_salt,client_crypto_iv,client_crypto_iterations,
+            expires_at,created_at,version_count`
+        );
+        newFile = fileResult.recordset[0];
+        newFile.folder_name = uploadFolder?.name || null;
+        console.info('[upload] File record inserted.', { userId: user.id, originalName: original_name, fileId: newFile.id });
+      }
 
       currentStage = 'insert_key_record';
       sendUploadProgress({
@@ -3194,30 +3384,38 @@ app.post('/api/files/:id/delete', authenticateUser as express.RequestHandler, as
       return res.status(403).json({ error: 'Administrator access is required for desktop update artifacts.' });
 
     const originalName = decryptColumn(file.original_name_encrypted, file.original_name_iv, file.original_name_auth_tag);
-    const vaultPath = path.join(FILE_VAULT, file.stored_path);
-    try {
-      await fs.promises.unlink(vaultPath);
-    } catch (err) {
-      console.error(`[DELETE FILE] Failed to delete vault file ${file.id} (${file.stored_path}):`, err);
-    }
 
-    const delReq = await getRequest();
-    delReq.input('id', sql.UniqueIdentifier, fileId);
-    await delReq.query('DELETE FROM files WHERE id=@id');
+    // Soft delete: mark the file as deleted (moves it to Trash), keeping the vault
+    // file on disk. The blob is physically removed later by the trash purge job
+    // after TRASH_RETENTION_DAYS, or by delete-permanent.
+    const softDelReq = await getRequest();
+    softDelReq.input('id', sql.UniqueIdentifier, fileId);
+    await softDelReq.query(
+      `UPDATE files SET deleted_at=SYSDATETIMEOFFSET() WHERE id=@id AND deleted_at IS NULL`
+    );
+
+    // Remove share links for this file entirely (they are gone with the file).
+    // Keeping them would leave version_id pins that could block a later permanent
+    // delete via FK_share_links_version (NO ACTION).
+    const removeSharesReq = await getRequest();
+    removeSharesReq.input('id', sql.UniqueIdentifier, fileId);
+    await removeSharesReq.query('DELETE FROM share_links WHERE file_id=@id');
 
     if (file.status === 'Available') {
       const sReq = await getRequest();
       sReq.input('sz', sql.BigInt, file.size_bytes); sReq.input('uid', sql.UniqueIdentifier, file.owner_user_id);
+      // Storage is released from the user's quota since the file will be purged
+      // after TRASH_RETENTION_DAYS.
       await sReq.query('UPDATE users SET storage_used_bytes=CASE WHEN storage_used_bytes-@sz<0 THEN 0 ELSE storage_used_bytes-@sz END WHERE id=@uid');
     }
 
-    await logSystemEvent(req.userId!, req.user!.username, 'Delete', 'File', fileId, req, `Deleted "${originalName}".`);
-    res.json({ success: true, message: 'File deleted from vault.' });
+    await logSystemEvent(req.userId!, req.user!.username, 'Delete', 'File', fileId, req, `Moved "${originalName}" to trash.`);
+    res.json({ success: true, message: 'File moved to trash.' });
   } catch (err) {
     console.error('[DELETE /api/files/:id]', err);
     // Only send response if headers haven't been sent yet
     if (!res.headersSent) {
-      res.status(500).json({ error: 'Failed to delete file.' });
+      res.status(500).json({ error: 'Failed to move file to trash.' });
     }
   }
 });
@@ -3285,19 +3483,18 @@ app.post('/api/files/delete', authenticateUser as express.RequestHandler, async 
     for (const file of files) {
       try {
         const originalName = decryptColumn(file.original_name_encrypted, file.original_name_iv, file.original_name_auth_tag);
-        const vaultPath = path.join(FILE_VAULT, file.stored_path);
 
-        // Delete vault file
-        try {
-          await fs.promises.unlink(vaultPath);
-        } catch (err) {
-          console.error(`[BULK DELETE FILE] Failed to delete vault file ${file.id} (${file.stored_path}):`, err);
-        }
+        // Soft delete: mark as deleted (move to Trash), keep vault blob on disk.
+        const softDelReq = await getRequest();
+        softDelReq.input('id', sql.UniqueIdentifier, file.id);
+        await softDelReq.query(
+          `UPDATE files SET deleted_at=SYSDATETIMEOFFSET() WHERE id=@id AND deleted_at IS NULL`
+        );
 
-        // Delete from database
-        const delReq = await getRequest();
-        delReq.input('id', sql.UniqueIdentifier, file.id);
-        await delReq.query('DELETE FROM files WHERE id=@id');
+        // Remove share links (avoid version_id pins blocking a later permanent delete).
+        const delSharesReq = await getRequest();
+        delSharesReq.input('id', sql.UniqueIdentifier, file.id);
+        await delSharesReq.query('DELETE FROM share_links WHERE file_id=@id');
 
         // Update user storage
         if (file.status === 'Available') {
@@ -3308,12 +3505,12 @@ app.post('/api/files/delete', authenticateUser as express.RequestHandler, async 
         }
 
         // Log the deletion
-        await logSystemEvent(req.userId!, req.user!.username, 'Delete', 'File', file.id, req, `Deleted "${originalName}".`);
+        await logSystemEvent(req.userId!, req.user!.username, 'Delete', 'File', file.id, req, `Moved "${originalName}" to trash.`);
 
         deletedFiles.push(file.id);
       } catch (err) {
-        console.error(`[BULK DELETE FILE] Error deleting file ${file.id}:`, err);
-        failedFiles.push({ id: file.id, error: 'Failed to delete file.' });
+        console.error(`[BULK DELETE FILE] Error moving file ${file.id} to trash:`, err);
+        failedFiles.push({ id: file.id, error: 'Failed to move file to trash.' });
       }
     }
 
@@ -3339,6 +3536,757 @@ app.post('/api/files/delete', authenticateUser as express.RequestHandler, async 
     if (!res.headersSent) {
       res.status(500).json({ error: 'Failed to process bulk delete request.' });
     }
+  }
+});
+
+// ──────────────────────────────────────────────────────────────
+// API: Files — Trash bin
+// ──────────────────────────────────────────────────────────────
+
+// GET /api/files/trash — list soft-deleted files for the current user, plus any
+// archived versions that were soft-deleted (moved to the version trash). Both can
+// be recovered (restore) or permanently purged.
+app.get('/api/files/trash', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  try {
+    const request = await getRequest();
+    request.input('ownerId', sql.UniqueIdentifier, req.userId!);
+    const result = await request.query<FileRow>(
+      `SELECT id, owner_user_id,
+              folder_id, folder_name,
+              original_name_encrypted, original_name_iv, original_name_auth_tag,
+              stored_path, mime_type, size_bytes, encrypted_size_bytes,
+              status, checksum_sha256, scan_result, scan_message,
+              is_encrypted, leeku_vibe, ttl_hours,
+              client_secret_hash,
+              expires_at, created_at, deleted_at, version_count
+      FROM (
+        SELECT f.*, ff.name AS folder_name
+        FROM files f
+        LEFT JOIN file_folders ff ON f.folder_id=ff.id
+        WHERE f.owner_user_id=@ownerId AND f.deleted_at IS NOT NULL
+      ) files
+       ORDER BY deleted_at DESC`
+    );
+
+    // Soft-deleted archived versions of the user's files (version trash). Each row
+    // also carries the parent file's encrypted name so the Trash list can label it.
+    const verReq = await getRequest();
+    verReq.input('ownerId', sql.UniqueIdentifier, req.userId!);
+    const verRes = await verReq.query<FileVersionRow & { file_name_encrypted: Buffer; file_name_iv: Buffer; file_name_auth_tag: Buffer }>(
+      `SELECT v.id, v.file_id, v.version_no,
+              v.original_name_encrypted, v.original_name_iv, v.original_name_auth_tag,
+              v.stored_path, v.mime_type, v.size_bytes, v.encrypted_size_bytes,
+              v.status, v.checksum_sha256, v.scan_result, v.scan_message,
+              v.is_encrypted, v.client_secret_hash, v.client_crypto_salt, v.client_crypto_iv, v.client_crypto_iterations,
+              v.created_at, v.deleted_at, v.deleted_by,
+              f.original_name_encrypted AS file_name_encrypted,
+              f.original_name_iv AS file_name_iv,
+              f.original_name_auth_tag AS file_name_auth_tag
+       FROM file_versions v
+       INNER JOIN files f ON f.id = v.file_id
+       WHERE f.owner_user_id=@ownerId AND v.deleted_at IS NOT NULL
+       ORDER BY v.deleted_at DESC`
+    );
+
+    const trashedVersions = verRes.recordset.map((v) => ({
+      id: v.id,
+      file_id: v.file_id,
+      version_no: v.version_no,
+      original_name: decryptColumn(v.original_name_encrypted, v.original_name_iv, v.original_name_auth_tag),
+      file_name: decryptColumn(v.file_name_encrypted, v.file_name_iv, v.file_name_auth_tag),
+      size_bytes: v.size_bytes,
+      mime_type: v.mime_type,
+      status: v.status,
+      created_at: v.created_at,
+      deleted_at: v.deleted_at
+        ? (v.deleted_at instanceof Date ? v.deleted_at : new Date(v.deleted_at)).toISOString()
+        : null,
+    }));
+
+    const mapped = result.recordset.map((row) => mapFileRow(row, req.user!.username));
+    res.json({ files: mapped, trashedVersions });
+  } catch (err) {
+    console.error('[GET /api/files/trash]', err);
+    if (!res.headersSent) res.status(500).json({ error: 'Failed to load trash.' });
+  }
+});
+
+// POST /api/files/:id/restore — restore a soft-deleted file from trash
+app.post('/api/files/:id/restore', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  const fileId = getSingleParam(req.params.id);
+  if (await checkMaintenanceMode('delete', req, res)) return;
+  try {
+    const fileReq = await getRequest();
+    fileReq.input('id', sql.UniqueIdentifier, fileId);
+    const fileResult = await fileReq.query<FileRow>(
+      `SELECT id,owner_user_id,original_name_encrypted,original_name_iv,original_name_auth_tag,
+              stored_path,size_bytes,status,mime_type,encrypted_size_bytes,checksum_sha256,
+              is_encrypted,leeku_vibe,ttl_hours,expires_at,created_at,deleted_at
+       FROM files WHERE id=@id`
+    );
+    if (!fileResult.recordset.length) return res.status(404).json({ error: 'File not found.' });
+    const file = fileResult.recordset[0];
+    if (file.owner_user_id !== req.userId && req.user!.role !== 'Admin')
+      return res.status(403).json({ error: 'You do not have permission to restore this file.' });
+    if (await isDesktopUpdateFile(fileId) && req.user!.role !== 'Admin')
+      return res.status(403).json({ error: 'Administrator access is required for desktop update artifacts.' });
+    if (!file.deleted_at)
+      return res.status(409).json({ error: 'This file is not in the trash.' });
+
+    const originalName = decryptColumn(file.original_name_encrypted, file.original_name_iv, file.original_name_auth_tag);
+
+    // Restore: clear the deleted_at marker
+    const restoreReq = await getRequest();
+    restoreReq.input('id', sql.UniqueIdentifier, fileId);
+    await restoreReq.query('UPDATE files SET deleted_at=NULL WHERE id=@id');
+
+    // Restore storage usage if file is Available
+    if (file.status === 'Available') {
+      const sReq = await getRequest();
+      sReq.input('sz', sql.BigInt, file.size_bytes);
+      sReq.input('uid', sql.UniqueIdentifier, file.owner_user_id);
+      await sReq.query('UPDATE users SET storage_used_bytes=storage_used_bytes+@sz WHERE id=@uid');
+    }
+
+    await logSystemEvent(req.userId!, req.user!.username, 'Delete', 'File', fileId, req, `Restored "${originalName}" from trash.`);
+    res.json({ success: true, message: 'File restored from trash.' });
+  } catch (err) {
+    console.error('[POST /api/files/:id/restore]', err);
+    if (!res.headersSent) res.status(500).json({ error: 'Failed to restore file.' });
+  }
+});
+
+// POST /api/files/:id/delete-permanent — permanently delete a trashed file
+app.post('/api/files/:id/delete-permanent', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  const fileId = getSingleParam(req.params.id);
+  if (await checkMaintenanceMode('delete', req, res)) return;
+  try {
+    const fileReq = await getRequest();
+    fileReq.input('id', sql.UniqueIdentifier, fileId);
+    const fileResult = await fileReq.query<FileRow>(
+      `SELECT id,owner_user_id,original_name_encrypted,original_name_iv,original_name_auth_tag,
+              stored_path,size_bytes,status,mime_type,encrypted_size_bytes,checksum_sha256,
+              is_encrypted,leeku_vibe,ttl_hours,expires_at,created_at,deleted_at
+       FROM files WHERE id=@id`
+    );
+    if (!fileResult.recordset.length) return res.status(404).json({ error: 'File not found.' });
+    const file = fileResult.recordset[0];
+    if (file.owner_user_id !== req.userId && req.user!.role !== 'Admin')
+      return res.status(403).json({ error: 'You do not have permission to delete this file.' });
+    if (await isDesktopUpdateFile(fileId) && req.user!.role !== 'Admin')
+      return res.status(403).json({ error: 'Administrator access is required for desktop update artifacts.' });
+    if (!file.deleted_at)
+      return res.status(409).json({ error: 'File must be in the trash to permanently delete it.' });
+
+    const originalName = decryptColumn(file.original_name_encrypted, file.original_name_iv, file.original_name_auth_tag);
+    const vaultPath = path.join(FILE_VAULT, file.stored_path);
+
+    // Physically delete the vault file
+    try {
+      await fs.promises.unlink(vaultPath);
+    } catch (err) {
+      console.error(`[PERM DELETE] Failed to delete vault file ${file.id} (${file.stored_path}):`, err);
+    }
+
+    // Remove share links for this file explicitly BEFORE deleting the file.
+    // FK_share_links_files cascades them anyway, but FK_share_links_version
+    // (version_id -> file_versions, NO ACTION) can block the cascade when a
+    // share is pinned to one of this file's archived versions.
+    const delSharesReq = await getRequest();
+    delSharesReq.input('id', sql.UniqueIdentifier, fileId);
+    await delSharesReq.query('DELETE FROM share_links WHERE file_id=@id');
+
+    // Permanently delete from DB (cascades to keys and versions)
+    const delReq = await getRequest();
+    delReq.input('id', sql.UniqueIdentifier, fileId);
+    await delReq.query('DELETE FROM files WHERE id=@id');
+
+    await logSystemEvent(req.userId!, req.user!.username, 'Delete', 'File', fileId, req, `Permanently deleted "${originalName}".`);
+    res.json({ success: true, message: 'File permanently deleted.' });
+  } catch (err) {
+    console.error('[POST /api/files/:id/delete-permanent]', err);
+    if (!res.headersSent) res.status(500).json({ error: 'Failed to permanently delete file.' });
+  }
+});
+
+// File version history endpoints (file_versions / file_version_keys)
+// ──────────────────────────────────────────────────────────────
+
+// GET /api/files/:id/versions — list current + archived versions of a logical file.
+app.get('/api/files/:id/versions', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  const fileId = getSingleParam(req.params.id);
+  if (!UUID_PATTERN.test(fileId)) return res.status(400).json({ error: 'Invalid file id.' });
+  try {
+    const curReq = await getRequest();
+    curReq.input('id', sql.UniqueIdentifier, fileId);
+    const curRes = await curReq.query<{
+      id: string; owner_user_id: string; version_count: number;
+      original_name_encrypted: Buffer; original_name_iv: Buffer; original_name_auth_tag: Buffer;
+      size_bytes: number; mime_type: string; status: string; created_at: Date; deleted_at: Date | null;
+    }>(
+      `SELECT id,owner_user_id,version_count,original_name_encrypted,original_name_iv,original_name_auth_tag,
+              size_bytes,mime_type,status,created_at,deleted_at
+       FROM files WHERE id=@id`
+    );
+    if (!curRes.recordset.length) return res.status(404).json({ error: 'File not found.' });
+    const cur = curRes.recordset[0];
+    if (cur.owner_user_id !== req.userId && req.user!.role !== 'Admin')
+      return res.status(403).json({ error: 'You do not have permission to view this file.' });
+
+    const verReq = await getRequest();
+    verReq.input('fid', sql.UniqueIdentifier, fileId);
+    const verRes = await verReq.query<FileVersionRow>(
+      `SELECT id,file_id,version_no,original_name_encrypted,original_name_iv,original_name_auth_tag,
+              stored_path,mime_type,size_bytes,encrypted_size_bytes,status,checksum_sha256,
+              scan_result,scan_message,is_encrypted,client_secret_hash,client_crypto_salt,client_crypto_iv,client_crypto_iterations,created_at,
+              deleted_at,deleted_by
+       FROM file_versions WHERE file_id=@fid ORDER BY version_no ASC`
+    );
+
+    const currentName = decryptColumn(cur.original_name_encrypted, cur.original_name_iv, cur.original_name_auth_tag);
+    const mapVersion = (v: FileVersionRow) => ({
+      id: v.id,
+      version_no: v.version_no,
+      is_current: false,
+      original_name: decryptColumn(v.original_name_encrypted, v.original_name_iv, v.original_name_auth_tag),
+      size_bytes: v.size_bytes,
+      mime_type: v.mime_type,
+      status: v.status,
+      created_at: v.created_at,
+      deleted_at: v.deleted_at
+        ? (v.deleted_at instanceof Date ? v.deleted_at : new Date(v.deleted_at)).toISOString()
+        : null,
+    });
+    const active = verRes.recordset.filter((v) => !v.deleted_at).map(mapVersion);
+    const trashed = verRes.recordset.filter((v) => !!v.deleted_at).map(mapVersion);
+
+    const versions = [
+      {
+        id: cur.id,
+        version_no: cur.version_count ?? 1,
+        is_current: true,
+        original_name: currentName,
+        size_bytes: cur.size_bytes,
+        mime_type: cur.mime_type,
+        status: cur.status,
+        created_at: cur.created_at,
+        deleted_at: null,
+      },
+      ...active,
+    ].sort((a, b) => Number(b.version_no) - Number(a.version_no));
+    const trashedSorted = [...trashed].sort((a, b) => b.version_no - a.version_no);
+
+    res.json({ versions, trashed: trashedSorted, current_id: cur.id });
+  } catch (err) {
+    console.error('[GET /api/files/:id/versions]', err);
+    res.status(500).json({ error: 'Failed to list file versions.' });
+  }
+});
+
+// GET /api/files/:id/versions/:versionId/download — download an archived version.
+app.get('/api/files/:id/versions/:versionId/download', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  const fileId = getSingleParam(req.params.id);
+  const versionId = getSingleParam(req.params.versionId);
+  let tempPath: string | null = null;
+  let tempFileCleaned = false;
+
+  const cleanupTemp = () => {
+    if (tempFileCleaned) return;
+    tempFileCleaned = true;
+    if (tempPath) {
+      unregisterTempFile(tempPath);
+      try { if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath); } catch {}
+    }
+  };
+
+  try {
+    const fileReq = await getRequest();
+    fileReq.input('id', sql.UniqueIdentifier, fileId);
+    const fileRes = await fileReq.query<{ owner_user_id: string }>('SELECT owner_user_id FROM files WHERE id=@id');
+    if (!fileRes.recordset.length) { cleanupTemp(); return res.status(404).json({ error: 'File not found.' }); }
+    const owner = fileRes.recordset[0].owner_user_id;
+    if (owner !== req.userId && req.user!.role !== 'Admin')
+      { cleanupTemp(); return res.status(403).json({ error: 'You do not have permission to download this file.' }); }
+
+    // The versions list synthesizes the CURRENT version with id = file.id (it lives in
+    // `files`, not `file_versions`). Route a download of the current version to the
+    // `files` blob so it doesn't 404 "Version not found." against the archive table.
+    if (versionId === fileId) {
+      const curReq = await getRequest();
+      curReq.input('id', sql.UniqueIdentifier, fileId);
+      const curRes = await curReq.query<FileRow>(
+        `SELECT id,owner_user_id,original_name_encrypted,original_name_iv,original_name_auth_tag,
+                stored_path,size_bytes,status,mime_type,encrypted_size_bytes,checksum_sha256,
+                scan_result,scan_message,is_encrypted,leeku_vibe,ttl_hours,
+                client_secret_hash,client_crypto_salt,client_crypto_iv,client_crypto_iterations,
+                expires_at,created_at
+         FROM files WHERE id=@id`
+      );
+      if (!curRes.recordset.length) { cleanupTemp(); return res.status(404).json({ error: 'File not found.' }); }
+      const current = curRes.recordset[0];
+      if (current.status === 'Blocked')
+        { cleanupTemp(); return res.status(410).json({ error: 'Blocked files cannot be downloaded.' }); }
+
+      const vaultPath = path.join(FILE_VAULT, current.stored_path);
+      if (!fs.existsSync(vaultPath)) { cleanupTemp(); return res.status(410).json({ error: 'Vault file not found.' }); }
+
+      const curKeyReq = await getRequest();
+      curKeyReq.input('fid', sql.UniqueIdentifier, fileId);
+      const curKeyRes = await curKeyReq.query<{
+        encrypted_key: Buffer; key_iv: Buffer; key_auth_tag: Buffer; file_iv: Buffer; file_auth_tag: Buffer;
+      }>('SELECT encrypted_key,key_iv,key_auth_tag,file_iv,file_auth_tag FROM file_encryption_keys WHERE file_id=@fid');
+      if (!curKeyRes.recordset.length) { cleanupTemp(); return res.status(500).json({ error: 'Encryption key not found.' }); }
+      const curKey = curKeyRes.recordset[0];
+      const fileKey = unwrapKey(curKey.encrypted_key, curKey.key_iv, curKey.key_auth_tag);
+
+      const secretHeaderRaw2 = req.headers['x-file-secret'];
+      const providedSecret2 = Array.isArray(secretHeaderRaw2)
+        ? String(secretHeaderRaw2[0] || '').trim()
+        : String(secretHeaderRaw2 || '').trim();
+      if (current.client_secret_hash) {
+        if (!providedSecret2) { cleanupTemp(); return res.status(403).json({ error: 'This version requires a secret key to download.' }); }
+        if (!(await verifyFileSecret(providedSecret2, current.client_secret_hash)))
+          { cleanupTemp(); return res.status(403).json({ error: 'Incorrect secret key.' }); }
+      }
+
+      tempPath = buildUniqueTempFilePath(UPLOAD_TEMP, 'leeku-ver', versionId);
+      registerTempFile(tempPath);
+
+      const hash2 = crypto.createHash('sha256');
+      await decryptFileStream(vaultPath, tempPath, fileKey, curKey.file_iv, curKey.file_auth_tag, undefined, hash2);
+      if (tempFileCleaned) return;
+      if (hash2.digest('hex') !== current.checksum_sha256)
+        { cleanupTemp(); return res.status(500).json({ error: 'File integrity check failed.' }); }
+
+      if (current.client_secret_hash) {
+        if (!current.client_crypto_salt || !current.client_crypto_iv || !current.client_crypto_iterations)
+          { cleanupTemp(); return res.status(500).json({ error: 'Secret-key metadata is missing for this version.' }); }
+        try {
+          await decryptClientProtectedFileInPlace(tempPath, providedSecret2, current.client_crypto_salt, current.client_crypto_iv, current.client_crypto_iterations);
+        } catch { cleanupTemp(); return res.status(403).json({ error: 'Incorrect secret key.' }); }
+      }
+
+      const currentName = decryptColumn(current.original_name_encrypted, current.original_name_iv, current.original_name_auth_tag);
+      const safeName = currentName.replace(/\"/g, '\\"');
+      const currentStat = fs.statSync(tempPath);
+
+      res.setHeader('Content-Type', current.mime_type || 'application/octet-stream');
+      res.setHeader('Content-Disposition', `attachment; filename="${safeName}"`);
+      res.setHeader('Content-Length', currentStat.size.toString());
+      await logSystemEvent(req.userId!, req.user!.username, 'Download', 'File', fileId, req, `Download of "${currentName}" (current version).`);
+
+      const readStream = fs.createReadStream(tempPath);
+      readStream.pipe(res);
+      readStream.on('end',   cleanupTemp);
+      readStream.on('error', cleanupTemp);
+      res.on('finish',       cleanupTemp);
+      res.on('close',        cleanupTemp);
+      return;
+    }
+
+    const verReq = await getRequest();
+    verReq.input('vid', sql.UniqueIdentifier, versionId);
+    verReq.input('fid', sql.UniqueIdentifier, fileId);
+    const verRes = await verReq.query<FileVersionRow>(
+      `SELECT id,file_id,version_no,original_name_encrypted,original_name_iv,original_name_auth_tag,
+              stored_path,mime_type,size_bytes,encrypted_size_bytes,status,checksum_sha256,
+              scan_result,scan_message,is_encrypted,client_secret_hash,client_crypto_salt,client_crypto_iv,client_crypto_iterations,created_at,deleted_at
+       FROM file_versions WHERE id=@vid AND file_id=@fid`
+    );
+    if (!verRes.recordset.length) { cleanupTemp(); return res.status(404).json({ error: 'Version not found.' }); }
+    const version = verRes.recordset[0];
+    if (version.deleted_at) { cleanupTemp(); return res.status(410).json({ error: 'This version is in the trash and must be restored before download.' }); }
+    if (version.status === 'Blocked')
+      { cleanupTemp(); return res.status(410).json({ error: 'Blocked versions cannot be downloaded.' }); }
+
+    const vaultPath = path.join(FILE_VAULT, version.stored_path);
+    if (!fs.existsSync(vaultPath)) { cleanupTemp(); return res.status(410).json({ error: 'Vault file not found.' }); }
+
+    const keyReq = await getRequest();
+    keyReq.input('vid', sql.UniqueIdentifier, versionId);
+    const keyRes = await keyReq.query<{
+      encrypted_key: Buffer; key_iv: Buffer; key_auth_tag: Buffer; file_iv: Buffer; file_auth_tag: Buffer;
+    }>(
+      'SELECT encrypted_key,key_iv,key_auth_tag,file_iv,file_auth_tag FROM file_version_keys WHERE version_id=@vid'
+    );
+    if (!keyRes.recordset.length) { cleanupTemp(); return res.status(500).json({ error: 'Encryption key not found.' }); }
+    const keyRow = keyRes.recordset[0];
+    const fileKey = unwrapKey(keyRow.encrypted_key, keyRow.key_iv, keyRow.key_auth_tag);
+
+    const secretHeaderRaw = req.headers['x-file-secret'];
+    const providedSecret = Array.isArray(secretHeaderRaw)
+      ? String(secretHeaderRaw[0] || '').trim()
+      : String(secretHeaderRaw || '').trim();
+    if (version.client_secret_hash) {
+      if (!providedSecret) { cleanupTemp(); return res.status(403).json({ error: 'This version requires a secret key to download.' }); }
+      if (!(await verifyFileSecret(providedSecret, version.client_secret_hash)))
+        { cleanupTemp(); return res.status(403).json({ error: 'Incorrect secret key.' }); }
+    }
+
+    // ── Streaming decrypt to temp file (mirrors the current-version download) ──
+    tempPath = buildUniqueTempFilePath(UPLOAD_TEMP, 'leeku-ver', versionId);
+    registerTempFile(tempPath);
+
+    const hash = crypto.createHash('sha256');
+    await decryptFileStream(vaultPath, tempPath, fileKey, keyRow.file_iv, keyRow.file_auth_tag, undefined, hash);
+    if (tempFileCleaned) return;
+
+    const actualChecksum = hash.digest('hex');
+    if (actualChecksum !== version.checksum_sha256) { cleanupTemp(); return res.status(500).json({ error: 'File integrity check failed.' }); }
+
+    if (version.client_secret_hash) {
+      if (!version.client_crypto_salt || !version.client_crypto_iv || !version.client_crypto_iterations) { cleanupTemp(); return res.status(500).json({ error: 'Secret-key metadata is missing for this version.' }); }
+      try {
+        await decryptClientProtectedFileInPlace(tempPath, providedSecret, version.client_crypto_salt, version.client_crypto_iv, version.client_crypto_iterations);
+      } catch { cleanupTemp(); return res.status(403).json({ error: 'Incorrect secret key.' }); }
+    }
+
+    const originalName = decryptColumn(version.original_name_encrypted, version.original_name_iv, version.original_name_auth_tag);
+    const safeName = originalName.replace(/\"/g, '\\"');
+    const stat = fs.statSync(tempPath);
+
+    res.setHeader('Content-Type', version.mime_type || 'application/octet-stream');
+    res.setHeader('Content-Disposition', `attachment; filename="${safeName}"`);
+    res.setHeader('Content-Length', stat.size.toString());
+    await logSystemEvent(req.userId!, req.user!.username, 'Download', 'FileVersion', versionId, req, `Download of "${originalName}" (version ${version.version_no}).`);
+
+    const readStream = fs.createReadStream(tempPath);
+    readStream.pipe(res);
+    readStream.on('end',   cleanupTemp);
+    readStream.on('error', cleanupTemp);
+    res.on('finish',       cleanupTemp);
+    res.on('close',        cleanupTemp);
+  } catch (err) {
+    cleanupTemp();
+    console.error('[GET /api/files/:id/versions/:versionId/download]', err);
+    if (!res.headersSent) res.status(500).json({ error: 'Download failed.' });
+  }
+});
+
+// POST /api/files/:id/versions/:versionId/restore — promote an archived version to current.
+app.post('/api/files/:id/versions/:versionId/restore', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  const fileId = getSingleParam(req.params.id);
+  const versionId = getSingleParam(req.params.versionId);
+  if (!UUID_PATTERN.test(fileId) || !UUID_PATTERN.test(versionId))
+    return res.status(400).json({ error: 'Invalid id.' });
+  try {
+    const curReq = await getRequest();
+    curReq.input('id', sql.UniqueIdentifier, fileId);
+    const curRes = await curReq.query<FileRow & { owner_user_id: string }>(
+      `SELECT id,owner_user_id,original_name_encrypted,original_name_iv,original_name_auth_tag,
+              stored_path,mime_type,size_bytes,encrypted_size_bytes,status,checksum_sha256,
+              scan_result,scan_message,is_encrypted,leeku_vibe,ttl_hours,version_count,
+              client_secret_hash,client_crypto_salt,client_crypto_iv,client_crypto_iterations,
+              expires_at,created_at
+       FROM files WHERE id=@id`
+    );
+    if (!curRes.recordset.length) return res.status(404).json({ error: 'File not found.' });
+    const cur = curRes.recordset[0];
+    if (cur.owner_user_id !== req.userId && req.user!.role !== 'Admin')
+      return res.status(403).json({ error: 'You do not have permission to modify this file.' });
+
+    const verReq = await getRequest();
+    verReq.input('vid', sql.UniqueIdentifier, versionId);
+    verReq.input('fid', sql.UniqueIdentifier, fileId);
+    const verRes = await verReq.query<FileVersionRow>(
+      `SELECT id,file_id,version_no,original_name_encrypted,original_name_iv,original_name_auth_tag,
+              stored_path,mime_type,size_bytes,encrypted_size_bytes,status,checksum_sha256,
+              scan_result,scan_message,is_encrypted,client_secret_hash,client_crypto_salt,client_crypto_iv,client_crypto_iterations,created_at
+       FROM file_versions WHERE id=@vid AND file_id=@fid`
+    );
+    if (!verRes.recordset.length) return res.status(404).json({ error: 'Version not found.' });
+    const restore = verRes.recordset[0];
+    if (restore.status === 'Blocked')
+      return res.status(410).json({ error: 'Blocked versions cannot be restored.' });
+
+    // 1) Archive the current `files` blob -> file_versions. Assign a version_no that
+    //    is strictly greater than any archived row AND the current version_count, so the
+    //    unique (file_id, version_no) constraint can never collide — even across repeated
+    //    restore cycles that reintroduce old version numbers.
+    const maxVerReq = await getRequest();
+    maxVerReq.input('fid', sql.UniqueIdentifier, fileId);
+    const maxVerRes = await maxVerReq.query<{ max_no: number | null }>(
+      'SELECT MAX(version_no) AS max_no FROM file_versions WHERE file_id=@fid'
+    );
+    const archivedMaxNo = maxVerRes.recordset[0]?.max_no ?? 0;
+    const nextArchivedNo = Math.max(cur.version_count ?? 1, archivedMaxNo) + 1;
+
+    const curKeyReq = await getRequest();
+    curKeyReq.input('fid', sql.UniqueIdentifier, fileId);
+    const curKeyRes = await curKeyReq.query<{ encrypted_key: Buffer; key_iv: Buffer; key_auth_tag: Buffer; file_iv: Buffer; file_auth_tag: Buffer }>(
+      'SELECT encrypted_key,key_iv,key_auth_tag,file_iv,file_auth_tag FROM file_encryption_keys WHERE file_id=@fid'
+    );
+    if (!curKeyRes.recordset.length) return res.status(500).json({ error: 'Current version encryption key missing.' });
+    const curKey = curKeyRes.recordset[0];
+
+    const archId = crypto.randomUUID();
+    const archReq = await getRequest();
+    archReq.input('archId', sql.UniqueIdentifier, archId);
+    archReq.input('fid',    sql.UniqueIdentifier, fileId);
+    archReq.input('verNo',  sql.Int, nextArchivedNo);
+    archReq.input('nEnc',   sql.VarBinary(2048), cur.original_name_encrypted);
+    archReq.input('nIv',    sql.VarBinary(16),   cur.original_name_iv);
+    archReq.input('nTag',   sql.VarBinary(16),   cur.original_name_auth_tag);
+    archReq.input('spath',  sql.NVarChar(1000),  cur.stored_path);
+    archReq.input('mime',   sql.NVarChar(255),   cur.mime_type);
+    archReq.input('sz',     sql.BigInt,          cur.size_bytes);
+    archReq.input('esz',    sql.BigInt,          cur.encrypted_size_bytes);
+    archReq.input('chk',    sql.Char(64),        cur.checksum_sha256);
+    archReq.input('scan',   sql.NVarChar(20),    cur.scan_result);
+    archReq.input('smsg',   sql.NVarChar(sql.MAX), cur.scan_message);
+    archReq.input('isEnc',  sql.Bit,             cur.is_encrypted ? 1 : 0);
+    archReq.input('secH',   sql.NVarChar(512),   cur.client_secret_hash);
+    archReq.input('secS',   sql.VarBinary(32),   cur.client_crypto_salt);
+    archReq.input('secI',   sql.VarBinary(16),   cur.client_crypto_iv);
+    archReq.input('secIt',  sql.Int,             cur.client_crypto_iterations);
+    await archReq.query(
+      `INSERT INTO file_versions
+        (id,file_id,version_no,original_name_encrypted,original_name_iv,original_name_auth_tag,
+         stored_path,mime_type,size_bytes,encrypted_size_bytes,status,checksum_sha256,
+         scan_result,scan_message,is_encrypted,client_secret_hash,client_crypto_salt,client_crypto_iv,client_crypto_iterations,created_at)
+       VALUES (@archId,@fid,@verNo,@nEnc,@nIv,@nTag,@spath,@mime,@sz,@esz,'Available',@chk,@scan,@smsg,@isEnc,@secH,@secS,@secI,@secIt,SYSDATETIMEOFFSET())`
+    );
+
+    // 2) Move current wrapped key -> file_version_keys, then drop the current key row.
+    const mvCurKeyReq = await getRequest();
+    mvCurKeyReq.input('archId', sql.UniqueIdentifier, archId);
+    mvCurKeyReq.input('encK',  sql.VarBinary(64),  curKey.encrypted_key);
+    mvCurKeyReq.input('kIv',   sql.VarBinary(16),  curKey.key_iv);
+    mvCurKeyReq.input('kTag',  sql.VarBinary(16),  curKey.key_auth_tag);
+    mvCurKeyReq.input('fIv',   sql.VarBinary(16),  curKey.file_iv);
+    mvCurKeyReq.input('fTag',  sql.VarBinary(16),  curKey.file_auth_tag);
+    await mvCurKeyReq.query(
+      `INSERT INTO file_version_keys (version_id,encrypted_key,key_iv,key_auth_tag,file_iv,file_auth_tag,algorithm,created_at)
+       VALUES (@archId,@encK,@kIv,@kTag,@fIv,@fTag,'AES-256-GCM',SYSDATETIMEOFFSET())`
+    );
+    const delCurKeyReq = await getRequest();
+    delCurKeyReq.input('fid', sql.UniqueIdentifier, fileId);
+    await delCurKeyReq.query('DELETE FROM file_encryption_keys WHERE file_id=@fid');
+
+    // 3) Read the restored version's wrapped key, then remove it from file_version_keys.
+    const resKeyReq = await getRequest();
+    resKeyReq.input('vid', sql.UniqueIdentifier, versionId);
+    const resKeyRes = await resKeyReq.query<{ encrypted_key: Buffer; key_iv: Buffer; key_auth_tag: Buffer; file_iv: Buffer; file_auth_tag: Buffer }>(
+      'SELECT encrypted_key,key_iv,key_auth_tag,file_iv,file_auth_tag FROM file_version_keys WHERE version_id=@vid'
+    );
+    if (!resKeyRes.recordset.length) return res.status(500).json({ error: 'Restored version encryption key missing.' });
+    const resKey = resKeyRes.recordset[0];
+    const delResKeyReq = await getRequest();
+    delResKeyReq.input('vid', sql.UniqueIdentifier, versionId);
+    await delResKeyReq.query('DELETE FROM file_version_keys WHERE version_id=@vid');
+
+    // 4) Point `files` at the restored version's blob + key.
+    const updReq = await getRequest();
+    updReq.input('fid',   sql.UniqueIdentifier, fileId);
+    updReq.input('nEnc',  sql.VarBinary(2048), restore.original_name_encrypted);
+    updReq.input('nIv',   sql.VarBinary(16),   restore.original_name_iv);
+    updReq.input('nTag',  sql.VarBinary(16),   restore.original_name_auth_tag);
+    updReq.input('spath', sql.NVarChar(1000),  restore.stored_path);
+    updReq.input('mime',  sql.NVarChar(255),   restore.mime_type);
+    updReq.input('sz',    sql.BigInt,          restore.size_bytes);
+    updReq.input('esz',   sql.BigInt,          restore.encrypted_size_bytes);
+    updReq.input('chk',   sql.Char(64),        restore.checksum_sha256);
+    updReq.input('scan',  sql.NVarChar(20),    restore.scan_result);
+    updReq.input('smsg',  sql.NVarChar(sql.MAX), restore.scan_message);
+    updReq.input('isEnc', sql.Bit,             restore.is_encrypted ? 1 : 0);
+    updReq.input('secH',  sql.NVarChar(512),   restore.client_secret_hash);
+    updReq.input('secS',  sql.VarBinary(32),   restore.client_crypto_salt);
+    updReq.input('secI',  sql.VarBinary(16),   restore.client_crypto_iv);
+    updReq.input('secIt', sql.Int,             restore.client_crypto_iterations);
+    updReq.input('encK',  sql.VarBinary(64),   resKey.encrypted_key);
+    updReq.input('kIv',   sql.VarBinary(16),   resKey.key_iv);
+    updReq.input('kTag',  sql.VarBinary(16),   resKey.key_auth_tag);
+    updReq.input('fIv',   sql.VarBinary(16),   resKey.file_iv);
+    updReq.input('fTag',  sql.VarBinary(16),   resKey.file_auth_tag);
+    updReq.input('vc',    sql.Int,             nextArchivedNo);
+    await updReq.query(
+      `UPDATE files SET
+         original_name_encrypted=@nEnc, original_name_iv=@nIv, original_name_auth_tag=@nTag,
+         stored_path=@spath, mime_type=@mime, size_bytes=@sz, encrypted_size_bytes=@esz,
+         checksum_sha256=@chk, scan_result=@scan, scan_message=@smsg,
+         is_encrypted=@isEnc, client_secret_hash=@secH, client_crypto_salt=@secS, client_crypto_iv=@secI, client_crypto_iterations=@secIt,
+         status='Available', deleted_at=NULL, current_version_id=NULL, version_count=@vc
+       WHERE id=@fid`
+    );
+    const insKeyReq = await getRequest();
+    insKeyReq.input('fid',  sql.UniqueIdentifier, fileId);
+    insKeyReq.input('encK', sql.VarBinary(64),    resKey.encrypted_key);
+    insKeyReq.input('kIv',  sql.VarBinary(16),    resKey.key_iv);
+    insKeyReq.input('kTag', sql.VarBinary(16),    resKey.key_auth_tag);
+    insKeyReq.input('fIv',  sql.VarBinary(16),    resKey.file_iv);
+    insKeyReq.input('fTag', sql.VarBinary(16),    resKey.file_auth_tag);
+    await insKeyReq.query(
+      `INSERT INTO file_encryption_keys (file_id,encrypted_key,key_iv,key_auth_tag,file_iv,file_auth_tag,algorithm,created_at)
+       VALUES (@fid,@encK,@kIv,@kTag,@fIv,@fTag,'AES-256-GCM',SYSDATETIMEOFFSET())`
+    );
+
+    // 4b) Any share link pinned to this version should now resolve to the CURRENT
+    // version (which this restore just made it). Repoint so the DELETE of the
+    // archived row below doesn't trip FK_share_links_version.
+    const repointSharesReq = await getRequest();
+    repointSharesReq.input('vid', sql.UniqueIdentifier, versionId);
+    await repointSharesReq.query('UPDATE share_links SET version_id=NULL WHERE version_id=@vid');
+
+    // 5) Remove the archived row that was just restored (its key row was already moved).
+    const delVerReq = await getRequest();
+    delVerReq.input('vid', sql.UniqueIdentifier, versionId);
+    await delVerReq.query('DELETE FROM file_versions WHERE id=@vid');
+
+    const originalName = decryptColumn(restore.original_name_encrypted, restore.original_name_iv, restore.original_name_auth_tag);
+    await logSystemEvent(req.userId!, req.user!.username, 'Delete', 'FileVersion', versionId, req, `Restored "${originalName}" to version ${restore.version_no}.`);
+    res.json({ success: true, message: 'Version restored.', version_no: restore.version_no });
+  } catch (err) {
+    console.error('[POST /api/files/:id/versions/:versionId/restore]', err);
+    if (!res.headersSent) res.status(500).json({ error: 'Failed to restore version.' });
+  }
+});
+
+// DELETE /api/files/:id/versions/:versionId — permanently delete (soft) an archived
+// version: move it to the version trash by stamping deleted_at/deleted_by.
+app.delete('/api/files/:id/versions/:versionId', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  const fileId = getSingleParam(req.params.id);
+  const versionId = getSingleParam(req.params.versionId);
+  if (!UUID_PATTERN.test(fileId) || !UUID_PATTERN.test(versionId))
+    return res.status(400).json({ error: 'Invalid id.' });
+  try {
+    const ownerReq = await getRequest();
+    ownerReq.input('id', sql.UniqueIdentifier, fileId);
+    const ownerRes = await ownerReq.query<{ owner_user_id: string }>('SELECT owner_user_id FROM files WHERE id=@id');
+    if (!ownerRes.recordset.length) return res.status(404).json({ error: 'File not found.' });
+    if (ownerRes.recordset[0].owner_user_id !== req.userId && req.user!.role !== 'Admin')
+      return res.status(403).json({ error: 'You do not have permission to delete this file.' });
+
+    const verReq = await getRequest();
+    verReq.input('vid', sql.UniqueIdentifier, versionId);
+    verReq.input('fid', sql.UniqueIdentifier, fileId);
+    const verRes = await verReq.query<{ id: string; stored_path: string; file_id: string }>(
+      `SELECT id,file_id,stored_path FROM file_versions WHERE id=@vid AND file_id=@fid`
+    );
+    if (!verRes.recordset.length) return res.status(404).json({ error: 'Version not found.' });
+    const version = verRes.recordset[0];
+
+    // Refuse to delete a version that is still referenced by a shared link
+    // (FK_share_links_version). The owner must unshare it first; this preserves
+    // the guarantee that a public link pinned to a deleted version reports
+    // "no longer available" rather than silently resolving elsewhere.
+    const shareRefReq = await getRequest();
+    shareRefReq.input('vid', sql.UniqueIdentifier, versionId);
+    const shareRefRes = await shareRefReq.query<{ cnt: number }>(
+      `SELECT COUNT(*) AS cnt FROM share_links WHERE version_id=@vid`
+    );
+    if (Number(shareRefRes.recordset[0]?.cnt ?? 0) > 0) {
+      return res.status(409).json({
+        error: 'This version is currently shared and cannot be deleted. Unshare it before deleting.',
+      });
+    }
+
+    // Soft delete: stamp deleted_at (and deleted_by) but KEEP the vault blob and
+    // the file_version_keys row so the version can be restored from the version
+    // trash. The DB row is not removed; only its visibility is.
+    const softDelReq = await getRequest();
+    softDelReq.input('vid', sql.UniqueIdentifier, versionId);
+    softDelReq.input('by', sql.UniqueIdentifier, req.userId || null);
+    await softDelReq.query(
+      `UPDATE file_versions SET deleted_at=SYSDATETIMEOFFSET(), deleted_by=@by
+       WHERE id=@vid AND deleted_at IS NULL`
+    );
+
+    await logSystemEvent(req.userId!, req.user!.username, 'Delete', 'FileVersion', versionId, req, 'Moved an archived file version to the version trash.');
+    res.json({ success: true, message: 'Version moved to trash.' });
+  } catch (err) {
+    console.error('[DELETE /api/files/:id/versions/:versionId]', err);
+    if (!res.headersSent) res.status(500).json({ error: 'Failed to delete version.' });
+  }
+});
+
+// POST /api/files/:id/versions/:versionId/restore-trashed — restore a soft-deleted
+// archived version (clear its deleted_at marker) so it shows up again in the list.
+app.post('/api/files/:id/versions/:versionId/restore-trashed', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  const fileId = getSingleParam(req.params.id);
+  const versionId = getSingleParam(req.params.versionId);
+  if (!UUID_PATTERN.test(fileId) || !UUID_PATTERN.test(versionId))
+    return res.status(400).json({ error: 'Invalid id.' });
+  try {
+    const ownerReq = await getRequest();
+    ownerReq.input('id', sql.UniqueIdentifier, fileId);
+    const ownerRes = await ownerReq.query<{ owner_user_id: string }>('SELECT owner_user_id FROM files WHERE id=@id');
+    if (!ownerRes.recordset.length) return res.status(404).json({ error: 'File not found.' });
+    if (ownerRes.recordset[0].owner_user_id !== req.userId && req.user!.role !== 'Admin')
+      return res.status(403).json({ error: 'You do not have permission to modify this file.' });
+
+    const updReq = await getRequest();
+    updReq.input('vid', sql.UniqueIdentifier, versionId);
+    updReq.input('fid', sql.UniqueIdentifier, fileId);
+    const updRes = await updReq.query<{ version_no: number }>(
+      `UPDATE file_versions
+       SET deleted_at=NULL, deleted_by=NULL
+       WHERE id=@vid AND file_id=@fid AND deleted_at IS NOT NULL
+       RETURNING version_no`
+    );
+    if (!updRes.recordset.length) return res.status(404).json({ error: 'Trashed version not found.' });
+    await logSystemEvent(req.userId!, req.user!.username, 'Delete', 'FileVersion', versionId, req, 'Restored an archived file version from trash.');
+    res.json({ success: true, message: 'Version restored from trash.', version_no: updRes.recordset[0].version_no });
+  } catch (err) {
+    console.error('[POST /api/files/:id/versions/:versionId/restore-trashed]', err);
+    if (!res.headersSent) res.status(500).json({ error: 'Failed to restore version.' });
+  }
+});
+
+// POST /api/files/:id/versions/:versionId/delete-permanent — permanently delete an
+// archived version that is in the version trash (hard delete: unlink the vault blob,
+// drop the row; file_version_keys cascades). A trashed version that is still shared
+// is refused (409, unshare first) so no pinned link silently breaks.
+app.post('/api/files/:id/versions/:versionId/delete-permanent', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  const fileId = getSingleParam(req.params.id);
+  const versionId = getSingleParam(req.params.versionId);
+  if (!UUID_PATTERN.test(fileId) || !UUID_PATTERN.test(versionId))
+    return res.status(400).json({ error: 'Invalid id.' });
+  try {
+    const ownerReq = await getRequest();
+    ownerReq.input('id', sql.UniqueIdentifier, fileId);
+    const ownerRes = await ownerReq.query<{ owner_user_id: string }>('SELECT owner_user_id FROM files WHERE id=@id');
+    if (!ownerRes.recordset.length) return res.status(404).json({ error: 'File not found.' });
+    if (ownerRes.recordset[0].owner_user_id !== req.userId && req.user!.role !== 'Admin')
+      return res.status(403).json({ error: 'You do not have permission to delete this file.' });
+
+    const verReq = await getRequest();
+    verReq.input('vid', sql.UniqueIdentifier, versionId);
+    verReq.input('fid', sql.UniqueIdentifier, fileId);
+    const verRes = await verReq.query<{ id: string; stored_path: string }>(
+      `SELECT id,stored_path FROM file_versions WHERE id=@vid AND file_id=@fid AND deleted_at IS NOT NULL`
+    );
+    if (!verRes.recordset.length) return res.status(404).json({ error: 'Trashed version not found.' });
+    const version = verRes.recordset[0];
+
+    // Refuse if still referenced by a shared link (FK_share_links_version).
+    const shareRefReq = await getRequest();
+    shareRefReq.input('vid', sql.UniqueIdentifier, versionId);
+    const shareRefRes = await shareRefReq.query<{ cnt: number }>(
+      `SELECT COUNT(*) AS cnt FROM share_links WHERE version_id=@vid`
+    );
+    if (Number(shareRefRes.recordset[0]?.cnt ?? 0) > 0) {
+      return res.status(409).json({
+        error: 'This version is currently shared and cannot be permanently deleted. Unshare it first.',
+      });
+    }
+
+    // Physically delete the vault blob (row delete cascades to file_version_keys).
+    try {
+      const vaultPath = path.join(FILE_VAULT, version.stored_path);
+      if (fs.existsSync(vaultPath)) await fs.promises.unlink(vaultPath);
+    } catch (err) {
+      console.error(`[DEL VERSION PERMANENT] Failed to delete vault file ${version.stored_path}:`, err);
+    }
+
+    const delReq = await getRequest();
+    delReq.input('vid', sql.UniqueIdentifier, versionId);
+    await delReq.query('DELETE FROM file_versions WHERE id=@vid');
+
+    await logSystemEvent(req.userId!, req.user!.username, 'Delete', 'FileVersion', versionId, req, 'Permanently deleted an archived file version from trash.');
+    res.json({ success: true, message: 'Version permanently deleted.' });
+  } catch (err) {
+    console.error('[POST /api/files/:id/versions/:versionId/delete-permanent]', err);
+    if (!res.headersSent) res.status(500).json({ error: 'Failed to delete version.' });
   }
 });
 
@@ -4086,7 +5034,7 @@ app.post('/api/file-folders/:id/share', authenticateUser as express.RequestHandl
 
 app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
   const fileId = getSingleParam(req.params.id);
-  const { password, expires_at, max_downloads, is_active, allow_external_preview, allow_decrypted_external_preview } = req.body;
+  const { password, expires_at, max_downloads, is_active, allow_external_preview, allow_decrypted_external_preview, version_id } = req.body;
   try {
     const fReq = await getRequest(); fReq.input('id', sql.UniqueIdentifier, fileId);
     const fRes = await fReq.query<{owner_user_id:string;status:string;stored_path:string;mime_type:string;size:number;client_secret_hash:string|null}>(
@@ -4101,6 +5049,21 @@ app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, asy
     if (file.status === 'Blocked') return res.status(400).json({ error: 'Blocked files cannot be shared.' });
     if (!fs.existsSync(path.join(FILE_VAULT, file.stored_path)))
       return res.status(410).json({ error: 'This file is no longer available in the vault.' });
+
+    // Per-version sharing — a link may be pinned to a specific archived version.
+    let pinnedVersionId: string | null = null;
+    if (version_id) {
+      if (!UUID_PATTERN.test(version_id)) return res.status(400).json({ error: 'Invalid version_id.' });
+      const pinReq = await getRequest();
+      pinReq.input('vid', sql.UniqueIdentifier, version_id);
+      pinReq.input('fid', sql.UniqueIdentifier, fileId);
+      const pinRes = await pinReq.query<{ id: string }>(
+        'SELECT id FROM file_versions WHERE id=@vid AND file_id=@fid'
+      );
+      if (!pinRes.recordset.length) return res.status(400).json({ error: 'The requested version does not belong to this file.' });
+      pinnedVersionId = version_id;
+    }
+
     const exceedsVideoEmbedSizeLimit =
       file.mime_type.startsWith('video/') && file.size > VIDEO_EMBED_MAX_SIZE_BYTES;
 
@@ -4147,9 +5110,10 @@ app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, asy
       insReq.input('act',   sql.Bit,              is_active !== undefined ? (is_active ? 1 : 0) : 1);
       insReq.input('allowExternalPreview', sql.Bit, allowExternalPreview ? 1 : 0);
       insReq.input('allowDecryptedExternalPreview', sql.Bit, allowDecryptedExternalPreview ? 1 : 0);
+      insReq.input('vid',   sql.UniqueIdentifier, pinnedVersionId);
       const insRes = await insReq.query<ShareRow>(
-        `INSERT INTO share_links (file_id,public_token,password_hash,expires_at,max_downloads,is_active,allow_external_preview,allow_decrypted_external_preview)
-        VALUES (@fid,@tok,@pwH,@exp,@md,@act,@allowExternalPreview,@allowDecryptedExternalPreview)
+        `INSERT INTO share_links (file_id,public_token,password_hash,expires_at,max_downloads,is_active,allow_external_preview,allow_decrypted_external_preview,version_id)
+        VALUES (@fid,@tok,@pwH,@exp,@md,@act,@allowExternalPreview,@allowDecryptedExternalPreview,@vid)
         RETURNING id,file_id,public_token,password_hash,expires_at,max_downloads,download_count,is_active,allow_external_preview,allow_decrypted_external_preview,created_at`
       );
       shareRow = insRes.recordset[0];
@@ -4204,6 +5168,7 @@ app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, asy
       if (expires_at !== undefined) { upReq.input('exp', sql.DateTimeOffset, expires_at||null); sets.push('expires_at=@exp'); }
       if (max_downloads !== undefined) { upReq.input('md', sql.Int, nextMaxDownloads); sets.push('max_downloads=@md'); }
       if (is_active !== undefined) { upReq.input('act', sql.Bit, is_active ? 1 : 0); sets.push('is_active=@act'); }
+      if (version_id !== undefined) { upReq.input('vid', sql.UniqueIdentifier, pinnedVersionId); sets.push('version_id=@vid'); }
       const shouldUpdateAllowExternalPreview =
         allow_external_preview !== undefined ||
         nextAllowExternalPreview !== !!shareRow.allow_external_preview;
@@ -4886,6 +5851,60 @@ async function logExpiredFile(file: ExpiredFileRecord): Promise<void> {
 }
 
 // ──────────────────────────────────────────────────────────────
+// Trash purge — data-layer callbacks (see utils/trash-purge.ts)
+// ──────────────────────────────────────────────────────────────
+
+async function getTrashedFiles(cutoff: Date): Promise<TrashedFileRecord[]> {
+  const request = await getRequest();
+  request.input('cutoff', sql.DateTimeOffset, cutoff);
+  const result = await request.query<{
+    id: string; stored_path: string; owner_user_id: string;
+    original_name_encrypted: Buffer; original_name_iv: Buffer; original_name_auth_tag: Buffer;
+    deleted_at: Date; size_bytes: number;
+  }>(
+    `SELECT id,stored_path,owner_user_id,original_name_encrypted,original_name_iv,original_name_auth_tag,deleted_at,size_bytes
+     FROM files WHERE deleted_at IS NOT NULL AND deleted_at<=@cutoff`
+  );
+  return result.recordset.map(r => ({
+    id:           r.id,
+    storedPath:   path.join(FILE_VAULT, r.stored_path),
+    ownerId:      r.owner_user_id,
+    originalName: decryptColumn(r.original_name_encrypted, r.original_name_iv, r.original_name_auth_tag),
+    deletedAt:    r.deleted_at,
+    sizeBytes:    r.size_bytes,
+  }));
+}
+
+async function purgeTrashedFile(file: TrashedFileRecord): Promise<void> {
+  const vaultPath = path.join(FILE_VAULT, file.storedPath);
+  try {
+    if (fs.existsSync(vaultPath)) fs.unlinkSync(vaultPath);
+  } catch (err) {
+    console.error(`[trash-purge] Failed to remove vault file ${file.id}:`, err);
+  }
+
+  // Remove share links first (see delete-permanent) so FK_share_links_version
+  // does not block the cascade that deletes this file's archived versions.
+  const delSharesReq = await getRequest();
+  delSharesReq.input('id', sql.UniqueIdentifier, file.id);
+  await delSharesReq.query('DELETE FROM share_links WHERE file_id=@id');
+
+  const delReq = await getRequest();
+  delReq.input('id', sql.UniqueIdentifier, file.id);
+  await delReq.query('DELETE FROM files WHERE id=@id');
+
+  const logReq = await getRequest();
+  logReq.input('uid', sql.UniqueIdentifier, file.ownerId);
+  logReq.input('usr', sql.NVarChar(200), 'System');
+  logReq.input('et',  sql.NVarChar(20),  'Delete');
+  logReq.input('tt',  sql.NVarChar(50),  'File');
+  logReq.input('tid', sql.NVarChar(100), file.id);
+  logReq.input('ip',  sql.NVarChar(45),  '127.0.0.1');
+  logReq.input('msg', sql.NVarChar(sql.MAX), `File "${file.originalName}" permanently deleted from trash after ${TRASH_RETENTION_DAYS} day retention.`);
+  await logReq.query('INSERT INTO system_logs (user_id,username_snapshot,event_type,target_type,target_id,ip_address,message) VALUES (@uid,@usr,@et,@tt,@tid,@ip,@msg)');
+}
+
+// ──────────────────────────────────────────────────────────────
 // Bootstrap
 // ──────────────────────────────────────────────────────────────
 
@@ -5264,6 +6283,9 @@ async function bootstrap() {
   // 6. Start expiry cleanup
   startExpiryCleanup(getExpiredFiles, markFilesExpired, logExpiredFile);
 
+  // 6a. Start trash purge (permanent removal after TRASH_RETENTION_DAYS)
+  startTrashPurge(getTrashedFiles, purgeTrashedFile);
+
   // 6b. Clean up stale download temp files from previous crashes
   cleanupStaleTempFiles(UPLOAD_TEMP);
   startThumbnailScan();
@@ -5371,6 +6393,7 @@ async function bootstrap() {
     stopUncShareMonitor();
     sweepPrivateDownloadSessions();
     stopExpiryCleanup();
+    stopTrashPurge();
     await stopThumbnailScan();
     await closePool();
     process.exit(0);
