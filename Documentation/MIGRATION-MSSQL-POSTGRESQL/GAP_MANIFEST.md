@@ -1,6 +1,6 @@
 # GAP_MANIFEST — Migration MSSQL → PostgreSQL (soft-deletion & file versioning)
 
-> DocHub / DocScout | date: 2026-11-01 (Milestones A-D DONE & validated on dev incl. incidental fixes 0a7abf9/ee62ac0/f469a1e/0244620)
+> DocHub / DocScout | date: 2026-11-01 (Milestones A-D DONE & validated on dev incl. incidental fixes 0a7abf9/ee62ac0/f469a1e/0244620; docs G-26 DONE)
 > Priority: P1 = blocks the feature, P2 = required, P3 = hygiene.
 > Status legend: OPEN / PLAN / DONE
 
@@ -48,7 +48,7 @@
 |---|---|---|---|---|
 | G-24 | Port `scripts/backfill-file-hashes.ts` (pg + native pagination) + `backfill:file-hashes` npm script | P1 | DONE (commit 740eb58, verified on dev) | Backend/DevOps |
 | G-25 | Add `TRASH_RETENTION_DAYS=90` to `.env.example` | P2 | DONE (commit 740eb58) | DevOps |
-| G-26 | Update `DEV-CHANGE-REPORT.md` / SQL `README.md` / `QUERIES-REFERENCE.md` on postgresql | P2 | OPEN | DocEngineer |
+| G-26 | Update `DEV-CHANGE-REPORT.md` / SQL `README.md` / `QUERIES-REFERENCE.md` on postgresql | P2 | DONE (commit — DEV-CHANGE-REPORT entry, README versioning section, PG-dialect QUERIES-REFERENCE.md) | DocEngineer |
 
 ## E. Tests / quality
 
@@ -59,7 +59,7 @@
 
 ## Summary
 - **Total gaps: 28** (P1: 17, P2: 11).
-- **Completed: 25/28** — Section A (schema, 9), Section B (backend, 10), Section C (frontend: G-20..G-23), and D items G-24/G-25 are DONE and validated on the dev environment (Milestones A, B, C, D).
-- **Remaining: 3** — docs G-26, tests G-27/G-28.
+- **Completed: 26/28** — Section A (schema, 9), Section B (backend, 10), Section C (frontend: G-20..G-23), and D items G-24/G-25/G-26 are DONE and validated on the dev environment (Milestones A, B, C, D + docs).
+- **Remaining: 2** — tests G-27/G-28.
 - **Recommended execution order**: A (schema DDL) → B (backend) → D (scripts/config)
   → C (frontend) → E (tests). The schema is the hard dependency for everything else.

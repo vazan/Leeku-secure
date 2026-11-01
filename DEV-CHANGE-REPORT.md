@@ -1,4 +1,60 @@
 ---
+agent: DevEngineer | date: 2026-11-01 | model: dev-engineer
+---
+
+## Intention
+Port soft-deletion (Trash) and file versioning from the `mssql` branch onto the
+`postgresql` branch (node-postgres with the `mssql`-like `PgRequest`/`translateQuery`
+adapter). Source of truth: `mssql` commit range
+`d364703f8b89baced180e5a565ee55d62d19ad99 .. e82dba6c8816258713409cd294f2835f3e0b5861`.
+
+## Changement
+Classe : CRITICAL — DB migration (public schema contract) + new backend routes + frontend UI.
+
+## Fichiers
+| Fichier | Raison |
+|---|---|
+| `Documentation/SQL/2026-10-31-postgresql-file-versioning.sql` | Idempotent PostgreSQL migration: `files.file_name_hash/version_count/current_version_id`, `file_versions`, `file_version_keys`, `share_links.version_id`, FKs + indexes |
+| `src/server.ts` | Soft-delete/trash/restore/purge endpoints, version-instead upload pipeline, version endpoints + share `version_id` pinning, PG-native `RETURNING` |
+| `src/server/utils/trash-purge.ts` | `startTrashPurge()` + `runTrashPurgeCycle()` purge job honouring `TRASH_RETENTION_DAYS` |
+| `src/app/shared/types/index.ts` | `FileVersion`, `version_count?` on `FileMetadata` |
+| `src/app/features/files/pages/user-dashboard.tsx` | Trash tab + `VersionsDialog` UI + version actions + share pinning + types |
+| `src/server/routes/public-sharing.ts` | Version-aware public share resolution (metadata/preview/download/OG/embed) |
+| `scripts/backfill-file-hashes.ts` (+ `package.json` script) | One-time `file_name_hash` backfill with PG-native pagination |
+| `.env.example` | `TRASH_RETENTION_DAYS=90` |
+
+## Contrats publics impactés
+OUI (schema):
+- `files`: +`file_name_hash CHAR(64) NULL`, +`version_count INT NOT NULL DEFAULT 1`, +`current_version_id UUID NULL`.
+- New `file_versions` / `file_version_keys` (archived older versions; Model B — current stays in `files`).
+- `share_links`: +`version_id UUID NULL` (FK → `file_versions`, NULL = resolve to current).
+- New authenticated HTTP routes:
+  - `GET /api/files/trash`, restore, `POST /api/files/:id/delete-permanent`
+  - `GET /api/files/:id/versions`, `GET /api/files/:id/versions/:versionId/download`,
+    `POST /api/files/:id/versions/:versionId/restore`, `DELETE /api/files/:id/versions/:versionId`
+- `POST /api/files/:id/share` — optional `version_id` (pinned archived version).
+- `GET /api/public/share/:token` — adds `version_no` on the response.
+
+## Dialect notes (PostgreSQL adapter)
+- `OUTPUT INSERTED/DELETED` → native `RETURNING` (ADR-1, matches existing upload INSERT).
+- `NEWID()` → `gen_random_uuid()` / client `crypto.randomUUID()`.
+- `UPDATE/DELETE TOP (n)` → `LIMIT` subselects; `OFFSET ... FETCH NEXT` → `LIMIT/OFFSET`.
+- Nullable params in `IS NULL` predicates need explicit casts (`CAST(@folderId AS uuid)`)
+  because node-postgres sends params without explicit type OIDs and PG cannot infer the
+  type of a null parameter (fix commit `ee62ac0`).
+- Translation is scoped to query text; the `@param`/`sql.*` input layer is unchanged.
+
+## Validation status
+- Type-check: PASSED (`npx tsc --noEmit`)
+- Build: PASSED (`npx vite build`)
+- Dev-instance validation: Trash, restore, permanent delete, version upload/list/restore/
+  delete/share, and public pinned-version share confirmed working by the user on the dev
+  instance (Milestones A-D + incidental fixes `0a7abf9`, `ee62ac0`, `f469a1e`, `0244620`).
+
+## Handoff TestEngineer / QaEngineer
+- Milestone E (G-27/G-28): versioning/trash regression tests + `translateQuery` unit tests
+  for the new conversions (`RETURNING`, `LIMIT`, `CAST(@x AS uuid)`, `COALESCE`).
+---
 agent: DevEngineer | date: 2026-08-21 | model: GPT-5.3-Codex
 plan: /memories/session/dev-plan.md
 ---
