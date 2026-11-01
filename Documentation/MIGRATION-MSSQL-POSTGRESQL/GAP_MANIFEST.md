@@ -1,6 +1,6 @@
 # GAP_MANIFEST — Migration MSSQL → PostgreSQL (soft-deletion & file versioning)
 
-> DocHub / DocScout | date: 2026-10-31
+> DocHub / DocScout | date: 2026-11-01 (updated after Milestone B + D validated on dev)
 > Priority: P1 = blocks the feature, P2 = required, P3 = hygiene.
 > Status legend: OPEN / PLAN / DONE
 
@@ -15,23 +15,23 @@
 | G-05 | `file_versions` table (23 cols, UNIQUE(file_id, version_no)) | P1 | DONE (DDL authored & validated) | DB engineer |
 | G-06 | `file_version_keys` table (7 cols, PK version_id, FK cascade) | P1 | DONE (DDL authored & validated) | DB engineer |
 | G-07 | `file_versions.deleted_at` / `deleted_by` (soft-delete per version) | P1 | DONE (DDL authored & validated) | DB engineer |
-| G-08 | `files.deleted_at` present but **purge/retention** DDL absent (no `TRASH_RETENTION_DAYS`) | P1 | PARTIAL (scan index authored; env/purge job is backend work G-11) | DB engineer |
+| G-08 | `files.deleted_at` present but **purge/retention** DDL absent (no `TRASH_RETENTION_DAYS`) | P1 | DONE (scan index + purge job G-11 + env G-25) | DB engineer |
 | G-09 | PostgreSQL migration file (`Documentation/SQL/2026-10-31-postgresql-file-versioning.sql`) consistent with the SQL folder — **[written & validated on PG 16]** | P1 | DONE (schema applied) | DB engineer |
 
 ## B. Backend code (`src/server.ts` + `db.ts`)
 
 | # | Gap | Priority | Status | Owner |
 |---|---|---|---|---|
-| G-10 | Soft-delete mutation: replace hard `DELETE FROM files` with `UPDATE files SET deleted_at=...` in `/api/files/:id/delete` and bulk delete | P1 | OPEN | Backend engineer |
-| G-11 | Trash list + restore endpoints (`GET /api/files/trash`, restore) and `TRASH_RETENTION_DAYS` purge job | P1 | OPEN | Backend engineer |
-| G-12 | Upload version-detection: `file_name_hash` same-name/same-folder check; archive current blob → `file_versions`/`file_version_keys` before writing new version | P1 | OPEN | Backend engineer |
-| G-13 | Version endpoints: list, download specific, restore, soft-delete version, purge version | P1 | OPEN | Backend engineer |
-| G-14 | Share links `version_id` pinning + latest-vs-pinned resolution in public-sharing | P1 | OPEN | Backend engineer |
-| G-15 | Convert MSSQL `OUTPUT INSERTED/*DELETED` → `RETURNING` in all migrated queries | P1 | OPEN | Backend engineer |
-| G-16 | Convert `NEWID()` → `gen_random_uuid()` / client UUID | P2 | OPEN | Backend engineer |
-| G-17 | Convert `UPDATE TOP (@n)` / `DELETE TOP (@n)` batch patterns → LIMIT subselects | P2 | OPEN | Backend engineer |
-| G-18 | Convert backfill `OFFSET ... ROWS FETCH NEXT` to PG pagination | P1 | OPEN | Backend engineer |
-| G-19 | Decide translator expansion vs native rewrite for the above (recommend native `RETURNING`, matching existing pattern) | P2 | OPEN | Backend engineer |
+| G-10 | Soft-delete mutation: replace hard `DELETE FROM files` with `UPDATE files SET deleted_at=...` in `/api/files/:id/delete` and bulk delete | P1 | DONE (commit 740eb58) | Backend engineer |
+| G-11 | Trash list + restore endpoints (`GET /api/files/trash`, restore) and `TRASH_RETENTION_DAYS` purge job | P1 | DONE (commit 740eb58) | Backend engineer |
+| G-12 | Upload version-detection: `file_name_hash` same-name/same-folder check; archive current blob → `file_versions`/`file_version_keys` before writing new version | P1 | DONE (commit 740eb58) | Backend engineer |
+| G-13 | Version endpoints: list, download specific, restore, soft-delete version, purge version | P1 | DONE (commit 740eb58) | Backend engineer |
+| G-14 | Share links `version_id` pinning + latest-vs-pinned resolution in public-sharing | P1 | DONE (commit 740eb58) | Backend engineer |
+| G-15 | Convert MSSQL `OUTPUT INSERTED/*DELETED` → `RETURNING` in all migrated queries | P1 | DONE (commit 740eb58) | Backend engineer |
+| G-16 | Convert `NEWID()` → `gen_random_uuid()` / client UUID | P2 | DONE (client `crypto.randomUUID()` already used; no `NEWID()` remains) | Backend engineer |
+| G-17 | Convert `UPDATE TOP (@n)` / `DELETE TOP (@n)` batch patterns → LIMIT subselects | P2 | DONE (no `TOP` patterns remain; translator handles `SELECT TOP`) | Backend engineer |
+| G-18 | Convert backfill `OFFSET ... ROWS FETCH NEXT` to PG pagination | P1 | DONE (native `LIMIT/@OFFSET` in `scripts/backfill-file-hashes.ts`) | Backend engineer |
+| G-19 | Decide translator expansion vs native rewrite for the above (recommend native `RETURNING`, matching existing pattern) | P2 | DONE (ADR-1 Option B: native `RETURNING` chosen) | Backend engineer |
 
 ## C. Frontend
 
@@ -46,8 +46,8 @@
 
 | # | Gap | Priority | Status | Owner |
 |---|---|---|---|---|
-| G-24 | Port `scripts/backfill-file-hashes.ts` (pg + native pagination) + `backfill:file-hashes` npm script | P1 | OPEN | Backend/DevOps |
-| G-25 | Add `TRASH_RETENTION_DAYS=90` to `.env.example` | P2 | OPEN | DevOps |
+| G-24 | Port `scripts/backfill-file-hashes.ts` (pg + native pagination) + `backfill:file-hashes` npm script | P1 | DONE (commit 740eb58, verified on dev) | Backend/DevOps |
+| G-25 | Add `TRASH_RETENTION_DAYS=90` to `.env.example` | P2 | DONE (commit 740eb58) | DevOps |
 | G-26 | Update `DEV-CHANGE-REPORT.md` / SQL `README.md` / `QUERIES-REFERENCE.md` on postgresql | P2 | OPEN | DocEngineer |
 
 ## E. Tests / quality
@@ -59,5 +59,7 @@
 
 ## Summary
 - **Total gaps: 28** (P1: 17, P2: 11).
+- **Completed: 21/28** — Section A (schema, 9), Section B (backend, 10), and D items G-24/G-25 are DONE and validated on the dev environment (Milestones A, B, D).
+- **Remaining: 7** — Milestone C (frontend: G-20..G-23), docs G-26, tests G-27/G-28.
 - **Recommended execution order**: A (schema DDL) → B (backend) → D (scripts/config)
   → C (frontend) → E (tests). The schema is the hard dependency for everything else.
