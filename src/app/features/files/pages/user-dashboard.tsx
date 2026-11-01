@@ -2591,7 +2591,7 @@ export default function UserDashboard({
               </div>
 
               {visibleFolders.length > 0 && (
-                <div className="mb-6 grid w-full min-w-0 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                <div className="mb-6 grid w-full min-w-0 gap-3 sm:grid-cols-2 lg:hidden">
                   {visibleFolders.map((folder) => (
                     <button
                       key={folder.id}
