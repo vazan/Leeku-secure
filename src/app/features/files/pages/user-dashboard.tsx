@@ -638,36 +638,56 @@ export default function UserDashboard({
     }
   };
 
-  const loadAdmin = async () => {
+  const loadAdminCore = async () => {
     if (user.role !== "Admin") return;
     const headers = authHeaders(token);
-    const [usersResponse, filesResponse, foldersResponse, logsResponse, statsResponse] =
-      await Promise.all([
-        fetch("/api/admin/users?_t=" + Date.now(), { headers }),
-        fetch("/api/admin/files?_t=" + Date.now(), { headers }),
-        fetch("/api/admin/file-folders?_t=" + Date.now(), { headers }),
-        fetch("/api/admin/logs?_t=" + Date.now(), { headers }),
-        fetch("/api/stats?_t=" + Date.now()),
-      ]);
+    const [usersResponse, logsResponse, statsResponse] = await Promise.all([
+      fetch("/api/admin/users?_t=" + Date.now(), { headers }),
+      fetch("/api/admin/logs?_t=" + Date.now(), { headers }),
+      fetch("/api/stats?_t=" + Date.now()),
+    ]);
     if (usersResponse.ok)
       setAdminUsers((await usersResponse.json()).users || []);
+    if (logsResponse.ok) setLogs((await logsResponse.json()).logs || []);
+    if (statsResponse.ok) setStats(await statsResponse.json());
+  };
+
+  // The admin-wide file & folder datasets are large (every file across all
+  // users plus every folder). Loading them on dashboard mount is expensive
+  // even when the admin never opens the Files tab, so they are fetched
+  // lazily only when the admin view becomes active.
+  const loadAdminFiles = async () => {
+    if (user.role !== "Admin") return;
+    const headers = authHeaders(token);
+    const [filesResponse, foldersResponse] = await Promise.all([
+      fetch("/api/admin/files?_t=" + Date.now(), { headers }),
+      fetch("/api/admin/file-folders?_t=" + Date.now(), { headers }),
+    ]);
     if (filesResponse.ok)
       setAdminFiles((await filesResponse.json()).files || []);
     if (foldersResponse.ok)
       setAdminFolders((await foldersResponse.json()).folders || []);
-    if (logsResponse.ok) setLogs((await logsResponse.json()).logs || []);
-    if (statsResponse.ok) setStats(await statsResponse.json());
+  };
+
+  const loadAdmin = async () => {
+    await Promise.all([loadAdminCore(), loadAdminFiles()]);
   };
 
   useEffect(() => {
     loadFolders().catch(() => notifyError("Could not refresh folders."));
     loadFilesAndLinks().catch(() => notifyError("Could not refresh your files."));
-    loadAdmin().catch(() => notifyError("Could not refresh admin data."));
+    // Only load the lightweight admin datasets (users, logs, stats) eagerly.
+    // The large admin-wide files/folders datasets load lazily when the admin
+    // view is opened (see the view effect below).
+    loadAdminCore().catch(() => notifyError("Could not refresh admin data."));
   }, []);
 
   useEffect(() => {
     if (view === "trash") {
       loadTrash().catch(() => notifyError("Could not refresh trash."));
+    }
+    if (view === "admin" && user.role === "Admin") {
+      loadAdminFiles().catch(() => notifyError("Could not refresh admin data."));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [view]);

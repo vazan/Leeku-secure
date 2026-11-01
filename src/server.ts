@@ -855,18 +855,12 @@ function mapFileRow(row: FileRow, ownerUsername: string): FileMetadata {
   const originalName = decryptColumn(row.original_name_encrypted, row.original_name_iv, row.original_name_auth_tag);
   const previewKind = getTextPreviewKind(originalName, row.mime_type || '');
   
-  // Only verify MIME type for files that might have incorrect metadata
-  // (Document type is a known issue from secondary tools)
-  let verifiedMimeType = row.mime_type;
-  if (row.mime_type && row.mime_type === 'Document') {
-    const vaultPath = path.join(FILE_VAULT, row.stored_path);
-    const detectedMime = detectFileMime(vaultPath);
-    if (detectedMime) {
-      console.info(`[mapFileRow] Corrected MIME type for file ${originalName}: ${row.mime_type} -> ${detectedMime}`);
-      verifiedMimeType = detectedMime;
-    }
-  }
-  
+  // Use the MIME type exactly as stored. Upload-time MIME correction
+  // (see the "Verify and correct MIME type" step in POST /api/files/upload)
+  // already resolves the legacy "Document" placeholder before it is written,
+  // so re-sniffing file contents from disk on every list load is redundant
+  // and blockades the event loop with synchronous I/O at scale.
+
   return {
     id:             row.id,
     owner_user_id:  row.owner_user_id,
@@ -875,7 +869,7 @@ function mapFileRow(row: FileRow, ownerUsername: string): FileMetadata {
     folder_name:    row.folder_name || null,
     original_name:  originalName,
     stored_name:    row.stored_path,
-    mime_type:      verifiedMimeType,
+    mime_type:      row.mime_type,
     size:           Number(row.size_bytes),
     has_user_secret: !!row.client_secret_hash,
     encrypted_size: Number(row.encrypted_size_bytes),
