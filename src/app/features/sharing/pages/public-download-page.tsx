@@ -4,6 +4,7 @@ import {
   Check,
   Download,
   Eye,
+  FileQuestion,
   Loader2,
   Lock,
 } from "lucide-react";
@@ -24,6 +25,7 @@ interface PublicDownloadPageProps {
 }
 interface PublicFileMeta {
   file_name: string;
+  version_no?: number | null;
   mime_type: string;
   size: number;
   created_at: string;
@@ -373,7 +375,31 @@ export default function PublicDownloadPage({
         <Loader2 className="h-5 w-5 animate-spin text-[var(--text-muted)]" />
       </div>
     );
-  if (!meta) return <ErrorScreen code={404} onGoBack={onGoHome} />;
+  // When the metadata fetch fails (e.g. the pinned version was deleted and the
+  // server returned a specific 410 message), surface that exact reason instead
+  // of the generic "expired or moved" 404 screen.
+  if (!meta) {
+    if (error) {
+      return (
+        <div className="grid min-h-[70vh] place-items-center px-5">
+          <div className="max-w-md text-center">
+            <div className="mx-auto grid h-16 w-16 place-items-center rounded-xl bg-[var(--bg-muted)]">
+              <FileQuestion className="h-6 w-6 text-[var(--text-muted)]" />
+            </div>
+            <h1 className="mt-5 text-2xl font-semibold">{error}</h1>
+            <button
+              onClick={onGoHome}
+              className="mx-auto mt-6 flex items-center gap-2 rounded-lg border border-[var(--border-subtle)] bg-[var(--bg-panel)] px-4 py-2.5 text-sm font-medium"
+            >
+              <ArrowLeft className="h-4 w-4" />
+              Go back
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return <ErrorScreen code={404} onGoBack={onGoHome} />;
+  }
 
   return (
     <div className="min-h-screen bg-[var(--bg-primary)] px-5 py-6">
@@ -408,9 +434,16 @@ export default function PublicDownloadPage({
               />
             </div>
             <div className="min-w-0 flex-1">
-              <h1 className="break-all text-xl font-semibold leading-snug">
-                {meta.file_name}
-              </h1>
+              <div className="flex flex-wrap items-center gap-2">
+                <h1 className="break-all text-xl font-semibold leading-snug">
+                  {meta.file_name}
+                </h1>
+                {meta.version_no != null && (
+                  <span className="inline-flex flex-none items-center rounded-full border border-[var(--border-subtle)] bg-[var(--bg-muted)] px-2.5 py-0.5 text-xs font-medium text-[var(--text-muted)]">
+                    Version {meta.version_no}
+                  </span>
+                )}
+              </div>
               <p className="mt-1 text-sm text-[var(--text-muted)]">
                 {formatBytes(meta.size)} · Shared by {meta.uploader}
               </p>
