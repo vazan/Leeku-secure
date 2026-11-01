@@ -4,8 +4,9 @@
 
 ## 1. PostgreSQL migration DDL
 
-Create as `Documentation/SQL/2026-10-31-postgresql-file-versioning.sql`, styled after
-`postgresql_schema.sql` (idempotent, `IF NOT EXISTS`, DO blocks where needed).
+Materialized & applied at `Documentation/SQL/2026-10-31-postgresql-file-versioning.sql`
+(validated on PostgreSQL 16 — idempotent, cascade + pin FK behavior confirmed). It is
+styled after `postgresql_schema.sql`. Reference copy:
 
 ```sql
 -- Migration: File version history + soft-deletion retention (PostgreSQL)

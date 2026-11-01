@@ -10,6 +10,6 @@
 | `ARCHITECTURE.md` | Architect/Lead | Design choice (native `RETURNING`), ADRs, sequencing, risks |
 | `ENGINEER-SCHEMA-PARITY.md` | DB/Backend/Frontend engineers | Idempotent PostgreSQL DDL + code conversion table |
 | `OPS-RUNBOOK.md` | DevOps/SRE | ordered migration steps, smoke test, rollback, purge job ops |
-| `../SQL/2026-10-31-postgresql-file-versioning.sql` | DB engineer | executable migration (target) |
+| `../SQL/2026-10-31-postgresql-file-versioning.sql` | DB engineer | executable migration (validated on PostgreSQL 16) |
 
 Source of truth: commits `d364703f8b89baced180e5a565ee55d62d19ad99 .. e82dba6c8816258713409cd294f2835f3e0b5861` on `mssql`.

@@ -8,15 +8,15 @@
 
 | # | Gap | Priority | Status | Owner |
 |---|---|---|---|---|
-| G-01 | `files.file_name_hash CHAR(64)` + index on `(owner_user_id, folder_id, file_name_hash)` | P1 | OPEN | DB engineer |
-| G-02 | `files.version_count INT NOT NULL DEFAULT 1` | P1 | OPEN | DB engineer |
-| G-03 | `files.current_version_id UUID` (reserved) | P2 | OPEN | DB engineer |
-| G-04 | `share_links.version_id UUID` + FK → `file_versions(id)` NO ACTION | P1 | OPEN | DB engineer |
-| G-05 | `file_versions` table (16 cols, UNIQUE(file_id, version_no)) | P1 | OPEN | DB engineer |
-| G-06 | `file_version_keys` table (7 cols, PK version_id, FK cascade) | P1 | OPEN | DB engineer |
-| G-07 | `file_versions.deleted_at` / `deleted_by` (soft-delete per version) | P1 | OPEN | DB engineer |
-| G-08 | `files.deleted_at` present but **purge/retention** DDL absent (no `TRASH_RETENTION_DAYS`) | P1 | OPEN | DB engineer |
-| G-09 | PostgreSQL migration file (e.g. `2026-10-31-postgresql-file-versioning.sql`) consistent with the 7 files SQL folder | P1 | OPEN | DB engineer |
+| G-01 | `files.file_name_hash CHAR(64)` + index on `(owner_user_id, folder_id, file_name_hash)` | P1 | DONE (DDL authored & validated) | DB engineer |
+| G-02 | `files.version_count INT NOT NULL DEFAULT 1` | P1 | DONE (DDL authored & validated) | DB engineer |
+| G-03 | `files.current_version_id UUID` (reserved) | P2 | DONE (DDL authored & validated) | DB engineer |
+| G-04 | `share_links.version_id UUID` + FK → `file_versions(id)` NO ACTION | P1 | DONE (DDL authored & validated) | DB engineer |
+| G-05 | `file_versions` table (23 cols, UNIQUE(file_id, version_no)) | P1 | DONE (DDL authored & validated) | DB engineer |
+| G-06 | `file_version_keys` table (7 cols, PK version_id, FK cascade) | P1 | DONE (DDL authored & validated) | DB engineer |
+| G-07 | `file_versions.deleted_at` / `deleted_by` (soft-delete per version) | P1 | DONE (DDL authored & validated) | DB engineer |
+| G-08 | `files.deleted_at` present but **purge/retention** DDL absent (no `TRASH_RETENTION_DAYS`) | P1 | PARTIAL (scan index authored; env/purge job is backend work G-11) | DB engineer |
+| G-09 | PostgreSQL migration file (`Documentation/SQL/2026-10-31-postgresql-file-versioning.sql`) consistent with the SQL folder — **[written & validated on PG 16]** | P1 | DONE (schema applied) | DB engineer |
 
 ## B. Backend code (`src/server.ts` + `db.ts`)
 

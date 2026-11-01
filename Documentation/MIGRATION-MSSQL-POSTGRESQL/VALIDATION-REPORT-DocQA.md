@@ -30,10 +30,19 @@
   redundant trash-version row removed).
 
 ### NOT_RUN / NOT_VERIFIED (documented, not fabricated)
-- `Documentation/SQL/2026-10-31-postgresql-file-versioning.sql` is provided as DDL in the
-  doc but the file itself is not yet written to `Documentation/SQL/` — DocEngineer target.
-- No live PostgreSQL execution of the DDL; parity is by code reading (ADR-1).
+- No live PostgreSQL execution of the DDL was available at audit time; DDL was reviewed
+  by code reading (ADR-1).
 - Backfill/purge runtime behaviour on PG not executed in this audit.
+
+### Post-audit validation (2026-10-31, after audit)
+- The DDL was materialized to `Documentation/SQL/2026-10-31-postgresql-file-versioning.sql`
+  and executed against a throwaway **PostgreSQL 16** instance on top of the canonical
+  `postgresql_schema.sql` baseline:
+  - Applies cleanly (exit 0): 4 columns, 2 tables, 3 indexes, 1 FK.
+  - **Idempotent**: re-run is a no-op ("already exists, skipping", committed).
+  - Behavior verified: `version_count` defaults to 1; archive into `file_versions` +
+    `file_version_keys` works; `share_links.version_id` pin works; parent-file delete
+    cascades to versions, keys, and share links.
 
 ## Verdict
 **PASS (9.0/10)** — above the ≥ 7.0 gate inside a single review; no rework required.
