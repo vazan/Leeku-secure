@@ -1,6 +1,6 @@
 # GAP_MANIFEST — Migration MSSQL → PostgreSQL (soft-deletion & file versioning)
 
-> DocHub / DocScout | date: 2026-11-01 (updated after Milestone B + D validated on dev)
+> DocHub / DocScout | date: 2026-11-01 (updated after Milestones A-D validated; frontend Milestone C landed)
 > Priority: P1 = blocks the feature, P2 = required, P3 = hygiene.
 > Status legend: OPEN / PLAN / DONE
 
@@ -37,10 +37,10 @@
 
 | # | Gap | Priority | Status | Owner |
 |---|---|---|---|---|
-| G-20 | Trash tab + version history UI in `user-dashboard.tsx` | P1 | OPEN | Frontend engineer |
-| G-21 | Version dropdown / hide-versions-when-single rule (`version_count > 1`) | P2 | OPEN | Frontend engineer |
-| G-22 | Sharing UI for versioned files + download-specific-version | P2 | OPEN | Frontend engineer |
-| G-23 | Types: `FileVersion`, `version_count`, `file_name_hash` in `types/index.ts` | P1 | OPEN | Frontend engineer |
+| G-20 | Trash tab + version history UI in `user-dashboard.tsx` | P1 | DONE (Milestone C) | Frontend engineer |
+| G-21 | Version dropdown / hide-versions-when-single rule (`version_count > 1`) | P2 | DONE (Milestone C) | Frontend engineer |
+| G-22 | Sharing UI for versioned files + download-specific-version | P2 | DONE (Milestone C) | Frontend engineer |
+| G-23 | Types: `FileVersion`, `version_count`, `file_name_hash` in `types/index.ts` | P1 | DONE (Milestone B types landed with 740eb58) | Frontend engineer |
 
 ## D. Scripts / config
 
@@ -59,7 +59,7 @@
 
 ## Summary
 - **Total gaps: 28** (P1: 17, P2: 11).
-- **Completed: 21/28** — Section A (schema, 9), Section B (backend, 10), and D items G-24/G-25 are DONE and validated on the dev environment (Milestones A, B, D).
-- **Remaining: 7** — Milestone C (frontend: G-20..G-23), docs G-26, tests G-27/G-28.
+- **Completed: 25/28** — Section A (schema, 9), Section B (backend, 10), Section C (frontend: G-20..G-23), and D items G-24/G-25 are DONE and validated on the dev environment (Milestones A, B, C, D).
+- **Remaining: 3** — docs G-26, tests G-27/G-28.
 - **Recommended execution order**: A (schema DDL) → B (backend) → D (scripts/config)
   → C (frontend) → E (tests). The schema is the hard dependency for everything else.
