@@ -1,6 +1,6 @@
 # GAP_MANIFEST — Migration MSSQL → PostgreSQL (soft-deletion & file versioning)
 
-> DocHub / DocScout | date: 2026-11-01 (updated after Milestones A-D validated; frontend Milestone C landed)
+> DocHub / DocScout | date: 2026-11-01 (Milestones A-D DONE & validated on dev incl. incidental fixes 0a7abf9/ee62ac0/f469a1e/0244620)
 > Priority: P1 = blocks the feature, P2 = required, P3 = hygiene.
 > Status legend: OPEN / PLAN / DONE
 
