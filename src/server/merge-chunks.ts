@@ -3,14 +3,20 @@ import os from 'node:os';
 import path from 'node:path';
 import { pipeline as streamPipeline } from 'node:stream/promises';
 
-// Upload temp dir and the resumable-upload chunk directory. These mirror the
-// values used by the main server module (src/server.ts), so `mergeChunks`
-// assembled here is consistent with the chunk paths the upload handler writes.
-const UPLOAD_TEMP = process.env.UPLOAD_TEMP_PATH || path.join(os.tmpdir(), 'leeku-uploads');
-export const RESUMABLE_CHUNK_DIR = path.join(UPLOAD_TEMP, 'chunks');
+// POURQUOI : these paths are resolved LAZILY (at call time) instead of at module
+// scope. This module is imported by src/server.ts BEFORE dotenv.config() runs,
+// so a module-scope `process.env.UPLOAD_TEMP_PATH` here would always be
+// undefined and silently fall back to the OS temp dir, diverging from the
+// `UPLOAD_TEMP`/`RESUMABLE_CHUNK_DIR` that server.ts resolves AFTER dotenv
+// loads. That divergence made server.ts write chunks to the real temp path
+// (e.g. "P:\\Leeku-Temp\\chunks") while this module looked for them in the OS
+// temp dir -> "Missing chunk 1..N" on every resumable upload.
+function uploadTemp(): string {
+  return process.env.UPLOAD_TEMP_PATH || path.join(os.tmpdir(), 'leeku-uploads');
+}
 
-function chunkDir(identifier: string): string {
-  return path.join(RESUMABLE_CHUNK_DIR, identifier);
+function resumableChunkDir(identifier: string): string {
+  return path.join(uploadTemp(), 'chunks', identifier);
 }
 
 /**
@@ -24,12 +30,22 @@ function chunkDir(identifier: string): string {
  * @returns the absolute path of the merged temporary file.
  */
 export async function mergeChunks(identifier: string, totalChunks: number): Promise<string> {
-  const dir = chunkDir(identifier);
-  const mergedPath = path.join(UPLOAD_TEMP, `merged_${identifier}`);
+  const temp = uploadTemp();
+  const dir = resumableChunkDir(identifier);
+  const mergedPath = path.join(temp, `merged_${identifier}`);
 
+  // The write stream is opened asynchronously, so an error (e.g. ENOENT when
+  // a missing chunk aborts the loop before any pipeline attaches a handler)
+  // can surface as an 'error' event AFTER the caller has already thrown. Attach
+  // the handler up front so a failed merge can never crash the process with an
+  // unhandled 'error' event; the merge error below is what the caller sees.
   const writeStream = fs.createWriteStream(mergedPath);
+  let streamError: Error | null = null;
+  writeStream.on('error', (err) => { streamError = err; });
+
   try {
     for (let i = 1; i <= totalChunks; i++) {
+      if (streamError) throw streamError;
       const cp = path.join(dir, String(i));
       if (!fs.existsSync(cp)) {
         throw new Error(`Missing chunk ${i} of ${totalChunks} for identifier "${identifier}".`);
@@ -39,6 +55,7 @@ export async function mergeChunks(identifier: string, totalChunks: number): Prom
       await streamPipeline(fs.createReadStream(cp), writeStream, { end: false });
       fs.unlinkSync(cp); // clean up chunk after appending
     }
+    if (streamError) throw streamError;
     // Flush and close the output stream once every chunk has been appended.
     await new Promise<void>((resolve, reject) => {
       writeStream.end((err?: Error | null) => (err ? reject(err) : resolve()));

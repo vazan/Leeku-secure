@@ -4,9 +4,9 @@ import os from 'node:os';
 import path from 'node:path';
 import test, { before, after } from 'node:test';
 
-// mergeChunks lives in the big server module, which reads UPLOAD_TEMP_PATH at
-// import time. Point it at an isolated temp dir and THEN import the module
-// (dynamic import) so the constants resolve to our sandbox.
+// mergeChunks resolves UPLOAD_TEMP_PATH LAZILY at call time (not at import
+// time), matching how src/server.ts resolves it AFTER dotenv.config() has run.
+// Point it at an isolated temp dir and import the module dynamically.
 const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'leeku-merge-chunks-'));
 process.env.UPLOAD_TEMP_PATH = sandbox;
 
@@ -66,4 +66,58 @@ test('mergeChunks rejects when a chunk is missing and removes the partial output
 
   // The partially written merged file must not be left behind.
   assert.equal(fs.existsSync(path.join(sandbox, `merged_${id}`)), false);
+});
+
+// Regression: the crash reported in production was a "Missing chunk 1..N"
+// thrown while the asynchronously-opened merge output stream could not be
+// opened (output dir missing) — with no 'error' handler, the late 'error'
+// event crashed the Node process. A missing chunk must reject cleanly and must
+// NOT leave an unhandled 'error' event behind, even when the output directory
+// does not exist.
+test('mergeChunks rejects cleanly without crashing when the output dir is missing', async () => {
+  const id = 'h1-missing-outdir';
+  const otherSandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'leeku-merge-chunks-missing-'));
+  // Stage the chunks under a real dir, but point UPLOAD_TEMP_PATH at a
+  // NON-EXISTENT output dir so createWriteStream's open fails (ENOENT).
+  const realChunks = path.join(sandbox, 'chunks', id);
+  fs.mkdirSync(realChunks, { recursive: true });
+  fs.writeFileSync(path.join(realChunks, '1'), 'only-one-');
+  fs.writeFileSync(path.join(realChunks, '2'), 'missing-rest-');
+
+  const brokenOutput = path.join(otherSandbox, 'does-not-exist');
+  const prev = process.env.UPLOAD_TEMP_PATH;
+  process.env.UPLOAD_TEMP_PATH = brokenOutput;
+  try {
+    await assert.rejects(() => mergeChunks(id, 2));
+  } finally {
+    process.env.UPLOAD_TEMP_PATH = prev;
+    fs.rmSync(otherSandbox, { recursive: true, force: true });
+  }
+});
+
+// Regression: mergeChunks must resolve UPLOAD_TEMP_PATH at CALL time so it
+// agrees with src/server.ts (which reads the env AFTER dotenv runs). If the
+// env var is set AFTER this module was imported, a merge must still find the
+// chunks in the newly-pointed directory rather than a fallback temp dir.
+test('mergeChunks resolves UPLOAD_TEMP_PATH lazily (env set after import)', async () => {
+  const id = 'h1-lazy';
+  const lazySandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'leeku-merge-chunks-lazy-'));
+  const lazyChunks = path.join(lazySandbox, 'chunks', id);
+  fs.mkdirSync(lazyChunks, { recursive: true });
+  fs.writeFileSync(path.join(lazyChunks, '1'), 'lazy-');
+  fs.writeFileSync(path.join(lazyChunks, '2'), 'path');
+
+  const prev = process.env.UPLOAD_TEMP_PATH;
+  process.env.UPLOAD_TEMP_PATH = lazySandbox; // changed AFTER import
+  try {
+    const mergedPath = await mergeChunks(id, 2);
+    assert.equal(fs.readFileSync(mergedPath, 'utf8'), 'lazy-path');
+    // The merged output must live under the lazily-resolved dir, not the
+    // pre-import fallback/sandbox.
+    assert.equal(fs.existsSync(path.join(lazySandbox, `merged_${id}`)), true);
+    assert.equal(fs.existsSync(path.join(sandbox, `merged_${id}`)), false);
+  } finally {
+    process.env.UPLOAD_TEMP_PATH = prev;
+    fs.rmSync(lazySandbox, { recursive: true, force: true });
+  }
 });
