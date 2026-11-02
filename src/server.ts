@@ -2089,10 +2089,21 @@ app.get('/api/files', authenticateUser as express.RequestHandler, async (req: Au
     // limit/offset and can scope by folder_id + search; total/has_more let it
     // render accurate counts and a "Show more" button without holding every
     // file in memory.
+    //
+    // POURQUOI : pagination is OPT-IN. Legacy/third-party clients (the
+    // leeku-desktop desktop/mobile/CLI apps) call GET /api/files without any
+    // limit/offset and rely on the FULL remote inventory to plan sync/upload
+    // and quota correctly. Only apply OFFSET/FETCH when the caller asks for a
+    // page, otherwise keep the historical "all files" contract intact so those
+    // clients do not silently receive a truncated (200-file) inventory.
+    const hasPagingParams =
+      req.query.limit !== undefined ||
+      req.query.offset !== undefined;
     const rawLimit  = parseInt(String(req.query.limit ?? ''), 10);
     const rawOffset = parseInt(String(req.query.offset ?? ''), 10);
-    const limit     = Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), 500) : 200;
+    const limit     = hasPagingParams ? (Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), 500) : 200) : 0;
     const offset    = Number.isFinite(rawOffset) ? Math.max(rawOffset, 0) : 0;
+    const paged     = hasPagingParams;
     let folderId   = normalizeNullableFolderId(req.query.folder_id);
     if (folderId === undefined) folderId = null;
 
@@ -2101,7 +2112,7 @@ app.get('/api/files', authenticateUser as express.RequestHandler, async (req: Au
     request.input('includeSystem', sql.Bit, req.user?.role === 'Admin' && req.query.include_system === '1' ? 1 : 0);
     request.input('systemFolderName', sql.NVarChar(120), SYSTEM_UPDATE_FOLDER_NAME);
     request.input('folderId', sql.UniqueIdentifier, folderId);
-    request.input('limit', sql.Int, limit);
+    request.input('limit', sql.Int, Math.max(limit, 1));
     request.input('offset', sql.Int, offset);
     let result;
     try {
@@ -2136,7 +2147,7 @@ app.get('/api/files', authenticateUser as express.RequestHandler, async (req: Au
             AND (f.folder_id=@folderId OR (@folderId IS NULL AND f.folder_id IS NULL))
         ) files
          ORDER BY created_at DESC
-         OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY`
+         ${paged ? 'OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY' : ''}`
       );
     } catch (queryErr: any) {
       const isMissingSecretColumn =
@@ -2159,7 +2170,7 @@ app.get('/api/files', authenticateUser as express.RequestHandler, async (req: Au
         FROM files WHERE owner_user_id=@ownerId AND COALESCE(status,'Available')!='Expired' AND deleted_at IS NULL
           AND (folder_id=@folderId OR (@folderId IS NULL AND folder_id IS NULL))
          ORDER BY created_at DESC
-         OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY`
+         ${paged ? 'OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY' : ''}`
       );
     }
     // COUNT(*) OVER() carries the server-side total across the whole filtered
@@ -2184,7 +2195,8 @@ app.get('/api/files', authenticateUser as express.RequestHandler, async (req: Au
     res.json({
       files,
       total: totalCount,
-      has_more: offset + files.length < totalCount,
+      // Unpaginated (legacy) callers receive the full set, so has_more is false.
+      has_more: paged && offset + files.length < totalCount,
       account_file_count: accountFileCount,
       trash_retention_days: TRASH_RETENTION_DAYS,
     });
