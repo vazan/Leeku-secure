@@ -1,4 +1,4 @@
-# DEV-PLAN — Port 4 mssql dashboard-UI commits to postgresql branch
+# DEV-PLAN — Port mssql dashboard-UI commits to postgresql branch
 Date : 2026-11-02 | Modèle : dev-engineer | Classe : STANDARD
 
 ## Exploration (résumé subagent)
@@ -19,6 +19,7 @@ Date : 2026-11-02 | Modèle : dev-engineer | Classe : STANDARD
 | 2 | `9e24bb0` | Hide sidebar "Settings" on desktop (lg+) via `isDesktopNav` matchMedia |
 | 3 | `81a89f7` | Move mobile Log Out icon to top-right corner (`absolute right-3`, `sm:hidden`) |
 | 4 | `6b5808e` | Fix mobile Log Out anchor (`top-3`) so it sits above the search bar |
+| 5 | `8736339` | Replace spinning wheels with a multicolored progression bar (All files / Trash)
 
 ## Étapes
 | # | Action | Fichier | Classe |

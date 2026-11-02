@@ -4,27 +4,34 @@ plan: /memories/session/dev-plan.md
 ---
 
 ## Intention
-Port the four mssql dashboard-UI commits onto the `postgresql` branch:
+Port the mssql dashboard-UI commits onto the `postgresql` branch:
 - `61d9c78` — add desktop profile dropdown (Settings / Log Out) in the top-right corner
 - `9e24bb0` — hide sidebar "Settings" on desktop (lg+) since the dropdown covers it
 - `81a89f7` — move the mobile Log Out icon to the top-right corner of the header
 - `6b5808e` — fix mobile Log Out anchoring (`top-3`) so it sits above the search bar
+- `8736339` — replace spinning wheels with a multicolored progression bar
+  (All files / Trash / other sections)
 
 ## Changement
-Classe : STANDARD — isolated client-side UX change in a single component; no
-public contract, API, or server change.
+Classe : STANDARD — isolated client-side UX change in a single dashboard
+component plus two new leaf UI modules; no public contract, API, or server
+change.
 
-The change fully replicates the combined effect of the four mssql commits on
-`src/app/features/files/pages/user-dashboard.tsx`. The ported regions were
-verified to byte-match the mssql final state (at `6b5808e`): imports, the
-`isDesktopNav` matchMedia state+effect, the conditional sidebar "Settings"
-entry, the desktop `DropdownMenu` wrapper, and the re-anchored mobile Log Out
-button (`absolute right-3 top-3 z-10 … sm:hidden`).
+The reported regions replicate the combined effect of the five mssql commits on
+`src/app/features/files/pages/user-dashboard.tsx`, verified byte-for-byte
+against the mssql final state: imports, the `DropdownMenu` desktop profile
+wrapper, `isDesktopNav` matchMedia state+effect, the conditional sidebar
+"Settings" entry, the re-anchored mobile Log Out button, and the multicolored
+`LoadingProgressBar` that replaces the spinning wheels (weighted across
+files/folders/trash/versions). Two new modules (`use-loading-progress.ts`,
+`loading-progress-bar.tsx`) also match the mssql sources exactly.
 
 ## Fichiers
 | Fichier | Raison |
 |---|---|
-| `src/app/features/files/pages/user-dashboard.tsx` | Add DropdownMenu imports + ChevronDown, wrap desktop profile in dropdown, conditionally hide sidebar Settings on lg+, move & re-anchor mobile Log Out |
+| `src/app/features/files/pages/user-dashboard.tsx` | Dropdown imports+ChevronDown, desktop profile dropdown, hide sidebar Settings on lg+, move & re-anchor mobile Log Out, replace spinning wheels with progression bar |
+| `src/app/shared/hooks/use-loading-progress.ts` | NEW — blends weighted loading operations into a 0–100 eased progress value |
+| `src/app/shared/components/common/loading-progress-bar.tsx` | NEW — multicolored progression bar UI driven by the hook |
 
 ## Contrats publics impactés
 NON — no API, types, or route changes. `DashboardView`, `DashboardNavItem`,
@@ -62,6 +69,10 @@ N/A — STANDARD class, no sensitive files.
 - Keyboard: trigger is focusable; radix-menu arrow-key navigable; Escape closes;
   click-outside closes.
 - Regression: sidebar "Log out" button and Settings sidebar entry (mobile) work.
+- Progression bar: while files/trash load, a multicolored bar fills from the left
+  at the top of the dashboard content; it completes to 100% and fades out when
+  loading settles (All files, Trash, folder navigation, search).
+- No spinning wheels remain under All files / Trash / folder sections.
 
 ## Handoff QaEngineer
 STANDARD-class client-only change; build + type-check green (identical to base).
