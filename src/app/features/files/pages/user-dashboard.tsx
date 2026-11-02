@@ -9,6 +9,7 @@ import {
   ArrowDownToLine,
   Camera,
   CalendarDays,
+  ChevronDown,
   Copy,
   Eye,
   FileVolume2,
@@ -40,6 +41,13 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/app/shared/components/ui/popover";
+import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+} from "@/app/shared/components/ui/dropdown-menu";
 import { MaintenanceModeBanner } from "@/app/shared/components/maintenance-mode-banner";
 import type {
   AdminFileFolder,
@@ -2451,16 +2459,46 @@ export default function UserDashboard({
           >
             <LogOut className="h-4 w-4" />
           </button>
-          <div className="absolute right-5 hidden items-center gap-3 sm:flex lg:right-8">
-            <ProfileAvatar
-              user={user}
-              version={avatarVersion}
-              className="h-9 w-9 text-sm"
-            />
-            <div>
-              <p className="text-sm font-medium">{user.username}</p>
-              <p className="text-xs text-[var(--text-muted)]">{user.role}</p>
-            </div>
+          <div className="absolute right-5 z-10 hidden items-center sm:flex lg:right-8">
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <button
+                  type="button"
+                  aria-label="Open profile menu"
+                  title="Profile menu"
+                  className="flex items-center gap-2 rounded-lg px-2 py-1.5 text-left outline-none hover:bg-[var(--bg-hover)] focus-visible:bg-[var(--bg-hover)] focus-visible:outline-none"
+                >
+                  <ProfileAvatar
+                    user={user}
+                    version={avatarVersion}
+                    className="h-9 w-9 text-sm"
+                  />
+                  <div>
+                    <p className="text-sm font-medium">{user.username}</p>
+                    <p className="text-xs text-[var(--text-muted)]">{user.role}</p>
+                  </div>
+                  <ChevronDown className="h-4 w-4 text-[var(--text-faint)]" />
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" sideOffset={6} className="w-56">
+                <DropdownMenuItem
+                  onSelect={() => navigateDashboard("settings")}
+                  className="gap-2 py-2"
+                >
+                  <Settings className="h-4 w-4" />
+                  Settings
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  variant="destructive"
+                  onSelect={onLogout}
+                  className="gap-2 py-2"
+                >
+                  <LogOut className="h-4 w-4" />
+                  Log Out
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
           </div>
         </header>
 
