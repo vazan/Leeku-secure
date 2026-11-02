@@ -12,7 +12,8 @@
     "clean": "rimraf dist",
     "test:desktop-updates": "tsx --test tests/desktop-updates-path.test.ts",
     "lint": "tsc --noEmit",
-    "backfill:file-hashes": "tsx scripts/backfill-file-hashes.ts"
+    "backfill:file-hashes": "tsx scripts/backfill-file-hashes.ts",
+    "cleanup:vault-orphans": "tsx scripts/cleanup-vault-orphans.ts"
   },
   "dependencies": {
     "@azure/msal-node": "^7.1.1",
