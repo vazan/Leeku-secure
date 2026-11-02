@@ -25,8 +25,14 @@ export function validateProductionConfig(): void {
   if (missing.length) {
     throw new Error(`[production] Missing or placeholder configuration: ${missing.join(', ')}`);
   }
-  if (!isScannerAvailable()) {
-    throw new Error('[production] Bitdefender CLI is required. Set BITDEFENDER_SCAN_CLI_PATH to a readable scanner executable.');
+  // POURQUOI : admins may opt out of Bitdefender in any environment via
+  // ALLOW_UNSCANNED_UPLOADS=true (or legacy dev var), so don't require a
+  // reachable scanner in that case.
+  const scanningDisabled =
+    process.env.ALLOW_UNSCANNED_UPLOADS === 'true' ||
+    process.env.ALLOW_UNSCANNED_UPLOADS_IN_DEVELOPMENT === 'true';
+  if (!scanningDisabled && !isScannerAvailable()) {
+    throw new Error('[production] Bitdefender CLI is required. Set BITDEFENDER_SCAN_CLI_PATH to a readable scanner executable, or opt out with ALLOW_UNSCANNED_UPLOADS=true.');
   }
   if (process.env.COOKIE_SECURE === 'false') {
     throw new Error('[production] COOKIE_SECURE cannot be false.');
