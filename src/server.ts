@@ -2111,12 +2111,18 @@ app.get('/api/files', authenticateUser as express.RequestHandler, async (req: Au
     const paged     = hasPagingParams;
     let folderId   = normalizeNullableFolderId(req.query.folder_id);
     if (folderId === undefined) folderId = null;
+    // Dashboard "All Files" root view requests only the folder's own files
+    // (folder_id IS NULL) and pages among them. Legacy/third-party clients
+    // (desktop/CLI sync) omit `scope=root` and rely on the historical FULL
+    // inventory across every folder, so the filter must stay opt-in.
+    const rootOnly = req.query.scope === 'root' && folderId === null;
 
     const request = await getRequest();
     request.input('ownerId', sql.UniqueIdentifier, req.userId!);
     request.input('includeSystem', sql.Bit, req.user?.role === 'Admin' && req.query.include_system === '1' ? 1 : 0);
     request.input('systemFolderName', sql.NVarChar(120), SYSTEM_UPDATE_FOLDER_NAME);
     request.input('folderId', sql.UniqueIdentifier, folderId);
+    request.input('rootOnly', sql.Bit, rootOnly ? 1 : 0);
     request.input('limit', sql.Int, Math.max(limit, 1));
     request.input('offset', sql.Int, offset);
     let result;
@@ -2149,7 +2155,10 @@ app.get('/api/files', authenticateUser as express.RequestHandler, async (req: Au
                   )
               )
             )
-            AND ((CAST(@folderId AS uuid) IS NULL) OR f.folder_id=CAST(@folderId AS uuid))
+            AND (
+              (@rootOnly=FALSE AND ((CAST(@folderId AS uuid) IS NULL) OR f.folder_id=CAST(@folderId AS uuid)))
+              OR (@rootOnly=TRUE AND f.folder_id IS NULL)
+            )
         ) files
          ORDER BY created_at DESC
          ${paged ? 'LIMIT @limit OFFSET @offset' : ''}`
@@ -2173,7 +2182,10 @@ app.get('/api/files', authenticateUser as express.RequestHandler, async (req: Au
                 expires_at, created_at,
                 COUNT(*) OVER() AS total_count
         FROM files WHERE owner_user_id=@ownerId AND COALESCE(status,'Available')!='Expired' AND deleted_at IS NULL
-          AND ((CAST(@folderId AS uuid) IS NULL) OR folder_id=CAST(@folderId AS uuid))
+          AND (
+            (@rootOnly=FALSE AND ((CAST(@folderId AS uuid) IS NULL) OR folder_id=CAST(@folderId AS uuid)))
+            OR (@rootOnly=TRUE AND folder_id IS NULL)
+          )
          ORDER BY created_at DESC
          ${paged ? 'LIMIT @limit OFFSET @offset' : ''}`
       );

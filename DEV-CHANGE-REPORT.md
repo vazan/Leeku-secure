@@ -1546,3 +1546,66 @@ Unit tests: ✅ `merge-chunks` 5/5, `translate-query-versioning` 10/10, encrypti
 ```bash
 git revert <port-commit>   # on feat/port-routes-perf-m1-m3-h1-postgresql
 ```
+
+---
+
+## Port record — Lazy-load large file lists on scroll + `scope=root` (mssql `1c868bd`)
+agent: DevEngineer | date: 2026-11-02 | source: mssql commit `1c868bd04fd00d90bc4681d8d33f42551e5a217f`
+
+## Intention
+Port the mssql lazy-loading of large file lists (scroll-driven, replacing
+repeated "Show more" clicks) onto the `postgresql` branch, including the opt-in
+`GET /api/files?scope=root` so the root "All Files" view pages this folder's own
+files (`folder_id IS NULL`) without bundling sub-folder files and without
+breaking the legacy full-inventory contract used by desktop/CLI sync.
+
+## Changement
+Classe : STANDARD — client-side UX change + additive opt-in query param; no
+breaking contract change on the PostgreSQL branch.
+
+An `IntersectionObserver` watches a 1px sentinel after the file list. When the
+sentinel enters a 400px pre-fold margin it calls `loadMoreFiles()` when the
+server reports more rows (`filesHasMore`), or reveals locally-windowed matches
+(`setVisibleLimit`) when a fully-loaded filtered result still has hidden rows.
+The observer re-arms on scope/search/window changes. "Show more" is retained as
+a fallback for keyboard / screen-reader / non-scroll interaction.
+
+`GET /api/files` gains an opt-in `scope=root` param (only meaningful without
+`folder_id`): when set, the query filters to `folder_id IS NULL`; when omitted,
+the historical FULL all-folders inventory contract is preserved.
+
+Client page size `FILES_SERVER_PAGE` raised from 100 to 500 (the server's cap)
+to cut round-trips 5x while the local render window (`visibleLimit`) still keeps
+the DOM small.
+
+## Fichiers
+| Fichier | Raison |
+|---|---|
+| `src/server.ts` (`GET /api/files`) | Add opt-in `scope=root` filter (`folder_id IS NULL`) to primary + legacy-fallback queries |
+| `src/app/features/files/pages/user-dashboard.tsx` | `useRef` + sentinel ref, IntersectionObserver effect, `scope=root` on load/load-more, `FILES_SERVER_PAGE=500` |
+
+## Contrats publics impactés
+OUI — `GET /api/files` (additive, opt-in):
+- `?scope=root` (no `folder_id`) → paginate/filter to `folder_id IS NULL` (this folder's own files only).
+- omitted → historical FULL all-folders inventory (legacy desktop/CLI contract preserved).
+- `folder_id=...` inside sub-folders → unchanged.
+- Response shape/fields unchanged; `limit/offset`, `total`, `has_more`, `account_file_count` unchanged.
+
+## SQL readjustment (mssql → postgresql)
+| MSSQL (`1c868bd`) | PostgreSQL (port) |
+|---|---|
+| `@rootOnly=0 AND (@folderId IS NULL …)` / `@rootOnly=0` | `@rootOnly=FALSE` / `@rootOnly=TRUE` (matches existing `@includeSystem=TRUE/FALSE` convention; `sql.Bit` normalizes to PG boolean) |
+| `@folderId IS NULL` | `(CAST(@folderId AS uuid) IS NULL)` (ee62ac0 null-param type inference, unchanged from M-3 port) |
+
+Translation verified: `@rootOnly=TRUE` → `$3=TRUE AND f.folder_id IS NULL`;
+`@rootOnly=FALSE` → `$2=FALSE AND (…full inventory…)`.
+
+## Validation
+Type-check: ✅ (`npm run lint` → `tsc --noEmit`, exit 0)
+Build: ✅ (`npm run build`, both vite client and esbuild server bundle)
+Smoke: ⚠SKIPPED (no live PostgreSQL DB/UI here)
+
+## Rollback
+```bash
+git revert <port-commit>   # on feat/port-mssql-lazy-loading-postgresql
+```
