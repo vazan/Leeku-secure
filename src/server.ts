@@ -827,6 +827,12 @@ interface ShareRow {
   id: string; file_id: string; public_token: string; password_hash: string | null;
   expires_at: Date | null; max_downloads: number | null; download_count: number;
   is_active: boolean; allow_external_preview: boolean; allow_decrypted_external_preview: boolean; created_at: Date;
+  // Columns joined from `files` so the endpoint can return each shared file's
+  // decrypted name without the client fetching the whole inventory.
+  original_name_encrypted: Buffer;
+  original_name_iv: Buffer;
+  original_name_auth_tag: Buffer;
+  original_name?: string;
 }
 
 interface FolderShareRow {
@@ -1100,6 +1106,7 @@ function mapShareRow(row: ShareRow): ShareLink {
     id:             row.id,
     file_id:        row.file_id,
     public_token:   row.public_token,
+    original_name:  decryptColumn(row.original_name_encrypted, row.original_name_iv, row.original_name_auth_tag),
     allow_external_preview: !!row.allow_external_preview,
     allow_decrypted_external_preview: !!row.allow_decrypted_external_preview,
     password:       row.password_hash ? '[protected]' : undefined,
@@ -5061,7 +5068,7 @@ app.get('/api/sharing/links', authenticateUser as express.RequestHandler, async 
     request.input('ownerId', sql.UniqueIdentifier, req.userId!);
     request.input('systemFolderName', sql.NVarChar(120), SYSTEM_UPDATE_FOLDER_NAME);
     const result = await request.query<ShareRow & { stored_path: string }>(
-      `SELECT sl.id,sl.file_id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.allow_external_preview,sl.allow_decrypted_external_preview,sl.created_at,f.stored_path
+      `SELECT sl.id,sl.file_id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.allow_external_preview,sl.allow_decrypted_external_preview,sl.created_at,f.stored_path,f.original_name_encrypted,f.original_name_iv,f.original_name_auth_tag
        FROM share_links sl
        INNER JOIN files f ON sl.file_id=f.id
        WHERE f.owner_user_id=@ownerId

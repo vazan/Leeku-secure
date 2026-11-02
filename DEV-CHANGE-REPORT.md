@@ -5,50 +5,50 @@ plan: /memories/session/dev-plan.md
 
 ## Intention
 Fix the "Shared" dashboard tab showing the generic "Shared file" placeholder instead of
-each file's real name. Root cause: the tab resolved names against the paginated,
-folder-scoped `files` state, so shared files outside the current page/scope were not found.
+each file's real name — without the client loading and decrypting the whole inventory.
 
 ## Changement
-Classe : STANDARD — client-only UI fix; no API/type/route contract change.
+Classe : STANDARD — additive server field + client tweak; no breaking contract change.
 
 ## Fichiers
 | Fichier | Raison |
 |---|---|
-| src/app/features/files/pages/user-dashboard.tsx | Added full-inventory fetch + name resolution in the Shared tab |
+| src/server.ts | ShareRow + mapShareRow + GET /api/sharing/links SELECT decrypt & return each file's name |
+| src/app/shared/types/index.ts | ShareLink gains optional `original_name` |
+| src/app/features/files/pages/user-dashboard.tsx | Use `link.original_name` (fallback to `files` lookup) |
 
 ## Contrats publics impactés
-NON — no API, DB schema, or shared type/route changed only a client-side state fetch.
+OUI — additive only: `GET /api/sharing/links` returns a new optional `original_name`
+per link. Old clients ignore unknown fields; existing fields unchanged. BC-safe.
 
 ## Risques
-Perf : low — full inventory only fetched (and decrypted server-side per row) when the
-Shared view is opened, mirroring the existing trash/admin lazy-load pattern; the request
-reuses the pre-existing unpaginated `/api/files` contract.
-Sécu : none.
-Régression : low — `files` lookup kept as a fallback; "Shared file"/"Shared folder"
-placeholders still shown if the fetch fails or the file no longer exists.
-Compat : none — same endpoint, same response shape.
+Perf : improved — only shared links' names are decrypted (small set), instead of the
+whole inventory (thousands) on every Shared-view load. Initial client approach (load
+all files) reversed.
+Sécu : none — name comes from the owner's own file rows under existing authz.
+Régression : low — `link.original_name` is optional; fallback to `files` lookup and the
+"Shared file" default are preserved.
+Compat : none — same endpoint/response shape plus an additive field.
 
 ## Dette observée
-MINOR — the Shared tab could avoid loading the whole inventory by having
-`/api/sharing/links` return each file's name, but that requires server-side decryption
-per row and a contract change; out of scope here.
+AUCUNE — the prior MINOR debt (client loading the whole inventory for names) is resolved
+by this server-side field.
 
 ## Validation
-Build: ✅  Lint/type-check: ✅ (52 pre-existing server errors unchanged; 0 new in
-user-dashboard.tsx)  Smoke: ⚠SKIPPED (no DB runtime available)
+Build (client `vite build`): ✅ | Build (server esbuild bundle): ✅ | Lint/type-check: ✅
+(52 pre-existing server errors unchanged; 0 new in edited regions) | Smoke: ⚠SKIPPED
+(no DB runtime available)
 
 ## Approbation CRITICAL
 N/A
 
 ## Handoff TestEngineer
-- Enter "Shared" tab while a shared file lives in a different folder → its real name
-  must render (was "Shared file").
-- Enter "Shared" tab while a shared file is beyond the first server page (offset > 500)
-  → real name must render.
-- Shared folder cards unaffected.
-- Transient network failure while Shared loads → cards still render (fallback name),
-  no crash.
+- GET /api/sharing/links returns `original_name` matching the file's real name.
+- Shared tab shows the real name even when the file is in another folder / beyond the
+  first page (no full-inventory fetch fired).
+- Fallback path: cached/older link without `original_name` still resolves via `files`
+  or shows "Shared file" — no crash.
 
 ## Handoff QaEngineer
-Validated: client build clean, no new type errors elsewhere; handoff report +
+Validated: both client and server build clean; no new type errors elsewhere; report +
 trail on branch `fix/files-shared-tab-names`.

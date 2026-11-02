@@ -424,11 +424,6 @@ export default function UserDashboard({
   const [activeFolderId, setActiveFolderId] = useState<string | null>(null);
   const [links, setLinks] = useState<ShareLink[]>([]);
   const [folderLinks, setFolderLinks] = useState<FolderShareLink[]>([]);
-  // Full (unpaginated) inventory used to resolve real names for shared-file
-  // cards. The paginated `files` state is folder-scoped and windowed, so a
-  // shared file outside the current page/scope would otherwise render as the
-  // generic "Shared file" placeholder. Fetched lazily when Shared is opened.
-  const [sharedFiles, setSharedFiles] = useState<FileMetadata[]>([]);
   const [adminUsers, setAdminUsers] = useState<User[]>([]);
   const [adminFiles, setAdminFiles] = useState<FileMetadata[]>([]);
   const [adminFolders, setAdminFolders] = useState<AdminFileFolder[]>([]);
@@ -738,25 +733,6 @@ export default function UserDashboard({
     }
   };
 
-  // Fetch the user's full file inventory (no limit/offset → unpaginated legacy
-  // contract) so the Shared tab can display every shared file's real name even
-  // when the file lives in another folder or beyond the currently loaded page.
-  const loadSharedFiles = async () => {
-    try {
-      const response = await fetch("/api/files?_t=" + Date.now(), {
-        headers: authHeaders(token),
-      });
-      if (response.ok) {
-        setSharedFiles(((await response.json()).files || []) as FileMetadata[]);
-      } else {
-        notifyError("Could not load files for the shared list.");
-      }
-    } catch {
-      // Keep the previously loaded inventory (or the "Shared file" fallback)
-      // rather than crashing the Shared tab on a transient network error.
-    }
-  };
-
   const loadAdminCore = async () => {
     if (user.role !== "Admin") return;
     const headers = authHeaders(token);
@@ -813,9 +789,6 @@ export default function UserDashboard({
   useEffect(() => {
     if (view === "trash") {
       loadTrash().catch(() => notifyError("Could not refresh trash."));
-    }
-    if (view === "shared") {
-      loadSharedFiles().catch(() => notifyError("Could not refresh shared files."));
     }
     if (view === "admin" && user.role === "Admin") {
       loadAdminFiles().catch(() => notifyError("Could not refresh admin data."));
@@ -3353,9 +3326,7 @@ export default function UserDashboard({
               ) : (
                 <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
                   {links.map((link) => {
-                    const file =
-                      sharedFiles.find((item) => item.id === link.file_id) ||
-                      files.find((item) => item.id === link.file_id);
+                    const file = files.find((item) => item.id === link.file_id);
                     return (
                       <div
                         key={link.id}
@@ -3374,7 +3345,7 @@ export default function UserDashboard({
                           </span>
                         </div>
                         <p className="mt-4 truncate text-sm font-medium">
-                          {file?.original_name || "Shared file"}
+                          {link.original_name || file?.original_name || "Shared file"}
                         </p>
                         <p className="mt-1 text-xs text-[var(--text-muted)]">
                           {link.download_count}
