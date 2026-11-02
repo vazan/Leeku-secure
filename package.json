@@ -16,6 +16,7 @@
     "test:trash-purge": "tsx --test tests/trash-purge.test.ts",
     "test:translate-query-versioning": "tsx --test tests/translate-query-versioning.test.ts",
     "backfill:file-hashes": "tsx scripts/backfill-file-hashes.ts",
+    "cleanup:vault-orphans": "tsx scripts/cleanup-vault-orphans.ts",
     "lint": "tsc --noEmit"
   },
   "dependencies": {

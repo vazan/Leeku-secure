@@ -1502,3 +1502,47 @@ Handoff QaEngineer
 
 Approval trail
 - Not required (STANDARD change).
+
+---
+
+## Port record — Routes/perf fixes from mssql PR #29 (M-1, M-3, H-1)
+agent: DevEngineer | date: 2026-11-02 | source: mssql PR #29 (`5a68939`, base `08a1ca7`, merged `ee4ccb0`)
+
+## Intention
+Port the mssql route-performance fixes (M-1, M-3, H-1) and the vault-orphan
+cleanup tool onto the `postgresql` branch, reworking every T-SQL construct that
+the `PgRequest`/`translateQuery` adapter does not handle.
+
+## Changement
+Classe : STANDARD — backend + frontend port; the only contract delta on the
+PostgreSQL branch is additive and opt-in (`GET /api/files` `limit/offset/folder_id`
++ `total/has_more/account_file_count`), mirroring mssql PR #29.
+
+## Fichiers
+| Fichier | Raison |
+|---|---|
+| `src/server.ts` | M-1: drop per-auth `files_used` COUNT; M-3: opt-in pagination on `GET /api/files` (PG-native `LIMIT @n OFFSET @m` + `CAST(@folderId AS uuid)`); folder-delete ×2 unlink archived `file_versions` blobs; H-1: use imported `mergeChunks` |
+| `src/server/merge-chunks.ts` | (NEW) streaming chunk merge extracted (no SQL — ported as-is) |
+| `scripts/cleanup-vault-orphans.ts` | (NEW) vault-orphan reconciler; `dbo.<t>` → `<t>`, `OFFSET..FETCH NEXT` → `LIMIT..OFFSET` |
+| `src/app/features/files/pages/user-dashboard.tsx` | M-3 client paging (no SQL — ported as-is) |
+| `tests/merge-chunks.test.ts` | (NEW) H-1 unit tests (no SQL) |
+| `tests/translate-query-versioning.test.ts` | +2 tests covering the PR #29 pagination SQL translation |
+| `package.json` | +`cleanup:vault-orphans` script |
+
+## SQL readjustment (mssql → postgresql)
+| MSSQL (PR #29) | PostgreSQL (port) |
+|---|---|
+| `OFFSET @o ROWS FETCH NEXT @n ROWS ONLY` | `LIMIT @n OFFSET @o` (native; translator does not rewrite `OFFSET..FETCH NEXT`) |
+| `@folderId IS NULL` (nullable uuid) | `(CAST(@folderId AS uuid) IS NULL)` (ee62ac0 null-param type inference) |
+| `COUNT(*) OVER() AS total_count` | unchanged (valid in both) |
+| folder-delete `file_versions ... WHERE file_id IN (@fid…)` | unchanged (params via translator) |
+| `dbo.<table>` | `<table>` |
+
+## Validation
+Type-check: ✅ (`npm run lint` → `tsc --noEmit`, exit 0)
+Unit tests: ✅ `merge-chunks` 5/5, `translate-query-versioning` 10/10, encryption/text-preview/syntax-preview/desktop-updates all pass.
+
+## Rollback
+```bash
+git revert <port-commit>   # on feat/port-routes-perf-m1-m3-h1-postgresql
+```

@@ -123,3 +123,44 @@ test('translateQuery - missing bound parameter throws (guards null-param regress
     req.translateQuery('SELECT * FROM file_versions WHERE file_id=@fileId AND id=@vid', req['params']);
   }, /Missing bound parameter: vid/);
 });
+
+// PR #29 (routes perf M-3): server-side pagination on GET /api/files ported to
+// PostgreSQL. The native LIMIT/OFFSET form is written directly in the source
+// (translateQuery does NOT rewrite T-SQL "OFFSET .. ROWS FETCH NEXT .. ROWS
+// ONLY"), and the nullable folderId param is CAST to uuid so PG can infer its
+// type when NULL (ee62ac0 pattern). This guards the mssql→postgresql
+// readjustment of the PR #29 SQL.
+test('translateQuery - GET /api/files pagination (LIMIT/OFFSET + CAST folderId)', () => {
+  const { text, values } = run(
+    `SELECT id, COUNT(*) OVER() AS total_count
+     FROM files f
+     WHERE owner_user_id=@ownerId
+       AND ((CAST(@folderId AS uuid) IS NULL) OR f.folder_id=CAST(@folderId AS uuid))
+     ORDER BY created_at DESC
+     LIMIT @limit OFFSET @offset`,
+    [
+      ['ownerId', 'user-1'],
+      ['folderId', null],
+      ['limit', 100],
+      ['offset', 0],
+    ]
+  );
+  // Native LIMIT/OFFSET must survive translation untouched (with @params -> $n).
+  assert.ok(/LIMIT \$3 OFFSET \$4/.test(text), 'LIMIT @limit OFFSET @offset -> LIMIT $3 OFFSET $4');
+  // CAST wrappers must be preserved for NULL-safe type inference.
+  assert.ok(text.includes('CAST($2 AS uuid)'), 'CAST(@folderId AS uuid) -> CAST($2 AS uuid)');
+  // count() window function is passed through unchanged (valid in PG).
+  assert.ok(text.includes('COUNT(*) OVER()'), 'COUNT(*) OVER() preserved');
+  assert.deepEqual(values, ['user-1', null, 100, 0]);
+});
+
+test('translateQuery - GET /api/files unpaged legacy call has no LIMIT/OFFSET', () => {
+  const { text } = run(
+    `SELECT id FROM files
+     WHERE owner_user_id=@ownerId
+     ORDER BY created_at DESC`,
+    [['ownerId', 'user-1']]
+  );
+  assert.ok(!/LIMIT/.test(text), 'no LIMIT clause for legacy full-inventory call');
+  assert.ok(!/OFFSET/.test(text), 'no OFFSET clause for legacy full-inventory call');
+});
