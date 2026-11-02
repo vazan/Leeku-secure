@@ -9,6 +9,7 @@ import {
   ArrowDownToLine,
   Camera,
   CalendarDays,
+  ChevronDown,
   Copy,
   Eye,
   FileVolume2,
@@ -40,6 +41,13 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/app/shared/components/ui/popover";
+import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+} from "@/app/shared/components/ui/dropdown-menu";
 import { MaintenanceModeBanner } from "@/app/shared/components/maintenance-mode-banner";
 import type {
   AdminFileFolder,
@@ -2383,12 +2391,32 @@ export default function UserDashboard({
   const [isReadOnly, setIsReadOnly] = useState(true);
   const [password, setPassword] = useState('');
 
+  // POURQUOI : Settings moved into the top-right profile dropdown for desktop
+  // (lg+), so the sidebar hides its duplicate nav entry. Mobile keeps the menu
+  // item because it has no profile dropdown. `isDesktopNav` tracks the lg
+  // (1024px) breakpoint the sidebar uses to decide its own visibility.
+  const [isDesktopNav, setIsDesktopNav] = useState(
+    () =>
+      typeof window !== "undefined" &&
+      window.matchMedia("(min-width: 1024px)").matches,
+  );
+
+  useEffect(() => {
+    const mql = window.matchMedia("(min-width: 1024px)");
+    const onChange = (event: MediaQueryListEvent) =>
+      setIsDesktopNav(event.matches);
+    mql.addEventListener("change", onChange);
+    return () => mql.removeEventListener("change", onChange);
+  }, []);
+
   const navItems: DashboardNavItem[] = [
     ["home", <LayoutGrid className="h-4 w-4" />, "Home"],
     ["files", <Folder className="h-4 w-4" />, "All files"],
     ["shared", <Share2 className="h-4 w-4" />, "Shared"],
     ["trash", <Trash2 className="h-4 w-4" />, "Trash"],
-    ["settings", <Settings className="h-4 w-4" />, "Settings"],
+    ...(isDesktopNav
+      ? []
+      : ([[ "settings", <Settings className="h-4 w-4" />, "Settings" ]] as DashboardNavItem[])),
   ];
   if (user.role === "Admin")
     navItems.push(["admin", <Shield className="h-4 w-4" />, "Admin"]);
@@ -2461,20 +2489,50 @@ export default function UserDashboard({
             aria-label="Log out"
             title="Log out"
             onClick={onLogout}
-            className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg border border-[var(--border-subtle)] text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] lg:hidden"
+            className="absolute right-3 top-3 z-10 flex h-11 w-11 shrink-0 items-center justify-center rounded-lg border border-[var(--border-subtle)] text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] sm:hidden"
           >
             <LogOut className="h-4 w-4" />
           </button>
-          <div className="absolute right-5 hidden items-center gap-3 sm:flex lg:right-8">
-            <ProfileAvatar
-              user={user}
-              version={avatarVersion}
-              className="h-9 w-9 text-sm"
-            />
-            <div>
-              <p className="text-sm font-medium">{user.username}</p>
-              <p className="text-xs text-[var(--text-muted)]">{user.role}</p>
-            </div>
+          <div className="absolute right-5 z-10 hidden items-center sm:flex lg:right-8">
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <button
+                  type="button"
+                  aria-label="Open profile menu"
+                  title="Profile menu"
+                  className="flex items-center gap-2 rounded-lg px-2 py-1.5 text-left outline-none hover:bg-[var(--bg-hover)] focus-visible:bg-[var(--bg-hover)] focus-visible:outline-none"
+                >
+                  <ProfileAvatar
+                    user={user}
+                    version={avatarVersion}
+                    className="h-9 w-9 text-sm"
+                  />
+                  <div>
+                    <p className="text-sm font-medium">{user.username}</p>
+                    <p className="text-xs text-[var(--text-muted)]">{user.role}</p>
+                  </div>
+                  <ChevronDown className="h-4 w-4 text-[var(--text-faint)]" />
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" sideOffset={6} className="w-56">
+                <DropdownMenuItem
+                  onSelect={() => navigateDashboard("settings")}
+                  className="gap-2 py-2"
+                >
+                  <Settings className="h-4 w-4" />
+                  Settings
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  variant="destructive"
+                  onSelect={onLogout}
+                  className="gap-2 py-2"
+                >
+                  <LogOut className="h-4 w-4" />
+                  Log Out
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
           </div>
         </header>
 
