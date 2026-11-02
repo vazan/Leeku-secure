@@ -2144,7 +2144,7 @@ app.get('/api/files', authenticateUser as express.RequestHandler, async (req: Au
                   )
               )
             )
-            AND (f.folder_id=@folderId OR (@folderId IS NULL AND f.folder_id IS NULL))
+            AND (@folderId IS NULL OR f.folder_id=@folderId)
         ) files
          ORDER BY created_at DESC
          ${paged ? 'OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY' : ''}`
@@ -2168,7 +2168,7 @@ app.get('/api/files', authenticateUser as express.RequestHandler, async (req: Au
                 expires_at, created_at,
                 COUNT(*) OVER() AS total_count
         FROM files WHERE owner_user_id=@ownerId AND COALESCE(status,'Available')!='Expired' AND deleted_at IS NULL
-          AND (folder_id=@folderId OR (@folderId IS NULL AND folder_id IS NULL))
+          AND (@folderId IS NULL OR folder_id=@folderId)
          ORDER BY created_at DESC
          ${paged ? 'OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY' : ''}`
       );

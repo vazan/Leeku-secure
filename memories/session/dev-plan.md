@@ -34,6 +34,29 @@ git revert  <merge-commit>   # or: git checkout mssql -- src/server.ts src/app/f
 git rm src/server/merge-chunks.ts tests/merge-chunks.test.ts
 ```
 
+---
+
+## DEV-PLAN — Fix M-3 folder-scoping regression in GET /api/files (version-explosion)
+Date : 2026-11-02 | Modèle : dev-engineer | Classe : CRITICAL (data: version explosion, up to 160 versions)
+
+### Bug (reproduced live)
+- `GET /api/files` with **no `folder_id`** (the legacy desktop/CLI contract) returned **only root-level files** (`folder_id IS NULL`), silently excluding every file inside a sub-folder.
+- Desktop sync engine calls `/api/files` without `folder_id` to build its FULL remote inventory → could never see already-uploaded files under a sub-folder remoteRoot → `findRemoteMatch` returned null → re-upload with `replaceRemoteId` each poll → server's "version-instead" archived the current version and bumped `version_count` → version explosion (160 versions).
+- Reproduced live with test account `admin_god601`: root-folder job stable, sub-folder job (`Leeku Desktop/pictures-3ef9f200`) looped infinitely. Live SMOKE: `WITH folder_id → 23 files (version_count 22)` vs `WITHOUT folder_id → 1 file (root only)`.
+
+### Root cause
+Introduced by `2e95019` (server-side pagination, M-3): the new unconditional folder-scope predicate
+`(f.folder_id=@folderId OR (@folderId IS NULL AND f.folder_id IS NULL))`
+reduces to `f.folder_id IS NULL` when `@folderId` is NULL — breaking the "all files" default.
+
+### Fix (applied & deployed by user)
+Change the predicate to `(@folderId IS NULL OR f.folder_id=@folderId)` in BOTH the primary query and the legacy fallback — no `folder_id` ⇒ return all folders; folder_id ⇒ scope to that folder.
+
+### Validation
+- `tsc --noEmit` : EXIT 0.
+- Live re-verify after deploy: `GET /api/files` (no folder_id) returns full inventory (27 files incl. sub-folder), sub-folder job `7d145a2e` shows 0 pending ops across successive polls (`last_sync_at` advancing, no operations queued).
+
+
 ### Risques
 | Risque | Prob. | Mitigation |
 |---|---|---|

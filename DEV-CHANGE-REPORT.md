@@ -1,82 +1,82 @@
 ---
-agent: DevEngineer | date: 2026-11-01 | model: dev-engineer
+agent: DevEngineer | date: 2026-11-02 | model: dev-engineer
 plan: /memories/session/dev-plan.md
 ---
 
 ## Intention
-Implement the Route & Performance audit fixes M-1 (remove the per-request
-`COUNT(*) FROM files` subquery from `authenticateUser`), M-3 (server-side
-pagination of `GET /api/files` so a bounded page, not the whole account file
-set, is transferred and held in the client), and H-1 (streaming chunk-merge for
-resumable uploads so large files don't block the event loop), all behind a
-feature branch and validated by build/lint/tests.
+Fix a regression introduced by the M-3 server-side pagination work (`2e95019`)
+in `GET /api/files`: when called **without** `folder_id` (the legacy desktop /
+CLI / mobile "full inventory" contract), the route returned only **root-level
+files** (`folder_id IS NULL`), silently hiding every file stored inside a
+sub-folder. That made the desktop sync engine believe its already-uploaded
+files no longer existed remotely, so it re-uploaded them every poll with
+`replaceRemoteId`, and the server's version-instead logic archived the current
+version and bumped `version_count` on each pass — producing the **version
+explosion** (up to 160 versions of a single logical file).
 
 ## Changement
-Classe : STANDARD — touches the auth middleware, a public route contract, the
-file-dashboard client, and the resumable-upload merge path; each of the three
-changes is localized and CI-validated.
+Classe : CRITICAL — a one-line SQL predicate in a public route contract whose
+failure caused unbounded, destructive data growth (version_count inflation)
+and stalled sync. Localized to two WHERE clauses in one handler; validated
+both by type-check and by a live production re-verify after deploy.
 
 ## Fichiers
 | Fichier | Raison |
 |---|---|
-| `src/server.ts` | M-1 (auth COUNT removal), M-3 (paginated `/api/files`), H-1 (call `mergeChunks` from extracted module, drop local def) |
-| `src/server/merge-chunks.ts` | NEW — H-1 streaming merge extracted from `server.ts` so it is unit-testable without booting the server |
-| `src/app/features/files/pages/user-dashboard.tsx` | M-3 — fetch per-folder-scope pages, "Show more" loads next server page, totals/quota from server; folder nav via centralized `[activeFolderId]` refetch |
-| `tests/merge-chunks.test.ts` | NEW — H-1 unit tests (merge correctness, chunk cleanup, missing-chunk cleanup) |
-| `memories/session/dev-plan.md` | Plan artifact |
+| `src/server.ts` (`GET /api/files`) | Fix folder-scoping predicate in the primary query and the legacy fallback |
 
 ## Contrats publics impactés
-OUI
-- `GET /api/files` : added query params `limit` (default 200, clamp 1–500),
-  `offset`, `folder_id`; response adds `total`, `has_more`, `account_file_count`.
-  Backwards compatible — existing `files`/`trash_retention_days` fields kept.
-- `User.files_used` : now always 0 on the auth path (was a per-request COUNT).
-  Frontend does not consume it, so no functional impact.
-- Search is **not** executed server-side (the filename column is AES-256-GCM
-  encrypted); the client still filters the loaded/decrypted pages locally.
+OUI — `GET /api/files`:
+- No change to response shape/fields (backwards compatible).
+- **Behavior fix**: omitting `folder_id` now returns the owner's **full
+  inventory across all folders** (restores pre-M-3 contract) instead of only
+  root files. Passing `folder_id` still scopes to that folder.
+- `limit`/`offset` paging, `total`, `has_more`, `account_file_count` unchanged.
 
 ## Risques
-- Perf : ✅ — removed the per-request COUNT (M-1); `/api/files` now OFFSET/FETCH
-  pages (M-3); merge streams with backpressure (H-1).
-- Sécu : ✅ — no new trust boundary; folder scoping is owner-scoped; an
-  extra account-wide COUNT runs only once per list load, not per request.
-- Régression : ⚠ — client folder navigation re-wired through a centralized
-  `[activeFolderId]` effect; root scope semantics aligned with the client's
-  "All Files root". Needs QaEngineer manual pass on folder nav + multi-select.
-- Compat : ✅ — old `/api/files` callers still work (params optional).
+- Perf : restoring "all files" when no `folder_id` re-introduces the large
+  payload the M-3 pagination sought to bound. Mitigation: desktop/CLI already
+  opt-in to `limit`/`offset` where they page; the full-inventory call is the
+  documented legacy contract those clients depend on (sync planning needs the
+  whole tree). Accounts with very large file sets may page by passing
+  `limit`/`offset` — unaffected by this predicate change.
+- Sécu : none — same owner scoping, no new data exposed.
+- Régression : the only behavior changed is the no-`folder_id` default, which
+  was already broken (root-only) since `2e95019`; restoring "all files" fixes
+  the desktop loop. Folder-scoped browsing (`folder_id` set) is unchanged.
+- Compat	db : predicate is ANSI-standard; no schema dependency.
 
 ## Dette observée
-MAJOR — `tests/syntax-preview.test.ts` fails on base `mssql` and on this branch
-(both pre-existing; Node ESM cannot load the `.tsx` component in this test
-runner). Not introduced here, but the suite can't be fully green until fixed
-(TestEngineer/QaEngineer to triage separately).
+MAJOR — the upload version-detection query (lines ~3237, ~3265) still uses the
+`((@folderId IS NULL AND folder_id IS NULL) OR folder_id=@folderId)` form,
+which is CORRECT there (uploading to root vs a folder), so it was intentionally
+left alone. No other inventory endpoint showed the same buggy pattern.
 
 ## Validation
-Build: ✅  Lint: ✅ (`tsc --noEmit`)  Type-check: ✅  Tests: 15/16 (the 1
-failure, `syntax-preview`, is pre-existing on base `mssql`) + 2/2 new `merge-chunks`.
+Build: ✅ (esbuild/`vite build` unaffected — SQL string only; `tsc --noEmit` EXIT 0)  Lint: ✅ (`tsc --noEmit`)  Type-check: ✅  Smoke: ✅ (**live production re-verify after user deployed**)
+
+Live smoke evidence (test account `admin_god601`):
+- Before fix: `GET /api/files` (no folder_id) → 1 file (root only).
+- After fix: `GET /api/files` (no folder_id) → **27 files** (23 under `pictures-3ef9f200`, 3 under `direct-sync`, 1 root).
+- Sub-folder job `7d145a2e` (`/home/midorica/Pictures/discord` → `Leeku Desktop/pictures-3ef9f200`): after deploy, successive polls at 05:00:19, 05:02:06 show **0 pending operations** — the loop is stopped, no new versions created.
 
 ## Approbation CRITICAL
-N/A — no sensitive files (`**/.env`, keys) modified. M-3 choice of "full
-server-side pagination" was approved by the user via ask_user in the audit
-handoff; H-1 was explicitly allowed by the user ("can be attempted ... as long
-as a branch is created and properly tested").
+N/A — no sensitive files modified (`src/server.ts` only). Live deploy and
+confirmation performed by the user (user: "pushed your change ... desktop app
+seems to no longer be looping").
 
 ## Handoff TestEngineer
-- H-1 new tests live in `tests/merge-chunks.test.ts` (2 cases). Consider adding
-  an idempotency case (re-run merge is a no-op) and a case where a chunk result
-  is non-sequential (e.g. gaps).
-- M-3 has **no automated test** (no HTTP integration harness exists). Recommend
-  standing up an integration harness for `GET /api/files` asserting: default
-  page size, `offset` paging, `folder_id` scoping vs root, `total`/`has_more`
-  correctness, and `limit` clamping.
-- The `syntax-preview.test.ts` failure is pre-existing but should be triaged so
-  the suite can go fully green.
+- Add an integration/unit test asserting the `@folderId IS NULL` default
+  returns rows across ALL folders (not just `folder_id IS NULL`), for both the
+  primary and legacy-fallback queries.
+- Regression case: with `folder_id` set, still scopes to exactly that folder
+  (and rejects/ignores a `folder_id` the user doesn't own).
+- Consider parameterized test over: no params, `folder_id=null`, `folder_id=<subfolder>`, with paging.
 
 ## Handoff QaEngineer
-- Validation summary: build + lint + type-check green; new H-1 tests pass; the
-  one failing test (`syntax-preview`) is pre-existing on base `mssql`.
-- To re-validate manually: folder navigation (root ↔ subfolders ↔ breadcrumb),
-  "Show more" paging with >100 files, header count and quota display, search
-  over loaded pages, multi-select across pages, resumable upload completion.
-- Approbation state: M-3 full server-side pagination approved via ask_user;
-  H-1 approved on condition of branch + tests (met).
+- Validation summary: type-check green; **live production re-verify confirms
+  the version-explosion loop is fixed** (full inventory returned, sub-folder
+  job settled to 0 pending ops across multiple polls).
+- Approbation state: CRITICAL class, no sensitive files; user deployed and
+  confirmed the fix live. Recommend a follow-up cleanup of existing inflated
+  `version_count` rows (the already-created 160-version files) if desired.
