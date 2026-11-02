@@ -11,19 +11,28 @@ clickable, opening a dropdown menu with "Settings" and "Log Out".
 Classe : STANDARD — isolated client-side UX change in a single component; no
 public contract, API, or server change.
 
-The desktop (sm+) top-right profile block (avatar + username/role) is wrapped
-in a `DropdownMenu` whose trigger is a button containing the existing
-`ProfileAvatar`. The dropdown places two items:
+**Feature 1 — Profile dropdown.** The desktop (sm+) top-right profile block
+(avatar + username/role) is wrapped in a `DropdownMenu` whose trigger is a
+button containing the existing `ProfileAvatar`. The dropdown places two items:
 - **Settings** → `navigateDashboard("settings")` (existing settings view)
 - **Log Out** → `onLogout` (existing dashboard logout handler)
 
 The mobile fallback "Log out" icon button (visible below `lg`) is preserved as
 is, since the new dropdown wrapper is hidden on small screens (`hidden sm:flex`).
 
+**Feature 2 — Hide sidebar "Settings" on desktop.** Since desktop users now
+reach Settings via the profile dropdown, the duplicate "Settings" entry is
+removed from the side navigation on lg+ viewports. A `matchMedia("(min-width:
+1024px)")` listener (`isDesktopNav`) mirrors the sidebar's own `lg` visibility
+breakpoint, so:
+- **Desktop (lg+):** sidebar hides "Settings" (accessible via profile dropdown).
+- **Mobile (<lg):** the "Settings" item remains in the mobile `<select>` nav,
+  because mobile lacks the profile dropdown.
+
 ## Fichiers
 | Fichier | Raison |
 |---|---|
-| `src/app/features/files/pages/user-dashboard.tsx` | Add DropdownMenu imports, ChevronDown icon, and wrap profile in dropdown |
+| `src/app/features/files/pages/user-dashboard.tsx` | Add DropdownMenu imports, ChevronDown icon, wrap profile in dropdown, and conditionally hide sidebar Settings on desktop |
 
 ## Contrats publics impactés
 NON — no API, types, or route changes. `DashboardView`, `navigateDashboard`,
@@ -55,8 +64,11 @@ N/A — STANDARD class, no sensitive files.
 - "Log Out" logs the user out and returns to the landing view.
 - Keyboard: trigger is focusable (button), dropdown is a radix-menu (arrow-key
   navigable); Escape closes.
-- Regression: sidebar "Log out" button, mobile (<lg) header LogOut button, and
-  the Settings sidebar entry all still work.
+- Regression: sidebar "Log out" button, mobile (<lg) header LogOut button all still work.
+- Desktop (lg+): sidebar does NOT show "Settings"; it is reachable via the profile dropdown.
+- Mobile (<lg): sidebar/mobile nav still shows "Settings" (no profile dropdown available).
+- Resize across the 1024px breakpoint: "Settings" appears/disappears in the nav
+  to match the available entry points; dropdown stays functional.
 - Confirm dropdown closes when clicking outside / pressing Escape.
 
 ## Handoff QaEngineer

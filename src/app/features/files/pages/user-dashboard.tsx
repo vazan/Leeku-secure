@@ -2377,12 +2377,32 @@ export default function UserDashboard({
   const [isReadOnly, setIsReadOnly] = useState(true);
   const [password, setPassword] = useState('');
 
+  // POURQUOI : Settings moved into the top-right profile dropdown for desktop
+  // (lg+), so the sidebar hides its duplicate nav entry. Mobile keeps the menu
+  // item because it has no profile dropdown. `isDesktopNav` tracks the lg
+  // (1024px) breakpoint the sidebar uses to decide its own visibility.
+  const [isDesktopNav, setIsDesktopNav] = useState(
+    () =>
+      typeof window !== "undefined" &&
+      window.matchMedia("(min-width: 1024px)").matches,
+  );
+
+  useEffect(() => {
+    const mql = window.matchMedia("(min-width: 1024px)");
+    const onChange = (event: MediaQueryListEvent) =>
+      setIsDesktopNav(event.matches);
+    mql.addEventListener("change", onChange);
+    return () => mql.removeEventListener("change", onChange);
+  }, []);
+
   const navItems: DashboardNavItem[] = [
     ["home", <LayoutGrid className="h-4 w-4" />, "Home"],
     ["files", <Folder className="h-4 w-4" />, "All files"],
     ["shared", <Share2 className="h-4 w-4" />, "Shared"],
     ["trash", <Trash2 className="h-4 w-4" />, "Trash"],
-    ["settings", <Settings className="h-4 w-4" />, "Settings"],
+    ...(isDesktopNav
+      ? []
+      : ([[ "settings", <Settings className="h-4 w-4" />, "Settings" ]] as DashboardNavItem[])),
   ];
   if (user.role === "Admin")
     navItems.push(["admin", <Shield className="h-4 w-4" />, "Admin"]);
