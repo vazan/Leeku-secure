@@ -121,3 +121,41 @@ test('mergeChunks resolves UPLOAD_TEMP_PATH lazily (env set after import)', asyn
     fs.rmSync(lazySandbox, { recursive: true, force: true });
   }
 });
+
+// Regression: the original per-chunk `pipeline(readStream, writeStream,
+// { end:false })` loop accumulated a new set of error/close/finish/end
+// listeners on the shared write stream for EVERY chunk. Past 10 chunks Node
+// emits `MaxListenersExceededWarning` (seen on the 97-chunk production upload).
+// A single pipeline must keep the listener count flat, so merging well over 10
+// chunks must not emit that warning.
+test('mergeChunks does not accumulate listeners across many chunks', async () => {
+  const id = 'h1-many';
+  const chunkCount = 25; // well above the default MaxListeners threshold (10)
+  const parts: string[] = [];
+  const dir = chunkDir(id);
+  fs.mkdirSync(dir, { recursive: true });
+  for (let i = 1; i <= chunkCount; i++) {
+    const part = `part-${i}-`;
+    parts.push(part);
+    fs.writeFileSync(path.join(dir, String(i)), part);
+  }
+
+  const warnings: string[] = [];
+  const onWarning = (w: Error) => {
+    if (w.name === 'MaxListenersExceededWarning' || /MaxListenersExceeded/.test(w.message)) {
+      warnings.push(w.message);
+    }
+  };
+  process.on('warning', onWarning);
+  try {
+    const mergedPath = await mergeChunks(id, chunkCount);
+    assert.equal(fs.readFileSync(mergedPath, 'utf8'), parts.join(''));
+    assert.equal(fs.existsSync(dir), false, 'chunk dir should be cleaned up');
+    fs.rmSync(mergedPath, { force: true });
+  } finally {
+    process.removeListener('warning', onWarning);
+  }
+
+  assert.deepEqual(warnings, [], `expected no MaxListenersExceededWarning, got: ${warnings.join(' | ')}`);
+});
+
