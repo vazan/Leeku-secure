@@ -1,4 +1,10 @@
-import React, { Suspense, useEffect, useMemo, useState } from "react";
+import React, {
+  Suspense,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   ArrowDownToLine,
   Camera,
@@ -79,10 +85,10 @@ const TextFilePreview = React.lazy(
 // window the list and reveal additional files on demand.
 const INITIAL_VISIBLE_FILES = 100;
 const VISIBLE_FILES_PAGE = 200;
-// Server-side page size for GET /api/files (M-3). Kept small enough that a page
-// of decrypted metadata is light; matches INITIAL_VISIBLE_FILES so the first
-// page renders immediately without a local "Show more" window shrink.
-const FILES_SERVER_PAGE = 100;
+// Server-side page size for GET /api/files (M-3). Set to the server's max
+// allowed limit (500) to cut the round-trips needed to populate large folders;
+// the local render window (visibleLimit) below still keeps the DOM small.
+const FILES_SERVER_PAGE = 500;
 
 interface UserDashboardProps {
   user: User;
@@ -475,6 +481,7 @@ export default function UserDashboard({
     activeXhr: XMLHttpRequest | null;
   } | null>(null);
   const downloadRequestRef = React.useRef<AbortController | null>(null);
+  const loadMoreSentinelRef = React.useRef<HTMLDivElement | null>(null);
 
   const activeQuota =
     quotas.find((quota) => quota.id === user.quota_id) || quotas[0];
@@ -609,7 +616,12 @@ export default function UserDashboard({
   const loadFilesAndLinks = async () => {
     setFilesLoading(true);
     try {
-      const scope = activeFolderId ? `&folder_id=${encodeURIComponent(activeFolderId)}` : "";
+      const scope = activeFolderId
+        ? `&folder_id=${encodeURIComponent(activeFolderId)}`
+        // Root "All Files" view shows only this folder's own files, so ask the
+        // server to paginate the root-only set (folder_id IS NULL). Omitting it
+        // would return the full all-folders inventory and starve the root list.
+        : `&scope=root`;
       const [filesResponse, linksResponse] = await Promise.all([
         fetch(`/api/files?_t=${Date.now()}&limit=${FILES_SERVER_PAGE}&offset=0${scope}`, {
           headers: authHeaders(token),
@@ -665,7 +677,9 @@ export default function UserDashboard({
     if (filesLoading) return;
     setFilesLoading(true);
     try {
-      const scope = activeFolderId ? `&folder_id=${encodeURIComponent(activeFolderId)}` : "";
+      const scope = activeFolderId
+        ? `&folder_id=${encodeURIComponent(activeFolderId)}`
+        : `&scope=root`;
       const response = await fetch(
         `/api/files?_t=${Date.now()}&limit=${FILES_SERVER_PAGE}&offset=${files.length}${scope}`,
         { headers: authHeaders(token) },
@@ -825,6 +839,29 @@ export default function UserDashboard({
     () => visibleFiles.slice(0, visibleLimit),
     [visibleFiles, visibleLimit],
   );
+
+  // POURQUOI : re-arm the observer whenever filesHasMore / the visible window /
+  // the scope changes so the trigger always reflects the latest state instead of
+  // firing once on mount only. This replaces "Show more" clicks with seamless
+  // scroll-driven lazy loading for accounts holding thousands of files.
+  useEffect(() => {
+    const sentinel = loadMoreSentinelRef.current;
+    if (!sentinel) return;
+    // Root margin pulls the trigger slightly ahead of the fold so a new page is
+    // fetched before the user hits the very bottom, keeping the scroll smooth.
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (!entries.some((entry) => entry.isIntersecting) || filesLoading) return;
+        // Load next server page if one exists; otherwise reveal locally-windowed matches.
+        if (filesHasMore) void loadMoreFiles();
+        else setVisibleLimit((limit) => limit + VISIBLE_FILES_PAGE);
+      },
+      { root: null, rootMargin: "400px 0px", threshold: 0 },
+    );
+    observer.observe(sentinel);
+    return () => observer.disconnect();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filesHasMore, visibleFiles.length, paginatedFiles.length, activeFolderId, search]);
 
   // Reset the render window when the scope or search changes so results start
   // from the top. Paged appends (loadMoreFiles) grow the window instead — the
@@ -3031,6 +3068,13 @@ export default function UserDashboard({
                     </span>
                   </button>
                 </div>
+              )}
+              {!filesLoading && (filesHasMore || paginatedFiles.length < visibleFiles.length) && (
+                <div
+                  ref={loadMoreSentinelRef}
+                  aria-hidden="true"
+                  className="h-px w-px"
+                />
               )}
 
               {/* Floating action button for the current multi-selection, bottom-right of the list. */}
