@@ -63,6 +63,7 @@ import DashboardSidebar, {
 import TransferProgress, {
   type TransferState,
 } from "@/app/shared/components/common/transfer-progress";
+import LoadingProgressBar from "@/app/shared/components/common/loading-progress-bar";
 import FileTypeIcon, {
   getFileTypeBadge,
 } from "@/app/shared/components/common/file-type-icon";
@@ -2464,6 +2465,14 @@ export default function UserDashboard({
         </header>
 
         <div className="mx-auto w-full min-w-0 max-w-7xl overflow-x-hidden px-3 py-5 sm:p-5 lg:p-8">
+          <LoadingProgressBar
+            operations={[
+              { loading: filesLoading, weight: 3 },
+              { loading: foldersLoading, weight: 1 },
+              { loading: trashLoading, weight: 2 },
+              { loading: versionsLoading, weight: 1 },
+            ]}
+          />
           {transfer && (
             <div className="mx-auto mb-6 max-w-5xl">
               <TransferProgress
@@ -2626,8 +2635,7 @@ export default function UserDashboard({
                 </h1>
                 <p className="mt-1 text-sm text-[var(--text-muted)]">
                   {filesLoading ? (
-                    <span className="inline-flex items-center gap-1.5">
-                      <div className="h-4 w-4 animate-spin rounded-full border-2 border-[var(--border-subtle)] border-t-[var(--accent-linear)]" />
+                    <span className="text-sm text-[var(--text-faint)]">
                       Loading files...
                     </span>
                   ) : (
@@ -2733,15 +2741,7 @@ export default function UserDashboard({
                 </div>
               )}
 
-              {filesLoading ? (
-                <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] p-8 text-center shadow-[var(--shadow-hairline)]">
-                  <div className="mx-auto mb-3 h-8 w-8 animate-spin rounded-full border-2 border-[var(--border-subtle)] border-t-[var(--accent-linear)]" />
-                  <p className="text-sm font-medium">Loading files...</p>
-                  <p className="mt-1 text-xs text-[var(--text-muted)]">
-                    Please wait while we fetch your files.
-                  </p>
-                </div>
-              ) : visibleFiles.length === 0 ? (
+              {filesLoading ? null : visibleFiles.length === 0 ? (
                 <div className="rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-panel)] p-8 text-center shadow-[var(--shadow-hairline)]">
                   <p className="text-sm font-medium">No matching files</p>
                   <p className="mt-1 text-xs text-[var(--text-muted)]">
@@ -3113,8 +3113,7 @@ export default function UserDashboard({
                 </p>
               </div>
               {trashLoading ? (
-                <div className="flex items-center justify-center gap-2 py-16 text-[var(--text-muted)]">
-                  <div className="h-5 w-5 animate-spin rounded-full border-2 border-[var(--border-subtle)] border-t-[var(--accent-linear)]" />
+                <div className="py-16 text-center text-[var(--text-muted)]">
                   Loading trash...
                 </div>
               ) : trashFiles.length === 0 && trashVersions.length === 0 ? (
