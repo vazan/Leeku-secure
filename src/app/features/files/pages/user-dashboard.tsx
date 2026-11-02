@@ -86,10 +86,8 @@ const TextFilePreview = React.lazy(
 const INITIAL_VISIBLE_FILES = 100;
 const VISIBLE_FILES_PAGE = 200;
 // Server-side page size for GET /api/files (M-3). Set to the server's max
-// allowed limit (500) so each lazy-load fetch pulls the largest bounded page
-// the endpoint accepts — this cuts the round-trips (and time) needed to
-// populate large folders 5x vs the old 100-per-page default, while the local
-// render window (visibleLimit) below still keeps the DOM small.
+// allowed limit (500) to cut the round-trips needed to populate large folders;
+// the local render window (visibleLimit) below still keeps the DOM small.
 const FILES_SERVER_PAGE = 500;
 
 interface UserDashboardProps {
@@ -483,9 +481,6 @@ export default function UserDashboard({
     activeXhr: XMLHttpRequest | null;
   } | null>(null);
   const downloadRequestRef = React.useRef<AbortController | null>(null);
-  // Sentinel element at the bottom of the file list; when it scrolls into view
-  // the IntersectionObserver triggers lazy-loading of the next page (M-3) so
-  // users no longer have to click "Show more" dozens of times for large sets.
   const loadMoreSentinelRef = React.useRef<HTMLDivElement | null>(null);
 
   const activeQuota =
@@ -684,9 +679,6 @@ export default function UserDashboard({
     try {
       const scope = activeFolderId
         ? `&folder_id=${encodeURIComponent(activeFolderId)}`
-        // Root "All Files" view shows only this folder's own files, so ask the
-        // server to paginate the root-only set (folder_id IS NULL). Omitting it
-        // would return the full all-folders inventory and starve the root list.
         : `&scope=root`;
       const response = await fetch(
         `/api/files?_t=${Date.now()}&limit=${FILES_SERVER_PAGE}&offset=${files.length}${scope}`,
@@ -848,16 +840,10 @@ export default function UserDashboard({
     [visibleFiles, visibleLimit],
   );
 
-  // Lazy loading: when the sentinel at the bottom of the file list scrolls into
-  // view (or is near it), automatically fetch the next server page and reveal
-  // locally-windowed matches. This replaces the need to click "Show more"
-  // dozens of times for accounts holding thousands of files — the list keeps
-  // growing as the user scrolls. The "Show more" button remains as a fallback
-  // for non-scroll (e.g. keyboard/screen-reader) interaction.
-  //
-  // POURQUOI : we re-arm the observer whenever filesHasMore / the visible window
-  // / the scope changes so the trigger always reflects the latest state instead
-  // of firing once on mount only.
+  // POURQUOI : re-arm the observer whenever filesHasMore / the visible window /
+  // the scope changes so the trigger always reflects the latest state instead of
+  // firing once on mount only. This replaces "Show more" clicks with seamless
+  // scroll-driven lazy loading for accounts holding thousands of files.
   useEffect(() => {
     const sentinel = loadMoreSentinelRef.current;
     if (!sentinel) return;
@@ -866,9 +852,7 @@ export default function UserDashboard({
     const observer = new IntersectionObserver(
       (entries) => {
         if (!entries.some((entry) => entry.isIntersecting) || filesLoading) return;
-        // Prefer loading the next server page when one exists (M-3); otherwise
-        // reveal any remaining locally-rendered matches (e.g. a filtered search
-        // result already fully loaded).
+        // Load next server page if one exists; otherwise reveal locally-windowed matches.
         if (filesHasMore) void loadMoreFiles();
         else setVisibleLimit((limit) => limit + VISIBLE_FILES_PAGE);
       },
