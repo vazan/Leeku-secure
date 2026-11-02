@@ -1,26 +1,29 @@
-# DEV-PLAN — Profile Dropdown (Settings / Log Out) for Desktop
+# DEV-PLAN — Shared tab shows real file names (load all files on Shared view)
 Date : 2026-11-02 | Modèle : dev-engineer | Classe : STANDARD
 
 ## Exploration (résumé subagent)
-- Fichiers impactés : `src/app/features/files/pages/user-dashboard.tsx`
-- Contrats publics : AUCUN (purely client-side UI change; no API/types/routes)
-- Tests existants : aucuns — change is JSX-only inside the dashboard header.
-- UI primitives déjà disponibles : `DropdownMenu*` (radix-ui) +
-  `Popover`/`Button` in `src/app/shared/components/ui/` — no new deps required.
-- `DashboardView` includes `"settings"`; `navigateDashboard("settings")` exists.
-- `onLogout` prop is already threaded from `App.tsx`.
+- Bug : Shared tab renders `file?.original_name || "Shared file"`. `files` state
+  only holds the current folder's current server page (M-3 pagination, FILES_SERVER_PAGE=500,
+  folder-scoped). Any shared file outside that window/scope resolves to undefined =>
+  "Shared file" placeholder instead of the real name.
+- Fichiers impactés : `src/app/features/files/pages/user-dashboard.tsx` (client only)
+- Contrats publics : AUCUN (no API/type/route change)
+- Server : `GET /api/files` without limit/offset returns the FULL unpaginated
+  inventory (legacy contract preserved), which the client can use to resolve names.
+- Tests existants : aucuns client-selectionnels; no shared-tab test suite.
 
 ## Étapes
 | # | Action | Fichier | Classe |
 |---|---|---|---|
-| 1 | Import DropdownMenu primitives + ChevronDown | user-dashboard.tsx | STANDARD |
-| 2 | Wrap desktop top-right profile in DropdownMenu (trigger = avatar) with Settings + Log Out items | user-dashboard.tsx | STANDARD |
-| 3 | Validate build + type-check | terminal | — |
+| 1 | Add `sharedFiles` state + `loadSharedFiles()` (unpaginated GET /api/files) | user-dashboard.tsx | STANDARD |
+| 2 | Fetch it in the `view === "shared"` effect (mirrors trash/admin pattern) | user-dashboard.tsx | STANDARD |
+| 3 | Resolve shared file name from `sharedFiles` in the Shared tab render | user-dashboard.tsx | STANDARD |
+| 4 | Validate build + lint/type-check | terminal | — |
 
 ## Critères de succès
-- [x] Build/lint/type-check propres (no new errors; pre-existing server.ts/mssql errors unchanged)
-- [x] Desktop (sm+) top-right profile is clickable and opens dropdown with "Settings" and "Log Out"
-- [x] "Settings" navigates to the existing settings dashboard view; "Log Out" invokes existing onLogout
+- [ ] Build/lint/type-check propres
+- [ ] Loading the Shared tab loads all the user's files; each shared link card shows
+      the file's real `original_name` (never "Shared file" when the file exists)
 
 ## Rollback
 ```
@@ -30,5 +33,5 @@ git checkout mssql -- src/app/features/files/pages/user-dashboard.tsx
 ## Risques
 | Risque | Prob. | Mitigation |
 |---|---|---|
-| Dropdown overlay z-index | Low | default z-50; header content may scroll beneath, acceptable for menu |
-| Mobile double logout entry | Low | mobile LogOut button preserved (lg:hidden); dropdown is hidden on <sm via wrapper `hidden sm:flex` |
+| Full inventory fetch cost (only names needed) | Low-Med | Shared view is rarely the default; throttled by server; fallback "Shared file" preserved if fetch fails |
+| Stale names after rename | Low | Refetch on each Shared-view entry (mirrors trash/admin behavior) |
