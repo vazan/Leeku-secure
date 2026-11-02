@@ -2475,7 +2475,7 @@ export default function UserDashboard({
             aria-label="Log out"
             title="Log out"
             onClick={onLogout}
-            className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg border border-[var(--border-subtle)] text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] lg:hidden"
+            className="absolute right-3 z-10 flex h-11 w-11 shrink-0 items-center justify-center rounded-lg border border-[var(--border-subtle)] text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] sm:hidden"
           >
             <LogOut className="h-4 w-4" />
           </button>

@@ -29,10 +29,17 @@ breakpoint, so:
 - **Mobile (<lg):** the "Settings" item remains in the mobile `<select>` nav,
   because mobile lacks the profile dropdown.
 
+**Feature 3 — Move mobile Log Out to the top-right corner.** The mobile-only
+Log Out icon button is now absolutely positioned at the top-right corner
+(`absolute right-3`) instead of sitting inline next to the upload control. It
+is now scoped to true mobile (`sm:hidden`) so the sm–lg range relies on the
+desktop profile dropdown (already visible from `sm+`) for Log Out, avoiding
+two overlapping corner controls.
+
 ## Fichiers
 | Fichier | Raison |
 |---|---|
-| `src/app/features/files/pages/user-dashboard.tsx` | Add DropdownMenu imports, ChevronDown icon, wrap profile in dropdown, and conditionally hide sidebar Settings on desktop |
+| `src/app/features/files/pages/user-dashboard.tsx` | Add DropdownMenu imports, ChevronDown icon, wrap profile in dropdown, hide sidebar Settings on desktop, move mobile Log Out to corner |
 
 ## Contrats publics impactés
 NON — no API, types, or route changes. `DashboardView`, `navigateDashboard`,
@@ -70,6 +77,10 @@ N/A — STANDARD class, no sensitive files.
 - Resize across the 1024px breakpoint: "Settings" appears/disappears in the nav
   to match the available entry points; dropdown stays functional.
 - Confirm dropdown closes when clicking outside / pressing Escape.
+- Mobile (<sm): the Log Out icon is pinned to the top-right corner of the
+  header, not next to the upload control.
+- sm–lg: only the profile dropdown (top-right) shows Log Out; no overlapping
+  corner controls.
 
 ## Handoff QaEngineer
 STANDARD-class client-only change; build + type-check green for touched file.
