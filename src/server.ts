@@ -2404,16 +2404,54 @@ app.post('/api/file-folders/:id/delete', authenticateUser as express.RequestHand
         const files = filesResult.recordset;
         if (files.length === 0) break;
         
-        // Process vault file deletions in batches
+        // Process vault file deletions in batches.
+        // A file's physical data may live in TWO places: the current blob
+        // (files.stored_path) and one or more archived-version blobs
+        // (file_versions.stored_path). The DB DELETE below cascades file_versions
+        // rows away, so we must unlink BOTH sets of blobs here — otherwise archived
+        // versions become orphaned on disk and leak vault storage (the 25k leftover
+        // blobs reported by ops). Every unlink is guarded by existsSync so blobs
+        // that were already purged (trash purge, prior soft-delete, etc.) do not
+        // spam ENOENT errors into the console.
         const fileBatchSize = 25;
         for (let i = 0; i < files.length; i += fileBatchSize) {
           const batch = files.slice(i, i + fileBatchSize);
-          await Promise.all(batch.map((file) => {
-            const vaultPath = path.join(FILE_VAULT, file.stored_path);
-            return fs.promises.unlink(vaultPath).catch((err) => {
-              console.error(`[DELETE FOLDER] Failed to delete vault file ${file.id} (${file.stored_path}):`, err);
-            });
-          }));
+
+          // Collect this batch's archived-version blob paths BEFORE the rows are
+          // cascaded away, so no version blob is left behind.
+          let versionPaths: string[] = [];
+          try {
+            const verReq = await getRequest();
+            batch.forEach((file, idx) => verReq.input(`fid${idx}`, sql.UniqueIdentifier, file.id));
+            const verRes = await verReq.query<{ stored_path: string }>(
+              `SELECT stored_path FROM file_versions
+               WHERE file_id IN (${batch.map((_, idx) => `@fid${idx}`).join(', ')})`
+            );
+            versionPaths = verRes.recordset.map((v) => v.stored_path);
+          } catch (err) {
+            // Enumeration failure is not fatal: the DB delete still proceeds and we
+            // fall back to unlinking only the current blobs, plus whatever versions
+            // we managed to gather. A later vault sweep can reclaim leftovers.
+            console.warn('[DELETE FOLDER] Could not enumerate archived version blobs:', err);
+            versionPaths = [];
+          }
+
+          await Promise.all([
+            ...batch.map((file) => {
+              const vaultPath = path.join(FILE_VAULT, file.stored_path);
+              if (!fs.existsSync(vaultPath)) return Promise.resolve();
+              return fs.promises.unlink(vaultPath).catch((err) => {
+                console.error(`[DELETE FOLDER] Failed to delete vault file ${file.id} (${file.stored_path}):`, err);
+              });
+            }),
+            ...versionPaths.map((storedPath) => {
+              const vaultPath = path.join(FILE_VAULT, storedPath);
+              if (!fs.existsSync(vaultPath)) return Promise.resolve();
+              return fs.promises.unlink(vaultPath).catch((err) => {
+                console.error(`[DELETE FOLDER] Failed to delete archived version vault file (${storedPath}):`, err);
+              });
+            }),
+          ]);
         }
         
         // Calculate storage to remove
@@ -5744,16 +5782,54 @@ app.post('/api/admin/file-folders/:id/delete', authenticateUser as express.Reque
         const files = filesResult.recordset;
         if (files.length === 0) break;
         
-        // Process vault file deletions in batches
+        // Process vault file deletions in batches.
+        // A file's physical data may live in TWO places: the current blob
+        // (files.stored_path) and one or more archived-version blobs
+        // (file_versions.stored_path). The DB DELETE below cascades file_versions
+        // rows away, so we must unlink BOTH sets of blobs here — otherwise archived
+        // versions become orphaned on disk and leak vault storage (the 25k leftover
+        // blobs reported by ops). Every unlink is guarded by existsSync so blobs
+        // that were already purged (trash purge, prior soft-delete, etc.) do not
+        // spam ENOENT errors into the console.
         const fileBatchSize = 25;
         for (let i = 0; i < files.length; i += fileBatchSize) {
           const batch = files.slice(i, i + fileBatchSize);
-          await Promise.all(batch.map((file) => {
-            const vaultPath = path.join(FILE_VAULT, file.stored_path);
-            return fs.promises.unlink(vaultPath).catch((err) => {
-              console.error(`[DELETE FOLDER] Failed to delete vault file ${file.id} (${file.stored_path}):`, err);
-            });
-          }));
+
+          // Collect this batch's archived-version blob paths BEFORE the rows are
+          // cascaded away, so no version blob is left behind.
+          let versionPaths: string[] = [];
+          try {
+            const verReq = await getRequest();
+            batch.forEach((file, idx) => verReq.input(`fid${idx}`, sql.UniqueIdentifier, file.id));
+            const verRes = await verReq.query<{ stored_path: string }>(
+              `SELECT stored_path FROM file_versions
+               WHERE file_id IN (${batch.map((_, idx) => `@fid${idx}`).join(', ')})`
+            );
+            versionPaths = verRes.recordset.map((v) => v.stored_path);
+          } catch (err) {
+            // Enumeration failure is not fatal: the DB delete still proceeds and we
+            // fall back to unlinking only the current blobs, plus whatever versions
+            // we managed to gather. A later vault sweep can reclaim leftovers.
+            console.warn('[DELETE FOLDER] Could not enumerate archived version blobs:', err);
+            versionPaths = [];
+          }
+
+          await Promise.all([
+            ...batch.map((file) => {
+              const vaultPath = path.join(FILE_VAULT, file.stored_path);
+              if (!fs.existsSync(vaultPath)) return Promise.resolve();
+              return fs.promises.unlink(vaultPath).catch((err) => {
+                console.error(`[DELETE FOLDER] Failed to delete vault file ${file.id} (${file.stored_path}):`, err);
+              });
+            }),
+            ...versionPaths.map((storedPath) => {
+              const vaultPath = path.join(FILE_VAULT, storedPath);
+              if (!fs.existsSync(vaultPath)) return Promise.resolve();
+              return fs.promises.unlink(vaultPath).catch((err) => {
+                console.error(`[DELETE FOLDER] Failed to delete archived version vault file (${storedPath}):`, err);
+              });
+            }),
+          ]);
         }
         
         // Calculate storage to remove
