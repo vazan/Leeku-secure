@@ -1,54 +1,62 @@
 ---
-agent: DevEngineer | date: 2026-11-02 | model: dev-engineer
+agent: DevEngineer | date: 2026-11-04 | model: (dev)
 plan: /memories/session/dev-plan.md
 ---
 
 ## Intention
-Fix the "Shared" dashboard tab showing the generic "Shared file" placeholder instead of
-each file's real name — without the client loading and decrypting the whole inventory.
+Fix the CRITICAL resumable-upload path-traversal (arbitrary file write) by validating the
+`resumableIdentifier` query parameter before it reaches any `path.join`, while keeping the
+legitimate upload flow intact.
 
 ## Changement
-Classe : STANDARD — additive server field + client tweak; no breaking contract change.
+Classe : STANDARD — a well-scoped input-validation hardening of two upload handlers plus a
+defense-in-depth guard in the merge module. No public API contract or response shape changes;
+no shared infra touched.
 
 ## Fichiers
 | Fichier | Raison |
 |---|---|
-| src/server.ts | ShareRow + mapShareRow + GET /api/sharing/links SELECT decrypt & return each file's name |
-| src/app/shared/types/index.ts | ShareLink gains optional `original_name` |
-| src/app/features/files/pages/user-dashboard.tsx | Use `link.original_name` (fallback to `files` lookup) |
+| src/server/merge-chunks.ts | Add exported `isSafeResumableIdentifier()`; reject unsafe identifiers inside `mergeChunks()` |
+| src/server.ts | Validate `resumableIdentifier` in GET and POST `/api/files/upload` before path use → 400 |
 
 ## Contrats publics impactés
-OUI — additive only: `GET /api/sharing/links` returns a new optional `original_name`
-per link. Old clients ignore unknown fields; existing fields unchanged. BC-safe.
+NON. Request params are further validated (returns 400 for unsafe identifiers); the response
+contract and all legitimate-client behaviour are unchanged.
 
 ## Risques
-Perf : improved — only shared links' names are decrypted (small set), instead of the
-whole inventory (thousands) on every Shared-view load. Initial client approach (load
-all files) reversed.
-Sécu : none — name comes from the owner's own file rows under existing authz.
-Régression : low — `link.original_name` is optional; fallback to `files` lookup and the
-"Shared file" default are preserved.
-Compat : none — same endpoint/response shape plus an additive field.
+- Perf: negligible (single regex per chunk request).
+- Sécu: closes arbitrary file write / path-existence oracle. Defense-in-depth in merge module.
+- Régression: safe charset `[A-Za-z0-9_-]{1,128}` accepts the client's real identifier format
+  (base36 `<hash>-<time>`), UUIDs, and all pre-existing test identifiers — verified by
+  `tests/merge-chunks.test.ts` (5/5 pass) and a 13-case validator matrix.
+- Compat: non-resumable upload path untouched.
 
 ## Dette observée
-AUCUNE — the prior MINOR debt (client loading the whole inventory for names) is resolved
-by this server-side field.
+MINOR — pre-existing `tsc` noise (52 errors: missing `mssql` type declarations + unrelated
+implicit-any) is unrelated to this change and present on baseline. Not introduced here.
 
 ## Validation
-Build (client `vite build`): ✅ | Build (server esbuild bundle): ✅ | Lint/type-check: ✅
-(52 pre-existing server errors unchanged; 0 new in edited regions) | Smoke: ⚠SKIPPED
-(no DB runtime available)
+Build: ✅ (esbuild bundles server.cjs cleanly; pre-existing `import.meta` warning only)
+Lint: ✅ (tsc 52 errors before = 52 after; **none** in edited regions)
+Type-check: ✅ (no new errors)
+Smoke: ✅ (validator matrix 13/13; merge-chunks tests 5/5 pass)
 
 ## Approbation CRITICAL
-N/A
+N/A — STANDARD class.
 
 ## Handoff TestEngineer
-- GET /api/sharing/links returns `original_name` matching the file's real name.
-- Shared tab shows the real name even when the file is in another folder / beyond the
-  first page (no full-inventory fetch fired).
-- Fallback path: cached/older link without `original_name` still resolves via `files`
-  or shows "Shared file" — no crash.
+Surfaces modified:
+1. `GET /api/files/upload?resumableIdentifier=…` — must reject traversal/`.`/`..`/absolute paths
+   with 400 and must not write/read any file; must still accept legitimate identifiers (200/204).
+2. `POST /api/files/upload` resumable branch — same rejection before chunk persist/merge.
+3. `mergeChunks()` defense-in-depth — throws `Invalid resumable identifier.` on unsafe input.
+
+Cas limites to cover:
+- `../`, `..\`, `/abs/path`, `C:\abs`, `..`, `.`, empty, whitespace, `>128` chars → 400/no write.
+- Legitimate client format (`<base36>-<base36>`), UUIDs, large multi-chunk upload still merges.
+- Confirmed no regression in the non-resumable (direct) upload path.
 
 ## Handoff QaEngineer
-Validated: both client and server build clean; no new type errors elsewhere; report +
-trail on branch `fix/files-shared-tab-names`.
+Change is STANDARD scope: adds strict identifier validation (server.ts) plus a defense-in-depth
+guard (merge-chunks.ts). Build/lint/type-check/smoke validated; no contract break; existing
+merge-chunks suite green. This directly remediates Finding #1 (CRITICAL) from the audit report.
