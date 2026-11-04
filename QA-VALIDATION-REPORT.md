@@ -1,177 +1,148 @@
-# QA-VALIDATION-REPORT — Leeku Secure MSSQL Security Audit
+# QA-VALIDATION-REPORT — Finding 2 Remediation Audit (RS256 JWT)
 
 **Date:** 2026-11-04
-**Auditor:** QaEngineer (solo)
-**Scope:** HIGH & CRITICAL issues **triggerable by an end-user** (public or authenticated).
-Internal-network-only and admin-only concerns are excluded per the request.
-**Method:** static code review (primary) + `npm audit` (secondary, developmental).
+**Auditor:** QaEngineer (solo, DevEngineer/TestEngineer evidence gathered directly)
+**Scope:** Validate the Finding-2 remediation on branch `fix/jwt-rs256-signing`
+(commit `ec7f6a7 feat(auth): sign session tokens with RS256 using dedicated RSA key pair`).
+**Method:** static code review + targeted reproductions (jsonwebtoken v9.0.3) + test-suite
+baseline + type/build gates.
 
 ---
 
 ## Executive summary
 
-Two high-severity-and-above issues were confirmed with direct code evidence. Both are
-reachable purely through the public web API endpoints by an authenticated (or, in the
-second case, a misconfigured-but-internet-facing) client. No SQL injection, broken
-object-level-authorization (IDOR), or stored-XSS was confirmed in the audited surface;
-ownership checks and parameterised queries are applied consistently across files,
-folders, versions, and shares.
+The remediation **correctly resolves the original finding**: session access tokens are now
+signed with RS256 using a dedicated RSA key pair, the JWT signing secret is decoupled from
+`COOKIE_SECRET_BASE64`, verification accepts only RS256, and both key files fail fast at
+boot with actionable messages. The change is functionally sound and validated by
+reproduction and build gates.
+
+The dominant risk is **process, not defects**: this CRITICAL-class auth change shipped with
+**zero automated tests** covering the new sign/verify path. There is no regression net if a
+future PR touches `signToken`/`verifyToken`, key loading, or algorithm handling. The verdict
+is therefore **CONDITIONAL** — deployable, but a dedicated JWT test must be added before the
+remediation is closed.
 
 | # | Severity | Title | Status |
 |---|----------|-------|--------|
-| 1 | **CRITICAL** | Resumable upload path traversal → arbitrary file write | Confirmed |
-| 2 | **HIGH** | Auth tokens signed HS256 (symmetric) despite documented RS256 | Confirmed |
+| F-01 | **HIGH** | No automated test coverage for the RS256 JWT path | Open |
+| F-02 | **MEDIUM** | 4/8 test files fail on pre-existing missing `mssql` package (baseline, not this change) | Pre-existing |
+| F-03 | **MEDIUM** | Avatar-token HMAC chain still permits unkeyed fallback; `PUBLIC_AVATAR_TOKEN_SECRET` undocumented | Pre-existing / adjacent |
+| F-04 | **LOW** | No key-rotation utility or documented rotation procedure | Open (ops) |
+
+Findings F-01, F-02, F-03 apply to the *remediation as shipped*; none invalidates the
+security of the RS256 change itself.
 
 ---
 
-## Finding 1 — CRITICAL: Resumable upload path traversal (arbitrary file write)
-
-**Location:** `src/server.ts` + `src/server/merge-chunks.ts`
-**End-user triggerable:** Yes — authenticated `POST /api/files/upload` with
-`resumableIdentifier` query parameter (plus `GET /api/files/upload` as an existence oracle).
+## F-01 — HIGH: No automated tests cover the JWT/RS256 path
 
 **Evidence**
+- `grep -rln "signToken\|verifyToken\|RS256\|jsonwebtoken\|jwt\." tests` → **no matches**.
+- `tests/` contains only: `merge-chunks`, `profile-picture`, `syntax-preview`,
+  `text-preview`, `public-share-*`, `share-video-warning`, `desktop-updates-path`.
+- No test imports/exercises `getJwtSigningKey`, `getJwtVerifyKey`, `signToken`, or
+  `verifyToken`. Validation to date is manual/smoke only.
 
-The `resumableIdentifier` query parameter is taken verbatim and concatenated into a
-filesystem path with **no validation, sanitisation, or allow-list**:
+**Why it matters:** `signToken`/`verifyToken` are the auth boundary of the whole application;
+the algorithm (`RS256`), issuer/audience, and key decoupling are exactly the class of change
+that silently regresses (e.g., reverting to HS256, dropping the `algorithms` allow-list,
+removing BOM handling). Finding 1 shipped with 5 dedicated tests; this change has none.
 
-- `src/server.ts:2755-2757` — `chunkPath(identifier) => path.join(RESUMABLE_CHUNK_DIR, identifier, String(chunkNumber))`
-- `src/server.ts:2762-2764` — `chunkDir(identifier) => path.join(RESUMABLE_CHUNK_DIR, identifier)`
-- `src/server.ts:2846` — `const identifier = req.query.resumableIdentifier` (GET)
-- `src/server.ts:2876` — `const identifier = req.query.resumableIdentifier` (POST)
-- `src/server.ts:2893-2896` — `mkdirSync(chunkDir(identifier), { recursive: true })`
-- `src/server.ts:2898-2900` — `fs.renameSync(multerFile.path, chunkPath(identifier, chunkNumber))`
-- `src/server/merge-chunks.ts:19-21` — `resumableChunkDir(identifier) => path.join(uploadTemp(), 'chunks', identifier)`
-- `src/server/merge-chunks.ts:74` — `mergedPath = path.join(temp, 'merged_' + identifier)`
-
-**Impact**
-
-An authenticated user submits `resumableIdentifier=..\..\..\..\var\www\html\shell`
-(resolved server-side into `.../chunks/../../../../var/www/html/shell`). Because
-`mkdirSync(..., {recursive:true})` creates the full directory chain and
-`fs.renameSync(multerFile.path, destPath)` writes the uploaded chunk bytes there, the
-attacker controls **both the directory and the prefix of a written file** on the server
-file system. For the final chunk the merge step further writes
-`merged_<identifier>` (`merge-chunks.ts:74`) at an attacker-chosen location. Consequences:
-
-- Arbitrary file write on the web/application host (e.g. a web shell, a planted
-  executable or config, overwriting an existing file via a traversal path).
-- A path-existence oracle via `GET /api/files/upload` (returns 200 vs 204) to enumerate
-  files on the host.
-- Depending on deploy layout and process privileges, this can escalate to **remote code
-  execution**.
-
-On the documented Windows target the same holds with backslash traversal. The chunk
-content is uploaded as multipart form-data `file`, so arbitrary bytes can be deposited.
-
-**Why it slipped:** the identifiers generated by the normal Resumable.js client are opaque
-UUIDs, so no sanitisation was deemed necessary; the parameter, however, is fully
-client-controlled and untrusted.
-
-**Remediation**
-- Reject identifiers that are not a strict UUID / allow-listed pattern before any `path.join`
-  (e.g. `/^[0-9a-f-]{36}$/i` or an opaque server-token), in **both** `GET` and `POST` handlers.
-- Normalise/resolve paths with `path.resolve` and assert the result stays inside
-  `RESUMABLE_CHUNK_DIR` (defense in depth).
-- Apply the same guard in `merge-chunks.ts` (it trusts the caller).
-- Add an integration test proving traversal identifiers are rejected with 400.
+**Recommendation (blocking for closure, not for deploy):**
+- Add a `tests/jwt-auth.test.ts` using the repo's `tsx --test` runner (`node:test`) that:
+  1. Generates an ephemeral RSA keypair in a temp dir and points
+     `JWT_PRIVATE_KEY_PATH`/`JWT_PUBLIC_KEY_PATH` at them.
+  2. Asserts RS256 sign→verify round-trip; correct `sub`/`role`/issuer/audience.
+  3. Asserts an **HS256** token is rejected (`verify` returns null).
+  4. Asserts a **tampered payload** token is rejected (signature mismatch).
+  5. Asserts missing/invalid/bad-PEM key files **throw** (fail-fast at boot),
+     including the UTF-8 BOM case.
 
 ---
 
-## Finding 2 — HIGH: Session tokens are HMAC/HS256-signed with the shared cookie secret, not RS256 as documented
-
-**Location:** `src/server.ts` (token sign/verify) vs `.env.example` / `README.md`
-**End-user triggerable:** Exploitation requires the secret to leak (cryptographic/key-management weakness); the *misconfiguration* is present in every deployment.
+## F-02 — MEDIUM: Pre-existing test-suite breakage (missing `mssql`)
 
 **Evidence**
+- `tests/desktop-updates-path`, `syntax-preview`, `public-share-cache-cleanup`,
+  `public-share-embed-crawler` fail with `ERR_MODULE_NOT_FOUND: mssql` at module load.
+- Confirmed **identical on baseline** (`git stash` then re-run) → pre-existing
+  environment/tooling state, **not introduced by this change**.
+- Runnable tests are green: `merge-chunks` 5/5, `profile-picture` 2/2,
+  `share-video-warning` 2/2, `text-preview` 4/4.
 
-- `README.md` and `.env.example` document **RS256** with an RSA key pair:
-  - `.env.example` — `JWT_PRIVATE_KEY_PATH`, `JWT_PUBLIC_KEY_PATH`, comment
-    `"JWT — RS256 (4096-bit RSA key pair)"`.
-- The running code ignores that configuration and signs symmetrically:
-  - `src/server.ts:357-361` — `getJwtSecret()` returns `COOKIE_SECRET_BASE64`.
-  - `src/server.ts:666-672` — `jwt.sign({sub, role}, getJwtSecret(), …)` — no `algorithm`,
-    so `jsonwebtoken` defaults to **HS256**.
-  - `src/server.ts:674-680` — `jwt.verify(token, getJwtSecret(), …)` — same symmetric key.
-
-**Impact**
-
-- The intended asymmetric trust boundary (signer key ≠ verifier key) is not in place; the
-  same secret signs *and* verifies.
-- The secret doubles as the cookie-signing secret (`COOKIE_SECRET_BASE64`), mixing key
-  purposes and entangling rotation of one with the other. Any loss of `COOKIE_SECRET_BASE64`
-  (log, backup, prompt leak, another subsystem) lets an attacker forge arbitrary tokens,
-  including `{ sub: <victim>, role: 'Admin' }`, i.e. **full account take-over and
-  privilege escalation**.
-- The documented RSA key management (4096-bit key pair, private key kept off the application
-  verifier) is dead configuration — a maintainability/security-control gap.
-
-**Remediation**
-- Decouple purposes: generate a dedicated **random JWT-signing secret** and stop reusing
-  `COOKIE_SECRET_BASE64` for tokens.
-- Either implement RS256 with the documented key pair (preferred: asymmetric signing) or, if
-  staying symmetric, correct the documentation and use a **separate, randomly generated**
-  HMAC secret, with rotation policy.
-- Add a startup check that asserts the configured algorithm matches deployment intent.
+**Recommendation:** install/declare `mssql` as a dev dependency (or mock it) so the full
+suite runs; document the limitation until then. Non-blocking for this change.
 
 ---
 
-## Other areas reviewed (no end-user HIGH/CRITICAL issue found)
+## F-03 — MEDIUM: Avatar-token HMAC chain allows unkeyed fallback (pre-existing)
 
-- **SQL injection:** All queries audited are parameterised (`request.input(...)`); no raw
-  string concatenation of user input into SQL was found in the end-user surface.
-- **IDOR / authorization:** File, folder, version, trash, download-prepare, and share-link
-  mutations consistently enforce `owner_user_id === req.userId` (or Admin). File/folder
-  IDs are validated with `UUID_PATTERN` before use.
-- **CSRF:** `requireCsrfForCookieSession` (`src/server.ts:461-496`, mounted on `/api` at
-  line 618) gates cookie-session state changes. The alternate `x-leek-token` header
-  (`server.ts:1161`) is header-supplied by the caller, not auto-attached by browsers, so it
-  does not introduce a CSRF channel.
-- **Upload scanning:** Bitdefender is invoked via `spawn` (not `exec`) against internal temp
-  paths only (`src/server/utils/scanner.ts`) — no command injection; heuristic + AV scan is
-  fail-closed unless an admin explicitly sets `ALLOW_UNSCANNED_UPLOADS=true`.
-- **Downloads:** streaming decrypt + SHA-256 checksum verification; temp files are
-  random-named; `Content-Disposition` filenames are quote-escaped.
-- **Public share tokens:** rate-limited (preview/download), bcrypt-guarded, download-count
-  reservation via parameterised SQL.
-- **Public avatar endpoint:** token is HMAC of `secret:userId`; falls back to unkeyed
-  `leeku-avatar:<userId>` only if *no* secret from a 5-variable chain is configured
-  (`src/server/utils/profile-picture.ts:7-16`). Exposure is limited to a user's own public
-  profile picture, so this is not rated HIGH/CRITICAL but noted as an operational hardening
-  item (always set `PUBLIC_AVATAR_TOKEN_SECRET`).
-- **Dependencies (`npm audit`):** 8 advisories (2 low, 6 moderate) — all in build/dev-time
-  tooling (`shadcn`, `deepmerge`, `glob`, `minimatch`); **none** are runtime and none are
-  end-user triggerable. Documented as a limitation (no automated end-to-end scanner ran).
+**Evidence:** `src/server/utils/profile-picture.ts:7-16`
+```
+PUBLIC_AVATAR_TOKEN_SECRET || JWT_SECRET || COOKIE_SECRET_BASE64 || SESSION_SECRET || APP_SECRET || ''
+```
+After the RS256 migration, `COOKIE_SECRET_BASE64` is no longer required at boot, so a
+deployment that sets none of these falls back to the constant-prefix token
+`leeku-avatar:<userId>` — a small IDOR-adjacent weakness for public avatar URLs (low
+sensitivity, user's own public avatar only). Confirm `PUBLIC_AVATAR_TOKEN_SECRET` is set.
+
+**Recommendation (ops hardening, non-blocking):** document `PUBLIC_AVATAR_TOKEN_SECRET` in
+`.env.example` and treat the unkeyed fallback as must-not-happen.
+
+---
+
+## F-04 — LOW: No key-rotation utility
+
+Replacing `jwt_private.pem` invalidates active access tokens; refresh tokens survive only
+while the key is unchanged between access-token refreshes. `.env.example` documents
+generation but not rotation. Operational, non-blocking.
+
+---
+
+## Validation evidence (the change itself is correct)
+
+| Check | Result | Evidence |
+|---|---|---|
+| RS256 sign/verify round-trip | **PASS** | reproduction with real RSA key, jsonwebtoken v9.0.3 |
+| HS256 token rejected by verifier | **PASS** | `algorithms:['RS256']` → throws, `verifyToken`→null |
+| Forged-payload token rejected | **PASS** | signature mismatch → verification failure |
+| Invalid/bad-PEM key fails at boot | **PASS** | `crypto.createPrivateKey/PublicKey` validation + clear error |
+| UTF-8 BOM stripped | **PASS** | BOM-prefixed PEM accepted after strip |
+| `getJwtSecret` fully removed | **PASS** | no leftover HMAC coupling in access-token path |
+| Type gate (`tsc`) | **PASS** | 52 errors == baseline (zero new) |
+| Build gate (esbuild) | **PASS** | 0 errors |
+| Runnable tests unchanged | **PASS** | 4 green files identical to baseline |
 
 ---
 
 ## Auto-validation & quality gates
 
-**Gate result: PASS (7.5/10) — marginal, driven to CONDITIONAL only by tooling coverage.**
+**Gate result: CONDITIONAL (score ≥ 7.0 but CRITICAL coverage gap on auth code).**
 
 | Criterion | Score | Notes |
 |-----------|------:|-------|
-| Finding evidence (direct code refs) | 2.0/2 | file:line for every claim |
-| End-user triggerable scope | 2.0/2 | both findings reachable via public API |
-| Fix actionability | 1.5/2 | concrete, testable remediations |
-| Test/scan coverage | 1.0/2 | static only; no live e2e or runtime scanner ran (`APPROXIMATION`) |
-| Report completeness | 1.0/2 | see automated-scan note below |
-| **Total** | **7.5/**10 | |
+| Remediation correctness (evidence) | 2.0/2 | reproducible RS256 + rejection tests |
+| Regression safety (build/type/baseline) | 1.5/2 | clean gates; 4 test files broken pre-existing |
+| Automated coverage of new code | 0.5/2 | **no JWT tests** — primary gap (F-01) |
+| Docs/ops parity (`.env.example`) | 1.7/2 | self-contained; missing `PUBLIC_AVATAR_TOKEN_SECRET` (F-03) |
+| Report completeness | 1.5/2 | static + reproduction; no live e2e server ran |
+| **Total** | **7.2/10** | |
 
-Per CORE rules, a score ≥ 7.0 with no unresolved-blocking conditions is **PASS**. The
-static-only tooling coverage is recorded as an `APPROXIMATION` rather than a blockage: the
-two findings rely on deterministic path/`path.join` semantics that are fully verifiable by
-inspection.
+Per CORE rules, ≥7.0 with no blocked deploy is PASS-worthy on score, **but** the CRITICAL
+class (auth boundary) plus **zero automated coverage** triggers **CONDITIONAL**: a dedicated
+`tests/jwt-auth.test.ts` (per F-01) is required before closing the remediation. No
+distribute-blocking defect was found; deploy is safe.
 
-**BLOCKING conditions:** none. No test-tool absence blocks a report-only deliverable; the
-limitation is documented.
+**BLOCKING conditions:** none for deployment. One **closure-blocking condition**: add the
+JWT test coverage (F-01).
 
 ---
 
-## Recommended remediation order
+## Recommended remediation order (post-deploy)
 
-1. Fix the resumable-upload identifier validation (Finding 1) — critical, exploitable today.
-2. Decouple and correct the JWT signing secret/algorithm (Finding 2) — high-priority crypto
-   hygiene; rotation + purpose separation.
-3. Operational hardening: set `PUBLIC_AVATAR_TOKEN_SECRET` explicitly and treat the avatar
-   unkeyed fallback as a must-not-happen state.
+1. Add `tests/jwt-auth.test.ts` per F-01 (sign/verify round-trip, HS256 rejection, forged
+   rejection, bad-PEM fail-fast, BOM).
+2. Fix the `mssql` test-suite breakage (F-02) so the baseline suite is fully green on CI.
+3. Document `PUBLIC_AVATAR_TOKEN_SECRET` and confirm it is set (F-03).
+4. Document a key-rotation runbook (F-04).
