@@ -3360,7 +3360,7 @@ export default function UserDashboard({
                           </span>
                         </div>
                         <p className="mt-4 truncate text-sm font-medium">
-                          {file?.original_name || "Shared file"}
+                          {link.original_name || file?.original_name || "Shared file"}
                         </p>
                         <p className="mt-1 text-xs text-[var(--text-muted)]">
                           {link.download_count}
