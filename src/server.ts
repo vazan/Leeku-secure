@@ -65,7 +65,7 @@ import { cleanupPublicShareDecryptedPreviewFiles, createPublicSharingRouter } fr
 import { createPublicFolderSharingRouter } from './server/routes/public-folder-sharing.js';
 import { createMaintenanceModeRouter } from './server/routes/maintenance-mode.js';
 import { createDesktopUpdatesRouter, SYSTEM_UPDATE_FOLDER_NAME } from './server/routes/desktop-updates.js';
-import { mergeChunks } from './server/merge-chunks.js';
+import { mergeChunks, isSafeResumableIdentifier } from './server/merge-chunks.js';
 import { validateProductionConfig } from './server/utils/production.js';
 import { getTextPreviewKind, TEXT_PREVIEW_MAX_BYTES } from './server/utils/text-preview.js';
 import type { AdminFileFolder, Quota, User, FileMetadata, FileFolder, FolderShareLink, ShareLink, SystemLog, SystemStats } from './app/shared/types/index.js';
@@ -2849,6 +2849,9 @@ app.get('/api/files/upload', authenticateUser as express.RequestHandler, async (
   if (!identifier || !chunkNumber) {
     return res.status(400).json({ error: 'Missing "resumableIdentifier" or "resumableChunkNumber" query parameter.' });
   }
+  if (!isSafeResumableIdentifier(identifier)) {
+    return res.status(400).json({ error: 'Invalid "resumableIdentifier".' });
+  }
 
   const cp = chunkPath(identifier, parseInt(chunkNumber, 10));
   if (fs.existsSync(cp) && fs.statSync(cp).size > 0) {
@@ -2882,6 +2885,9 @@ app.post(
 
       if (!identifier || isNaN(chunkNumber) || isNaN(totalChunks)) {
         return res.status(400).json({ error: 'Invalid or missing resumable upload parameters.' });
+      }
+      if (!isSafeResumableIdentifier(identifier)) {
+        return res.status(400).json({ error: 'Invalid "resumableIdentifier".' });
       }
 
       const multerFile = req.file;
