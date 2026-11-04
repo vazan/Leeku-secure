@@ -83,6 +83,7 @@ export interface ShareLink {
   id: string;
   file_id: string;
   public_token: string;
+  original_name?: string; // decrypted name of the shared file, provided by the server
   allow_external_preview?: boolean;
   allow_decrypted_external_preview?: boolean;
   password?: string; // Optional password

@@ -1,34 +1,43 @@
-# DEV-PLAN — Profile Dropdown (Settings / Log Out) for Desktop
+# DEV-PLAN — Shared tab shows real file names (server returns name per link)
 Date : 2026-11-02 | Modèle : dev-engineer | Classe : STANDARD
 
 ## Exploration (résumé subagent)
-- Fichiers impactés : `src/app/features/files/pages/user-dashboard.tsx`
-- Contrats publics : AUCUN (purely client-side UI change; no API/types/routes)
-- Tests existants : aucuns — change is JSX-only inside the dashboard header.
-- UI primitives déjà disponibles : `DropdownMenu*` (radix-ui) +
-  `Popover`/`Button` in `src/app/shared/components/ui/` — no new deps required.
-- `DashboardView` includes `"settings"`; `navigateDashboard("settings")` exists.
-- `onLogout` prop is already threaded from `App.tsx`.
+- Bug : Shared tab rendered `file?.original_name || "Shared file"`. `files` state only
+  holds the current folder's current server page (M-3 pagination), so shared files
+  outside that window/scope resolved to undefined => "Shared file" placeholder.
+- First iteration loaded the whole (unpaginated) inventory client-side, but that
+  decrypted every file name server-side just to show a handful of shared names.
+- Better: `/api/sharing/links` already `INNER JOIN files f` (for `stored_path`), so
+  add the encrypted-name columns + decrypt them per returned link. Client stops
+  fetching the inventory entirely.
+- Fichiers impactés :
+  - `src/server.ts` — ShareRow + mapShareRow + GET /api/sharing/links SQL
+  - `src/app/shared/types/index.ts` — ShareLink.original_name (optional, BC)
+  - `src/app/features/files/pages/user-dashboard.tsx` — use link.original_name
+- Contrats publics : additive optional field on existing endpoint response (BC-safe).
+- Tests existants : aucuns for the shared-links endpoint.
 
 ## Étapes
 | # | Action | Fichier | Classe |
 |---|---|---|---|
-| 1 | Import DropdownMenu primitives + ChevronDown | user-dashboard.tsx | STANDARD |
-| 2 | Wrap desktop top-right profile in DropdownMenu (trigger = avatar) with Settings + Log Out items | user-dashboard.tsx | STANDARD |
-| 3 | Validate build + type-check | terminal | — |
+| 1 | Add encrypted-name columns to ShareRow + decrypt in mapShareRow | server.ts | STANDARD |
+| 2 | SELECT the name columns in GET /api/sharing/links | server.ts | STANDARD |
+| 3 | Add optional original_name to ShareLink type | types/index.ts | STANDARD |
+| 4 | Render link.original_name (fallback to files lookup) in Shared tab | user-dashboard.tsx | STANDARD |
+| 5 | Validate build (client+server) + type-check | terminal | — |
 
 ## Critères de succès
-- [x] Build/lint/type-check propres (no new errors; pre-existing server.ts/mssql errors unchanged)
-- [x] Desktop (sm+) top-right profile is clickable and opens dropdown with "Settings" and "Log Out"
-- [x] "Settings" navigates to the existing settings dashboard view; "Log Out" invokes existing onLogout
+- [ ] Build/lint/type-check propres (52 pre-existing server errors unchanged)
+- [ ] GET /api/sharing/links returns each link's real `original_name`
+- [ ] Shared tab shows real file names without loading the full inventory
 
 ## Rollback
 ```
-git checkout mssql -- src/app/features/files/pages/user-dashboard.tsx
+git checkout mssql -- src/server.ts src/app/shared/types/index.ts src/app/features/files/pages/user-dashboard.tsx
 ```
 
 ## Risques
 | Risque | Prob. | Mitigation |
 |---|---|---|
-| Dropdown overlay z-index | Low | default z-50; header content may scroll beneath, acceptable for menu |
-| Mobile double logout entry | Low | mobile LogOut button preserved (lg:hidden); dropdown is hidden on <sm via wrapper `hidden sm:flex` |
+| Per-row decrypt cost for large share sets | Low | Only shared links' names decrypted, not the whole inventory; count is small in practice |
+| Client cache holding old links without original_name | Low | optional field + `file` fallback + "Shared file" default preserved |

@@ -4,84 +4,51 @@ plan: /memories/session/dev-plan.md
 ---
 
 ## Intention
-For desktop users, make the profile in the top-right corner of the dashboard
-clickable, opening a dropdown menu with "Settings" and "Log Out".
+Fix the "Shared" dashboard tab showing the generic "Shared file" placeholder instead of
+each file's real name — without the client loading and decrypting the whole inventory.
 
 ## Changement
-Classe : STANDARD — isolated client-side UX change in a single component; no
-public contract, API, or server change.
-
-**Feature 1 — Profile dropdown.** The desktop (sm+) top-right profile block
-(avatar + username/role) is wrapped in a `DropdownMenu` whose trigger is a
-button containing the existing `ProfileAvatar`. The dropdown places two items:
-- **Settings** → `navigateDashboard("settings")` (existing settings view)
-- **Log Out** → `onLogout` (existing dashboard logout handler)
-
-The mobile fallback "Log out" icon button (visible below `lg`) is preserved as
-is, since the new dropdown wrapper is hidden on small screens (`hidden sm:flex`).
-
-**Feature 2 — Hide sidebar "Settings" on desktop.** Since desktop users now
-reach Settings via the profile dropdown, the duplicate "Settings" entry is
-removed from the side navigation on lg+ viewports. A `matchMedia("(min-width:
-1024px)")` listener (`isDesktopNav`) mirrors the sidebar's own `lg` visibility
-breakpoint, so:
-- **Desktop (lg+):** sidebar hides "Settings" (accessible via profile dropdown).
-- **Mobile (<lg):** the "Settings" item remains in the mobile `<select>` nav,
-  because mobile lacks the profile dropdown.
-
-**Feature 3 — Move mobile Log Out to the top-right corner.** The mobile-only
-Log Out icon button is now absolutely positioned at the top-right corner
-(`absolute right-3`) instead of sitting inline next to the upload control. It
-is now scoped to true mobile (`sm:hidden`) so the sm–lg range relies on the
-desktop profile dropdown (already visible from `sm+`) for Log Out, avoiding
-two overlapping corner controls.
+Classe : STANDARD — additive server field + client tweak; no breaking contract change.
 
 ## Fichiers
 | Fichier | Raison |
 |---|---|
-| `src/app/features/files/pages/user-dashboard.tsx` | Add DropdownMenu imports, ChevronDown icon, wrap profile in dropdown, hide sidebar Settings on desktop, move mobile Log Out to corner |
+| src/server.ts | ShareRow + mapShareRow + GET /api/sharing/links SELECT decrypt & return each file's name |
+| src/app/shared/types/index.ts | ShareLink gains optional `original_name` |
+| src/app/features/files/pages/user-dashboard.tsx | Use `link.original_name` (fallback to `files` lookup) |
 
 ## Contrats publics impactés
-NON — no API, types, or route changes. `DashboardView`, `navigateDashboard`,
-`onLogout`, and the `UserDashboard` props interface are unchanged.
+OUI — additive only: `GET /api/sharing/links` returns a new optional `original_name`
+per link. Old clients ignore unknown fields; existing fields unchanged. BC-safe.
 
 ## Risques
-- Perf : none (no new data fetching or effects).
-- Sécu : none — reuses existing `onLogout` (CSRF-protected server logout).
-- Régression : desktop Log Out still works via dropdown; sidebar "Log out" and
-  mobile header LogOut button unchanged and still functional. Settings view
-  already exists and is reachable via the dropdown exactly as via sidebar.
+Perf : improved — only shared links' names are decrypted (small set), instead of the
+whole inventory (thousands) on every Shared-view load. Initial client approach (load
+all files) reversed.
+Sécu : none — name comes from the owner's own file rows under existing authz.
+Régression : low — `link.original_name` is optional; fallback to `files` lookup and the
+"Shared file" default are preserved.
+Compat : none — same endpoint/response shape plus an additive field.
 
 ## Dette observée
-MINOR — pre-existing `src/server.ts` type errors and `mssql` module resolution
-failures on the base branch are unrelated to this change and not addressed here
-(same as noted in the previous DEV-CHANGE-REPORT).
+AUCUNE — the prior MINOR debt (client loading the whole inventory for names) is resolved
+by this server-side field.
 
 ## Validation
-Build: ✅ (`npx vite build` ok)  Lint: ✅ (type-check clean for `src/app/`;
-pre-existing server-side errors unchanged)  Type-check: ✅ (per-file)
-Smoke: ⚠SKIPPED (no live DB/UI in this environment)
+Build (client `vite build`): ✅ | Build (server esbuild bundle): ✅ | Lint/type-check: ✅
+(52 pre-existing server errors unchanged; 0 new in edited regions) | Smoke: ⚠SKIPPED
+(no DB runtime available)
 
 ## Approbation CRITICAL
-N/A — STANDARD class, no sensitive files.
+N/A
 
 ## Handoff TestEngineer
-- Desktop viewport: click the top-right profile → dropdown shows "Settings" and "Log Out".
-- "Settings" navigates to the Settings dashboard view.
-- "Log Out" logs the user out and returns to the landing view.
-- Keyboard: trigger is focusable (button), dropdown is a radix-menu (arrow-key
-  navigable); Escape closes.
-- Regression: sidebar "Log out" button, mobile (<lg) header LogOut button all still work.
-- Desktop (lg+): sidebar does NOT show "Settings"; it is reachable via the profile dropdown.
-- Mobile (<lg): sidebar/mobile nav still shows "Settings" (no profile dropdown available).
-- Resize across the 1024px breakpoint: "Settings" appears/disappears in the nav
-  to match the available entry points; dropdown stays functional.
-- Confirm dropdown closes when clicking outside / pressing Escape.
-- Mobile (<sm): the Log Out icon is pinned to the top-right corner of the
-  header, not next to the upload control.
-- sm–lg: only the profile dropdown (top-right) shows Log Out; no overlapping
-  corner controls.
+- GET /api/sharing/links returns `original_name` matching the file's real name.
+- Shared tab shows the real name even when the file is in another folder / beyond the
+  first page (no full-inventory fetch fired).
+- Fallback path: cached/older link without `original_name` still resolves via `files`
+  or shows "Shared file" — no crash.
 
 ## Handoff QaEngineer
-STANDARD-class client-only change; build + type-check green for touched file.
-No CRITICAL approval required. Branch: `feat/profile-dropdown-desktop`.
+Validated: both client and server build clean; no new type errors elsewhere; report +
+trail on branch `fix/files-shared-tab-names`.
