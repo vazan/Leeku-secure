@@ -658,7 +658,7 @@ function StoragePanel() {
 
   const patchDevice = async (id: string, body: unknown) => {
     const response = await fetch(`/api/admin/storage/${id}`, {
-      method: "PATCH",
+      method: "POST",
       headers: adminHeaders(true),
       body: JSON.stringify(body),
     });

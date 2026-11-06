@@ -6373,13 +6373,13 @@ app.post('/api/admin/storage', authenticateUser as express.RequestHandler, verif
   }
 });
 
-app.patch('/api/admin/storage/:id', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+app.post('/api/admin/storage/:id', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
   try {
     const id = getSingleParam(req.params.id);
     const device = await updateStorageDevice(id, req.body ?? {});
     res.json({ success: true, device: await toDto(device) });
   } catch (err: any) {
-    console.error('[PATCH /api/admin/storage/:id]', err);
+    console.error('[POST /api/admin/storage/:id]', err);
     res.status(400).json({ error: err?.message || 'Failed to update storage device.' });
   }
 });
