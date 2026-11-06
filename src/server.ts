@@ -5500,15 +5500,21 @@ app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, asy
       insReq.input('allowExternalPreview', sql.Bit, allowExternalPreview ? 1 : 0);
             insReq.input('allowDecryptedExternalPreview', sql.Bit, allowDecryptedExternalPreview ? 1 : 0);
       insReq.input('vid',   sql.UniqueIdentifier, pinnedVersionId);
-      const insRes = await insReq.query<ShareRow>(
-         `INSERT INTO share_links (file_id,public_token,password_hash,expires_at,max_downloads,is_active,allow_external_preview,allow_decrypted_external_preview,version_id)
-         OUTPUT INSERTED.id,INSERTED.file_id,INSERTED.public_token,INSERTED.password_hash,
-            INSERTED.expires_at,INSERTED.max_downloads,INSERTED.download_count,INSERTED.is_active,INSERTED.allow_external_preview,INSERTED.allow_decrypted_external_preview,INSERTED.created_at,
-            f.original_name_encrypted,f.original_name_iv,f.original_name_auth_tag
-         FROM share_links INNER JOIN files f ON f.id=@fid
-          VALUES (@fid,@tok,@pwH,@exp,@md,@act,@allowExternalPreview,@allowDecryptedExternalPreview,@vid)`
+      await insReq.query(
+        `INSERT INTO share_links (file_id,public_token,password_hash,expires_at,max_downloads,is_active,allow_external_preview,allow_decrypted_external_preview,version_id)
+         VALUES (@fid,@tok,@pwH,@exp,@md,@act,@allowExternalPreview,@allowDecryptedExternalPreview,@vid)`
       );
-      shareRow = insRes.recordset[0];
+      // Reload the inserted row joined to `files` so the original-name columns
+      // (needed by mapShareRow) are present — OUTPUT cannot reference a JOIN in
+      // a simple INSERT ... VALUES.
+      const selReq = await getRequest(); selReq.input('fid', sql.UniqueIdentifier, fileId);
+      const selRes = await selReq.query<ShareRow>(
+        `SELECT sl.id,sl.file_id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.allow_external_preview,sl.allow_decrypted_external_preview,sl.created_at,
+                f.original_name_encrypted,f.original_name_iv,f.original_name_auth_tag
+         FROM share_links sl INNER JOIN files f ON sl.file_id=f.id
+         WHERE sl.file_id=@fid`
+      );
+      shareRow = selRes.recordset[0];
     } else {
       shareRow = existing.recordset[0];
       const sets: string[] = [];
