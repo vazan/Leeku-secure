@@ -6607,6 +6607,7 @@ export function startThumbnailScan(intervalMinutes: number = 60): void {
       const files = result.recordset.map((r) => ({
         id: r.id,
         stored_path: r.stored_path,
+        storage_device_id: r.storage_device_id,
         owner_user_id: r.owner_user_id,
         original_name_encrypted: r.original_name_encrypted,
         original_name_iv: r.original_name_iv,
