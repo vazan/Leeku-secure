@@ -13,7 +13,6 @@ export function validateProductionConfig(): void {
     'DB_SERVER',
     'DB_USER',
     'DB_PASSWORD',
-    'FILE_STORAGE_UNC_PATH',
     'UPLOAD_TEMP_PATH',
     'COOKIE_DOMAIN',
   ];
@@ -50,6 +49,11 @@ export function validateProductionConfig(): void {
   if (process.env.COOKIE_SECURE === 'false') {
     throw new Error('[production] COOKIE_SECURE cannot be false.');
   }
-  const vault = process.env.FILE_STORAGE_UNC_PATH!;
-  fs.accessSync(vault, fs.constants.R_OK | fs.constants.W_OK);
+  // Legacy single-vault validation (ADR-0001). Storage is now DB-backed via
+  // the storage_devices registry; FILE_STORAGE_UNC_PATH is optional and only
+  // checked here for backward compatibility during migration. Device
+  // reachability is validated at boot by provisionStorageDevices/monitor.
+  if (process.env.FILE_STORAGE_UNC_PATH) {
+    fs.accessSync(process.env.FILE_STORAGE_UNC_PATH, fs.constants.R_OK | fs.constants.W_OK);
+  }
 }

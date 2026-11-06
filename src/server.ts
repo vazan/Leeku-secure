@@ -67,6 +67,21 @@ import { createMaintenanceModeRouter } from './server/routes/maintenance-mode.js
 import { createDesktopUpdatesRouter, SYSTEM_UPDATE_FOLDER_NAME } from './server/routes/desktop-updates.js';
 import { mergeChunks, isSafeResumableIdentifier } from './server/merge-chunks.js';
 import { validateProductionConfig } from './server/utils/production.js';
+import {
+  listStorageDevices,
+  getStorageDevice,
+  createStorageDevice,
+  updateStorageDevice,
+  deleteStorageDevice,
+  selectProvisionDevice,
+  resolveBlobPath,
+  isDeviceReachable,
+  migrateLegacyStorage,
+  toDto,
+  decryptedUsername,
+  decryptedPassword,
+  type StorageDevice,
+} from './server/utils/storage-devices.js';
 import { getTextPreviewKind, TEXT_PREVIEW_MAX_BYTES } from './server/utils/text-preview.js';
 import type { AdminFileFolder, Quota, User, FileMetadata, FileFolder, FolderShareLink, ShareLink, SystemLog, SystemStats } from './app/shared/types/index.js';
 
@@ -286,21 +301,38 @@ async function isUncShareAvailable(sharePath: string): Promise<boolean> {
   }
 }
 
+/**
+ * Per-device storage health monitor (ADR-0001).
+ *
+ * Every check enumerates the DB-backed storage_devices registry and probes
+ * each provisionable device's root. Maintenance mode is only enabled when
+ * ALL provisionable devices are unreachable (there is nowhere to write).
+ * A single device going offline only removes it from the provisioning
+ * balancer — the platform keeps writing to remaining devices.
+ */
 async function evaluateUncShareHealth(): Promise<void> {
-  if (!FILE_VAULT.startsWith('\\\\')) return;
   if (uncShareMonitorRunning) return;
   uncShareMonitorRunning = true;
 
   try {
-    const shareAvailable = await isUncShareAvailable(FILE_VAULT);
+    const devices = await listStorageDevices();
+    const provisionable = devices.filter((d) => d.provisioning_enabled);
+    if (provisionable.length === 0) return; // no dynamic provisioning — leave as-is
+
+    const results = await Promise.all(
+      provisionable.map(async (d) => ({ device: d, reachable: await isUncShareAvailable(d.storage_path) }))
+    );
+    const anyUp = results.some((r) => r.reachable);
+    const allDown = !anyUp;
+
     const maintenanceEnabled = await getMaintenanceStatus();
     const autoEnabled = await getUncShareAutoMaintenanceStatus();
 
-    if (!shareAvailable) {
+    if (allDown) {
       if (!maintenanceEnabled) {
         await setMaintenanceStatus(true);
         await setUncShareAutoMaintenanceStatus(true);
-        console.error(`[maintenance][unc-monitor] UNC share unavailable: ${FILE_VAULT}. Maintenance mode enabled.`);
+        console.error(`[maintenance][storage-monitor] All provisionable storage devices unreachable. Maintenance mode enabled.`);
       }
       return;
     }
@@ -308,20 +340,21 @@ async function evaluateUncShareHealth(): Promise<void> {
     if (autoEnabled) {
       await setMaintenanceStatus(false);
       await setUncShareAutoMaintenanceStatus(false);
-      console.log(`[maintenance][unc-monitor] UNC share restored: ${FILE_VAULT}. Maintenance mode disabled.`);
+      console.log(`[maintenance][storage-monitor] At least one storage device reachable. Maintenance mode disabled.`);
+    }
+
+    const down = results.filter((r) => !r.reachable).map((r) => r.device.storage_id);
+    if (down.length > 0) {
+      console.warn(`[maintenance][storage-monitor] Device(s) offline (balancer will skip): ${down.join(', ')}`);
     }
   } catch (error) {
-    console.error('[maintenance][unc-monitor] Health check failed:', error);
+    console.error('[maintenance][storage-monitor] Health check failed:', error);
   } finally {
     uncShareMonitorRunning = false;
   }
 }
 
 function startUncShareMonitor(intervalMs: number = UNC_SHARE_HEALTHCHECK_INTERVAL_MS): void {
-  if (!FILE_VAULT.startsWith('\\\\')) {
-    console.log('[maintenance][unc-monitor] FILE_STORAGE_UNC_PATH is not a UNC path. Monitor disabled.');
-    return;
-  }
   if (uncShareMonitorTimer) return;
 
   void evaluateUncShareHealth();
@@ -331,13 +364,72 @@ function startUncShareMonitor(intervalMs: number = UNC_SHARE_HEALTHCHECK_INTERVA
   if (uncShareMonitorTimer && typeof uncShareMonitorTimer === 'object' && 'unref' in uncShareMonitorTimer) {
     uncShareMonitorTimer.unref();
   }
-  console.log(`[maintenance][unc-monitor] Started. Interval=${intervalMs}ms Path=${FILE_VAULT}`);
+  console.log(`[maintenance][storage-monitor] Started. Interval=${intervalMs}ms`);
 }
 
 function stopUncShareMonitor(): void {
   if (!uncShareMonitorTimer) return;
   clearInterval(uncShareMonitorTimer);
   uncShareMonitorTimer = null;
+}
+
+// ──────────────────────────────────────────────────────────────
+// Device provisioning (net use) — ADR-0001
+// ──────────────────────────────────────────────────────────────
+
+/**
+ * Mounts every DB-registered UNC storage device using its decrypted SMB
+ * credentials (replaces the retired STORAGE_NET_USE_* env-driven mount).
+ *
+ * Local paths (e.g. P:\DATA-00\) and devices without SMB credentials are
+ * left untouched — they are expected to be already accessible to the Node
+ * service account (pre-mapped persistent credential or local disk).
+ */
+async function mountStorageDevice(device: StorageDevice): Promise<void> {
+  if (process.platform !== 'win32') {
+    console.log(`[storage] Non-Windows host — skipping net use for ${device.storage_path}.`);
+    return;
+  }
+  if (!device.storage_path.startsWith('\\\\')) return; // local path or non-UNC
+
+  const user = device.smb_username_encrypted ? decryptedUsername(device) : undefined;
+  const pass = device.smb_password_encrypted ? decryptedPassword(device) : undefined;
+
+  try {
+    const args = [device.storage_path];
+    if (pass) args.push(pass);
+    if (user) args.push(`/user:${user}`);
+    args.push('/persistent:no');
+    execFileSync('net', ['use', ...args], { stdio: 'pipe' });
+    console.log(`[storage] UNC share mapped: ${device.storage_path}`);
+  } catch (e: any) {
+    const msg = (e.stderr?.toString() || e.message || '').trim();
+    if (/already been used|multiple connections/i.test(msg)) {
+      console.log(`[storage] UNC share already mapped: ${device.storage_path}`);
+    } else {
+      console.error(`[storage] Failed to map UNC share "${device.storage_path}": ${msg}`);
+    }
+  }
+}
+
+async function provisionStorageDevices(): Promise<void> {
+  const devices = await listStorageDevices();
+  for (const device of devices) {
+    await mountStorageDevice(device);
+  }
+}
+
+/**
+ * Resolves the absolute on-disk path of a vault blob, honoring the file's
+ * storage device FK (ADR-0001). Falls back to the legacy single vault root
+ * for rows not yet assigned a device (pre-migration / NULL FK).
+ */
+async function resolveVaultPathForRow(deviceId: string | null | undefined, storedPath: string): Promise<string> {
+  if (deviceId) {
+    const dev = await getStorageDevice(deviceId);
+    if (dev) return resolveBlobPath(dev, storedPath);
+  }
+  return path.join(FILE_VAULT, storedPath);
 }
 
 function configureHttpServer(server: http.Server): http.Server {
@@ -556,38 +648,17 @@ function requireCsrfForCookieSession(req: express.Request, res: express.Response
 }
 
 // ──────────────────────────────────────────────────────────────
-// Vault directory / UNC share mount
+// Vault directory bootstrap
 // ──────────────────────────────────────────────────────────────
+// NOTE: UNC share provisioning (`net use`) is now performed by
+// provisionStorageDevices() during bootstrap, driven by the DB-backed
+// storage_devices registry (ADR-0001). The legacy env-driven auto-mount
+// (STORAGE_NET_USE_*) is retired.
+//
+// FILE_VAULT remains as a legacy safety net for the profile-picture root
+// and for environments with no multi-storage registry yet.
 
-/**
- * If STORAGE_NET_USE_PATH is set, run `net use` at startup to map
- * the UNC share with the supplied credentials. This is only needed
- * when the Windows service account cannot be pre-configured with
- * persistent credentials for the share.
- *
- * Credentials are read from env vars — never hardcoded.
- */
-if (process.env.STORAGE_NET_USE_PATH) {
-  const sharePath = process.env.STORAGE_NET_USE_PATH;
-  const shareUser = process.env.STORAGE_NET_USE_USER;
-  const sharePass = process.env.STORAGE_NET_USE_PASS;
-  try {
-    const args = [sharePath];
-    if (sharePass) args.push(sharePass);
-    if (shareUser) args.push(`/user:${shareUser}`);
-    args.push('/persistent:no');
-    execFileSync('net', ['use', ...args], { stdio: 'pipe' });
-    console.log(`[server] UNC share mapped: ${sharePath}`);
-  } catch (e: any) {
-    // Already mapped or reconnected — not fatal
-    const msg = (e.stderr?.toString() || e.message || '').trim();
-    if (/already been used|multiple connections/i.test(msg)) {
-      console.log(`[server] UNC share already mapped: ${sharePath}`);
-    } else {
-      console.error(`[server] Failed to map UNC share "${sharePath}": ${msg}`);
-    }
-  }
-}
+// Retired: `if (process.env.STORAGE_NET_USE_PATH) { ... net use ... }`
 
 if (!FILE_VAULT.startsWith('\\\\') && !fs.existsSync(FILE_VAULT)) {
   fs.mkdirSync(FILE_VAULT, { recursive: true });
@@ -857,6 +928,7 @@ interface FileRow {
   deleted_at?: Date | string | null; // Set when file is moved to Trash
   version_count?: number;           // total versions (current + archived)
   file_name_hash?: string | null;   // HMAC of normalized filename (same-name detection)
+  storage_device_id?: string | null; // device FK (ADR-0001 multi-storage)
 }
 
 // Archived (older) version of a logical file. The current version lives in `files`
@@ -871,6 +943,7 @@ interface FileVersionRow {
   created_at: Date;
   deleted_at?: Date | string | null;  // soft-delete marker (version trash)
   deleted_by?: string | null;
+  storage_device_id?: string | null;  // device FK (ADR-0001 multi-storage)
 }
 
 interface FolderRow {
@@ -2056,15 +2129,15 @@ app.post('/api/users/me/delete-confirm', async (req, res) => {
       `Account permanently deleted: ${email}. All files, share links, and keys cascaded.`);
 
     // Fetch vault file paths BEFORE deleting the user (files cascade on user delete)
-    const vaultPathsToDelete: string[] = [];
+    const vaultPathsToDelete: { stored_path: string; storage_device_id: string | null }[] = [];
     try {
       const fpReq = await getRequest();
       fpReq.input('uid', sql.UniqueIdentifier, row.id);
-      const fpResult = await fpReq.query<{ stored_path: string }>(
-        `SELECT stored_path FROM files WHERE owner_user_id=@uid`
+      const fpResult = await fpReq.query<{ stored_path: string; storage_device_id: string | null }>(
+        `SELECT stored_path, storage_device_id FROM files WHERE owner_user_id=@uid`
       );
       for (const f of fpResult.recordset) {
-        vaultPathsToDelete.push(f.stored_path);
+        vaultPathsToDelete.push({ stored_path: f.stored_path, storage_device_id: f.storage_device_id });
       }
     } catch (e) {
       console.warn('[delete-confirm] Could not fetch file paths before deletion:', (e as Error).message);
@@ -2076,9 +2149,9 @@ app.post('/api/users/me/delete-confirm', async (req, res) => {
     await delReq.query(`DELETE FROM users WHERE id=@id`);
 
     // Clean up vault files from disk
-    for (const storedPath of vaultPathsToDelete) {
+    for (const entry of vaultPathsToDelete) {
       try {
-        const vaultPath = path.join(FILE_VAULT, storedPath);
+        const vaultPath = await resolveVaultPathForRow(entry.storage_device_id, entry.stored_path);
         if (fs.existsSync(vaultPath)) fs.unlinkSync(vaultPath);
       } catch (e) { /* file may already be gone */ }
     }
@@ -2470,7 +2543,7 @@ app.post('/api/file-folders/:id/delete', authenticateUser as express.RequestHand
         filesReq.input('ownerId', sql.UniqueIdentifier, req.userId!);
         filesReq.input('batchSize', sql.Int, BATCH_SIZE);
         
-        const filesResult = await filesReq.query<{id:string;stored_path:string;size_bytes:number;status:string}>(
+        const filesResult = await filesReq.query<{id:string;stored_path:string;size_bytes:number;status:string;storage_device_id:string|null}>(
           `;WITH folder_tree AS (
              SELECT id FROM file_folders WHERE id=@folderId AND owner_user_id=@ownerId
              UNION ALL
@@ -2479,7 +2552,7 @@ app.post('/api/file-folders/:id/delete', authenticateUser as express.RequestHand
              INNER JOIN folder_tree ft ON ff.parent_folder_id=ft.id
              WHERE ff.owner_user_id=@ownerId
            )
-           SELECT id, stored_path, size_bytes, status
+           SELECT id, stored_path, size_bytes, status, storage_device_id
            FROM files
            WHERE owner_user_id=@ownerId AND folder_id IN (SELECT id FROM folder_tree)
            ORDER BY id
@@ -2504,15 +2577,15 @@ app.post('/api/file-folders/:id/delete', authenticateUser as express.RequestHand
 
           // Collect this batch's archived-version blob paths BEFORE the rows are
           // cascaded away, so no version blob is left behind.
-          let versionPaths: string[] = [];
+          let versionPaths: { stored_path: string; storage_device_id: string | null }[] = [];
           try {
             const verReq = await getRequest();
             batch.forEach((file, idx) => verReq.input(`fid${idx}`, sql.UniqueIdentifier, file.id));
-            const verRes = await verReq.query<{ stored_path: string }>(
-              `SELECT stored_path FROM file_versions
+            const verRes = await verReq.query<{ stored_path: string; storage_device_id: string | null }>(
+              `SELECT stored_path, storage_device_id FROM file_versions
                WHERE file_id IN (${batch.map((_, idx) => `@fid${idx}`).join(', ')})`
             );
-            versionPaths = verRes.recordset.map((v) => v.stored_path);
+            versionPaths = verRes.recordset.map((v) => ({ stored_path: v.stored_path, storage_device_id: v.storage_device_id }));
           } catch (err) {
             // Enumeration failure is not fatal: the DB delete still proceeds and we
             // fall back to unlinking only the current blobs, plus whatever versions
@@ -2522,18 +2595,18 @@ app.post('/api/file-folders/:id/delete', authenticateUser as express.RequestHand
           }
 
           await Promise.all([
-            ...batch.map((file) => {
-              const vaultPath = path.join(FILE_VAULT, file.stored_path);
-              if (!fs.existsSync(vaultPath)) return Promise.resolve();
+            ...batch.map(async (file) => {
+              const vaultPath = await resolveVaultPathForRow(file.storage_device_id, file.stored_path);
+              if (!fs.existsSync(vaultPath)) return;
               return fs.promises.unlink(vaultPath).catch((err) => {
                 console.error(`[DELETE FOLDER] Failed to delete vault file ${file.id} (${file.stored_path}):`, err);
               });
             }),
-            ...versionPaths.map((storedPath) => {
-              const vaultPath = path.join(FILE_VAULT, storedPath);
-              if (!fs.existsSync(vaultPath)) return Promise.resolve();
+            ...versionPaths.map(async (v) => {
+              const vaultPath = await resolveVaultPathForRow(v.storage_device_id, v.stored_path);
+              if (!fs.existsSync(vaultPath)) return;
               return fs.promises.unlink(vaultPath).catch((err) => {
-                console.error(`[DELETE FOLDER] Failed to delete archived version vault file (${storedPath}):`, err);
+                console.error(`[DELETE FOLDER] Failed to delete archived version vault file (${v.stored_path}):`, err);
               });
             }),
           ]);
@@ -3059,6 +3132,7 @@ app.post(
   let uploadFolder: FolderRow | null = null;
     let currentStage = 'quota_lookup';
     let vaultFilePath: string | null = null;
+    let provisionDevice: StorageDevice | null = null;
     const streamsProgress = String(req.headers.accept || '').includes('application/x-ndjson');
     const processingTotal = 1000;
     let progressStreamStarted = false;
@@ -3284,7 +3358,16 @@ app.post(
       // ── Stream-encrypt directly to vault (constant memory) ─────
       currentStage = 'encrypt_file';
       const vaultFileName = generateSecureToken(16) + '.vault';
-      vaultFilePath = path.join(FILE_VAULT, vaultFileName);
+
+      // Select the target device for this upload (auto-balancing, ADR-0001).
+      // Fail closed if no provisionable + reachable device exists.
+      const devicePool = await listStorageDevices();
+      const target = await selectProvisionDevice(devicePool);
+      if (!target) {
+        throw new Error('No storage device available for provisioning. Add an enabled device in the admin panel or verify device reachability.');
+      }
+      provisionDevice = target;
+      vaultFilePath = resolveBlobPath(target, vaultFileName);
 
       sendUploadProgress({
         type: 'processing',
@@ -3338,7 +3421,7 @@ app.post(
                 stored_path, mime_type, size_bytes, encrypted_size_bytes, status, checksum_sha256,
                 scan_result, scan_message, is_encrypted, leeku_vibe, ttl_hours,
                 client_secret_hash, client_crypto_salt, client_crypto_iv, client_crypto_iterations,
-                expires_at, created_at, deleted_at, version_count
+                expires_at, created_at, deleted_at, version_count, storage_device_id
          FROM files
          WHERE owner_user_id=@ownerId
            AND ((@folderId IS NULL AND folder_id IS NULL) OR folder_id=@folderId)
@@ -3366,7 +3449,7 @@ app.post(
                   stored_path, mime_type, size_bytes, encrypted_size_bytes, status, checksum_sha256,
                   scan_result, scan_message, is_encrypted, leeku_vibe, ttl_hours,
                   client_secret_hash, client_crypto_salt, client_crypto_iv, client_crypto_iterations,
-                  expires_at, created_at, deleted_at, version_count
+                  expires_at, created_at, deleted_at, version_count, storage_device_id
            FROM files
            WHERE owner_user_id=@ownerId
              AND ((@folderId IS NULL AND folder_id IS NULL) OR folder_id=@folderId)
@@ -3420,12 +3503,14 @@ app.post(
         archiveReq.input('secS',  sql.VarBinary(32),   existingFile.client_crypto_salt);
         archiveReq.input('secI',  sql.VarBinary(16),   existingFile.client_crypto_iv);
         archiveReq.input('secIt', sql.Int,             existingFile.client_crypto_iterations);
+        archiveReq.input('devId', sql.UniqueIdentifier, existingFile.storage_device_id ?? null);
         await archiveReq.query(
           `INSERT INTO file_versions
             (id,file_id,version_no,original_name_encrypted,original_name_iv,original_name_auth_tag,
              stored_path,mime_type,size_bytes,encrypted_size_bytes,status,checksum_sha256,
-             scan_result,scan_message,is_encrypted,client_secret_hash,client_crypto_salt,client_crypto_iv,client_crypto_iterations,created_at)
-           VALUES (@archiveId,@fileId,@versionNo,@nEnc,@nIv,@nTag,@spath,@mime,@sz,@esz,'Available',@chk,@scan,@smsg,@isEnc,@secH,@secS,@secI,@secIt,SYSDATETIMEOFFSET())`
+             scan_result,scan_message,is_encrypted,client_secret_hash,client_crypto_salt,client_crypto_iv,client_crypto_iterations,created_at,
+             storage_device_id)
+           VALUES (@archiveId,@fileId,@versionNo,@nEnc,@nIv,@nTag,@spath,@mime,@sz,@esz,'Available',@chk,@scan,@smsg,@isEnc,@secH,@secS,@secI,@secIt,SYSDATETIMEOFFSET(),@devId)`
         );
 
         // 2) Move previous wrapped key -> file_version_keys.
@@ -3471,11 +3556,13 @@ app.post(
         updReq.input('secI',  sql.VarBinary(16),   uploadSecretIv);
         updReq.input('secIt', sql.Int,             uploadSecretIterations);
         updReq.input('nameHash', sql.Char(64),     nameHash);
+        updReq.input('devId', sql.UniqueIdentifier, provisionDevice?.id ?? null);
         const updRes = await updReq.query<FileRow>(
           `UPDATE files SET
              stored_path=@spath, mime_type=@mime, size_bytes=@sz, encrypted_size_bytes=@esz,
              checksum_sha256=@chk, scan_result=@scan, scan_message=@smsg,
              leeku_vibe=@vibe, ttl_hours=@ttl, expires_at=@exp,
+             storage_device_id=@devId,
              client_secret_hash=@secH, client_crypto_salt=@secS, client_crypto_iv=@secI, client_crypto_iterations=@secIt,
              file_name_hash=@nameHash, version_count=version_count+1, current_version_id=NULL,
              status='Available', deleted_at=NULL
@@ -3524,6 +3611,7 @@ app.post(
         fileReq.input('clientCryptoIterations', sql.Int, uploadSecretIterations);
         fileReq.input('folderId', sql.UniqueIdentifier, uploadFolder?.id || null);
         fileReq.input('nameHash', sql.Char(64), nameHash);
+        fileReq.input('deviceId', sql.UniqueIdentifier, provisionDevice?.id ?? null);
 
         const fileResult = await fileReq.query<FileRow>(
           `INSERT INTO files (
@@ -3532,7 +3620,7 @@ app.post(
              checksum_sha256, scan_result, scan_message, scanned_at,
              leeku_vibe, ttl_hours,
              client_secret_hash, client_crypto_salt, client_crypto_iv, client_crypto_iterations,
-             expires_at, is_encrypted, file_name_hash
+             expires_at, is_encrypted, file_name_hash, storage_device_id
            )
             OUTPUT INSERTED.id, INSERTED.owner_user_id, INSERTED.folder_id,
                   INSERTED.original_name_encrypted, INSERTED.original_name_iv, INSERTED.original_name_auth_tag,
@@ -3540,10 +3628,10 @@ app.post(
                   INSERTED.status, INSERTED.checksum_sha256, INSERTED.scan_result, INSERTED.scan_message,
                   INSERTED.is_encrypted, INSERTED.leeku_vibe, INSERTED.ttl_hours,
                   INSERTED.client_secret_hash, INSERTED.client_crypto_salt, INSERTED.client_crypto_iv, INSERTED.client_crypto_iterations,
-                  INSERTED.expires_at, INSERTED.created_at
+                  INSERTED.expires_at, INSERTED.created_at, INSERTED.storage_device_id
           VALUES (@ownerId,@folderId,@nEnc,@nIv,@nTag, @spath,@mime,@sz,@esz, @chk,@scan,@smsg,SYSDATETIMEOFFSET(), @vibe,@ttl,
                    @clientSecretHash,@clientCryptoSalt,@clientCryptoIv,@clientCryptoIterations,
-                   @exp,1,@nameHash)`
+                   @exp,1,@nameHash,@deviceId)`
         );
         newFile = fileResult.recordset[0];
         newFile.folder_name = uploadFolder?.name || null;
@@ -3883,7 +3971,7 @@ app.post('/api/files/:id/restore', authenticateUser as express.RequestHandler, a
     fileReq.input('id', sql.UniqueIdentifier, fileId);
     const fileResult = await fileReq.query<FileRow>(
       `SELECT id,owner_user_id,original_name_encrypted,original_name_iv,original_name_auth_tag,
-              stored_path,size_bytes,status,mime_type,encrypted_size_bytes,checksum_sha256,
+              stored_path,storage_device_id,size_bytes,status,mime_type,encrypted_size_bytes,checksum_sha256,
               is_encrypted,leeku_vibe,ttl_hours,expires_at,created_at,deleted_at
        FROM files WHERE id=@id`
     );
@@ -3930,7 +4018,7 @@ app.post('/api/files/:id/delete-permanent', authenticateUser as express.RequestH
     fileReq.input('id', sql.UniqueIdentifier, fileId);
     const fileResult = await fileReq.query<FileRow>(
       `SELECT id,owner_user_id,original_name_encrypted,original_name_iv,original_name_auth_tag,
-              stored_path,size_bytes,status,mime_type,encrypted_size_bytes,checksum_sha256,
+              stored_path,storage_device_id,size_bytes,status,mime_type,encrypted_size_bytes,checksum_sha256,
               is_encrypted,leeku_vibe,ttl_hours,expires_at,created_at,deleted_at
        FROM files WHERE id=@id`
     );
@@ -3944,7 +4032,7 @@ app.post('/api/files/:id/delete-permanent', authenticateUser as express.RequestH
       return res.status(409).json({ error: 'File must be in the trash to permanently delete it.' });
 
     const originalName = decryptColumn(file.original_name_encrypted, file.original_name_iv, file.original_name_auth_tag);
-    const vaultPath = path.join(FILE_VAULT, file.stored_path);
+    const vaultPath = await resolveVaultPathForRow(file.storage_device_id, file.stored_path);
 
     // Physically delete the vault file
     try {
@@ -3992,7 +4080,7 @@ app.get('/api/files/:id/preview', authenticateUser as express.RequestHandler, as
     fileReq.input('id', sql.UniqueIdentifier, fileId);
     const fileResult = await fileReq.query<FileRow>(
       `SELECT id,owner_user_id,original_name_encrypted,original_name_iv,original_name_auth_tag,
-              stored_path,size_bytes,status,mime_type,encrypted_size_bytes,checksum_sha256,
+              stored_path,storage_device_id,size_bytes,status,mime_type,encrypted_size_bytes,checksum_sha256,
               scan_result,scan_message,is_encrypted,leeku_vibe,ttl_hours,
               client_secret_hash,client_crypto_salt,client_crypto_iv,client_crypto_iterations,
               expires_at,created_at
@@ -4028,7 +4116,7 @@ app.get('/api/files/:id/preview', authenticateUser as express.RequestHandler, as
         return res.status(403).json({ error: 'Incorrect secret key.' });
     }
 
-    const vaultPath = path.join(FILE_VAULT, file.stored_path);
+    const vaultPath = await resolveVaultPathForRow(file.storage_device_id, file.stored_path);
     if (!fs.existsSync(vaultPath)) return res.status(410).json({ error: 'Vault file not found.' });
 
     const keyReq = await getRequest();
@@ -4119,7 +4207,7 @@ app.get('/api/files/:id/thumbnail', authenticateUser as express.RequestHandler, 
     fileReq.input('id', sql.UniqueIdentifier, fileId);
     const fileResult = await fileReq.query<FileRow>(
       `SELECT id,owner_user_id,original_name_encrypted,original_name_iv,original_name_auth_tag,
-              stored_path,size_bytes,status,mime_type,encrypted_size_bytes,checksum_sha256,
+              stored_path,storage_device_id,size_bytes,status,mime_type,encrypted_size_bytes,checksum_sha256,
               scan_result,scan_message,is_encrypted,leeku_vibe,ttl_hours,
               client_secret_hash,client_crypto_salt,client_crypto_iv,client_crypto_iterations,
               expires_at,created_at,thumbnail_preview
@@ -4137,7 +4225,7 @@ app.get('/api/files/:id/thumbnail', authenticateUser as express.RequestHandler, 
       return res.status(415).json({ error: 'Thumbnail is not available for this file type.' });
 
     const originalName = decryptColumn(file.original_name_encrypted, file.original_name_iv, file.original_name_auth_tag);
-    const vaultPath = path.join(FILE_VAULT, file.stored_path);
+    const vaultPath = await resolveVaultPathForRow(file.storage_device_id, file.stored_path);
     if (!fs.existsSync(vaultPath)) return res.status(410).json({ error: 'Vault file not found.' });
 
     const keyReq = await getRequest();
@@ -4209,7 +4297,7 @@ app.get('/api/files/:id/download', authenticateUser as express.RequestHandler, a
     fileReq.input('id', sql.UniqueIdentifier, fileId);
     const fileResult = await fileReq.query<FileRow>(
       `SELECT id,owner_user_id,original_name_encrypted,original_name_iv,original_name_auth_tag,
-      stored_path,size_bytes,status,mime_type,encrypted_size_bytes,checksum_sha256,
+      stored_path,storage_device_id,size_bytes,status,mime_type,encrypted_size_bytes,checksum_sha256,
       scan_result,scan_message,is_encrypted,leeku_vibe,ttl_hours,
       client_secret_hash,client_crypto_salt,client_crypto_iv,client_crypto_iterations,
       expires_at,created_at
@@ -4224,7 +4312,7 @@ app.get('/api/files/:id/download', authenticateUser as express.RequestHandler, a
     if (file.status === 'Blocked')
       { cleanupTemp(); return res.status(410).json({ error: 'Blocked files cannot be downloaded.' }); }
 
-    const vaultPath = path.join(FILE_VAULT, file.stored_path);
+    const vaultPath = await resolveVaultPathForRow(file.storage_device_id, file.stored_path);
     if (!fs.existsSync(vaultPath)) { cleanupTemp(); return res.status(410).json({ error: 'Vault file not found.' }); }
 
     const keyReq = await getRequest();
@@ -4410,7 +4498,7 @@ app.get('/api/files/:id/versions/:versionId/download', authenticateUser as expre
       curReq.input('id', sql.UniqueIdentifier, fileId);
       const curRes = await curReq.query<FileRow>(
         `SELECT id,owner_user_id,original_name_encrypted,original_name_iv,original_name_auth_tag,
-                stored_path,size_bytes,status,mime_type,encrypted_size_bytes,checksum_sha256,
+                stored_path,storage_device_id,size_bytes,status,mime_type,encrypted_size_bytes,checksum_sha256,
                 scan_result,scan_message,is_encrypted,leeku_vibe,ttl_hours,
                 client_secret_hash,client_crypto_salt,client_crypto_iv,client_crypto_iterations,
                 expires_at,created_at
@@ -4421,7 +4509,7 @@ app.get('/api/files/:id/versions/:versionId/download', authenticateUser as expre
       if (current.status === 'Blocked')
         { cleanupTemp(); return res.status(410).json({ error: 'Blocked files cannot be downloaded.' }); }
 
-      const vaultPath = path.join(FILE_VAULT, current.stored_path);
+      const vaultPath = await resolveVaultPathForRow(current.storage_device_id, current.stored_path);
       if (!fs.existsSync(vaultPath)) { cleanupTemp(); return res.status(410).json({ error: 'Vault file not found.' }); }
 
       const curKeyReq = await getRequest();
@@ -4483,7 +4571,7 @@ app.get('/api/files/:id/versions/:versionId/download', authenticateUser as expre
     verReq.input('fid', sql.UniqueIdentifier, fileId);
     const verRes = await verReq.query<FileVersionRow>(
       `SELECT id,file_id,version_no,original_name_encrypted,original_name_iv,original_name_auth_tag,
-              stored_path,mime_type,size_bytes,encrypted_size_bytes,status,checksum_sha256,
+              stored_path,storage_device_id,mime_type,size_bytes,encrypted_size_bytes,status,checksum_sha256,
               scan_result,scan_message,is_encrypted,client_secret_hash,client_crypto_salt,client_crypto_iv,client_crypto_iterations,created_at,deleted_at
        FROM file_versions WHERE id=@vid AND file_id=@fid`
     );
@@ -4493,7 +4581,7 @@ app.get('/api/files/:id/versions/:versionId/download', authenticateUser as expre
     if (version.status === 'Blocked')
       { cleanupTemp(); return res.status(410).json({ error: 'Blocked versions cannot be downloaded.' }); }
 
-    const vaultPath = path.join(FILE_VAULT, version.stored_path);
+    const vaultPath = await resolveVaultPathForRow(version.storage_device_id, version.stored_path);
     if (!fs.existsSync(vaultPath)) { cleanupTemp(); return res.status(410).json({ error: 'Vault file not found.' }); }
 
     const keyReq = await getRequest();
@@ -4752,8 +4840,8 @@ app.delete('/api/files/:id/versions/:versionId', authenticateUser as express.Req
     const verReq = await getRequest();
     verReq.input('vid', sql.UniqueIdentifier, versionId);
     verReq.input('fid', sql.UniqueIdentifier, fileId);
-    const verRes = await verReq.query<{ id: string; stored_path: string; file_id: string }>(
-      `SELECT id,file_id,stored_path FROM file_versions WHERE id=@vid AND file_id=@fid`
+    const verRes = await verReq.query<{ id: string; stored_path: string; storage_device_id: string | null; file_id: string }>(
+      `SELECT id,file_id,stored_path,storage_device_id FROM file_versions WHERE id=@vid AND file_id=@fid`
     );
     if (!verRes.recordset.length) return res.status(404).json({ error: 'Version not found.' });
     const version = verRes.recordset[0];
@@ -4845,8 +4933,8 @@ app.post('/api/files/:id/versions/:versionId/delete-permanent', authenticateUser
     const verReq = await getRequest();
     verReq.input('vid', sql.UniqueIdentifier, versionId);
     verReq.input('fid', sql.UniqueIdentifier, fileId);
-    const verRes = await verReq.query<{ id: string; stored_path: string }>(
-      `SELECT id,stored_path FROM file_versions WHERE id=@vid AND file_id=@fid AND deleted_at IS NOT NULL`
+    const verRes = await verReq.query<{ id: string; stored_path: string; storage_device_id: string | null }>(
+      `SELECT id,stored_path,storage_device_id FROM file_versions WHERE id=@vid AND file_id=@fid AND deleted_at IS NOT NULL`
     );
     if (!verRes.recordset.length) return res.status(404).json({ error: 'Trashed version not found.' });
     const version = verRes.recordset[0];
@@ -4865,7 +4953,7 @@ app.post('/api/files/:id/versions/:versionId/delete-permanent', authenticateUser
 
     // Physically delete the vault blob (row delete cascades to file_version_keys).
     try {
-      const vaultPath = path.join(FILE_VAULT, version.stored_path);
+      const vaultPath = await resolveVaultPathForRow(version.storage_device_id, version.stored_path);
       if (fs.existsSync(vaultPath)) await fs.promises.unlink(vaultPath);
     } catch (err) {
       console.error(`[DEL VERSION PERMANENT] Failed to delete vault file ${version.stored_path}:`, err);
@@ -4895,7 +4983,7 @@ app.post('/api/files/:id/download/prepare', authenticateUser as express.RequestH
     fileReq.input('id', sql.UniqueIdentifier, fileId);
     const fileResult = await fileReq.query<FileRow>(
       `SELECT id,owner_user_id,original_name_encrypted,original_name_iv,original_name_auth_tag,
-              stored_path,size_bytes,status,mime_type,encrypted_size_bytes,checksum_sha256,
+              stored_path,storage_device_id,size_bytes,status,mime_type,encrypted_size_bytes,checksum_sha256,
               scan_result,scan_message,is_encrypted,leeku_vibe,ttl_hours,
               client_secret_hash,client_crypto_salt,client_crypto_iv,client_crypto_iterations,
               expires_at,created_at
@@ -4914,7 +5002,7 @@ app.post('/api/files/:id/download/prepare', authenticateUser as express.RequestH
       return res.status(410).json({ error: 'Blocked files cannot be downloaded.' });
     }
 
-    const vaultPath = path.join(FILE_VAULT, file.stored_path);
+    const vaultPath = await resolveVaultPathForRow(file.storage_device_id, file.stored_path);
     if (!fs.existsSync(vaultPath)) return res.status(410).json({ error: 'Vault file not found.' });
 
     const keyReq = await getRequest();
@@ -5134,8 +5222,8 @@ app.get('/api/sharing/links', authenticateUser as express.RequestHandler, async 
     const request = await getRequest();
     request.input('ownerId', sql.UniqueIdentifier, req.userId!);
     request.input('systemFolderName', sql.NVarChar(120), SYSTEM_UPDATE_FOLDER_NAME);
-    const result = await request.query<ShareRow & { stored_path: string }>(
-      `SELECT sl.id,sl.file_id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.allow_external_preview,sl.allow_decrypted_external_preview,sl.created_at,f.stored_path,f.original_name_encrypted,f.original_name_iv,f.original_name_auth_tag
+    const result = await request.query<ShareRow & { stored_path: string; storage_device_id: string | null }>(
+      `SELECT sl.id,sl.file_id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.allow_external_preview,sl.allow_decrypted_external_preview,sl.created_at,f.stored_path,f.storage_device_id,f.original_name_encrypted,f.original_name_iv,f.original_name_auth_tag
        FROM share_links sl
        INNER JOIN files f ON sl.file_id=f.id
        WHERE f.owner_user_id=@ownerId
@@ -5166,10 +5254,17 @@ app.get('/api/sharing/links', authenticateUser as express.RequestHandler, async 
          )
        ORDER BY fsl.created_at DESC`,
     );
+    const links = result.recordset;
+    const linkAvailability = await Promise.all(
+      links.map(async (row) => {
+        const availPath = await resolveVaultPathForRow(row.storage_device_id, row.stored_path);
+        return fs.existsSync(availPath);
+      })
+    );
     res.json({
-      links: result.recordset.map((row) => ({
+      links: links.map((row, i) => ({
         ...mapShareRow(row),
-        is_available: fs.existsSync(path.join(FILE_VAULT, row.stored_path)),
+        is_available: linkAvailability[i],
       })),
       folder_links: folderResult.recordset.map(mapFolderShareRow),
     });
@@ -5325,8 +5420,8 @@ app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, asy
   const { password, expires_at, max_downloads, is_active, allow_external_preview, allow_decrypted_external_preview, version_id } = req.body;
   try {
     const fReq = await getRequest(); fReq.input('id', sql.UniqueIdentifier, fileId);
-    const fRes = await fReq.query<{owner_user_id:string;status:string;stored_path:string;mime_type:string;size:number;client_secret_hash:string|null}>(
-      'SELECT owner_user_id,status,stored_path,mime_type,size_bytes AS size,client_secret_hash FROM files WHERE id=@id'
+    const fRes = await fReq.query<{owner_user_id:string;status:string;stored_path:string;storage_device_id:string|null;mime_type:string;size:number;client_secret_hash:string|null}>(
+      'SELECT owner_user_id,status,stored_path,storage_device_id,mime_type,size_bytes AS size,client_secret_hash FROM files WHERE id=@id'
     );
     if (!fRes.recordset.length) return res.status(404).json({ error: 'File not found.' });
     const file = fRes.recordset[0];
@@ -5335,7 +5430,8 @@ app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, asy
     if (await isDesktopUpdateFile(fileId))
       return res.status(403).json({ error: 'Desktop update artifacts cannot be shared.' });
     if (file.status === 'Blocked') return res.status(400).json({ error: 'Blocked files cannot be shared.' });
-    if (!fs.existsSync(path.join(FILE_VAULT, file.stored_path)))
+    const shareVaultPath = await resolveVaultPathForRow(file.storage_device_id, file.stored_path);
+    if (!fs.existsSync(shareVaultPath))
       return res.status(410).json({ error: 'This file is no longer available in the vault.' });
 
     // POURQUOI : per-version sharing — a link may be pinned to a specific archived version.
@@ -5404,15 +5500,21 @@ app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, asy
       insReq.input('allowExternalPreview', sql.Bit, allowExternalPreview ? 1 : 0);
             insReq.input('allowDecryptedExternalPreview', sql.Bit, allowDecryptedExternalPreview ? 1 : 0);
       insReq.input('vid',   sql.UniqueIdentifier, pinnedVersionId);
-      const insRes = await insReq.query<ShareRow>(
-         `INSERT INTO share_links (file_id,public_token,password_hash,expires_at,max_downloads,is_active,allow_external_preview,allow_decrypted_external_preview,version_id)
-         OUTPUT INSERTED.id,INSERTED.file_id,INSERTED.public_token,INSERTED.password_hash,
-            INSERTED.expires_at,INSERTED.max_downloads,INSERTED.download_count,INSERTED.is_active,INSERTED.allow_external_preview,INSERTED.allow_decrypted_external_preview,INSERTED.created_at,
-            f.original_name_encrypted,f.original_name_iv,f.original_name_auth_tag
-         FROM share_links INNER JOIN files f ON f.id=@fid
-          VALUES (@fid,@tok,@pwH,@exp,@md,@act,@allowExternalPreview,@allowDecryptedExternalPreview,@vid)`
+      await insReq.query(
+        `INSERT INTO share_links (file_id,public_token,password_hash,expires_at,max_downloads,is_active,allow_external_preview,allow_decrypted_external_preview,version_id)
+         VALUES (@fid,@tok,@pwH,@exp,@md,@act,@allowExternalPreview,@allowDecryptedExternalPreview,@vid)`
       );
-      shareRow = insRes.recordset[0];
+      // Reload the inserted row joined to `files` so the original-name columns
+      // (needed by mapShareRow) are present — OUTPUT cannot reference a JOIN in
+      // a simple INSERT ... VALUES.
+      const selReq = await getRequest(); selReq.input('fid', sql.UniqueIdentifier, fileId);
+      const selRes = await selReq.query<ShareRow>(
+        `SELECT sl.id,sl.file_id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.allow_external_preview,sl.allow_decrypted_external_preview,sl.created_at,
+                f.original_name_encrypted,f.original_name_iv,f.original_name_auth_tag
+         FROM share_links sl INNER JOIN files f ON sl.file_id=f.id
+         WHERE sl.file_id=@fid`
+      );
+      shareRow = selRes.recordset[0];
     } else {
       shareRow = existing.recordset[0];
       const sets: string[] = [];
@@ -5879,7 +5981,7 @@ app.post('/api/admin/file-folders/:id/delete', authenticateUser as express.Reque
         filesReq.input('batchSize', sql.Int, 100);
         filesReq.input('offset', sql.Int, offset);
         
-        const filesResult = await filesReq.query<{id:string;stored_path:string;size_bytes:number;status:string}>(
+        const filesResult = await filesReq.query<{id:string;stored_path:string;size_bytes:number;status:string;storage_device_id:string|null}>(
           `;WITH folder_tree AS (
              SELECT id FROM file_folders WHERE id=@folderId AND owner_user_id=@ownerId
              UNION ALL
@@ -5888,7 +5990,7 @@ app.post('/api/admin/file-folders/:id/delete', authenticateUser as express.Reque
              INNER JOIN folder_tree ft ON ff.parent_folder_id=ft.id
              WHERE ff.owner_user_id=@ownerId
            )
-           SELECT id, stored_path, size_bytes, status
+           SELECT id, stored_path, size_bytes, status, storage_device_id
            FROM files
            WHERE owner_user_id=@ownerId AND folder_id IN (SELECT id FROM folder_tree)
            ORDER BY id
@@ -5913,15 +6015,15 @@ app.post('/api/admin/file-folders/:id/delete', authenticateUser as express.Reque
 
           // Collect this batch's archived-version blob paths BEFORE the rows are
           // cascaded away, so no version blob is left behind.
-          let versionPaths: string[] = [];
+          let versionPaths: { stored_path: string; storage_device_id: string | null }[] = [];
           try {
             const verReq = await getRequest();
             batch.forEach((file, idx) => verReq.input(`fid${idx}`, sql.UniqueIdentifier, file.id));
-            const verRes = await verReq.query<{ stored_path: string }>(
-              `SELECT stored_path FROM file_versions
+            const verRes = await verReq.query<{ stored_path: string; storage_device_id: string | null }>(
+              `SELECT stored_path, storage_device_id FROM file_versions
                WHERE file_id IN (${batch.map((_, idx) => `@fid${idx}`).join(', ')})`
             );
-            versionPaths = verRes.recordset.map((v) => v.stored_path);
+            versionPaths = verRes.recordset.map((v) => ({ stored_path: v.stored_path, storage_device_id: v.storage_device_id }));
           } catch (err) {
             // Enumeration failure is not fatal: the DB delete still proceeds and we
             // fall back to unlinking only the current blobs, plus whatever versions
@@ -5931,18 +6033,18 @@ app.post('/api/admin/file-folders/:id/delete', authenticateUser as express.Reque
           }
 
           await Promise.all([
-            ...batch.map((file) => {
-              const vaultPath = path.join(FILE_VAULT, file.stored_path);
-              if (!fs.existsSync(vaultPath)) return Promise.resolve();
+            ...batch.map(async (file) => {
+              const vaultPath = await resolveVaultPathForRow(file.storage_device_id, file.stored_path);
+              if (!fs.existsSync(vaultPath)) return;
               return fs.promises.unlink(vaultPath).catch((err) => {
                 console.error(`[DELETE FOLDER] Failed to delete vault file ${file.id} (${file.stored_path}):`, err);
               });
             }),
-            ...versionPaths.map((storedPath) => {
-              const vaultPath = path.join(FILE_VAULT, storedPath);
-              if (!fs.existsSync(vaultPath)) return Promise.resolve();
+            ...versionPaths.map(async (v) => {
+              const vaultPath = await resolveVaultPathForRow(v.storage_device_id, v.stored_path);
+              if (!fs.existsSync(vaultPath)) return;
               return fs.promises.unlink(vaultPath).catch((err) => {
-                console.error(`[DELETE FOLDER] Failed to delete archived version vault file (${storedPath}):`, err);
+                console.error(`[DELETE FOLDER] Failed to delete archived version vault file (${v.stored_path}):`, err);
               });
             }),
           ]);
@@ -6233,27 +6335,99 @@ app.post('/api/admin/quotas/:id/delete', authenticateUser as express.RequestHand
 });
 
 // ──────────────────────────────────────────────────────────────
+// Admin: Storage device registry (multi-storage, ADR-0001)
+// ──────────────────────────────────────────────────────────────
+
+app.get('/api/admin/storage', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, async (_req: AuthenticatedRequest, res) => {
+  try {
+    const devices = await listStorageDevices();
+    const dtos = await Promise.all(devices.map((d) => toDto(d)));
+    res.json({ success: true, devices: dtos });
+  } catch (err) {
+    console.error('[GET /api/admin/storage]', err);
+    res.status(500).json({ error: 'Failed to list storage devices.' });
+  }
+});
+
+app.post('/api/admin/storage', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  try {
+    const body = req.body ?? {};
+    const storage_id = String(body.storage_id ?? '').trim();
+    const storage_path = String(body.storage_path ?? '').trim();
+    if (!storage_id || !storage_path)
+      return res.status(400).json({ error: 'storage_id and storage_path are required.' });
+
+    const device = await createStorageDevice({
+      storage_id,
+      storage_path,
+      smb_username: body.smb_username != null ? String(body.smb_username) : null,
+      smb_password: body.smb_password != null ? String(body.smb_password) : null,
+      provisioning_enabled: body.provisioning_enabled !== false,
+      is_primary: !!body.is_primary,
+    });
+    await mountStorageDevice(device);
+    res.json({ success: true, device: await toDto(device) });
+  } catch (err: any) {
+    console.error('[POST /api/admin/storage]', err);
+    res.status(400).json({ error: err?.message || 'Failed to create storage device.' });
+  }
+});
+
+app.patch('/api/admin/storage/:id', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  try {
+    const id = getSingleParam(req.params.id);
+    const device = await updateStorageDevice(id, req.body ?? {});
+    res.json({ success: true, device: await toDto(device) });
+  } catch (err: any) {
+    console.error('[PATCH /api/admin/storage/:id]', err);
+    res.status(400).json({ error: err?.message || 'Failed to update storage device.' });
+  }
+});
+
+app.put('/api/admin/storage/:id/primary', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  try {
+    const id = getSingleParam(req.params.id);
+    const device = await updateStorageDevice(id, { is_primary: true });
+    res.json({ success: true, device: await toDto(device) });
+  } catch (err: any) {
+    console.error('[PUT /api/admin/storage/:id/primary]', err);
+    res.status(400).json({ error: err?.message || 'Failed to set primary storage device.' });
+  }
+});
+
+app.delete('/api/admin/storage/:id', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  try {
+    const id = getSingleParam(req.params.id);
+    await deleteStorageDevice(id);
+    res.json({ success: true, message: 'Storage device deleted.' });
+  } catch (err: any) {
+    console.error('[DELETE /api/admin/storage/:id]', err);
+    res.status(409).json({ error: err?.message || 'Failed to delete storage device.' });
+  }
+});
+
+// ──────────────────────────────────────────────────────────────
 // Expiry cleanup callbacks
 // ──────────────────────────────────────────────────────────────
 
 async function getExpiredFiles(): Promise<ExpiredFileRecord[]> {
   const request = await getRequest();
   const result = await request.query<{
-    id: string; stored_path: string; owner_user_id: string;
+    id: string; stored_path: string; storage_device_id: string | null; owner_user_id: string;
     original_name_encrypted: Buffer; original_name_iv: Buffer; original_name_auth_tag: Buffer;
     expires_at: Date; size_bytes: number;
   }>(
-    `SELECT id,stored_path,owner_user_id,original_name_encrypted,original_name_iv,original_name_auth_tag,expires_at,size_bytes
+    `SELECT id,stored_path,storage_device_id,owner_user_id,original_name_encrypted,original_name_iv,original_name_auth_tag,expires_at,size_bytes
      FROM files WHERE expires_at IS NOT NULL AND expires_at<=SYSDATETIMEOFFSET() AND status='Available'`
   );
-  return result.recordset.map(r => ({
+  return Promise.all(result.recordset.map(async r => ({
     id:           r.id,
-    storedPath:   path.join(FILE_VAULT, r.stored_path),
+    storedPath:   await resolveVaultPathForRow(r.storage_device_id, r.stored_path),
     ownerId:      r.owner_user_id,
     originalName: decryptColumn(r.original_name_encrypted, r.original_name_iv, r.original_name_auth_tag),
     expiresAt:    r.expires_at.toISOString(),
     sizeBytes:    r.size_bytes,
-  }));
+  })));
 }
 
 async function markFilesExpired(fileIds: string[]): Promise<void> {
@@ -6312,12 +6486,12 @@ async function runTrashPurgeCycle(): Promise<void> {
   const req = await getRequest();
   req.input('cutoff', sql.DateTimeOffset, cutoff);
   const result = await req.query<TrashedFileRow>(
-    `SELECT id,stored_path,owner_user_id,original_name_encrypted,original_name_iv,original_name_auth_tag,deleted_at,size_bytes
+    `SELECT id,stored_path,storage_device_id,owner_user_id,original_name_encrypted,original_name_iv,original_name_auth_tag,deleted_at,size_bytes
      FROM files WHERE deleted_at IS NOT NULL AND deleted_at<=@cutoff`
   );
 
   for (const file of result.recordset) {
-    const vaultPath = path.join(FILE_VAULT, file.stored_path);
+    const vaultPath = await resolveVaultPathForRow(file.storage_device_id, file.stored_path);
     try {
       if (fs.existsSync(vaultPath)) fs.unlinkSync(vaultPath);
     } catch (err) {
@@ -6423,8 +6597,9 @@ export function startThumbnailScan(intervalMinutes: number = 60): void {
         mime_type: string;
         thumbnail_generated: string | null;
         size_bytes: number;
+        storage_device_id: string | null;
       }>(
-        `SELECT id,stored_path,owner_user_id,original_name_encrypted,original_name_iv,original_name_auth_tag,mime_type,thumbnail_generated,size_bytes
+        `SELECT id,stored_path,storage_device_id,owner_user_id,original_name_encrypted,original_name_iv,original_name_auth_tag,mime_type,thumbnail_generated,size_bytes
          FROM dbo.files WHERE mime_type LIKE 'image/%' AND (thumbnail_generated IS NULL OR thumbnail_generated < DATEADD(MINUTE, -@minutes, SYSDATETIMEOFFSET()) OR thumbnail_preview IS NULL)
          AND status = 'Available' AND owner_user_id IS NOT NULL AND thumbnail_excluded = 0`
       );
@@ -6458,7 +6633,7 @@ export function startThumbnailScan(intervalMinutes: number = 60): void {
 
       // Generate thumbnails for each file
       for (const file of files) {
-        const vaultPath = path.join(FILE_VAULT, file.stored_path);
+        const vaultPath = await resolveVaultPathForRow(file.storage_device_id, file.stored_path);
 
         if (!fs.existsSync(vaultPath)) {
           console.warn(`[thumbnail-scan] Vault file not found for ${file.original_name}, skipping.`);
@@ -6782,6 +6957,33 @@ async function bootstrap() {
   await ensureOptionalShareLinkColumns();
   await ensureFileFolderSchema();
   await ensureFileDeletedAtColumn();
+
+  // 2c. Multi-storage migration: seed initial device from legacy env vars and
+  // backfill existing rows (ADR-0001). Idempotent.
+  await migrateLegacyStorage({
+    fileStorageUncPath: process.env.FILE_STORAGE_UNC_PATH,
+    storageNetUseUser: process.env.STORAGE_NET_USE_USER,
+    storageNetUsePassword: process.env.STORAGE_NET_USE_PASS,
+  });
+
+  // 2d. Provision (net use) any DB-registered UNC devices before serving.
+  await provisionStorageDevices();
+
+  // 2e. Verify a provisionable + reachable storage device exists (ADR-0001).
+  // Not fatal: the per-device monitor flips maintenance mode if ALL devices go
+  // down, and an admin can add devices via the Storage panel. Warn loudly so an
+  // operator notices a mis-configured registry at boot.
+  try {
+    const bootDevices = await listStorageDevices();
+    const bootTarget = await selectProvisionDevice(bootDevices);
+    if (!bootTarget) {
+      console.warn('[storage] No provisionable + reachable storage device at boot. Uploads will fail-closed until a device is enabled/reachable or maintenance mode is lifted.');
+    } else {
+      console.log(`[storage] Provision target selected at boot: ${bootTarget.storage_id} (${bootTarget.storage_path})`);
+    }
+  } catch (e: any) {
+    console.error('[storage] Boot-time device presence check failed:', e?.message ?? e);
+  }
 
   app.use('/api/health', createHealthRouter(FILE_VAULT, NODE_ENV === 'production'));
 
