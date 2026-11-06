@@ -13,3 +13,6 @@ vault/
 .github
 .agents
 AGENTS.md
+
+# Agent session memory / planning artifacts — not for the repo
+/memories/
