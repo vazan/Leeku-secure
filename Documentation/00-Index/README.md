@@ -21,6 +21,9 @@
 - Plan: [DOCUMENTATION-ROADMAP](../05-Roadmap/DOCUMENTATION-ROADMAP.md)
 - Governance policy: [DOCUMENTATION-GOVERNANCE](./DOCUMENTATION-GOVERNANCE.md)
 
+## Feature Dossiers
+- Multi-Storage Device Pool (design/ADR): [ADR-0001](../01-Technical/MultiStorage/ADR-0001-MULTI-STORAGE.md) · [design spec](../01-Technical/MultiStorage/DESIGN-SPEC-MULTI-STORAGE.md) · [DB/API](../01-Technical/MultiStorage/DB-AND-API-MULTI-STORAGE.md) · [ops/migration](../01-Technical/MultiStorage/OPS-MIGRATION-MULTI-STORAGE.md) · [roadmap](../01-Technical/MultiStorage/ROADMAP-MULTI-STORAGE.md)
+
 ## Governance
 - Shared-first model: common behavior documented once.
 - DB deltas isolated in dedicated MSSQL and PostgreSQL sections.
