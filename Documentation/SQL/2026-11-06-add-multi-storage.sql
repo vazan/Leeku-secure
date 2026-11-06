@@ -37,7 +37,7 @@ BEGIN
         [is_primary]             [bit]               NOT NULL CONSTRAINT DF_storage_devices_is_primary DEFAULT (0),
         [created_at]             [datetimeoffset](7) NOT NULL CONSTRAINT DF_storage_devices_created_at DEFAULT (SYSDATETIMEOFFSET()),
         CONSTRAINT [PK_storage_devices] PRIMARY KEY CLUSTERED ([id] ASC)
-    ) ON [PRIMARY] TEXTIMAGE_ON [PRIMARY];
+    ) ON [PRIMARY];
     PRINT 'Created dbo.storage_devices table';
 END
 ELSE
