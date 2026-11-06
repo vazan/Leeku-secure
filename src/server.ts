@@ -345,10 +345,70 @@ function configureHttpServer(server: http.Server): http.Server {
   return server;
 }
 
-function getJwtSecret(): string {
-  const raw = process.env.COOKIE_SECRET_BASE64;
-  if (!raw) throw new Error('[server] COOKIE_SECRET_BASE64 must be set in .env');
-  return raw;
+/**
+ * Loads and caches the RSA signing (private) key for RS256 JWTs.
+ * Returns a cached Buffer. Throws with a clear message if the key path
+ * is missing or unreadable so misconfiguration fails at startup rather
+ * than at login time.
+ */
+let jwtSigningKey: Buffer | null = null;
+function getJwtSigningKey(): Buffer {
+  if (jwtSigningKey) return jwtSigningKey;
+  const keyPath = process.env.JWT_PRIVATE_KEY_PATH;
+  if (!keyPath) {
+    throw new Error('[server] JWT_PRIVATE_KEY_PATH must be set in .env (RS256 signing key).');
+  }
+  let pem: Buffer;
+  try {
+    pem = fs.readFileSync(keyPath);
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new Error(`[server] Cannot read JWT private key at "${keyPath}". Check the path and grant the service account read access (${detail})`);
+  }
+  // POURQUOI : a readable-but-invalid key file only fails later inside
+  // jsonwebtoken with a cryptic "must be an asymmetric key" error at login
+  // time. Validate the PEM here (via the same crypto backend jsonwebtoken
+  // uses) so a bad/mis-encoded key aborts at boot with the real reason.
+  // Windows-saved PEM files may carry a UTF-8 BOM that crypto rejects.
+  const clean = Buffer.from(pem.toString('utf8').replace(/^\uFEFF/, ''));
+  try {
+    crypto.createPrivateKey(clean);
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new Error(`[server] JWT private key at "${keyPath}" is not a valid RSA private key PEM. Regenerate it (openssl genrsa ... 4096). (${detail})`);
+  }
+  jwtSigningKey = clean;
+  return clean;
+}
+
+/**
+ * Loads and caches the RSA verifying (public) key for RS256 JWTs.
+ * The public key is low sensitivity; like the private key it is loaded
+ * eagerly at boot so a missing/unreadable file fails fast.
+ */
+let jwtVerifyingKey: Buffer | null = null;
+function getJwtVerifyKey(): Buffer {
+  if (jwtVerifyingKey) return jwtVerifyingKey;
+  const keyPath = process.env.JWT_PUBLIC_KEY_PATH;
+  if (!keyPath) {
+    throw new Error('[server] JWT_PUBLIC_KEY_PATH must be set in .env (RS256 verification key).');
+  }
+  let pem: Buffer;
+  try {
+    pem = fs.readFileSync(keyPath);
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new Error(`[server] Cannot read JWT public key at "${keyPath}". Check the path and file existence (${detail})`);
+  }
+  const clean = Buffer.from(pem.toString('utf8').replace(/^\uFEFF/, ''));
+  try {
+    crypto.createPublicKey(clean);
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new Error(`[server] JWT public key at "${keyPath}" is not a valid RSA public key PEM. Regenerate it (openssl rsa -in jwt_private.pem -pubout -out jwt_public.pem). (${detail})`);
+  }
+  jwtVerifyingKey = clean;
+  return clean;
 }
 
 function escapeHtml(value: string): string {
@@ -669,14 +729,15 @@ interface JwtPayload { sub: string; role: string; }
 function signToken(userId: string, role: string): string {
   return jwt.sign(
     { sub: userId, role } as JwtPayload,
-    getJwtSecret(),
-    { expiresIn: JWT_EXPIRY, issuer: JWT_ISSUER, audience: JWT_AUDIENCE }
+    getJwtSigningKey(),
+    { algorithm: 'RS256', expiresIn: JWT_EXPIRY, issuer: JWT_ISSUER, audience: JWT_AUDIENCE }
   );
 }
 
 function verifyToken(token: string): JwtPayload | null {
   try {
-    return jwt.verify(token, getJwtSecret(), {
+    return jwt.verify(token, getJwtVerifyKey(), {
+      algorithms: ['RS256'],
       issuer: JWT_ISSUER, audience: JWT_AUDIENCE,
     }) as JwtPayload;
   } catch { return null; }
@@ -6394,6 +6455,12 @@ async function bootstrap() {
   // 1. Validate production requirements and master encryption key
   validateProductionConfig();
   validateEncryptionConfig();
+
+  // 1b. Load (and cache) RS256 signing/verification keys now so a missing or
+  // unreadable key file surfaces at boot — never at login time. Consent to
+  // RS256 implies the key files are required in every environment.
+  getJwtSigningKey();
+  getJwtVerifyKey();
 
   // 2. Connect PostgreSQL
   await getPool();
