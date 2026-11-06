@@ -78,6 +78,11 @@ import {
   isDeviceReachable,
   migrateLegacyStorage,
   toDto,
+  moveDeviceFiles,
+  getMigrationProgress,
+  createMigrationJob,
+  finishMigrationJob,
+  sweepStaleMigrationJobs,
   decryptedUsername,
   decryptedPassword,
   type StorageDevice,
@@ -6373,6 +6378,103 @@ app.post('/api/admin/storage', authenticateUser as express.RequestHandler, verif
   }
 });
 
+// POST /api/admin/storage/migrate
+// Admin-only: moves every blob stored on the source device to the destination
+// device, updating each files/file_versions row's storage_device_id as its
+// blob is physically copied (ADR-0001). Preflights destination free space and
+// refuses moves that would overrun it. Set { dry_run: true } to preview what
+// would move without copying, updating, or deleting anything.
+//
+// Behaviour:
+//   - dry_run=true  -> synchronous response with the full per-blob preview
+//     summary (moved/failed/skipped), unchanged from before.
+//   - dry_run=false -> the migration runs in the background. The route returns
+//     immediately with a `job_id` so the admin UI can poll progress via
+//     GET /api/admin/storage/migrate/:jobId. The background pass reports
+//     per-blob progress into the in-memory job registry.
+//
+// IMPORTANT: this route MUST be registered before `POST /api/admin/storage/:id`
+// below, otherwise Express matches the literal "migrate" segment to the `:id`
+// placeholder and the request would be handled by the update route instead.
+app.post('/api/admin/storage/migrate', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  try {
+    const body = req.body ?? {};
+    const sourceId = String(body.source_id ?? '').trim();
+    const destinationId = String(body.destination_id ?? '').trim();
+    const dryRun = body.dry_run === true;
+    if (!sourceId || !destinationId) {
+      return res.status(400).json({ error: 'source_id and destination_id are required.' });
+    }
+
+    if (dryRun) {
+      // Dry-run is fast (validation + stat checks only) — return the full
+      // preview synchronously as before.
+      const summary = await moveDeviceFiles(sourceId, destinationId, { dryRun });
+      return res.json({ success: true, dry_run: true, ...summary });
+    }
+
+    // Real migration: run in the background and hand back a job id so the UI
+    // can poll live progress. Pre-create the job (total 0) so an immediate
+    // poll cannot 404; moveDeviceFiles later fills in the true total.
+    const jobId = crypto.randomUUID();
+    createMigrationJob(jobId, 0);
+    void moveDeviceFiles(sourceId, destinationId, { dryRun: false, jobId })
+      .catch((err: any) => {
+        // A preflight or unexpected error that escaped per-blob handling —
+        // mark the job as errored so the UI stops polling with a clear message.
+        finishMigrationJob(jobId, { moved: 0, failed: 0, skipped: 0, failures: [] }, {
+          status: 'error',
+          error: err?.message || 'Migration failed unexpectedly.',
+        });
+        console.error('[POST /api/admin/storage/migrate] background run failed:', err);
+      });
+
+    res.json({ success: true, dry_run: false, job_id: jobId, status: 'running' });
+  } catch (err: any) {
+    console.error('[POST /api/admin/storage/migrate]', err);
+    res.status(400).json({ error: err?.message || 'Failed to migrate storage device files.' });
+  }
+});
+
+// GET /api/admin/storage/migrate/:jobId
+// Admin-only: returns the live progress snapshot of a background migration
+// job started via POST /api/admin/storage/migrate. Registered before the
+// `:id` routes (same ordering rationale as the POST migrate route).
+app.get('/api/admin/storage/migrate/:jobId', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, (req: AuthenticatedRequest, res) => {
+  const jobId = getSingleParam(req.params.jobId);
+  const progress = getMigrationProgress(jobId);
+  if (!progress) {
+    return res.status(404).json({ error: 'Migration job not found or already cleaned up.' });
+  }
+  res.json({ success: true, job_id: jobId, ...progress });
+});
+
+// ──────────────────────────────────────────────────────────────
+// Device-migration job registry sweep — clears stale finished jobs
+// from the in-memory registry so it cannot grow without bound.
+// ──────────────────────────────────────────────────────────────
+const MIGRATION_JOB_TTL_MS = 15 * 60_000; // keep finished jobs 15 min for retries/polls
+let migrationJobSweepTimer: ReturnType<typeof setInterval> | null = null;
+
+function startMigrationJobSweep(intervalMs: number = 5 * 60_000): void {
+  if (migrationJobSweepTimer) return;
+  migrationJobSweepTimer = setInterval(() => {
+    try {
+      const removed = sweepStaleMigrationJobs(MIGRATION_JOB_TTL_MS);
+      if (removed > 0) console.log(`[storage-migrate] Swept ${removed} stale migration job(s).`);
+    } catch (err) {
+      console.error('[storage-migrate] Migration sweep error:', err);
+    }
+  }, intervalMs);
+}
+
+function stopMigrationJobSweep(): void {
+  if (migrationJobSweepTimer) {
+    clearInterval(migrationJobSweepTimer);
+    migrationJobSweepTimer = null;
+  }
+}
+
 app.post('/api/admin/storage/:id', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
   try {
     const id = getSingleParam(req.params.id);
@@ -7024,7 +7126,10 @@ async function bootstrap() {
   // 6d. Start UNC share health monitor (auto-maintenance toggle)
   startUncShareMonitor();
 
-  // 6e. Start thumbnail background scan job
+  // 6e. Start migration job registry sweep (stale migration progress cleanup)
+  startMigrationJobSweep();
+
+  // 6f. Start thumbnail background scan job
   startThumbnailScan(60); // Run every 60 minutes
 
   // 7. Share link vanity path (Discord embeds) & SPA fallback

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Activity, Database, Folder, FolderOpen, Plus, Server, ShieldAlert, Terminal, Users, AlertTriangle } from "lucide-react";
 import { toast } from "sonner";
 import { MaintenanceModeControl } from "@/app/shared/components/maintenance-mode-control";
@@ -627,6 +627,10 @@ type StorageDeviceDto = {
   has_smb_credentials: boolean;
   reachable: boolean;
   created_at: string;
+  file_count: number;
+  version_count: number;
+  bytes_used: number;
+  free_bytes: number | null;
 };
 
 function StoragePanel() {
@@ -640,6 +644,28 @@ function StoragePanel() {
     provisioning_enabled: true,
     is_primary: false,
   });
+  // Migration (move files between devices) state.
+  const [sourceId, setSourceId] = useState("");
+  const [destId, setDestId] = useState("");
+  const [migrating, setMigrating] = useState(false);
+  const [migrationProgress, setMigrationProgress] = useState<{
+    processed: number;
+    total: number;
+    moved: number;
+    failed: number;
+    skipped: number;
+  } | null>(null);
+  const [migrationResult, setMigrationResult] = useState<{
+    moved: number;
+    failed: number;
+    skipped: number;
+    dry_run: boolean;
+    failures: Array<{ kind: string; id: string; stored_path: string; reason: string }>;
+  } | null>(null);
+
+  // Holds the migration-progress poll timer so it can be cleared if the panel
+  // unmounts mid-migration (avoids polling/setState after unmount).
+  const migrationTimerRef = useRef<number | null>(null);
 
   const loadDevices = async () => {
     try {
@@ -655,6 +681,17 @@ function StoragePanel() {
   };
 
   useEffect(() => { void loadDevices(); }, []);
+
+  // Clear the migration-progress poll timer if the admin panel unmounts while
+  // a migration is still running, so we don't keep polling after unmount.
+  useEffect(() => {
+    return () => {
+      if (migrationTimerRef.current !== null) {
+        window.clearInterval(migrationTimerRef.current);
+        migrationTimerRef.current = null;
+      }
+    };
+  }, []);
 
   const patchDevice = async (id: string, body: unknown) => {
     const response = await fetch(`/api/admin/storage/${id}`, {
@@ -719,6 +756,125 @@ function StoragePanel() {
     }, "Storage device deleted.");
   };
 
+  const runMigration = async (dryRun: boolean) => {
+    if (migrating) return; // already running a migration/dry-run — no concurrent starts
+    if (!sourceId || !destId) {
+      toast.error("Select both a source and a destination storage device.");
+      return;
+    }
+    if (sourceId === destId) {
+      toast.error("Source and destination must be different devices.");
+      return;
+    }
+    const sourceDevice = devices.find((d) => d.id === sourceId);
+    const destDevice = devices.find((d) => d.id === destId);
+    if (!sourceDevice || !destDevice) return;
+    const sourceTotal = sourceDevice.file_count + sourceDevice.version_count;
+    if (sourceTotal === 0) {
+      toast.error(`Source device ${sourceDevice.storage_id} has no files to move.`);
+      return;
+    }
+    if (!dryRun && !window.confirm(
+      `Move all ${sourceTotal} blob(s) (${formatBytes(sourceDevice.bytes_used)}) from "${sourceDevice.storage_id}" to "${destDevice.storage_id}"?\n\n` +
+      `This physically copies each vault blob and updates the database references. Run a preview first to confirm.`
+    )) return;
+
+    setMigrating(true);
+    setMigrationResult(null);
+    setMigrationProgress(null);
+    try {
+      const response = await fetch("/api/admin/storage/migrate", {
+        method: "POST",
+        headers: adminHeaders(true),
+        body: JSON.stringify({ source_id: sourceId, destination_id: destId, dry_run: dryRun }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Failed to migrate storage device files.");
+
+      if (dryRun || data.dry_run) {
+        // Dry-run: the POST returns the full preview summary synchronously.
+        setMigrationResult(data);
+        setMigrating(false);
+        toast.success(`Preview: ${data.moved} would move, ${data.failed} would fail, ${data.skipped} would skip.`);
+        return;
+      }
+
+      // Real migration: the server returns a job_id and runs in the background.
+      // Poll progress until it reaches a terminal state (done/error).
+      const jobId = data.job_id as string;
+      if (!jobId) throw new Error("Migration job id missing from server response.");
+
+      let finished = false;
+
+      const applySnapshot = async (pollData: any): Promise<void> => {
+        if (pollData.status === "running") {
+          setMigrationProgress({
+            processed: pollData.processed ?? 0,
+            total: pollData.total ?? sourceTotal,
+            moved: pollData.moved ?? 0,
+            failed: pollData.failed ?? 0,
+            skipped: pollData.skipped ?? 0,
+          });
+          return;
+        }
+        if (pollData.status === "done") {
+          finished = true;
+          setMigrationResult({
+            moved: pollData.moved ?? 0,
+            failed: pollData.failed ?? 0,
+            skipped: pollData.skipped ?? 0,
+            dry_run: false,
+            failures: pollData.failures ?? [],
+          });
+          toast.success(`Migration complete: ${pollData.moved ?? 0} moved, ${pollData.failed ?? 0} failed, ${pollData.skipped ?? 0} skipped.`);
+          await loadDevices();
+          setSourceId("");
+          setDestId("");
+          setMigrating(false);
+          return;
+        }
+        // status === "error"
+        finished = true;
+        setMigrating(false);
+        toast.error(pollData.error || "Migration failed.");
+      };
+
+      const pollOnce = async (): Promise<void> => {
+        try {
+          const pollRes = await fetch(`/api/admin/storage/migrate/${encodeURIComponent(jobId)}`, {
+            headers: adminHeaders(),
+          });
+          const pollData = await pollRes.json();
+          if (!pollRes.ok) {
+            finished = true;
+            setMigrating(false);
+            toast.error(pollData.error || "Failed to poll migration progress.");
+            return;
+          }
+          await applySnapshot(pollData);
+        } catch (error) {
+          finished = true;
+          setMigrating(false);
+          toast.error(error instanceof Error ? error.message : "Failed to poll migration progress.");
+        }
+      };
+
+      // First poll immediately, then keep polling until a terminal state.
+      await pollOnce();
+      if (!finished) {
+        const timer = window.setInterval(async () => {
+          if (finished) { window.clearInterval(timer); migrationTimerRef.current = null; return; }
+          await pollOnce();
+          if (finished) { window.clearInterval(timer); migrationTimerRef.current = null; }
+        }, 800);
+        migrationTimerRef.current = timer;
+      }
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Migration failed.");
+      setMigrating(false);
+    }
+  };
+
   return (
     <div className="space-y-6">
       <AdminPanel title="Storage devices" accent="cyan" meta={`${devices.length} device${devices.length === 1 ? "" : "s"}`}>
@@ -749,6 +905,147 @@ function StoragePanel() {
             ))}
           </div>
         )}
+      </AdminPanel>
+
+      <AdminPanel title="Move files between storage devices" accent="purple">
+        <p className="mb-4 text-xs text-[var(--text-muted)]">
+          Migrate every blob currently stored on the source device to the destination device.
+          Each vault file is physically copied and its database reference updated per file.
+        </p>
+        <div className="grid gap-4 md:grid-cols-2">
+          <label>
+            <span className="mb-2 block text-xs text-[var(--text-muted)]">Source device (DATA-xx)</span>
+            <select
+              value={sourceId}
+              disabled={migrating}
+              onChange={(event) => { setSourceId(event.target.value); setMigrationResult(null); }}
+              className="w-full border border-[var(--border-subtle)] bg-[var(--bg-elevated)] px-3 py-2.5 text-[var(--text-primary)]"
+            >
+              <option value="">Select source…</option>
+              {devices.map((d) => (
+                <option key={d.id} value={d.id}>
+                  {d.storage_id} — {d.file_count + d.version_count} blob(s), {formatBytes(d.bytes_used)}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            <span className="mb-2 block text-xs text-[var(--text-muted)]">Destination device (DATA-xx)</span>
+            <select
+              value={destId}
+              disabled={migrating}
+              onChange={(event) => { setDestId(event.target.value); setMigrationResult(null); }}
+              className="w-full border border-[var(--border-subtle)] bg-[var(--bg-elevated)] px-3 py-2.5 text-[var(--text-primary)]"
+            >
+              <option value="">Select destination…</option>
+              {devices.map((d) => (
+                <option key={d.id} value={d.id}>
+                  {d.storage_id} — {d.file_count + d.version_count} blob(s), {formatBytes(d.bytes_used)}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+        {sourceId && (() => {
+          const sourceDevice = devices.find((d) => d.id === sourceId);
+          if (!sourceDevice) return null;
+          const sourceTotal = sourceDevice.file_count + sourceDevice.version_count;
+          return (
+            <p className="mt-3 text-xs text-[var(--text-muted)]">
+              Source <strong>{sourceDevice.storage_id}</strong> holds{" "}
+              <strong>{sourceTotal} blob(s)</strong> ({sourceDevice.file_count} current file(s),{" "}
+              {sourceDevice.version_count} version(s)) using{" "}
+              <strong>{formatBytes(sourceDevice.bytes_used)}</strong>.
+            </p>
+          );
+        })()}
+        {sourceId && destId && (() => {
+          const sourceDevice = devices.find((d) => d.id === sourceId);
+          const destDevice = devices.find((d) => d.id === destId);
+          if (!sourceDevice || !destDevice) return null;
+          const destTotal = destDevice.file_count + destDevice.version_count;
+          const destFree = destDevice.free_bytes;
+          const lacksSpace = destFree !== null && destFree < sourceDevice.bytes_used;
+          return (
+            <div className="mt-1">
+              <p className="text-xs text-[var(--text-muted)]">
+                Destination <strong>{destDevice.storage_id}</strong> currently holds{" "}
+                <strong>{destTotal} blob(s)</strong> using{" "}
+                <strong>{formatBytes(destDevice.bytes_used)}</strong>
+                {destFree !== null && <> with <strong>{formatBytes(destFree)}</strong> free</>}.
+              </p>
+              {lacksSpace && (
+                <p className="mt-1 border border-[var(--admin-border-critical)] bg-[var(--admin-surface)] px-3 py-2 text-xs text-[var(--admin-critical)]">
+                  Destination may not have enough free space for the <strong>{formatBytes(sourceDevice.bytes_used)}</strong> being moved. Migration will be refused if there is insufficient room.
+                </p>
+              )}
+            </div>
+          );
+        })()}
+        {migrationResult && (
+          <div className="mt-4 border border-[var(--border-subtle)] bg-[var(--admin-surface)] p-4 text-xs">
+            <p className="mb-2 font-semibold text-[var(--text-primary)]">
+              {migrationResult.dry_run ? "Migration preview — nothing was changed" : "Migration summary"}
+            </p>
+            <p className="text-[var(--text-muted)]">
+              <strong className="text-[var(--admin-success)]">{migrationResult.moved} {migrationResult.dry_run ? "would move" : "moved"}</strong>
+              {" · "}
+              <strong className="text-[var(--admin-critical)]">{migrationResult.failed} {migrationResult.dry_run ? "would fail" : "failed"}</strong>
+              {" · "}
+              <strong>{migrationResult.skipped} {migrationResult.dry_run ? "would skip" : "skipped"}</strong>
+            </p>
+            {migrationResult.failures.length > 0 && (
+              <div className="mt-2 max-h-40 space-y-1 overflow-y-auto">
+                {migrationResult.failures.map((f, index) => (
+                  <p key={index} className="text-[var(--text-muted)]">
+                    [{f.kind}] {f.stored_path} — {f.reason}
+                  </p>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Live progress bar shown only while a real migration is running. */}
+        {migrating && migrationProgress && (
+          <div className="mt-4 border border-[var(--border-subtle)] bg-[var(--admin-surface)] p-4 text-xs">
+            <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+              <p className="font-semibold text-[var(--text-primary)]">
+                Migrating — {migrationProgress.processed} / {migrationProgress.total} blob(s)
+              </p>
+              <p className="text-[var(--text-muted)]">
+                <strong className="text-[var(--admin-success)]">{migrationProgress.moved} moved</strong>
+                {" · "}
+                <strong className="text-[var(--admin-critical)]">{migrationProgress.failed} failed</strong>
+                {" · "}
+                <strong>{migrationProgress.skipped} skipped</strong>
+              </p>
+            </div>
+            <div className="h-2 w-full overflow-hidden rounded bg-[var(--border-subtle)]">
+              <div
+                className="h-full bg-[var(--admin-info)] transition-[width] duration-300"
+                style={{
+                  width: `${migrationProgress.total > 0 ? Math.min(100, (migrationProgress.processed / migrationProgress.total) * 100) : 0}%`,
+                }}
+              />
+            </div>
+          </div>
+        )}
+
+        <div className="mt-4 flex flex-wrap justify-end gap-2">
+          <AdminButton
+            tone="muted"
+            onClick={() => void runMigration(true)}
+          >
+            {migrating ? "Previewing…" : "Preview (dry run)"}
+          </AdminButton>
+          <AdminButton
+            tone="pink"
+            onClick={() => void runMigration(false)}
+          >
+            {migrating ? "Migrating…" : "Migrate all files"}
+          </AdminButton>
+        </div>
       </AdminPanel>
 
       <AdminPanel title="Add storage device" accent="purple">
