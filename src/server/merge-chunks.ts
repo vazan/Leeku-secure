@@ -20,6 +20,18 @@ function resumableChunkDir(identifier: string): string {
   return path.join(uploadTemp(), 'chunks', identifier);
 }
 
+// POURQUOI : `resumableIdentifier` is client-controlled and was previously joined
+// into filesystem paths unvalidated, enabling path traversal (`../`, `..\`, absolute
+// paths) for arbitrary file writes. Legitimate identifiers are opaque (Resumable.js
+// UUIDs, or this client's base36 `<hash>-<time>`), so a strict safe charset that
+// excludes `.` and both path separators blocks traversal while accepting all real
+// clients. Shared so server.ts and this module apply the identical rule.
+export function isSafeResumableIdentifier(identifier: string): boolean {
+  return typeof identifier === 'string'
+    && /^[A-Za-z0-9_-]{1,128}$/.test(identifier);
+}
+
+
 // Bounded block size (1 MiB) used to stream each chunk file into the merge. A
 // single block is in flight at a time thanks to Readable.from's backpressure,
 // so memory stays flat regardless of chunk/account size. Fresh buffers per read
@@ -69,6 +81,11 @@ async function* mergeChunkBlocks(
  * @returns the absolute path of the merged temporary file.
  */
 export async function mergeChunks(identifier: string, totalChunks: number): Promise<string> {
+  // POURQUOI : defense-in-depth — never let an unsafe identifier escape the chunks
+  // dir even if a future caller skips the upload-handler validation.
+  if (!isSafeResumableIdentifier(identifier)) {
+    throw new Error(`Invalid resumable identifier.`);
+  }
   const temp = uploadTemp();
   const dir = resumableChunkDir(identifier);
   const mergedPath = path.join(temp, `merged_${identifier}`);
