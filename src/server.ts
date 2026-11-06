@@ -5161,8 +5161,13 @@ app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, asy
       file.mime_type.startsWith('video/') && file.size > VIDEO_EMBED_MAX_SIZE_BYTES;
 
     const exReq = await getRequest(); exReq.input('fid', sql.UniqueIdentifier, fileId);
+    // POURQUOI : mapShareRow decrypts the file's name — always JOIN files so the
+    // encrypted-name columns are present on INSERT, UPDATE and existing rows alike.
     const existing = await exReq.query<ShareRow>(
-      'SELECT id,file_id,public_token,password_hash,expires_at,max_downloads,download_count,is_active,allow_external_preview,allow_decrypted_external_preview,created_at FROM share_links WHERE file_id=@fid'
+      `SELECT sl.id,sl.file_id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.allow_external_preview,sl.allow_decrypted_external_preview,sl.created_at,
+              f.original_name_encrypted,f.original_name_iv,f.original_name_auth_tag
+       FROM share_links sl INNER JOIN files f ON sl.file_id=f.id
+       WHERE sl.file_id=@fid`
     );
 
     let shareRow: ShareRow;
@@ -5206,8 +5211,12 @@ app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, asy
       insReq.input('vid',   sql.UniqueIdentifier, pinnedVersionId);
       const insRes = await insReq.query<ShareRow>(
         `INSERT INTO share_links (file_id,public_token,password_hash,expires_at,max_downloads,is_active,allow_external_preview,allow_decrypted_external_preview,version_id)
-        VALUES (@fid,@tok,@pwH,@exp,@md,@act,@allowExternalPreview,@allowDecryptedExternalPreview,@vid)
-        RETURNING id,file_id,public_token,password_hash,expires_at,max_downloads,download_count,is_active,allow_external_preview,allow_decrypted_external_preview,created_at`
+        SELECT @fid,@tok,@pwH,@exp,@md,@act,@allowExternalPreview,@allowDecryptedExternalPreview,@vid
+        FROM files f WHERE f.id=@fid
+        RETURNING share_links.id,share_links.file_id,share_links.public_token,share_links.password_hash,share_links.expires_at,share_links.max_downloads,share_links.download_count,share_links.is_active,share_links.allow_external_preview,share_links.allow_decrypted_external_preview,share_links.created_at,
+                  (SELECT original_name_encrypted FROM files WHERE id=share_links.file_id) AS original_name_encrypted,
+                  (SELECT original_name_iv FROM files WHERE id=share_links.file_id) AS original_name_iv,
+                  (SELECT original_name_auth_tag FROM files WHERE id=share_links.file_id) AS original_name_auth_tag`
       );
       shareRow = insRes.recordset[0];
     } else {
@@ -5279,8 +5288,10 @@ app.post('/api/files/:id/share', authenticateUser as express.RequestHandler, asy
       if (sets.length) {
         const upRes = await upReq.query<ShareRow>(
           `UPDATE share_links SET ${sets.join(',')}
-            WHERE id=@id
-            RETURNING id,file_id,public_token,password_hash,expires_at,max_downloads,download_count,is_active,allow_external_preview,allow_decrypted_external_preview,created_at`
+            FROM files f
+            WHERE share_links.file_id=f.id AND share_links.id=@id
+            RETURNING share_links.id,share_links.file_id,share_links.public_token,share_links.password_hash,share_links.expires_at,share_links.max_downloads,share_links.download_count,share_links.is_active,share_links.allow_external_preview,share_links.allow_decrypted_external_preview,share_links.created_at,
+                      f.original_name_encrypted,f.original_name_iv,f.original_name_auth_tag`
         );
         shareRow = upRes.recordset[0];
       }
