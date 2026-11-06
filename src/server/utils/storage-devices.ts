@@ -57,6 +57,14 @@ export interface StorageDeviceDto {
   has_smb_credentials: boolean;
   reachable: boolean;
   created_at: Date;
+  /** Number of current-file blobs physically stored on this device (ADR-0001). */
+  file_count: number;
+  /** Number of archived-version blobs physically stored on this device (ADR-0001). */
+  version_count: number;
+  /** Total size in bytes of the blobs physically stored on this device. */
+  bytes_used: number;
+  /** Estimated free space (bytes) on the device root, null when unknown. */
+  free_bytes: number | null;
 }
 
 export interface StorageDeviceInput {
@@ -215,6 +223,7 @@ export async function isDeviceReachable(storagePath: string): Promise<boolean> {
 
 /** Builds a safe admin DTO (no encrypted blobs, no plaintext credentials). */
 export async function toDto(device: StorageDevice): Promise<StorageDeviceDto> {
+  const usage = await getStorageDeviceUsage(device.id);
   return {
     id: device.id,
     storage_id: device.storage_id,
@@ -224,6 +233,10 @@ export async function toDto(device: StorageDevice): Promise<StorageDeviceDto> {
     has_smb_credentials: !!device.smb_username_encrypted || !!device.smb_password_encrypted,
     reachable: await isDeviceReachable(device.storage_path),
     created_at: device.created_at,
+    file_count: usage.files,
+    version_count: usage.versions,
+    bytes_used: usage.totalBytes,
+    free_bytes: await deviceFreeBytes(device.storage_path),
   };
 }
 
@@ -404,8 +417,374 @@ export async function deleteStorageDevice(id: string): Promise<void> {
 }
 
 // ──────────────────────────────────────────────────────────────
-// Startup migration + backfill
+// Per-device usage + migration (ADR-0001)
 // ──────────────────────────────────────────────────────────────
+
+export interface StorageDeviceUsage {
+  files: number;
+  versions: number;
+  totalBytes: number;
+}
+
+/**
+ * Returns how many current-file blobs, archived-version blobs, and total
+ * bytes reference a device. Used by the admin panel to report per-device
+ * usage and to guard migrations against space-constrained destinations.
+ */
+export async function getStorageDeviceUsage(id: string): Promise<StorageDeviceUsage> {
+  const req = await getRequest();
+  req.input('id', sql.UniqueIdentifier, id);
+  const result = await req.query<{ files: number; versions: number; bytes: number | null }>(
+    `SELECT
+       (SELECT COUNT(*) FROM dbo.files         WHERE storage_device_id = @id) AS files,
+       (SELECT COUNT(*) FROM dbo.file_versions WHERE storage_device_id = @id) AS versions,
+       (SELECT COALESCE(SUM(size_bytes), 0)
+          FROM (
+            SELECT size_bytes FROM dbo.files         WHERE storage_device_id = @id
+            UNION ALL
+            SELECT size_bytes FROM dbo.file_versions WHERE storage_device_id = @id
+          ) t) AS bytes`
+  );
+  const row = result.recordset[0];
+  return {
+    files: Number(row?.files ?? 0),
+    versions: Number(row?.versions ?? 0),
+    totalBytes: Number(row?.bytes ?? 0),
+  };
+}
+
+export interface DeviceMigrationResult {
+  moved: number;
+  failed: number;
+  skipped: number;
+  failures: Array<{ kind: 'file' | 'version'; id: string; stored_path: string; reason: string }>;
+}
+
+// ──────────────────────────────────────────────────────────────
+// Migration progress tracking
+// ──────────────────────────────────────────────────────────────
+
+export type MigrationStatus = 'running' | 'done' | 'error';
+
+/** Live progress snapshot for a running/finished device-migration job. */
+export interface MigrationProgress {
+  status: MigrationStatus;
+  total: number;      // number of blobs (files + versions) to process
+  processed: number;  // blobs processed so far (moved + failed + skipped)
+  moved: number;
+  failed: number;
+  skipped: number;
+  failures: Array<DeviceMigrationResult['failures'][number]>;
+  error?: string;     // set only when status === 'error'
+  updatedAt: number;  // epoch ms of last update, for staleness cleanup
+}
+
+/**
+ * In-process registry of active/recent device-migration jobs, keyed by an
+ * opaque job id handed back to the admin UI so it can poll progress.
+ * In-memory (not persisted): a job that outlives a process restart simply
+ * loses its progress reporting, but the migration itself is per-file atomic
+ * and resumable via a fresh run.
+ */
+const migrationJobs = new Map<string, MigrationProgress>();
+
+/** Snapshot of a migration job's progress, or null when unknown/expired. */
+export function getMigrationProgress(jobId: string): MigrationProgress | null {
+  return migrationJobs.get(jobId) ?? null;
+}
+
+/** Creates a new running job entry. Returns false if one already exists. */
+export function createMigrationJob(jobId: string, total: number): boolean {
+  if (migrationJobs.has(jobId)) return false;
+  migrationJobs.set(jobId, {
+    status: 'running',
+    total,
+    processed: 0,
+    moved: 0,
+    failed: 0,
+    skipped: 0,
+    failures: [],
+    updatedAt: Date.now(),
+  });
+  return true;
+}
+
+/**
+ * Updates the expected total blob count of a running job (used when the route
+ * pre-creates a job before the worker knows the true total). No-op when the
+ * job is absent or no longer running.
+ */
+export function setMigrationJobTotal(jobId: string, total: number): void {
+  const job = migrationJobs.get(jobId);
+  if (job && job.status === 'running') job.total = total;
+}
+
+/** Marks a migration job as finished with a summary. */
+export function finishMigrationJob(
+  jobId: string,
+  result: DeviceMigrationResult,
+  options?: { status?: MigrationStatus; error?: string },
+): void {
+  const job = migrationJobs.get(jobId);
+  if (!job) return;
+  job.status = options?.status ?? 'done';
+  job.error = options?.error;
+  job.processed = result.moved + result.failed + result.skipped;
+  job.moved = result.moved;
+  job.failed = result.failed;
+  job.skipped = result.skipped;
+  job.failures = result.failures;
+  job.updatedAt = Date.now();
+}
+
+/** Applies a per-blob result delta to a live job (no-op when job is absent). */
+function updateMigrationJobProgress(
+  jobId: string | null | undefined,
+  outcome: { moved?: boolean; failed?: boolean; skipped?: boolean; failure?: DeviceMigrationResult['failures'][number] },
+): void {
+  if (!jobId) return;
+  const job = migrationJobs.get(jobId);
+  if (!job || job.status !== 'running') return;
+  if (outcome.moved) job.moved += 1;
+  else if (outcome.failed) job.failed += 1;
+  else if (outcome.skipped) job.skipped += 1;
+  if (outcome.failure) job.failures.push(outcome.failure);
+  job.processed += 1;
+  job.updatedAt = Date.now();
+}
+
+/** Removes a finished/errored migration job, freeing memory. */
+export function clearMigrationJob(jobId: string): void {
+  migrationJobs.delete(jobId);
+}
+
+/**
+ * Removes all migration jobs that have been terminal (done/error) for longer
+ * than `ttlMs`. Used by a periodic sweep so the in-memory registry does not
+ * grow unbounded across many migrations. Returns the number removed.
+ */
+export function sweepStaleMigrationJobs(ttlMs: number): number {
+  const cutoff = Date.now() - ttlMs;
+  let removed = 0;
+  for (const [jobId, job] of migrationJobs) {
+    if (job.status !== 'running' && job.updatedAt < cutoff) {
+      migrationJobs.delete(jobId);
+      removed += 1;
+    }
+  }
+  return removed;
+}
+
+/**
+ * Checks how much free space (in bytes) a device root has via statfs.
+ * Returns null when it cannot be determined so the caller can decide
+ * whether to fail open or fail closed.
+ */
+async function deviceFreeBytes(storagePath: string): Promise<number | null> {
+  try {
+    const st = await fs.promises.statfs(storagePath);
+    return st.bavail * st.bsize;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Moves every blob (current files + archived versions) that physically
+ * resides on `sourceId` to `destinationId` (ADR-0001).
+ *
+ * When `dryRun` is true, execution stops before any physical or DB mutation:
+ * validation (ids, reachability, destination free space) and per-blob
+ * existence/collision checks run, but nothing is copied, updated, or deleted.
+ * The returned summary reports how many blobs would move and any that would
+ * fail or be skipped.
+ *
+ * Guarantees:
+ *   - Rejects when source === destination.
+ *   - Rejects when either device is missing or unreachable.
+ *   - Preflights destination free space: refuses the whole migration when the
+ *     destination's statfs-derived free space is insufficient for the total
+ *     bytes being moved (or cannot be determined — fail closed).
+ *   - Per-blob atomicity: the physical copy is only made once confirmed to the
+ *     destination; if the DB `storage_device_id` update fails, the copy is
+ *     removed so the source blob stays canonical and the row never points at a
+ *     device it does not physically live on.
+ *   - Never overwrites a destination path that already exists (reported as a
+ *     per-blob failure rather than clobbered).
+ *
+ * Returns a summary of blobs moved, skipped, and failed.
+ */
+export async function moveDeviceFiles(
+  sourceId: string,
+  destinationId: string,
+  options?: { dryRun?: boolean; jobId?: string },
+): Promise<DeviceMigrationResult> {
+  const dryRun = !!options?.dryRun;
+  const jobId = options?.jobId;
+  if (!sourceId || !destinationId) throw new Error('Source and destination device ids are required.');
+  if (sourceId === destinationId) throw new Error('Source and destination must be different devices.');
+
+  const source = await getStorageDevice(sourceId);
+  const destination = await getStorageDevice(destinationId);
+  if (!source) throw new Error('Source storage device not found.');
+  if (!destination) throw new Error('Destination storage device not found.');
+
+  if (!(await isDeviceReachable(source.storage_path)))
+    throw new Error(`Source device ${source.storage_id} is not reachable.`);
+  if (!(await isDeviceReachable(destination.storage_path)))
+    throw new Error(`Destination device ${destination.storage_id} is not reachable.`);
+
+  const req = await getRequest();
+  req.input('sourceId', sql.UniqueIdentifier, sourceId);
+
+  // Current-file blobs and archived-version blobs that physically live on the source.
+  const filesRes = await req.query<{ id: string; stored_path: string; size_bytes: number }>(
+    `SELECT id, stored_path, size_bytes FROM dbo.files WHERE storage_device_id = @sourceId`,
+  );
+  const versionsReq = await getRequest();
+  versionsReq.input('sourceId', sql.UniqueIdentifier, sourceId);
+  const versionsRes = await versionsReq.query<{ id: string; stored_path: string; size_bytes: number }>(
+    `SELECT id, stored_path, size_bytes FROM dbo.file_versions WHERE storage_device_id = @sourceId`,
+  );
+
+  const fileBlobs = filesRes.recordset as Array<{ id: string; stored_path: string; size_bytes: number }>;
+  const versionBlobs = versionsRes.recordset as Array<{ id: string; stored_path: string; size_bytes: number }>;
+  const totalBlobs = fileBlobs.length + versionBlobs.length;
+  const totalBytes =
+    fileBlobs.reduce((sum: number, b) => sum + Number(b.size_bytes || 0), 0) +
+    versionBlobs.reduce((sum: number, b) => sum + Number(b.size_bytes || 0), 0);
+
+  // Register/refresh the progress job. The POST route pre-creates the job
+  // (with total 0) so a client polling immediately cannot 404; once the true
+  // total is known we update it. createMigrationJob is a no-op if the route
+  // already created the entry.
+  if (jobId) {
+    createMigrationJob(jobId, totalBlobs);
+    setMigrationJobTotal(jobId, totalBlobs);
+  }
+
+  // ---- Preflight: destination must have room for everything we will move. ---
+  const destFree = await deviceFreeBytes(destination.storage_path);
+  if (destFree === null) {
+    throw new Error(`Cannot determine free space on destination ${destination.storage_id}. Migration refused.`);
+  }
+  if (destFree < totalBytes) {
+    throw new Error(
+      `Destination ${destination.storage_id} only has ${destFree} bytes free but the migration requires ${totalBytes} bytes. Migration refused.`,
+    );
+  }
+
+  const result: DeviceMigrationResult = { moved: 0, failed: 0, skipped: 0, failures: [] };
+
+  const migrateBlob = async (
+    kind: 'file' | 'version',
+    id: string,
+    storedPath: string,
+  ): Promise<void> => {
+    const srcPath = resolveBlobPath(source, storedPath);
+    const dstPath = resolveBlobPath(destination, storedPath);
+
+    let srcExists = false;
+    try {
+      srcExists = !!(await fs.promises.stat(srcPath));
+    } catch {
+      srcExists = false;
+    }
+    if (!srcExists) {
+      result.skipped += 1;
+      const failure = { kind, id, stored_path: storedPath, reason: 'source blob missing on disk' };
+      result.failures.push(failure);
+      updateMigrationJobProgress(jobId, { skipped: true, failure });
+      return;
+    }
+
+    // Never clobber an existing destination blob.
+    let dstExists = false;
+    try {
+      dstExists = !!(await fs.promises.stat(dstPath));
+    } catch {
+      dstExists = false;
+    }
+    if (dstExists) {
+      result.failed += 1;
+      const failure = { kind, id, stored_path: storedPath, reason: 'destination path already exists' };
+      result.failures.push(failure);
+      updateMigrationJobProgress(jobId, { failed: true, failure });
+      return;
+    }
+
+    // Dry-run: existence + collision checks above are the only work done.
+    // No data is copied, updated, or deleted.
+    if (dryRun) {
+      result.moved += 1;
+      updateMigrationJobProgress(jobId, { moved: true });
+      return;
+    }
+
+    // 1) Physically copy the ciphertext blob to the destination.
+    try {
+      await fs.promises.copyFile(srcPath, dstPath);
+    } catch (err: any) {
+      result.failed += 1;
+      const failure = { kind, id, stored_path: storedPath, reason: err?.message || 'Copy failed' };
+      result.failures.push(failure);
+      updateMigrationJobProgress(jobId, { failed: true, failure });
+      return;
+    }
+
+    // 2) Move the DB reference to the destination device entity for the blob.
+    //    Only now that the physical copy is confirmed do we touch the DB row.
+    try {
+      const mreq = await getRequest();
+      mreq.input('blobId', sql.UniqueIdentifier, id);
+      mreq.input('destId', sql.UniqueIdentifier, destinationId);
+      const table = kind === 'file' ? 'dbo.files' : 'dbo.file_versions';
+      await mreq.query(`UPDATE ${table} SET storage_device_id = @destId WHERE id = @blobId`);
+    } catch (err: any) {
+      // DB update failed — remove the copy so the source stays canonical and
+      // no duplicate/orphan blob is left behind.
+      try { await fs.promises.unlink(dstPath); } catch { /* best effort */ }
+      result.failed += 1;
+      const failure = { kind, id, stored_path: storedPath, reason: err?.message || 'DB update failed' };
+      result.failures.push(failure);
+      updateMigrationJobProgress(jobId, { failed: true, failure });
+      return;
+    }
+
+    // 3) Blob copy + DB update both succeeded — safe to remove the source blob.
+    //    If the source unlink fails the destination blob remains valid; the
+    //    leftover source copy is an orphan a vault-cleanup script can reclaim.
+    try {
+      await fs.promises.unlink(srcPath);
+    } catch {
+      /* best effort — destination blob is already the canonical copy */
+    }
+    result.moved += 1;
+    updateMigrationJobProgress(jobId, { moved: true });
+  };
+
+  try {
+    for (const blob of fileBlobs) await migrateBlob('file', blob.id, blob.stored_path);
+    for (const blob of versionBlobs) await migrateBlob('version', blob.id, blob.stored_path);
+  } catch (err: any) {
+    // Unexpected error that escaped the per-blob handling (e.g. DB outage
+    // mid-loop). Mark the job as errored so the UI stops polling and shows
+    // the failure instead of hanging at "running".
+    if (jobId) {
+      finishMigrationJob(jobId, result, { status: 'error', error: err?.message || 'Migration failed unexpectedly.' });
+    }
+    throw err;
+  }
+
+  // Finalize the job as done once every blob has been processed. Per-blob
+  // failures/skips still produce a "done" state — the UI surfaces the
+  // breakdown and can offer a retry for any failures.
+  if (jobId) {
+    finishMigrationJob(jobId, result, { status: 'done' });
+  }
+
+  return result;
+}
 
 /**
  * Seeds the initial storage device from the legacy env vars and backfills
