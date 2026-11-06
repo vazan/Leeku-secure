@@ -4,7 +4,7 @@ import { toast } from "sonner";
 import { MaintenanceModeControl } from "@/app/shared/components/maintenance-mode-control";
 import type { AdminFileFolder, FileMetadata, Quota, SystemLog, SystemStats, User } from "@/app/shared/types";
 
-type AdminTab = "overview" | "users" | "files" | "quotas" | "logs" | "security" | "health" | "maintenance";
+type AdminTab = "overview" | "users" | "files" | "quotas" | "logs" | "security" | "health" | "maintenance" | "storage";
 
 const tabs: Array<[AdminTab, string]> = [
   ["overview", "Overview"],
@@ -15,6 +15,7 @@ const tabs: Array<[AdminTab, string]> = [
   ["security", "Security Events"],
   ["health", "System Health"],
   ["maintenance", "Maintenance"],
+  ["storage", "Storage"],
 ];
 
 const getCsrfToken = () =>
@@ -566,6 +567,7 @@ export default function AdminWorkspace({
           />
         </div>
       )}
+      {tab === "storage" && <StoragePanel />}
     </section>
   );
 }
@@ -613,4 +615,161 @@ function LogPanel({ title, logs, security = false }: { title: string; logs: Syst
 
 function HealthMetric({ icon, label, value }: { icon: React.ReactNode; label: string; value: string }) {
   return <div className="border border-[var(--border-subtle)] bg-[var(--admin-surface)] p-4"><div className="mb-3 h-4 w-4 text-[var(--admin-info)]">{icon}</div><span className="text-xs text-[var(--text-muted)]">{label}</span><strong className="mt-1 block text-xl text-[var(--text-primary)]">{value}</strong></div>;
+}
+
+// Multi-storage device registry panel (ADR-0001).
+type StorageDeviceDto = {
+  id: string;
+  storage_id: string;
+  storage_path: string;
+  provisioning_enabled: boolean;
+  is_primary: boolean;
+  has_smb_credentials: boolean;
+  reachable: boolean;
+  created_at: string;
+};
+
+function StoragePanel() {
+  const [devices, setDevices] = useState<StorageDeviceDto[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [draft, setDraft] = useState({
+    storage_id: "",
+    storage_path: "",
+    smb_username: "",
+    smb_password: "",
+    provisioning_enabled: true,
+    is_primary: false,
+  });
+
+  const loadDevices = async () => {
+    try {
+      const response = await fetch("/api/admin/storage", { headers: adminHeaders() });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Failed to load storage devices.");
+      setDevices(data.devices ?? []);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Failed to load storage devices.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => { void loadDevices(); }, []);
+
+  const patchDevice = async (id: string, body: unknown) => {
+    const response = await fetch(`/api/admin/storage/${id}`, {
+      method: "PATCH",
+      headers: adminHeaders(true),
+      body: JSON.stringify(body),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "Failed to update storage device.");
+  };
+
+  const runDeviceAction = async (action: () => Promise<unknown>, success: string) => {
+    try {
+      await action();
+      toast.success(success);
+      await loadDevices();
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Storage action failed.");
+    }
+  };
+
+  const addDevice = async () => {
+    if (!draft.storage_id.trim() || !draft.storage_path.trim()) {
+      toast.error("Device ID and storage path are required.");
+      return;
+    }
+    await runDeviceAction(async () => {
+      const response = await fetch("/api/admin/storage", {
+        method: "POST",
+        headers: adminHeaders(true),
+        body: JSON.stringify({
+          storage_id: draft.storage_id.trim(),
+          storage_path: draft.storage_path.trim(),
+          smb_username: draft.smb_username.trim() || null,
+          smb_password: draft.smb_password.trim() || null,
+          provisioning_enabled: draft.provisioning_enabled,
+          is_primary: draft.is_primary,
+        }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Failed to add storage device.");
+    }, "Storage device added.");
+    setDraft({ storage_id: "", storage_path: "", smb_username: "", smb_password: "", provisioning_enabled: true, is_primary: false });
+  };
+
+  const setPrimary = (device: StorageDeviceDto) =>
+    runDeviceAction(async () => {
+      const response = await fetch(`/api/admin/storage/${device.id}/primary`, { method: "PUT", headers: adminHeaders() });
+      if (!response.ok) { const data = await response.json().catch(() => ({})); throw new Error(data.error || "Failed to set primary."); }
+    }, "Primary storage device set.");
+
+  const toggleProvisioning = (device: StorageDeviceDto) =>
+    runDeviceAction(async () => {
+      await patchDevice(device.id, { provisioning_enabled: !device.provisioning_enabled });
+    }, device.provisioning_enabled ? "Provisioning disabled." : "Provisioning enabled.");
+
+  const removeDevice = (device: StorageDeviceDto) => {
+    if (!window.confirm(`Delete storage device "${device.storage_id}"? Stored blobs are not removed.`)) return;
+    void runDeviceAction(async () => {
+      const response = await fetch(`/api/admin/storage/${device.id}`, { method: "DELETE", headers: adminHeaders() });
+      if (!response.ok) { const data = await response.json().catch(() => ({})); throw new Error(data.error || "Failed to delete storage device."); }
+    }, "Storage device deleted.");
+  };
+
+  return (
+    <div className="space-y-6">
+      <AdminPanel title="Storage devices" accent="cyan" meta={`${devices.length} device${devices.length === 1 ? "" : "s"}`}>
+        {loading ? (
+          <p className="py-8 text-center text-xs text-[var(--text-muted)]">Loading storage devices…</p>
+        ) : devices.length === 0 ? (
+          <p className="py-8 text-center text-xs text-[var(--text-muted)]">No storage devices configured. Add one below.</p>
+        ) : (
+          <div className="space-y-3">
+            {devices.map((device) => (
+              <div key={device.id} className="flex flex-wrap items-center gap-3 border border-[var(--border-subtle)] bg-[var(--admin-surface)] p-4">
+                <div className="min-w-[220px] flex-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <strong className="text-sm text-[var(--text-primary)]">{device.storage_id}</strong>
+                    {device.is_primary && <StatusBadge tone="green">Primary</StatusBadge>}
+                    <StatusBadge tone={device.provisioning_enabled ? "green" : "muted"}>{device.provisioning_enabled ? "Provisioning" : "Disabled"}</StatusBadge>
+                    <StatusBadge tone={device.reachable ? "green" : "pink"}>{device.reachable ? "Reachable" : "Offline"}</StatusBadge>
+                  </div>
+                  <p className="mt-1 text-xs text-[var(--text-muted)]">{device.storage_path}</p>
+                  <p className="mt-0.5 text-[10px] text-[var(--text-muted)]">{device.has_smb_credentials ? "SMB credentials set" : "No SMB credentials"} · added {new Date(device.created_at).toLocaleDateString()}</p>
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  {!device.is_primary && <AdminButton tone="cyan" onClick={() => void setPrimary(device)}>Set primary</AdminButton>}
+                  <AdminButton tone={device.provisioning_enabled ? "pink" : "green"} onClick={() => void toggleProvisioning(device)}>{device.provisioning_enabled ? "Disable" : "Enable"}</AdminButton>
+                  <AdminButton tone="pink" onClick={() => removeDevice(device)}>Delete</AdminButton>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </AdminPanel>
+
+      <AdminPanel title="Add storage device" accent="purple">
+        <form className="grid gap-4 md:grid-cols-2" onSubmit={(event) => { event.preventDefault(); void addDevice(); }}>
+          <AdminInput label="Device ID (unique)" value={draft.storage_id} onChange={(value) => setDraft({ ...draft, storage_id: value })} />
+          <AdminInput label="Storage path (local or \\\\UNC\\share)" value={draft.storage_path} onChange={(value) => setDraft({ ...draft, storage_path: value })} />
+          <AdminInput label="SMB username (optional)" value={draft.smb_username} onChange={(value) => setDraft({ ...draft, smb_username: value })} />
+          <AdminInput label="SMB password (optional, encrypted at rest)" type="password" value={draft.smb_password} onChange={(value) => setDraft({ ...draft, smb_password: value })} />
+          <div className="flex flex-wrap items-center gap-6 md:col-span-2">
+            <label className="flex items-center gap-2 text-xs text-[var(--text-muted)]">
+              <input type="checkbox" checked={draft.provisioning_enabled} onChange={(event) => setDraft({ ...draft, provisioning_enabled: event.target.checked })} />
+              Provision new uploads
+            </label>
+            <label className="flex items-center gap-2 text-xs text-[var(--text-muted)]">
+              <input type="checkbox" checked={draft.is_primary} onChange={(event) => setDraft({ ...draft, is_primary: event.target.checked })} />
+              Mark as primary
+            </label>
+          </div>
+          <div className="flex justify-end md:col-span-2"><AdminButton type="submit" tone="green"><Plus className="h-3.5 w-3.5" />Add device</AdminButton></div>
+        </form>
+      </AdminPanel>
+    </div>
+  );
 }
