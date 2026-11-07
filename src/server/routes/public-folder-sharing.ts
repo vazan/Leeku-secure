@@ -14,6 +14,7 @@ import {
   verifySharePassword,
 } from '../utils/encryption.js';
 import { getPublicProfilePictureUrl } from '../utils/profile-picture.js';
+import { listStorageDevices } from '../utils/storage-devices.js';
 
 interface FolderShareRow {
   id: string;
@@ -61,6 +62,7 @@ interface FolderManifestRow {
   created_at: Date;
   client_secret_hash: string | null;
   stored_path: string | null;
+  storage_device_id: string | null;
 }
 
 function getSingleParam(value: string | string[] | undefined): string {
@@ -81,6 +83,24 @@ export function createPublicFolderSharingRouter(options: {
   const downloadSessions = new Map<string, FolderDownloadSession>();
 
   if (!fs.existsSync(options.tempPath)) fs.mkdirSync(options.tempPath, { recursive: true });
+
+  // ── Device-aware vault path resolution (ADR-0001 multi-storage) ──
+  // A blob's absolute location depends on which storage device holds it
+  // (storage_device_id FK -> storage_devices.storage_path). We snapshot the
+  // device roots once per request so listings can resolve synchronously inside
+  // .filter() callbacks. Missing devices fall back to the legacy vaultPath.
+  const getDeviceRootMap = async (): Promise<Map<string, string>> => {
+    const devices = await listStorageDevices();
+    return new Map(devices.map((d) => [d.id, d.storage_path]));
+  };
+  const resolveVaultPathSync = (
+    deviceMap: Map<string, string>,
+    deviceId: string | null | undefined,
+    storedPath: string,
+  ): string => {
+    const root = deviceId ? deviceMap.get(deviceId) : null;
+    return root ? path.join(root, storedPath) : path.join(options.vaultPath, storedPath);
+  };
 
   const removeSession = (downloadId: string) => {
     const session = downloadSessions.get(downloadId);
@@ -172,22 +192,23 @@ export function createPublicFolderSharingRouter(options: {
 
     const countsRequest = await getRequest();
     countsRequest.input('folderId', sql.UniqueIdentifier, row.folder_id);
-    const counts = await countsRequest.query<{ stored_path: string | null }>(
+    const counts = await countsRequest.query<{ stored_path: string | null; storage_device_id: string | null }>(
       `;WITH folder_tree AS (
          SELECT id FROM file_folders WHERE id=@folderId
          UNION ALL
          SELECT ff.id FROM file_folders ff INNER JOIN folder_tree ft ON ff.parent_folder_id=ft.id
        )
-      SELECT f.stored_path
+      SELECT f.stored_path,f.storage_device_id
        FROM files f WHERE f.folder_id IN (SELECT id FROM folder_tree)
          AND COALESCE(f.status,'Available')='Available'
          AND (f.expires_at IS NULL OR f.expires_at>SYSDATETIMEOFFSET())
        OPTION (MAXRECURSION 100)`,
     );
 
+    const deviceMap = await getDeviceRootMap();
     const fileCount = counts.recordset.filter(
-      (file: { stored_path: string | null }) =>
-        file.stored_path && fs.existsSync(path.join(options.vaultPath, file.stored_path)),
+      (file: { stored_path: string | null; storage_device_id: string | null }) =>
+        file.stored_path && fs.existsSync(resolveVaultPathSync(deviceMap, file.storage_device_id, file.stored_path)),
     ).length;
     const uploader = decryptColumn(row.owner_username_encrypted, row.owner_username_iv, row.owner_username_auth_tag);
     const appUrl = `${baseUrl}/#d/${token}`;
@@ -289,20 +310,22 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
       );
       const countsRequest = await getRequest();
       countsRequest.input('folderId', sql.UniqueIdentifier, row.folder_id);
-      const counts = await countsRequest.query<{ stored_path: string | null; size_bytes: number | null }>(
+      const counts = await countsRequest.query<{ stored_path: string | null; size_bytes: number | null; storage_device_id: string | null }>(
         `;WITH folder_tree AS (
            SELECT id FROM file_folders WHERE id=@folderId
            UNION ALL
            SELECT ff.id FROM file_folders ff INNER JOIN folder_tree ft ON ff.parent_folder_id=ft.id
          )
-        SELECT f.stored_path,f.size_bytes
+        SELECT f.stored_path,f.size_bytes,f.storage_device_id
          FROM files f WHERE f.folder_id IN (SELECT id FROM folder_tree)
            AND COALESCE(f.status,'Available')='Available'
            AND (f.expires_at IS NULL OR f.expires_at>SYSDATETIMEOFFSET())
          OPTION (MAXRECURSION 100)`,
       );
+      const deviceMap = await getDeviceRootMap();
       const availableFiles = counts.recordset.filter(
-        (file: { stored_path: string | null }) => file.stored_path && fs.existsSync(path.join(options.vaultPath, file.stored_path)),
+        (file: { stored_path: string | null; storage_device_id: string | null }) =>
+          file.stored_path && fs.existsSync(resolveVaultPathSync(deviceMap, file.storage_device_id, file.stored_path)),
       );
       res.json({
         folder_name: row.folder_name,
@@ -344,12 +367,12 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
          )
          SELECT 'folder' AS item_type,id,parent_folder_id AS parent_id,name,
                 NULL AS original_name_encrypted,NULL AS original_name_iv,NULL AS original_name_auth_tag,
-                NULL AS mime_type,NULL AS size_bytes,created_at,NULL AS client_secret_hash,NULL AS stored_path
+                NULL AS mime_type,NULL AS size_bytes,created_at,NULL AS client_secret_hash,NULL AS stored_path,NULL AS storage_device_id
          FROM folder_tree WHERE id<>@folderId
          UNION ALL
          SELECT 'file',f.id,f.folder_id,NULL,
                 f.original_name_encrypted,f.original_name_iv,f.original_name_auth_tag,
-                f.mime_type,f.size_bytes,f.created_at,f.client_secret_hash,f.stored_path
+                f.mime_type,f.size_bytes,f.created_at,f.client_secret_hash,f.stored_path,f.storage_device_id
          FROM files f
          WHERE f.folder_id IN (SELECT id FROM folder_tree)
            AND COALESCE(f.status,'Available')='Available'
@@ -357,11 +380,12 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
          OPTION (MAXRECURSION 100)`,
       );
 
+      const deviceMap = await getDeviceRootMap();
       const folders = result.recordset
         .filter((item: FolderManifestRow) => item.item_type === 'folder')
         .map((item: FolderManifestRow) => ({ id: item.id, parent_folder_id: item.parent_id, name: item.name, created_at: item.created_at }));
       const files = result.recordset
-        .filter((item: FolderManifestRow) => item.item_type === 'file' && item.stored_path && fs.existsSync(path.join(options.vaultPath, item.stored_path)))
+        .filter((item: FolderManifestRow) => item.item_type === 'file' && item.stored_path && fs.existsSync(resolveVaultPathSync(deviceMap, item.storage_device_id, item.stored_path)))
         .map((item: FolderManifestRow) => ({
           id: item.id,
           folder_id: item.parent_id,
@@ -397,7 +421,7 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
       request.input('folderId', sql.UniqueIdentifier, row.folder_id);
       request.input('fileId', sql.UniqueIdentifier, getSingleParam(req.params.fileId));
       const result = await request.query<{
-        id: string; stored_path: string; mime_type: string; size_bytes: number; encrypted_size_bytes: number | null;
+        id: string; stored_path: string; storage_device_id: string | null; mime_type: string; size_bytes: number; encrypted_size_bytes: number | null;
         checksum_sha256: string; client_secret_hash: string | null; client_crypto_salt: Buffer | null;
         client_crypto_iv: Buffer | null; client_crypto_iterations: number | null;
         original_name_encrypted: Buffer; original_name_iv: Buffer; original_name_auth_tag: Buffer;
@@ -408,7 +432,7 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
            UNION ALL
            SELECT ff.id FROM file_folders ff INNER JOIN folder_tree ft ON ff.parent_folder_id=ft.id
          )
-         SELECT f.id,f.stored_path,f.mime_type,f.size_bytes,f.encrypted_size_bytes,f.checksum_sha256,
+         SELECT f.id,f.stored_path,f.storage_device_id,f.mime_type,f.size_bytes,f.encrypted_size_bytes,f.checksum_sha256,
                 f.client_secret_hash,f.client_crypto_salt,f.client_crypto_iv,f.client_crypto_iterations,
                 f.original_name_encrypted,f.original_name_iv,f.original_name_auth_tag,
                 k.encrypted_key,k.key_iv,k.key_auth_tag,k.file_iv,k.file_auth_tag
@@ -424,7 +448,8 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
       if (file.client_secret_hash && (!secretKey || !(await verifyFileSecret(secretKey, file.client_secret_hash)))) {
         return res.status(403).json({ error: secretKey ? 'Incorrect secret key.' : 'Secret key required.' });
       }
-      const vaultFile = path.join(options.vaultPath, file.stored_path);
+      const deviceMap = await getDeviceRootMap();
+      const vaultFile = resolveVaultPathSync(deviceMap, file.storage_device_id, file.stored_path);
       if (!fs.existsSync(vaultFile)) return res.status(410).json({ error: 'Vault file not found.' });
 
       const sessionId = crypto.randomUUID();
