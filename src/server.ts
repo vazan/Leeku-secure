@@ -20,7 +20,7 @@ import https from 'https';
 import crypto from 'crypto';
 import cluster from 'cluster';
 import { fileURLToPath } from 'url';
-import { execFileSync } from 'child_process';
+import { execFile, execFileSync } from 'child_process';
 import si from 'systeminformation';
 import sharp from 'sharp';
 
@@ -251,6 +251,98 @@ function sweepPrivateDownloadSessions(): void {
   }
 }
 
+// ── Media (video) preview warmup sessions ──────────────────────────────
+// Mirrors the private-download session pattern so the native <video> player can
+// stream from an already-decrypted temp file with HTTP Range support (enabling
+// immediate start, seeking, and true progress). AES-256-GCM is not randomly
+// seekable, so we decrypt the whole file once up front, then serve ranges.
+type MediaPreviewPhase = 'decrypting' | 'verifying' | 'optimizing' | 'ready' | 'error';
+
+interface MediaPreviewSession {
+  id: string;
+  userId: string;
+  fileId: string;
+  mimeType: string;
+  tempFile: string;
+  sizeBytes: number;
+  status: 'preparing' | 'ready' | 'error';
+  phase: MediaPreviewPhase;
+  loaded: number;
+  total: number;
+  expiresAt: number;
+  error?: string;
+}
+
+const MEDIA_PREVIEW_SESSION_TTL_MS = 10 * 60_000;
+const mediaPreviewSessions = new Map<string, MediaPreviewSession>();
+
+function removeMediaPreviewSession(previewId: string): void {
+  const session = mediaPreviewSessions.get(previewId);
+  if (!session) return;
+  mediaPreviewSessions.delete(previewId);
+  unregisterTempFile(session.tempFile);
+  try {
+    if (fs.existsSync(session.tempFile)) fs.unlinkSync(session.tempFile);
+  } catch {
+    // best-effort cleanup only
+  }
+}
+
+function sweepMediaPreviewSessions(): void {
+  const now = Date.now();
+  for (const [id, session] of mediaPreviewSessions.entries()) {
+    if (now > session.expiresAt) {
+      removeMediaPreviewSession(id);
+    }
+  }
+}
+
+// ── Video faststart normalization ──────────────────────────────────────
+// Large MP4s encoded without "faststart" place the moov atom (sample table)
+// at the tail of the file. A native <video> player must reach moov before it
+// can report duration or decode the first frame, so for a 3.1GB file that
+// means waiting through a huge prefix before playback starts — even with full
+// HTTP Range support (ranges let it seek, but it still has to find moov).
+// Remuxing with `-movflags +faststart -c copy` relocates moov to the front —
+// a lossless copy (no re-encode) — so the served temp file starts playing
+// almost instantly. Only meaningful for MP4-family containers.
+const FFMPEG_BIN = process.env.FFMPEG_PATH || 'ffmpeg';
+
+function isFaststartCandidate(mimeType: string): boolean {
+  const t = (mimeType || '').toLowerCase();
+  return t === 'video/mp4' || t === 'video/quicktime';
+}
+
+function remuxVideoToFaststart(inputPath: string, outputPath: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    // Temp files end in ".tmp", which ffmpeg can't map to a container, so force
+    // the MP4 muxer explicitly (input above was already probed by ffprobe/ffmpeg
+    // as mov/mp4). Without `-f mp4`, ffmpeg aborts with "Unable to choose an
+    // output format".
+    const child = execFile(
+      FFMPEG_BIN,
+      ['-i', inputPath, '-movflags', '+faststart', '-c', 'copy', '-f', 'mp4', '-y', outputPath],
+      { maxBuffer: 1024 * 1024 },
+      (error, _stdout, stderr) => {
+        if (error) {
+          // ENOENT means the ffmpeg binary isn't installed/on PATH — a
+          // deployment condition, not a remux failure. Surface it distinctly
+          // so callers can skip quietly instead of alarming.
+          if (error && 'code' in error && (error as NodeJS.ErrnoException).code === 'ENOENT') {
+            reject(new Error(`FFMPEG_NOT_FOUND: ${FFMPEG_BIN}`));
+            return;
+          }
+          reject(new Error(`ffmpeg faststart failed: ${error.message}`));
+          return;
+        }
+        resolve();
+      },
+    );
+    // ffmpeg reports progress/errors on stderr; swallow it to avoid log spam
+    if (child.stderr) child.stderr.resume();
+  });
+}
+
 // ── Periodic sweep of expired download sessions ──
 let privateDownloadSweepTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -258,6 +350,7 @@ function startPrivateDownloadSweep(intervalMs: number = 30_000): void {
   if (privateDownloadSweepTimer) return;
   privateDownloadSweepTimer = setInterval(() => {
     sweepPrivateDownloadSessions();
+    sweepMediaPreviewSessions();
   }, intervalMs);
   // Allow the timer to keep the process alive if it's the only thing running
   if (privateDownloadSweepTimer && typeof privateDownloadSweepTimer === 'object' && 'unref' in privateDownloadSweepTimer) {
@@ -4253,6 +4346,16 @@ app.get('/api/files/:id/thumbnail', authenticateUser as express.RequestHandler, 
       return;
     }
 
+    // Videos have no real on-demand thumbnail: the old fallback decrypted the
+    // entire file and served the raw bytes as image/jpeg, which crashes for
+    // files > 2 GiB (ERR_FS_FILE_TOO_LARGE) and renders as a broken image even
+    // when it fits in memory. Signal "no thumbnail" (204) so the client shows
+    // its fallback icon instead of the server erroring on every grid render.
+    if (file.mime_type.startsWith('video/')) {
+      res.status(204).end();
+      return;
+    }
+
     // Generate thumbnail on-demand (for backward compatibility)
     const tempThumbnailPath = buildUniqueTempFilePath(UPLOAD_TEMP, 'leeku-thumb-tmp', fileId);
     registerTempFile(tempThumbnailPath);
@@ -5215,6 +5318,265 @@ app.get('/api/files/:id/download/:downloadId/file', authenticateUser as express.
     session.claimed = false;
     console.error('[GET /api/files/:id/download/:downloadId/file]', err);
     if (!res.headersSent) res.status(500).json({ error: 'Download failed.' });
+  }
+});
+
+// ──────────────────────────────────────────────────────────────
+// Media preview warm-up: decrypt-to-temp once, then serve ranges
+// Video files only — AES-256-GCM is not randomly seekable, so the
+// native player can't progressively decode a single encrypted stream.
+// We decrypt the whole file once (with progress reporting) and serve
+// it from a temp file with HTTP Range support.
+// ──────────────────────────────────────────────────────────────
+app.post('/api/files/:id/preview/prepare', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  sweepMediaPreviewSessions();
+
+  const fileId = getSingleParam(req.params.id);
+  try {
+    const fileReq = await getRequest();
+    fileReq.input('id', sql.UniqueIdentifier, fileId);
+    const fileResult = await fileReq.query<FileRow>(
+      `SELECT id,owner_user_id,original_name_encrypted,original_name_iv,original_name_auth_tag,
+              stored_path,storage_device_id,size_bytes,status,mime_type,encrypted_size_bytes,checksum_sha256,
+              scan_result,scan_message,is_encrypted,leeku_vibe,ttl_hours,
+              client_secret_hash,client_crypto_salt,client_crypto_iv,client_crypto_iterations,
+              expires_at,created_at
+       FROM files WHERE id=@id`
+    );
+    if (!fileResult.recordset.length) return res.status(404).json({ error: 'File not found.' });
+    const file = fileResult.recordset[0];
+    if (file.owner_user_id !== req.userId && req.user!.role !== 'Admin')
+      return res.status(403).json({ error: 'You do not have permission to preview this file.' });
+    if (await isDesktopUpdateFile(fileId) && req.user!.role !== 'Admin')
+      return res.status(403).json({ error: 'Administrator access is required for desktop update artifacts.' });
+    if (file.status === 'Blocked')
+      return res.status(410).json({ error: 'Blocked files cannot be previewed.' });
+    if (!(file.mime_type || '').startsWith('video/'))
+      return res.status(415).json({ error: 'This preview warm-up is only available for video files.' });
+    if (file.client_secret_hash)
+      return res.status(403).json({ error: 'This file requires its secret key and cannot be previewed inline.' });
+
+    const vaultPath = await resolveVaultPathForRow(file.storage_device_id, file.stored_path);
+    if (!fs.existsSync(vaultPath)) return res.status(410).json({ error: 'Vault file not found.' });
+
+    const keyReq = await getRequest();
+    keyReq.input('fid', sql.UniqueIdentifier, fileId);
+    const keyRes = await keyReq.query<{ encrypted_key: Buffer; key_iv: Buffer; key_auth_tag: Buffer; file_iv: Buffer; file_auth_tag: Buffer }>(
+      'SELECT encrypted_key,key_iv,key_auth_tag,file_iv,file_auth_tag FROM file_encryption_keys WHERE file_id=@fid'
+    );
+    if (!keyRes.recordset.length) return res.status(500).json({ error: 'Encryption key not found.' });
+
+    const keyRow = keyRes.recordset[0];
+    const fileKey = unwrapKey(keyRow.encrypted_key, keyRow.key_iv, keyRow.key_auth_tag);
+
+    const tempFile = buildUniqueTempFilePath(UPLOAD_TEMP, 'leeku-dl', fileId);
+    registerTempFile(tempFile);
+    const encryptedSize = Number(file.encrypted_size_bytes || 0) || fs.statSync(vaultPath).size;
+    const previewId = crypto.randomUUID();
+    const session: MediaPreviewSession = {
+      id: previewId,
+      userId: req.userId!,
+      fileId,
+      mimeType: file.mime_type || 'video/mp4',
+      tempFile,
+      sizeBytes: Number(file.size_bytes || 0),
+      status: 'preparing',
+      phase: 'decrypting',
+      loaded: 0,
+      total: encryptedSize,
+      expiresAt: Date.now() + MEDIA_PREVIEW_SESSION_TTL_MS,
+    };
+    mediaPreviewSessions.set(previewId, session);
+
+    void (async () => {
+      try {
+        const hash = crypto.createHash('sha256');
+        await decryptFileStream(vaultPath, tempFile, fileKey, keyRow.file_iv, keyRow.file_auth_tag, ({ processedBytes, totalBytes }) => {
+          const current = mediaPreviewSessions.get(previewId);
+          if (!current) return;
+          current.phase = 'decrypting';
+          current.loaded = processedBytes;
+          current.total = totalBytes;
+          current.expiresAt = Date.now() + MEDIA_PREVIEW_SESSION_TTL_MS;
+        }, hash);
+
+        const current = mediaPreviewSessions.get(previewId);
+        if (!current) return;
+        current.phase = 'verifying';
+        current.loaded = 0;
+        current.total = current.sizeBytes || 1;
+
+        const checksum = hash.digest('hex');
+        if (checksum !== file.checksum_sha256) {
+          throw new Error('File integrity check failed.');
+        }
+
+        // ── Faststart optimization (MP4 only) ───────────────────────────────
+        // Verification above ran against the decrypted original, so integrity is
+        // already guaranteed. Remuxing to faststart relocates moov to the front
+        // (lossless -c copy) so the served file starts playing instantly even at
+        // multi-GB size. If ffmpeg is unavailable or fails, fall back to the
+        // decrypted file rather than breaking preview entirely.
+        let servedFile = tempFile;
+        if (isFaststartCandidate(file.mime_type)) {
+          const optimizing = mediaPreviewSessions.get(previewId);
+          if (optimizing) {
+            optimizing.phase = 'optimizing';
+            optimizing.loaded = 0;
+            optimizing.total = fs.statSync(tempFile).size || 1;
+            optimizing.expiresAt = Date.now() + MEDIA_PREVIEW_SESSION_TTL_MS;
+          }
+
+          const faststartFile = buildUniqueTempFilePath(UPLOAD_TEMP, 'leeku-dl', fileId);
+          registerTempFile(faststartFile);
+          try {
+            await remuxVideoToFaststart(tempFile, faststartFile);
+            servedFile = faststartFile;
+            // The decrypted original is no longer served; release it.
+            try { if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile); } catch {}
+            unregisterTempFile(tempFile);
+          } catch (optErr) {
+            const msg = optErr instanceof Error ? optErr.message : String(optErr);
+            if (msg.startsWith('FFMPEG_NOT_FOUND:')) {
+              // ffmpeg isn't installed on this host; serve the decrypted file
+              // without faststart optimization (large files will start slower).
+              console.info(`[preview] ffmpeg not found (${msg.slice('FFMPEG_NOT_FOUND:'.length)}); serving video without faststart optimization.`);
+            } else {
+              console.warn(`[preview] faststart remux skipped for ${fileId}:`, msg);
+            }
+            try { if (fs.existsSync(faststartFile)) fs.unlinkSync(faststartFile); } catch {}
+            unregisterTempFile(faststartFile);
+          }
+        }
+
+        const ready = mediaPreviewSessions.get(previewId);
+        if (!ready) return;
+        const servedSize = fs.existsSync(servedFile) ? fs.statSync(servedFile).size : ready.sizeBytes;
+        ready.tempFile = servedFile;
+        ready.sizeBytes = servedSize;
+        ready.status = 'ready';
+        ready.phase = 'ready';
+        ready.loaded = servedSize;
+        ready.total = servedSize;
+        ready.expiresAt = Date.now() + MEDIA_PREVIEW_SESSION_TTL_MS;
+      } catch (error) {
+        const failed = mediaPreviewSessions.get(previewId);
+        if (failed) {
+          failed.status = 'error';
+          failed.phase = 'error';
+          failed.error = error instanceof Error ? error.message : 'Preview failed.';
+          failed.expiresAt = Date.now() + 30_000;
+        }
+        try { if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile); } catch {}
+      }
+    })();
+
+    res.status(202).json({
+      preview_id: previewId,
+      status_url: `/api/files/${fileId}/preview/${previewId}/status`,
+      file_url: `/api/files/${fileId}/preview/${previewId}/file`,
+    });
+  } catch (err) {
+    console.error('[POST /api/files/:id/preview/prepare]', err);
+    res.status(500).json({ error: 'Preview failed.' });
+  }
+});
+
+app.get('/api/files/:id/preview/:previewId/status', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  sweepMediaPreviewSessions();
+  const fileId = getSingleParam(req.params.id);
+  const previewId = getSingleParam(req.params.previewId);
+  const session = mediaPreviewSessions.get(previewId);
+  if (!session || session.fileId !== fileId || session.userId !== req.userId) {
+    return res.status(404).json({ error: 'Preview session not found. Wait a few seconds.' });
+  }
+
+  res.json({
+    status: session.status,
+    phase: session.phase,
+    loaded: session.loaded,
+    total: session.total,
+    size: session.sizeBytes,
+    error: session.error || null,
+    file_url: session.status === 'ready'
+      ? `/api/files/${fileId}/preview/${previewId}/file`
+      : null,
+  });
+});
+
+app.get('/api/files/:id/preview/:previewId/file', authenticateUser as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  sweepMediaPreviewSessions();
+  const fileId = getSingleParam(req.params.id);
+  const previewId = getSingleParam(req.params.previewId);
+  const session = mediaPreviewSessions.get(previewId);
+  if (!session || session.fileId !== fileId || session.userId !== req.userId) {
+    return res.status(404).json({ error: 'Preview session not found. Wait a few seconds.' });
+  }
+  if (session.status === 'error') {
+    const errorMessage = session.error || 'Preview failed.';
+    removeMediaPreviewSession(previewId);
+    return res.status(500).json({ error: errorMessage });
+  }
+  if (session.status !== 'ready') {
+    return res.status(409).json({ error: 'Preview is still being prepared.' });
+  }
+
+  try {
+    const stat = fs.statSync(session.tempFile);
+    const totalBytes = stat.size;
+
+    res.setHeader('Content-Type', session.mimeType);
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Cache-Control', 'private, max-age=300');
+    res.setHeader('Content-Disposition', 'inline');
+
+    // ── Honor HTTP Range requests so the native <video> player can seek ──
+    const range = req.headers.range;
+    if (range) {
+      const match = /^bytes=(\d*)-(\d*)$/.exec(String(range));
+      if (match) {
+        let start: number;
+        let end: number;
+        if (match[1] === '' && match[2] !== '') {
+          // Suffix range (bytes=-N): the last N bytes.
+          const suffixLen = parseInt(match[2], 10);
+          start = Math.max(0, totalBytes - suffixLen);
+          end = totalBytes - 1;
+        } else {
+          start = match[1] ? parseInt(match[1], 10) : 0;
+          end = match[2]
+            ? Math.min(parseInt(match[2], 10), totalBytes - 1)
+            : totalBytes - 1;
+        }
+        if (start <= end && start < totalBytes) {
+          res.status(206);
+          res.setHeader('Content-Range', `bytes ${start}-${end}/${totalBytes}`);
+          res.setHeader('Content-Length', String(end - start + 1));
+          const readStream = fs.createReadStream(session.tempFile, { start, end });
+          // The video player issues many ranged requests against one shared
+          // session, so never delete the session here — the TTL sweep does.
+          readStream.on('error', () => {});
+          readStream.pipe(res);
+          return;
+        }
+
+        // Unsatisfiable range
+        res.status(416);
+        res.setHeader('Content-Range', `bytes */${totalBytes}`);
+        return res.end();
+      }
+    }
+
+    // No/ignorable Range header: serve the full file (206-like full or 200)
+    res.setHeader('Content-Length', String(totalBytes));
+    const readStream = fs.createReadStream(session.tempFile);
+    // Don't remove the shared session on this request's close — the player
+    // issues many requests against it; the TTL sweep cleans it up.
+    readStream.on('error', () => {});
+    readStream.pipe(res);
+  } catch (err) {
+    console.error('[GET /api/files/:id/preview/:previewId/file]', err);
+    if (!res.headersSent) res.status(500).json({ error: 'Preview failed.' });
   }
 });
 
