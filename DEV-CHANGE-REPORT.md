@@ -38,10 +38,17 @@ Follow-up 2 (same session): on the prod Windows host two issues surfaced:
   decrypted file). Faststart benefit on prod requires ffmpeg installed or
   `FFMPEG_PATH` set — a deployment action, documented in Handoff.
 
+Follow-up 3 (same session): after `FFMPEG_PATH` was set on the prod host, the remux
+started invoking ffmpeg but failed with "Unable to choose an output format for
+'...tmp'" — because the temp file ends in `.tmp` and ffmpeg can't infer the
+container from that extension. Fixed by adding `-f mp4` to the remux command
+(temp-file naming unchanged; verified end-to-end: bug repro'd without the flag,
+moov lands at front with it).
+
 ## Fichiers
 | Fichier | Raison |
 |---|---|
-| src/server.ts | Added `MediaPreviewSession` map + sweep; added `POST /api/files/:id/preview/prepare`, `GET .../status`, `GET .../file` (Range-capable). Added faststart remux (`remuxVideoToFaststart`, `isFaststartCandidate`, `FFMPEG_BIN` env) + `optimizing` phase in prepare. Follow-up: video thumbnail 204 guard; ENOENT-aware faststart skip |
+| src/server.ts | Added `MediaPreviewSession` map + sweep; added `POST /api/files/:id/preview/prepare`, `GET .../status`, `GET .../file` (Range-capable). Added faststart remux (`remuxVideoToFaststart`, `isFaststartCandidate`, `FFMPEG_BIN` env) + `optimizing` phase in prepare. Follow-ups: video thumbnail 204 guard; ENOENT-aware faststart skip; `-f mp4` explicit muxer for `.tmp` outputs |
 | src/app/features/files/pages/user-dashboard.tsx | Rewrote `VideoPlayer` to warm up, poll progress, show overlay + %; mount video at ready URL. Added `optimizing` phase + phase-aware label |
 
 ## Contrats publics impactés

@@ -315,9 +315,13 @@ function isFaststartCandidate(mimeType: string): boolean {
 
 function remuxVideoToFaststart(inputPath: string, outputPath: string): Promise<void> {
   return new Promise((resolve, reject) => {
+    // Temp files end in ".tmp", which ffmpeg can't map to a container, so force
+    // the MP4 muxer explicitly (input above was already probed by ffprobe/ffmpeg
+    // as mov/mp4). Without `-f mp4`, ffmpeg aborts with "Unable to choose an
+    // output format".
     const child = execFile(
       FFMPEG_BIN,
-      ['-i', inputPath, '-movflags', '+faststart', '-c', 'copy', '-y', outputPath],
+      ['-i', inputPath, '-movflags', '+faststart', '-c', 'copy', '-f', 'mp4', '-y', outputPath],
       { maxBuffer: 1024 * 1024 },
       (error, _stdout, stderr) => {
         if (error) {
