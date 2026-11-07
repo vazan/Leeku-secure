@@ -20,11 +20,18 @@ existing two-phase private-download session flow, plus a frontend `VideoPlayer`
 rewrite. No change to the storage format or the public `GET /api/files/:id/preview`
 contract (still used by audio/image/text and video fallback).
 
+Follow-up (same session): user confirmed Range works (seeking ok) but start on a
+3.1GB MP4 still took 1–2 min — diagnosed as non-faststart MP4 (moov atom at tail).
+Added an MP4 faststart remux (`ffmpeg -movflags +faststart -c copy`, lossless) to
+the prepare step, with a new `optimizing` phase + progress label. Verified with a
+real ffmpeg round-trip (moov moved to front). Falls back to decrypted file if
+ffmpeg unavailable/fails.
+
 ## Fichiers
 | Fichier | Raison |
 |---|---|
-| src/server.ts | Added `MediaPreviewSession` map + sweep; added `POST /api/files/:id/preview/prepare`, `GET .../status`, `GET .../file` (Range-capable) |
-| src/app/features/files/pages/user-dashboard.tsx | Rewrote `VideoPlayer` to warm up, poll progress, show overlay + %; mount video at ready URL |
+| src/server.ts | Added `MediaPreviewSession` map + sweep; added `POST /api/files/:id/preview/prepare`, `GET .../status`, `GET .../file` (Range-capable). Added faststart remux (`remuxVideoToFaststart`, `isFaststartCandidate`, `FFMPEG_BIN` env) + `optimizing` phase in prepare |
+| src/app/features/files/pages/user-dashboard.tsx | Rewrote `VideoPlayer` to warm up, poll progress, show overlay + %; mount video at ready URL. Added `optimizing` phase + phase-aware label |
 
 ## Contrats publics impactés
 NON (breaking). Additive endpoints only, admin/user auth-gated identically to the
@@ -61,6 +68,10 @@ Surfaces à tester :
 - file endpoint honors Range (206, Content-Range, 416 on bad range), full file when
   no Range, and 409 while still preparing / 500 on error.
 - Session TTL sweep (`leeku-dl-*.tmp` cleaned, 10-min expiry) and no leak.
+- NEW faststart: for `video/mp4`/`video/quicktime`, after verify the served file is
+  remuxed (`optimizing` phase). Confirm the served file's moov atom is at the front
+  (e.g., hexdump first 4KB for 'moov'), that it still plays, and that `sizeBytes`/
+  ranges reflect the remuxed size. Confirm graceful fallback when ffmpeg missing/fails.
 Cas limites : empty file, exactly-1-byte range, end>total, start=end, suffix range
 (`bytes=-N`), multiple concurrent ranged requests against one session.
 Risques non couverts : real network/proxy behavior behind reverse proxy.

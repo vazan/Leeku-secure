@@ -20,7 +20,7 @@ import https from 'https';
 import crypto from 'crypto';
 import cluster from 'cluster';
 import { fileURLToPath } from 'url';
-import { execFileSync } from 'child_process';
+import { execFile, execFileSync } from 'child_process';
 import si from 'systeminformation';
 import sharp from 'sharp';
 
@@ -256,7 +256,7 @@ function sweepPrivateDownloadSessions(): void {
 // stream from an already-decrypted temp file with HTTP Range support (enabling
 // immediate start, seeking, and true progress). AES-256-GCM is not randomly
 // seekable, so we decrypt the whole file once up front, then serve ranges.
-type MediaPreviewPhase = 'decrypting' | 'verifying' | 'ready' | 'error';
+type MediaPreviewPhase = 'decrypting' | 'verifying' | 'optimizing' | 'ready' | 'error';
 
 interface MediaPreviewSession {
   id: string;
@@ -295,6 +295,41 @@ function sweepMediaPreviewSessions(): void {
       removeMediaPreviewSession(id);
     }
   }
+}
+
+// ── Video faststart normalization ──────────────────────────────────────
+// Large MP4s encoded without "faststart" place the moov atom (sample table)
+// at the tail of the file. A native <video> player must reach moov before it
+// can report duration or decode the first frame, so for a 3.1GB file that
+// means waiting through a huge prefix before playback starts — even with full
+// HTTP Range support (ranges let it seek, but it still has to find moov).
+// Remuxing with `-movflags +faststart -c copy` relocates moov to the front —
+// a lossless copy (no re-encode) — so the served temp file starts playing
+// almost instantly. Only meaningful for MP4-family containers.
+const FFMPEG_BIN = process.env.FFMPEG_PATH || 'ffmpeg';
+
+function isFaststartCandidate(mimeType: string): boolean {
+  const t = (mimeType || '').toLowerCase();
+  return t === 'video/mp4' || t === 'video/quicktime';
+}
+
+function remuxVideoToFaststart(inputPath: string, outputPath: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = execFile(
+      FFMPEG_BIN,
+      ['-i', inputPath, '-movflags', '+faststart', '-c', 'copy', '-y', outputPath],
+      { maxBuffer: 1024 * 1024 },
+      (error, _stdout, stderr) => {
+        if (error) {
+          reject(new Error(`ffmpeg faststart failed: ${error.message}`));
+          return;
+        }
+        resolve();
+      },
+    );
+    // ffmpeg reports progress/errors on stderr; swallow it to avoid log spam
+    if (child.stderr) child.stderr.resume();
+  });
 }
 
 // ── Periodic sweep of expired download sessions ──
@@ -5355,12 +5390,46 @@ app.post('/api/files/:id/preview/prepare', authenticateUser as express.RequestHa
           throw new Error('File integrity check failed.');
         }
 
+        // ── Faststart optimization (MP4 only) ───────────────────────────────
+        // Verification above ran against the decrypted original, so integrity is
+        // already guaranteed. Remuxing to faststart relocates moov to the front
+        // (lossless -c copy) so the served file starts playing instantly even at
+        // multi-GB size. If ffmpeg is unavailable or fails, fall back to the
+        // decrypted file rather than breaking preview entirely.
+        let servedFile = tempFile;
+        if (isFaststartCandidate(file.mime_type)) {
+          const optimizing = mediaPreviewSessions.get(previewId);
+          if (optimizing) {
+            optimizing.phase = 'optimizing';
+            optimizing.loaded = 0;
+            optimizing.total = fs.statSync(tempFile).size || 1;
+            optimizing.expiresAt = Date.now() + MEDIA_PREVIEW_SESSION_TTL_MS;
+          }
+
+          const faststartFile = buildUniqueTempFilePath(UPLOAD_TEMP, 'leeku-dl', fileId);
+          registerTempFile(faststartFile);
+          try {
+            await remuxVideoToFaststart(tempFile, faststartFile);
+            servedFile = faststartFile;
+            // The decrypted original is no longer served; release it.
+            try { if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile); } catch {}
+            unregisterTempFile(tempFile);
+          } catch (optErr) {
+            console.warn(`[preview] faststart remux skipped for ${fileId}:`, (optErr as Error).message);
+            try { if (fs.existsSync(faststartFile)) fs.unlinkSync(faststartFile); } catch {}
+            unregisterTempFile(faststartFile);
+          }
+        }
+
         const ready = mediaPreviewSessions.get(previewId);
         if (!ready) return;
+        const servedSize = fs.existsSync(servedFile) ? fs.statSync(servedFile).size : ready.sizeBytes;
+        ready.tempFile = servedFile;
+        ready.sizeBytes = servedSize;
         ready.status = 'ready';
         ready.phase = 'ready';
-        ready.loaded = ready.sizeBytes;
-        ready.total = ready.sizeBytes;
+        ready.loaded = servedSize;
+        ready.total = servedSize;
         ready.expiresAt = Date.now() + MEDIA_PREVIEW_SESSION_TTL_MS;
       } catch (error) {
         const failed = mediaPreviewSessions.get(previewId);

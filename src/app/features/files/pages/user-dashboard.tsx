@@ -133,7 +133,7 @@ interface PreparedDownloadStartResponse {
 
 interface PreparedDownloadStatus {
   status: "preparing" | "ready" | "error";
-  phase: "decrypting" | "verifying" | "finalizing" | "ready" | "error";
+  phase: "decrypting" | "verifying" | "optimizing" | "finalizing" | "ready" | "error";
   loaded: number;
   total: number;
   size: number;
@@ -144,6 +144,7 @@ interface PreparedDownloadStatus {
 const preparationPhaseLabel: Record<PreparedDownloadStatus["phase"], string> = {
   decrypting: "Decrypting file",
   verifying: "Verifying integrity",
+  optimizing: "Optimizing video for instant play",
   finalizing: "Unlocking secure content",
   ready: "Starting download",
   error: "Download failed",
@@ -4612,7 +4613,7 @@ function VideoPlayer({
 }) {
   const [preparing, setPreparing] = useState(true);
   const [preparingError, setPreparingError] = useState("");
-  const [progress, setProgress] = useState<{ loaded: number; total: number } | null>(null);
+  const [progress, setProgress] = useState<{ phase: PreparedDownloadStatus["phase"]; loaded: number; total: number } | null>(null);
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
   const prepareRequestRef = React.useRef<AbortController | null>(null);
 
@@ -4649,7 +4650,7 @@ function VideoPlayer({
           controller.signal,
           (status) => {
             if (cancelled) return;
-            setProgress({ loaded: status.loaded, total: status.total || status.size || 1 });
+            setProgress({ phase: status.phase, loaded: status.loaded, total: status.total || status.size || 1 });
           },
         );
         if (cancelled) return;
@@ -4709,7 +4710,9 @@ function VideoPlayer({
             <p className="text-sm text-white/80">{preparingError}</p>
           ) : (
             <>
-              <p className="text-sm text-white/80">Preparing video…</p>
+              <p className="text-sm text-white/80">
+                {preparationPhaseLabel[progress?.phase ?? "decrypting"]}…
+              </p>
               <div className="flex w-full max-w-md flex-col items-center gap-1.5">
                 <div className="h-1.5 w-full overflow-hidden rounded-full bg-white/15">
                   <div
