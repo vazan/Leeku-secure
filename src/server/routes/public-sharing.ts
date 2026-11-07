@@ -16,6 +16,7 @@ import {
 } from '../utils/encryption.js';
 import { getPublicProfilePictureUrl } from '../utils/profile-picture.js';
 import { getTextPreviewKind, TEXT_PREVIEW_MAX_BYTES } from '../utils/text-preview.js';
+import { getStorageDevice, resolveBlobPath } from '../utils/storage-devices.js';
 
 interface ShareRow {
   id: string;
@@ -249,6 +250,21 @@ export function createPublicSharingRouter(options: {
     return path.join(options.tempPath, `${prefix}-${id}-${Date.now()}-${unique}.tmp`);
   };
 
+  // ── Device-aware vault path resolution (ADR-0001 multi-storage) ──
+  // A blob's absolute location depends on which storage device holds it
+  // (storage_device_id FK -> storage_devices.storage_path). Falling back to the
+  // legacy vaultPath keeps legacy rows (NULL device id) working.
+  const resolveVaultPath = async (
+    deviceId: string | null | undefined,
+    storedPath: string,
+  ): Promise<string> => {
+    if (deviceId) {
+      const dev = await getStorageDevice(deviceId);
+      if (dev) return resolveBlobPath(dev, storedPath);
+    }
+    return path.join(options.vaultPath, storedPath);
+  };
+
   const getEmbedCachePath = (token: string, fileId: string): string => {
     const key = crypto.createHash('sha256').update(`${token}:${fileId}`).digest('hex').slice(0, 24);
     return path.join(options.tempPath, `${EMBED_CACHE_PREFIX}-${key}.tmp`);
@@ -454,6 +470,7 @@ const buildPromise = (async () => {
         pinned_version_id: string | null; resolved_version_id: string | null;
         version_no: number | null; file_status: string; leeku_vibe: string|null; mime_type: string;
         size_bytes: number; file_created_at: Date; stored_path: string;
+        storage_device_id: string | null;
         client_secret_hash: string | null;
         original_name_encrypted: Buffer; original_name_iv: Buffer; original_name_auth_tag: Buffer;
         owner_username_encrypted: Buffer; owner_username_iv: Buffer; owner_username_auth_tag: Buffer;
@@ -461,6 +478,7 @@ const buildPromise = (async () => {
         `SELECT sl.id,sl.version_id AS pinned_version_id,v.id AS resolved_version_id,u.id AS owner_user_id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.allow_external_preview,sl.allow_decrypted_external_preview,
                 COALESCE(v.version_no,f.version_count) AS version_no,
                 COALESCE(v.status,f.status) AS file_status,f.leeku_vibe,COALESCE(v.mime_type,f.mime_type) AS mime_type,COALESCE(v.size_bytes,f.size_bytes) AS size_bytes,COALESCE(v.created_at,f.created_at) AS file_created_at,COALESCE(v.stored_path,f.stored_path) AS stored_path,
+                COALESCE(v.storage_device_id,f.storage_device_id) AS storage_device_id,
                 COALESCE(v.client_secret_hash,f.client_secret_hash) AS client_secret_hash,
                 COALESCE(v.original_name_encrypted,f.original_name_encrypted) AS original_name_encrypted,COALESCE(v.original_name_iv,f.original_name_iv) AS original_name_iv,COALESCE(v.original_name_auth_tag,f.original_name_auth_tag) AS original_name_auth_tag,
                 u.username_encrypted AS owner_username_encrypted,u.username_iv AS owner_username_iv,u.username_auth_tag AS owner_username_auth_tag
@@ -477,7 +495,7 @@ const buildPromise = (async () => {
       if (row.file_status === 'Blocked') return res.status(410).json({ error: 'File has been blocked.' });
       if (row.expires_at && new Date(row.expires_at) < new Date()) return res.status(410).json({ error: 'Share link has expired.' });
       if (row.max_downloads && row.download_count >= row.max_downloads) return res.status(410).json({ error: 'Download limit reached.' });
-      if (!fs.existsSync(path.join(options.vaultPath, row.stored_path))) return res.status(410).json({ error: 'The shared file is no longer available.' });
+      if (!fs.existsSync(await resolveVaultPath(row.storage_device_id, row.stored_path))) return res.status(410).json({ error: 'The shared file is no longer available.' });
       const fileName = decryptColumn(row.original_name_encrypted, row.original_name_iv, row.original_name_auth_tag);
       const previewKind = getTextPreviewKind(fileName, row.mime_type || '');
       res.json({
@@ -521,14 +539,14 @@ const buildPromise = (async () => {
       request.input('tok', sql.Char(32), token);
       const result = await request.query<ShareRow & {
         pinned_version_id: string | null; resolved_version_id: string | null;
-        file_status: string; stored_path: string; mime_type: string; size_bytes: number;
+        file_status: string; stored_path: string; storage_device_id: string | null; mime_type: string; size_bytes: number;
         client_secret_hash: string | null; client_crypto_salt: Buffer | null; client_crypto_iv: Buffer | null; client_crypto_iterations: number | null;
         original_name_encrypted: Buffer; original_name_iv: Buffer; original_name_auth_tag: Buffer;
         checksum_sha256: string; file_id_join: string;
         encrypted_key: Buffer; key_iv: Buffer; key_auth_tag: Buffer; file_iv: Buffer; file_auth_tag: Buffer;
       }>(
         `SELECT sl.id,sl.version_id AS pinned_version_id,v.id AS resolved_version_id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.allow_external_preview,
-                COALESCE(v.id,f.id) AS file_id_join,COALESCE(v.status,f.status) AS file_status,COALESCE(v.stored_path,f.stored_path) AS stored_path,COALESCE(v.mime_type,f.mime_type) AS mime_type,COALESCE(v.size_bytes,f.size_bytes) AS size_bytes,COALESCE(v.checksum_sha256,f.checksum_sha256) AS checksum_sha256,
+                COALESCE(v.id,f.id) AS file_id_join,COALESCE(v.status,f.status) AS file_status,COALESCE(v.stored_path,f.stored_path) AS stored_path,COALESCE(v.storage_device_id,f.storage_device_id) AS storage_device_id,COALESCE(v.mime_type,f.mime_type) AS mime_type,COALESCE(v.size_bytes,f.size_bytes) AS size_bytes,COALESCE(v.checksum_sha256,f.checksum_sha256) AS checksum_sha256,
                 COALESCE(v.client_secret_hash,f.client_secret_hash) AS client_secret_hash,COALESCE(v.client_crypto_salt,f.client_crypto_salt) AS client_crypto_salt,COALESCE(v.client_crypto_iv,f.client_crypto_iv) AS client_crypto_iv,COALESCE(v.client_crypto_iterations,f.client_crypto_iterations) AS client_crypto_iterations,
                 COALESCE(v.original_name_encrypted,f.original_name_encrypted) AS original_name_encrypted,COALESCE(v.original_name_iv,f.original_name_iv) AS original_name_iv,COALESCE(v.original_name_auth_tag,f.original_name_auth_tag) AS original_name_auth_tag,
                 COALESCE(vk.encrypted_key,k.encrypted_key) AS encrypted_key,COALESCE(vk.key_iv,k.key_iv) AS key_iv,COALESCE(vk.key_auth_tag,k.key_auth_tag) AS key_auth_tag,COALESCE(vk.file_iv,k.file_iv) AS file_iv,COALESCE(vk.file_auth_tag,k.file_auth_tag) AS file_auth_tag
@@ -562,7 +580,7 @@ const buildPromise = (async () => {
         }
       }
 
-      const vaultFile = path.join(options.vaultPath, row.stored_path);
+      const vaultFile = await resolveVaultPath(row.storage_device_id, row.stored_path);
       if (!fs.existsSync(vaultFile)) return res.status(410).json({ error: 'Vault file not found.' });
       tempFile = buildUniqueTempFilePath('leeku-preview', token);
       const fileKey = unwrapKey(row.encrypted_key, row.key_iv, row.key_auth_tag);
@@ -785,7 +803,7 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
       const request = await getRequest(); request.input('tok', sql.Char(32), token);
       const result = await request.query<ShareRow & {
         pinned_version_id: string | null; resolved_version_id: string | null;
-        file_status: string; stored_path: string;
+        file_status: string; stored_path: string; storage_device_id: string | null;
         size_bytes: number; encrypted_size_bytes: number | null;
         client_secret_hash: string | null; client_crypto_salt: Buffer | null; client_crypto_iv: Buffer | null; client_crypto_iterations: number | null;
         original_name_encrypted: Buffer; original_name_iv: Buffer; original_name_auth_tag: Buffer;
@@ -793,7 +811,7 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
         encrypted_key: Buffer; key_iv: Buffer; key_auth_tag: Buffer; file_iv: Buffer; file_auth_tag: Buffer;
       }>(
         `SELECT sl.id,sl.version_id AS pinned_version_id,v.id AS resolved_version_id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.allow_external_preview,
-          COALESCE(v.id,f.id) AS file_id_join,COALESCE(v.status,f.status) AS file_status,COALESCE(v.stored_path,f.stored_path) AS stored_path,COALESCE(v.mime_type,f.mime_type) AS mime_type,COALESCE(v.size_bytes,f.size_bytes) AS size_bytes,COALESCE(v.encrypted_size_bytes,f.encrypted_size_bytes) AS encrypted_size_bytes,COALESCE(v.checksum_sha256,f.checksum_sha256) AS checksum_sha256,
+          COALESCE(v.id,f.id) AS file_id_join,COALESCE(v.status,f.status) AS file_status,COALESCE(v.stored_path,f.stored_path) AS stored_path,COALESCE(v.storage_device_id,f.storage_device_id) AS storage_device_id,COALESCE(v.mime_type,f.mime_type) AS mime_type,COALESCE(v.size_bytes,f.size_bytes) AS size_bytes,COALESCE(v.encrypted_size_bytes,f.encrypted_size_bytes) AS encrypted_size_bytes,COALESCE(v.checksum_sha256,f.checksum_sha256) AS checksum_sha256,
                 COALESCE(v.client_secret_hash,f.client_secret_hash) AS client_secret_hash,COALESCE(v.client_crypto_salt,f.client_crypto_salt) AS client_crypto_salt,COALESCE(v.client_crypto_iv,f.client_crypto_iv) AS client_crypto_iv,COALESCE(v.client_crypto_iterations,f.client_crypto_iterations) AS client_crypto_iterations,
                 COALESCE(v.original_name_encrypted,f.original_name_encrypted) AS original_name_encrypted,COALESCE(v.original_name_iv,f.original_name_iv) AS original_name_iv,COALESCE(v.original_name_auth_tag,f.original_name_auth_tag) AS original_name_auth_tag,
                 COALESCE(vk.encrypted_key,k.encrypted_key) AS encrypted_key,COALESCE(vk.key_iv,k.key_iv) AS key_iv,COALESCE(vk.key_auth_tag,k.key_auth_tag) AS key_auth_tag,COALESCE(vk.file_iv,k.file_iv) AS file_iv,COALESCE(vk.file_auth_tag,k.file_auth_tag) AS file_auth_tag
@@ -819,7 +837,7 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
           return res.status(403).json({ error: 'Incorrect secret key.' });
         }
       }
-      const vaultFile = path.join(options.vaultPath, row.stored_path);
+      const vaultFile = await resolveVaultPath(row.storage_device_id, row.stored_path);
       if (!fs.existsSync(vaultFile)) return res.status(410).json({ error: 'Vault file not found.' });
       const fileKey = unwrapKey(row.encrypted_key, row.key_iv, row.key_auth_tag);
       const originalName = decryptColumn(row.original_name_encrypted, row.original_name_iv, row.original_name_auth_tag);
@@ -1028,7 +1046,7 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
       request.input('tok', sql.Char(32), token);
       const result = await request.query<ShareRow & {
         pinned_version_id: string | null; resolved_version_id: string | null;
-        file_status: string; stored_path: string;
+        file_status: string; stored_path: string; storage_device_id: string | null;
         client_secret_hash: string | null;
         original_name_encrypted: Buffer; original_name_iv: Buffer; original_name_auth_tag: Buffer;
         owner_username_encrypted: Buffer; owner_username_iv: Buffer; owner_username_auth_tag: Buffer;
@@ -1038,7 +1056,7 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
       }>(
         `SELECT sl.id,sl.version_id AS pinned_version_id,v.id AS resolved_version_id,sl.public_token,sl.password_hash,sl.expires_at,sl.max_downloads,sl.download_count,sl.is_active,sl.allow_external_preview,sl.allow_decrypted_external_preview,
                 u.id AS owner_user_id,
-                COALESCE(v.id,f.id) AS file_id_join,COALESCE(v.status,f.status) AS file_status,COALESCE(v.stored_path,f.stored_path) AS stored_path,COALESCE(v.mime_type,f.mime_type) AS mime_type,COALESCE(v.size_bytes,f.size_bytes) AS size_bytes,COALESCE(v.checksum_sha256,f.checksum_sha256) AS checksum_sha256,
+                COALESCE(v.id,f.id) AS file_id_join,COALESCE(v.status,f.status) AS file_status,COALESCE(v.stored_path,f.stored_path) AS stored_path,COALESCE(v.storage_device_id,f.storage_device_id) AS storage_device_id,COALESCE(v.mime_type,f.mime_type) AS mime_type,COALESCE(v.size_bytes,f.size_bytes) AS size_bytes,COALESCE(v.checksum_sha256,f.checksum_sha256) AS checksum_sha256,
                 COALESCE(v.client_secret_hash,f.client_secret_hash) AS client_secret_hash,
                 COALESCE(v.original_name_encrypted,f.original_name_encrypted) AS original_name_encrypted,COALESCE(v.original_name_iv,f.original_name_iv) AS original_name_iv,COALESCE(v.original_name_auth_tag,f.original_name_auth_tag) AS original_name_auth_tag,
                 u.username_encrypted AS owner_username_encrypted,u.username_iv AS owner_username_iv,u.username_auth_tag AS owner_username_auth_tag,
@@ -1123,9 +1141,9 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
         ? `/api/public/share/${token}/dec_embed_media`
         : `/api/public/share/${token}/embed_media`;
 
-      const warmEmbedCacheInBackground = () => {
+      const warmEmbedCacheInBackground = async () => {
         try {
-          const vaultFile = path.join(options.vaultPath, row.stored_path);
+          const vaultFile = await resolveVaultPath(row.storage_device_id, row.stored_path);
           if (!fs.existsSync(vaultFile)) return;
 
           const cachePath = useDecryptedExternalPreview
@@ -1163,7 +1181,7 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
       };
 
       if (!rawMode && shouldUseLargeVideoHtmlFallback) {
-        warmEmbedCacheInBackground();
+        void warmEmbedCacheInBackground();
         const uploader = decryptColumn(row.owner_username_encrypted, row.owner_username_iv, row.owner_username_auth_tag);
         const sizeLabel = ogFormatBytes(Number(row.size_bytes || 0));
         const previewUrl = `${req.protocol}://${req.get('host') || 'leeks.miku.rip'}${req.originalUrl}`;
@@ -1260,7 +1278,7 @@ ${safeOgImageUrl ? `<meta name="twitter:image" content="${safeOgImageUrl}" />` :
 </html>`);
       }
 
-      const vaultFile = path.join(options.vaultPath, row.stored_path);
+      const vaultFile = await resolveVaultPath(row.storage_device_id, row.stored_path);
       if (!fs.existsSync(vaultFile)) return res.status(410).json({ error: 'Vault file not found.' });
 
       if (warmupMode) {
@@ -1467,7 +1485,7 @@ ${safeOgImageUrl ? `<meta name="twitter:image" content="${safeOgImageUrl}" />` :
       const filesRequest = await getRequest();
       filesRequest.input('folderId', sql.UniqueIdentifier, folderId);
       const filesResult = await filesRequest.query<{
-        file_id: string; relative_path: string; stored_path: string; mime_type: string; size_bytes: number; checksum_sha256: string;
+        file_id: string; relative_path: string; stored_path: string; storage_device_id: string | null; mime_type: string; size_bytes: number; checksum_sha256: string;
         client_secret_hash: string | null;
         original_name_encrypted: Buffer; original_name_iv: Buffer; original_name_auth_tag: Buffer;
         encrypted_key: Buffer; key_iv: Buffer; key_auth_tag: Buffer; file_iv: Buffer; file_auth_tag: Buffer;
@@ -1481,7 +1499,7 @@ ${safeOgImageUrl ? `<meta name="twitter:image" content="${safeOgImageUrl}" />` :
          )
           SELECT f.id AS file_id,
             CASE WHEN ft.relative_path='' THEN N'' ELSE ft.relative_path+N'/' END AS relative_path,
-            f.stored_path,f.mime_type,f.size_bytes,f.checksum_sha256,f.client_secret_hash,
+            f.stored_path,f.storage_device_id,f.mime_type,f.size_bytes,f.checksum_sha256,f.client_secret_hash,
                 f.original_name_encrypted,f.original_name_iv,f.original_name_auth_tag,
                 k.encrypted_key,k.key_iv,k.key_auth_tag,k.file_iv,k.file_auth_tag
          FROM files f INNER JOIN file_encryption_keys k ON k.file_id=f.id
@@ -1501,7 +1519,7 @@ ${safeOgImageUrl ? `<meta name="twitter:image" content="${safeOgImageUrl}" />` :
         return res.status(403).json({ error: 'Secret-key-protected files cannot be used as direct links.' });
       }
 
-      const vaultFile = path.join(options.vaultPath, match.stored_path);
+      const vaultFile = await resolveVaultPath(match.storage_device_id, match.stored_path);
       if (!fs.existsSync(vaultFile)) return res.status(410).json({ error: 'Vault file not found.' });
 
       const originalName = decryptColumn(match.original_name_encrypted, match.original_name_iv, match.original_name_auth_tag);
