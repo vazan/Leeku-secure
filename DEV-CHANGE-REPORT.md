@@ -27,10 +27,21 @@ the prepare step, with a new `optimizing` phase + progress label. Verified with 
 real ffmpeg round-trip (moov moved to front). Falls back to decrypted file if
 ffmpeg unavailable/fails.
 
+Follow-up 2 (same session): on the prod Windows host two issues surfaced:
+- `GET /api/files/:id/thumbnail` crashed on videos > 2 GiB
+  (`ERR_FS_FILE_TOO_LARGE`) because the on-demand fallback read the whole decrypted
+  video into memory and served it as image/jpeg. Fixed: videos with no stored
+  thumbnail now return 204 so the client shows its fallback icon instead of
+  erroring (and no longer wastes a full decrypt + RAM read).
+- `spawn ffmpeg ENOENT` on prod (ffmpeg not on PATH). The faststart remux now
+  detects ENOENT specifically and skips quietly (info log, still serves the
+  decrypted file). Faststart benefit on prod requires ffmpeg installed or
+  `FFMPEG_PATH` set — a deployment action, documented in Handoff.
+
 ## Fichiers
 | Fichier | Raison |
 |---|---|
-| src/server.ts | Added `MediaPreviewSession` map + sweep; added `POST /api/files/:id/preview/prepare`, `GET .../status`, `GET .../file` (Range-capable). Added faststart remux (`remuxVideoToFaststart`, `isFaststartCandidate`, `FFMPEG_BIN` env) + `optimizing` phase in prepare |
+| src/server.ts | Added `MediaPreviewSession` map + sweep; added `POST /api/files/:id/preview/prepare`, `GET .../status`, `GET .../file` (Range-capable). Added faststart remux (`remuxVideoToFaststart`, `isFaststartCandidate`, `FFMPEG_BIN` env) + `optimizing` phase in prepare. Follow-up: video thumbnail 204 guard; ENOENT-aware faststart skip |
 | src/app/features/files/pages/user-dashboard.tsx | Rewrote `VideoPlayer` to warm up, poll progress, show overlay + %; mount video at ready URL. Added `optimizing` phase + phase-aware label |
 
 ## Contrats publics impactés
@@ -71,7 +82,11 @@ Surfaces à tester :
 - NEW faststart: for `video/mp4`/`video/quicktime`, after verify the served file is
   remuxed (`optimizing` phase). Confirm the served file's moov atom is at the front
   (e.g., hexdump first 4KB for 'moov'), that it still plays, and that `sizeBytes`/
-  ranges reflect the remuxed size. Confirm graceful fallback when ffmpeg missing/fails.
+  ranges reflect the remuxed size. Confirm graceful fallback when ffmpeg missing/fails
+  (ENOENT → info log, decrypted file served; other ffmpeg error → warn + fallback).
+- NEW thumbnail guard: `GET /api/files/:id/thumbnail` for a video with no stored
+  thumbnail returns 204 (no full-file decrypt, no 2 GiB crash); with a stored
+  thumbnail serves it; images still generate on-demand.
 Cas limites : empty file, exactly-1-byte range, end>total, start=end, suffix range
 (`bytes=-N`), multiple concurrent ranged requests against one session.
 Risques non couverts : real network/proxy behavior behind reverse proxy.

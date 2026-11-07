@@ -321,6 +321,13 @@ function remuxVideoToFaststart(inputPath: string, outputPath: string): Promise<v
       { maxBuffer: 1024 * 1024 },
       (error, _stdout, stderr) => {
         if (error) {
+          // ENOENT means the ffmpeg binary isn't installed/on PATH — a
+          // deployment condition, not a remux failure. Surface it distinctly
+          // so callers can skip quietly instead of alarming.
+          if (error && 'code' in error && (error as NodeJS.ErrnoException).code === 'ENOENT') {
+            reject(new Error(`FFMPEG_NOT_FOUND: ${FFMPEG_BIN}`));
+            return;
+          }
           reject(new Error(`ffmpeg faststart failed: ${error.message}`));
           return;
         }
@@ -4335,6 +4342,16 @@ app.get('/api/files/:id/thumbnail', authenticateUser as express.RequestHandler, 
       return;
     }
 
+    // Videos have no real on-demand thumbnail: the old fallback decrypted the
+    // entire file and served the raw bytes as image/jpeg, which crashes for
+    // files > 2 GiB (ERR_FS_FILE_TOO_LARGE) and renders as a broken image even
+    // when it fits in memory. Signal "no thumbnail" (204) so the client shows
+    // its fallback icon instead of the server erroring on every grid render.
+    if (file.mime_type.startsWith('video/')) {
+      res.status(204).end();
+      return;
+    }
+
     // Generate thumbnail on-demand (for backward compatibility)
     const tempThumbnailPath = buildUniqueTempFilePath(UPLOAD_TEMP, 'leeku-thumb-tmp', fileId);
     registerTempFile(tempThumbnailPath);
@@ -5415,7 +5432,14 @@ app.post('/api/files/:id/preview/prepare', authenticateUser as express.RequestHa
             try { if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile); } catch {}
             unregisterTempFile(tempFile);
           } catch (optErr) {
-            console.warn(`[preview] faststart remux skipped for ${fileId}:`, (optErr as Error).message);
+            const msg = optErr instanceof Error ? optErr.message : String(optErr);
+            if (msg.startsWith('FFMPEG_NOT_FOUND:')) {
+              // ffmpeg isn't installed on this host; serve the decrypted file
+              // without faststart optimization (large files will start slower).
+              console.info(`[preview] ffmpeg not found (${msg.slice('FFMPEG_NOT_FOUND:'.length)}); serving video without faststart optimization.`);
+            } else {
+              console.warn(`[preview] faststart remux skipped for ${fileId}:`, msg);
+            }
             try { if (fs.existsSync(faststartFile)) fs.unlinkSync(faststartFile); } catch {}
             unregisterTempFile(faststartFile);
           }
