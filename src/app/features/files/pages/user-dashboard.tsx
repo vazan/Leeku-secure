@@ -4610,6 +4610,12 @@ function VideoPlayer({
   file: FileMetadata;
   onClose: () => void;
 }) {
+  const [preparing, setPreparing] = useState(true);
+  const [preparingError, setPreparingError] = useState("");
+  const [progress, setProgress] = useState<{ loaded: number; total: number } | null>(null);
+  const [videoUrl, setVideoUrl] = useState<string | null>(null);
+  const prepareRequestRef = React.useRef<AbortController | null>(null);
+
   useEffect(() => {
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key === "Escape") onClose();
@@ -4617,6 +4623,63 @@ function VideoPlayer({
     document.addEventListener("keydown", closeOnEscape);
     return () => document.removeEventListener("keydown", closeOnEscape);
   }, [onClose]);
+
+  // Warm up the preview: decrypt the video to a temp file on the server and
+  // report progress so the user sees transfer/decoding status instead of a
+  // blank gray frame while a large file is being prepared.
+  useEffect(() => {
+    const controller = new AbortController();
+    prepareRequestRef.current = controller;
+    let cancelled = false;
+
+    const start = async () => {
+      try {
+        const startResponse = await fetch(`/api/files/${file.id}/preview/prepare`, {
+          method: "POST",
+          headers: authHeaders(""),
+          signal: controller.signal,
+        });
+        if (!startResponse.ok) {
+          throw new Error(await readJsonError(startResponse, "Video unavailable."));
+        }
+        const startData = (await startResponse.json()) as PreparedDownloadStartResponse;
+        const fileUrl = await waitForPreparedDownload(
+          startData.status_url,
+          authHeaders(""),
+          controller.signal,
+          (status) => {
+            if (cancelled) return;
+            setProgress({ loaded: status.loaded, total: status.total || status.size || 1 });
+          },
+        );
+        if (cancelled) return;
+        setVideoUrl(fileUrl);
+      } catch (error) {
+        if (!controller.signal.aborted) {
+          setPreparingError(error instanceof Error ? error.message : "Video unavailable.");
+        }
+      } finally {
+        if (!cancelled) setPreparing(false);
+      }
+    };
+
+    void start();
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+      if (prepareRequestRef.current === controller) {
+        prepareRequestRef.current = null;
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [file.id]);
+
+  const percent = progress
+    ? progress.total > 0
+      ? Math.min(100, Math.round((progress.loaded / progress.total) * 100))
+      : 0
+    : 0;
 
   return (
     <div
@@ -4636,13 +4699,44 @@ function VideoPlayer({
           <X className="h-4 w-4" />
         </button>
       </div>
-      <video
-        src={`/api/files/${file.id}/preview`}
-        controls
-        autoPlay
-        playsInline
-        className="min-h-0 w-full flex-1 object-contain"
-      />
+
+      {(preparing || preparingError) && (
+        <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 text-white">
+          {!preparingError && (
+            <Loader2 className="h-8 w-8 animate-spin motion-reduce:animate-none" />
+          )}
+          {preparingError ? (
+            <p className="text-sm text-white/80">{preparingError}</p>
+          ) : (
+            <>
+              <p className="text-sm text-white/80">Preparing video…</p>
+              <div className="flex w-full max-w-md flex-col items-center gap-1.5">
+                <div className="h-1.5 w-full overflow-hidden rounded-full bg-white/15">
+                  <div
+                    className="h-full bg-[var(--accent-linear)] transition-[width] duration-150 ease-out"
+                    style={{ width: `${percent}%` }}
+                  />
+                </div>
+                <p className="text-xs tabular-nums text-white/60">
+                  {percent}% · {formatBytes(progress?.loaded || 0)} of{" "}
+                  {formatBytes(progress?.total || file.size)}
+                </p>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
+      {!preparing && videoUrl && !preparingError && (
+        <video
+          src={videoUrl}
+          controls
+          autoPlay
+          playsInline
+          preload="metadata"
+          className="min-h-0 w-full flex-1 object-contain"
+        />
+      )}
     </div>
   );
 }
