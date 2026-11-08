@@ -44,6 +44,8 @@ export interface StorageDevice {
   smb_password_auth_tag: Buffer | null;
   provisioning_enabled: boolean;
   is_primary: boolean;
+  /** Soft storage cap in bytes for this device; null means unlimited. */
+  quota_bytes: number | null;
   created_at: Date;
 }
 
@@ -57,6 +59,10 @@ export interface StorageDeviceDto {
   has_smb_credentials: boolean;
   reachable: boolean;
   created_at: Date;
+  /** Soft storage cap in bytes for this device; null means unlimited. */
+  quota_bytes: number | null;
+  /** Per-device usage ratio (0..1+) against quota; null when quota is unset. */
+  quota_usage: number | null;
   /** Number of current-file blobs physically stored on this device (ADR-0001). */
   file_count: number;
   /** Number of archived-version blobs physically stored on this device (ADR-0001). */
@@ -74,6 +80,8 @@ export interface StorageDeviceInput {
   smb_password?: string | null;
   provisioning_enabled?: boolean;
   is_primary?: boolean;
+  /** Soft storage cap in bytes; null/undefined means unlimited. */
+  quota_bytes?: number | null;
 }
 
 type SelectRow = {
@@ -88,6 +96,7 @@ type SelectRow = {
   smb_password_auth_tag: Buffer | null;
   provisioning_enabled: boolean;
   is_primary: boolean;
+  quota_bytes: number | null;
   created_at: Date;
 };
 
@@ -99,7 +108,7 @@ const SELECT_COLS = `
   id, storage_id, storage_path,
   smb_username_encrypted, smb_username_iv, smb_username_auth_tag,
   smb_password_encrypted, smb_password_iv, smb_password_auth_tag,
-  provisioning_enabled, is_primary, created_at
+  provisioning_enabled, is_primary, quota_bytes, created_at
 `;
 
 function mapRow(row: SelectRow): StorageDevice {
@@ -115,6 +124,7 @@ function mapRow(row: SelectRow): StorageDevice {
     smb_password_auth_tag: row.smb_password_auth_tag,
     provisioning_enabled: !!row.provisioning_enabled,
     is_primary: !!row.is_primary,
+    quota_bytes: row.quota_bytes != null ? Number(row.quota_bytes) : null,
     created_at: row.created_at,
   };
 }
@@ -166,6 +176,9 @@ export async function createStorageDevice(input: StorageDeviceInput): Promise<St
   req.input('passTag', sql.VarBinary, password?.authTag ?? null);
   req.input('enabled', sql.Bit, input.provisioning_enabled ? 1 : 0);
   req.input('primary', sql.Bit, input.is_primary ? 1 : 0);
+  const quotaBytes = input.quota_bytes != null ? Math.floor(input.quota_bytes) : null;
+  if (quotaBytes != null && quotaBytes <= 0) throw new Error('quota_bytes must be a positive byte count when set.');
+  req.input('quotaBytes', sql.BigInt, quotaBytes);
 
   await req.query(`
     BEGIN TRANSACTION;
@@ -175,12 +188,12 @@ export async function createStorageDevice(input: StorageDeviceInput): Promise<St
       id, storage_id, storage_path,
       smb_username_encrypted, smb_username_iv, smb_username_auth_tag,
       smb_password_encrypted, smb_password_iv, smb_password_auth_tag,
-      provisioning_enabled, is_primary
+      provisioning_enabled, is_primary, quota_bytes
     ) VALUES (
       @id, @storageId, @storagePath,
       @userEnc, @userIv, @userTag,
       @passEnc, @passIv, @passTag,
-      @enabled, @primary
+      @enabled, @primary, @quotaBytes
     );
     COMMIT;
   `);
@@ -224,6 +237,10 @@ export async function isDeviceReachable(storagePath: string): Promise<boolean> {
 /** Builds a safe admin DTO (no encrypted blobs, no plaintext credentials). */
 export async function toDto(device: StorageDevice): Promise<StorageDeviceDto> {
   const usage = await getStorageDeviceUsage(device.id);
+  const quotaRatio =
+    device.quota_bytes != null && device.quota_bytes > 0
+      ? usage.totalBytes / device.quota_bytes
+      : null;
   return {
     id: device.id,
     storage_id: device.storage_id,
@@ -233,6 +250,8 @@ export async function toDto(device: StorageDevice): Promise<StorageDeviceDto> {
     has_smb_credentials: !!device.smb_username_encrypted || !!device.smb_password_encrypted,
     reachable: await isDeviceReachable(device.storage_path),
     created_at: device.created_at,
+    quota_bytes: device.quota_bytes,
+    quota_usage: quotaRatio,
     file_count: usage.files,
     version_count: usage.versions,
     bytes_used: usage.totalBytes,
@@ -261,8 +280,11 @@ export function resolveBlobPath(device: StorageDevice, storedPath: string): stri
  *
  * Auto-balancing rules:
  *   1. Filter devices with provisioning_enabled = 1.
- *   2. Prefer is_primary = 1 if reachable.
- *   3. Otherwise order by ascending free-space ratio (most free space first),
+ *   2. Filter out devices that have already reached their per-device quota
+ *      (quota_bytes set AND usage >= quota). Devices with a NULL quota are
+ *      treated as unlimited.
+ *   3. Prefer is_primary = 1 if reachable and within quota.
+ *   4. Otherwise order by ascending free-space ratio (most free space first),
  *      falling back to round-robin among reachable enabled devices.
  *
  * Free-space is derived from `statfs` (available_blocks * block_size);
@@ -275,8 +297,20 @@ export async function selectProvisionDevice(devices: StorageDevice[]): Promise<S
   const enabled = devices.filter((d) => d.provisioning_enabled);
   if (enabled.length === 0) return null;
 
-  const reachable: StorageDevice[] = [];
+  // Filter out devices that have already reached their quota (NULL = unlimited).
+  const withinQuota: StorageDevice[] = [];
   for (const d of enabled) {
+    if (d.quota_bytes == null || d.quota_bytes <= 0) {
+      withinQuota.push(d);
+      continue;
+    }
+    const usage = await getStorageDeviceUsage(d.id);
+    if (usage.totalBytes < d.quota_bytes) withinQuota.push(d);
+  }
+  if (withinQuota.length === 0) return null;
+
+  const reachable: StorageDevice[] = [];
+  for (const d of withinQuota) {
     if (await isDeviceReachable(d.storage_path)) reachable.push(d);
   }
   if (reachable.length === 0) return null;
@@ -341,6 +375,14 @@ export async function updateStorageDevice(
   if (patch.is_primary !== undefined) {
     req.input('primary', sql.Bit, patch.is_primary ? 1 : 0);
     sets.push('is_primary = @primary');
+  }
+  if (patch.quota_bytes !== undefined) {
+    // POURQUOI : allow both setting a positive cap and clearing it back to
+    // "unlimited" (null). Undefined (not present) leaves the field untouched.
+    const qb = patch.quota_bytes != null ? Math.floor(patch.quota_bytes) : null;
+    if (qb != null && qb <= 0) throw new Error('quota_bytes must be a positive byte count when set.');
+    req.input('quotaBytes', sql.BigInt, qb);
+    sets.push('quota_bytes = @quotaBytes');
   }
 
   if (patch.smb_username != null && patch.smb_username !== '') {

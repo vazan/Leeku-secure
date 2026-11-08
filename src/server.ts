@@ -6731,6 +6731,7 @@ app.post('/api/admin/storage', authenticateUser as express.RequestHandler, verif
       smb_password: body.smb_password != null ? String(body.smb_password) : null,
       provisioning_enabled: body.provisioning_enabled !== false,
       is_primary: !!body.is_primary,
+      quota_bytes: body.quota_bytes != null && body.quota_bytes !== '' ? Number(body.quota_bytes) : null,
     });
     await mountStorageDevice(device);
     res.json({ success: true, device: await toDto(device) });
@@ -7402,6 +7403,23 @@ async function ensureFileDeletedAtColumn(): Promise<void> {
   `);
 }
 
+// POURQUOI : per-device storage quota (soft cap in bytes). Idempotent —
+// NULL quota means "unlimited", so existing devices keep their behaviour
+// until an admin sets a cap via the Storage panel.
+async function ensureStorageDeviceQuotaColumn(): Promise<void> {
+  const request = await getRequest();
+  await request.query(`
+    IF OBJECT_ID('dbo.storage_devices', 'U') IS NOT NULL
+    BEGIN
+      IF COL_LENGTH('dbo.storage_devices', 'quota_bytes') IS NULL
+        ALTER TABLE dbo.storage_devices ADD quota_bytes BIGINT NULL;
+      IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_storage_devices_quota_bytes')
+        ALTER TABLE dbo.storage_devices
+          ADD CONSTRAINT CK_storage_devices_quota_bytes CHECK (quota_bytes IS NULL OR quota_bytes > 0);
+    END
+  `);
+}
+
 async function bootstrap() {
   // 1. Validate production requirements and master encryption key
   validateProductionConfig();
@@ -7422,6 +7440,9 @@ async function bootstrap() {
   await ensureOptionalShareLinkColumns();
   await ensureFileFolderSchema();
   await ensureFileDeletedAtColumn();
+
+  // 2b'. Per-device storage quota column (idempotent).
+  await ensureStorageDeviceQuotaColumn();
 
   // 2c. Multi-storage migration: seed initial device from legacy env vars and
   // backfill existing rows (ADR-0001). Idempotent.

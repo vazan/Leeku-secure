@@ -80,6 +80,9 @@ export default function AdminWorkspace({
     password: "",
     quota_id: "guest",
   });
+  // Yellow banner: alerts admins when the primary storage device is close to
+  // its per-device quota so they can switch primary to another device.
+  const [nearQuotaWarning, setNearQuotaWarning] = useState<string | null>(null);
 
   const folderById = useMemo(
     () => new Map(folders.map((folder) => [folder.id, folder])),
@@ -130,6 +133,42 @@ export default function AdminWorkspace({
       }
     };
     fetchMaintenanceStatus();
+  }, []);
+
+  // POURQUOI : check the primary device's quota usage and surface a yellow
+  // warning banner to admins when it is at ~90% so they can switch primary to
+  // another storage device (DATA-01 / DATA-02) before it fills up.
+  useEffect(() => {
+    let cancelled = false;
+    const checkQuotaWarning = async () => {
+      try {
+        const response = await fetch('/api/admin/storage', { headers: adminHeaders() });
+        const data = await response.json();
+        if (!response.ok || cancelled) return;
+        const devices: Array<{
+          id: string;
+          storage_id: string;
+          is_primary: boolean;
+          quota_bytes: number | null;
+          quota_usage: number | null;
+          bytes_used: number;
+        }> = data.devices ?? [];
+        const primary = devices.find((d) => d.is_primary);
+        if (primary && primary.quota_bytes != null && primary.quota_usage != null && primary.quota_usage >= 0.9) {
+          setNearQuotaWarning(
+            `Primary storage device "${primary.storage_id}" has reached ${Math.round(primary.quota_usage * 100)}% of its quota (${formatBytes(primary.bytes_used ?? 0)} / ${formatBytes(primary.quota_bytes)}). ` +
+            `Consider switching primary to another storage device (e.g. DATA-01 or DATA-02) in the Storage tab.`
+          );
+        } else {
+          setNearQuotaWarning(null);
+        }
+      } catch (error) {
+        console.error('Failed to check storage quota warning:', error);
+      }
+    };
+    void checkQuotaWarning();
+    const timer = window.setInterval(checkQuotaWarning, 60_000); // re-check every minute
+    return () => { cancelled = true; window.clearInterval(timer); };
   }, []);
 
   useEffect(() => setLocalQuotas(quotas), [quotas]);
@@ -314,6 +353,23 @@ export default function AdminWorkspace({
           </button>
         ))}
       </div>
+
+      {nearQuotaWarning && (
+        <div className="flex flex-wrap items-start gap-3 border-2 border-[var(--admin-border-warning)] bg-[var(--admin-surface)] px-4 py-3">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-[var(--admin-warning)]" />
+          <div className="flex-1">
+            <p className="text-xs font-semibold text-[var(--admin-warning)]">Storage quota warning</p>
+            <p className="mt-1 text-xs text-[var(--text-secondary)]">{nearQuotaWarning}</p>
+          </div>
+          <button
+            type="button"
+            onClick={() => setTab("storage")}
+            className="border border-[var(--border-subtle)] px-3 py-1.5 text-xs text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+          >
+            Open Storage
+          </button>
+        </div>
+      )}
 
       {tab === "overview" && (
         <div className="space-y-6">
@@ -627,6 +683,8 @@ type StorageDeviceDto = {
   has_smb_credentials: boolean;
   reachable: boolean;
   created_at: string;
+  quota_bytes: number | null;
+  quota_usage: number | null;
   file_count: number;
   version_count: number;
   bytes_used: number;
@@ -643,6 +701,7 @@ function StoragePanel() {
     smb_password: "",
     provisioning_enabled: true,
     is_primary: false,
+    quota_bytes: "",
   });
   // Migration (move files between devices) state.
   const [sourceId, setSourceId] = useState("");
@@ -729,12 +788,13 @@ function StoragePanel() {
           smb_password: draft.smb_password.trim() || null,
           provisioning_enabled: draft.provisioning_enabled,
           is_primary: draft.is_primary,
+          quota_bytes: draft.quota_bytes.trim() ? Number(draft.quota_bytes.trim()) : null,
         }),
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || "Failed to add storage device.");
     }, "Storage device added.");
-    setDraft({ storage_id: "", storage_path: "", smb_username: "", smb_password: "", provisioning_enabled: true, is_primary: false });
+    setDraft({ storage_id: "", storage_path: "", smb_username: "", smb_password: "", provisioning_enabled: true, is_primary: false, quota_bytes: "" });
   };
 
   const setPrimary = (device: StorageDeviceDto) =>
@@ -747,6 +807,25 @@ function StoragePanel() {
     runDeviceAction(async () => {
       await patchDevice(device.id, { provisioning_enabled: !device.provisioning_enabled });
     }, device.provisioning_enabled ? "Provisioning disabled." : "Provisioning enabled.");
+
+  const editQuota = (device: StorageDeviceDto) => {
+    const currentGB = device.quota_bytes != null ? device.quota_bytes / 1073741824 : undefined;
+    const input = window.prompt(
+      `Set storage quota for "${device.storage_id}" in GB.\n` +
+      `Leave empty or enter 0 to remove the quota (unlimited).\nCurrent: ${currentGB != null ? `${currentGB.toFixed(2)} GB` : "unlimited"}`,
+      currentGB != null ? String(Math.round(currentGB * 100) / 100) : ""
+    );
+    if (input === null) return; // cancelled
+    const trimmed = input.trim();
+    const gb = trimmed ? Number(trimmed) : null;
+    if (gb !== null && (!Number.isFinite(gb) || gb <= 0)) {
+      toast.error("Quota must be a positive number (GB), or empty for unlimited.");
+      return;
+    }
+    void runDeviceAction(async () => {
+      await patchDevice(device.id, { quota_bytes: gb != null ? Math.round(gb * 1073741824) : null });
+    }, gb != null ? `Quota set to ${gb} GB for ${device.storage_id}.` : `Quota removed for ${device.storage_id}.`);
+  };
 
   const removeDevice = (device: StorageDeviceDto) => {
     if (!window.confirm(`Delete storage device "${device.storage_id}"? Stored blobs are not removed.`)) return;
@@ -895,9 +974,34 @@ function StoragePanel() {
                   </div>
                   <p className="mt-1 text-xs text-[var(--text-muted)]">{device.storage_path}</p>
                   <p className="mt-0.5 text-[10px] text-[var(--text-muted)]">{device.has_smb_credentials ? "SMB credentials set" : "No SMB credentials"} · added {new Date(device.created_at).toLocaleDateString()}</p>
+                  {device.quota_bytes != null && device.quota_bytes > 0 ? (
+                    <div className="mt-2">
+                      <div className="flex items-center justify-between text-[10px]">
+                        <span className={`text-[var(--text-muted)]`}>
+                          {formatBytes(device.bytes_used)} / {formatBytes(device.quota_bytes)}
+                          {device.quota_usage != null && (
+                            <span className={device.quota_usage >= 0.9 ? "ml-1 text-[var(--admin-warning)]" : "ml-1 text-[var(--text-muted)]"}>
+                              ({Math.round(device.quota_usage * 100)}%)
+                            </span>
+                          )}
+                        </span>
+                      </div>
+                      <div className="mt-1 h-1.5 w-full max-w-[280px] overflow-hidden rounded bg-[var(--border-subtle)]">
+                        <div
+                          className={`h-full ${device.quota_usage != null && device.quota_usage >= 0.9 ? "bg-[var(--admin-warning)]" : "bg-[var(--admin-info)]"}`}
+                          style={{ width: `${device.quota_usage != null ? Math.min(100, device.quota_usage * 100) : 0}%` }}
+                        />
+                      </div>
+                    </div>
+                  ) : (
+                    <p className="mt-1 text-[10px] text-[var(--text-muted)]">
+                      {formatBytes(device.bytes_used)} stored · quota not set (unlimited)
+                    </p>
+                  )}
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
                   {!device.is_primary && <AdminButton tone="cyan" onClick={() => void setPrimary(device)}>Set primary</AdminButton>}
+                  <AdminButton tone="muted" onClick={() => editQuota(device)}>Quota</AdminButton>
                   <AdminButton tone={device.provisioning_enabled ? "pink" : "green"} onClick={() => void toggleProvisioning(device)}>{device.provisioning_enabled ? "Disable" : "Enable"}</AdminButton>
                   <AdminButton tone="pink" onClick={() => removeDevice(device)}>Delete</AdminButton>
                 </div>
@@ -1054,6 +1158,7 @@ function StoragePanel() {
           <AdminInput label="Storage path (local or \\\\UNC\\share)" value={draft.storage_path} onChange={(value) => setDraft({ ...draft, storage_path: value })} />
           <AdminInput label="SMB username (optional)" value={draft.smb_username} onChange={(value) => setDraft({ ...draft, smb_username: value })} />
           <AdminInput label="SMB password (optional, encrypted at rest)" type="password" value={draft.smb_password} onChange={(value) => setDraft({ ...draft, smb_password: value })} />
+          <AdminInput label="Storage quota (GB, optional — empty = unlimited)" type="number" value={draft.quota_bytes} onChange={(value) => setDraft({ ...draft, quota_bytes: value })} />
           <div className="flex flex-wrap items-center gap-6 md:col-span-2">
             <label className="flex items-center gap-2 text-xs text-[var(--text-muted)]">
               <input type="checkbox" checked={draft.provisioning_enabled} onChange={(event) => setDraft({ ...draft, provisioning_enabled: event.target.checked })} />

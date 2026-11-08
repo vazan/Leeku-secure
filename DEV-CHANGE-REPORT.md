@@ -1,107 +1,103 @@
 ---
-agent: DevEngineer | date: 2026-11-07 | model: (dev)
+agent: DevEngineer | date: 2026-11-08 | model: (dev)
 plan: /memories/session/dev-plan.md
 ---
 
 ## Intention
-Fix public **file sharing** links broken by the DB-backed multi-storage pool
-(ADR-0001, commit 966eee4). After that commit, all file downloads/previews for
-files stored on a non-primary storage device failed with `"Vault file not found."`
-(HTTP 410) or surfaced "Not Found". Root cause: the public share routers still
-resolved every blob against the single legacy vault root (`options.vaultPath ==
-FILE_VAULT`) via `path.join(options.vaultPath, row.stored_path)`, ignoring each
-row's `storage_device_id`. In multi-storage, `stored_path` is a relative name per
-device and the actual device root lives in `storage_devices.storage_path`, so the
-legacy join pointed at a path that does not exist on the primary device.
+Add a **per-device storage quota** to the multi-storage system so admins can
+restrict how much data is stored under each storage device (e.g. DATA-00).
+When the **primary** device reaches ~90% of its quota, a yellow warning banner
+is shown to admins (visible across all admin tabs) suggesting they switch
+primary to another device (DATA-01 / DATA-02) in the Storage tab.
 
 ## Changement
-Classe : STANDARD — bug fix (regression). The public share routes now resolve the
-blob path **per-device** the same way the rest of the app already does (see
-`resolveVaultPathForRow` in src/server.ts): look up the row's `storage_device_id`,
-and if it maps to a registered device use `path.join(device.storage_path,
-stored_path)`; otherwise fall back to the legacy `vaultPath` (NULL device id on
-pre-multi-storage rows). No change to any public contract, DB schema, or client
-API — responses keep the same status codes and JSON shapes.
+Classe : STANDARD — additive feature. A new nullable `quota_bytes BIGINT`
+column (`NULL` = unlimited, preserving behaviour for all existing devices)
+plus enforcement in device selection and an admin-facing warning.
 
-Affected surfaces:
-- `public-sharing.ts` — `GET /:token`, `POST /:token/preview`,
-  `POST /:token/download`, `GET /:token/embed_media`(+`dec_embed_media`, incl. the
-  background cache warm-up), and the folder-style `GET /:userId/:folderId/:filename`
-  direct-link route. Each SELECT now pulls `storage_device_id` (COALESCEd across
-  version/current like the other columns) and each `vaultFile` is resolved through
-  a new `resolveVaultPath(deviceId, storedPath)` helper.
-- `public-folder-sharing.ts` — `POST /:token/manifest`, `GET /:token`,
-  `buildFolderShareOgHtml`, and `POST /:token/files/:fileId/download`. Because the
-  listing/count routes use synchronous `fs.existsSync` inside `.filter()`, a
-  per-request device-root snapshot (`getDeviceRootMap()` +
-  `resolveVaultPathSync`) is used so device lookup stays DB-free after the single
-  snapshot.
+**Backend**
+- `storage_devices.quota_bytes` (nullable) added via a new idempotent SQL
+  migration and a runtime boot-time schema guard.
+- `selectProvisionDevice()`: devices with `quota_bytes` set AND current usage
+  `>=` quota are excluded from new-upload selection (fail-closed when all
+  enabled reachable devices are over quota). Devices with a NULL quota remain
+  unlimited and keep auto-balancing behaviour.
+- `StorageDeviceDto` now reports `quota_bytes` and `quota_usage` (usage/quota
+  ratio, or `null` when unlimited), consumed by the admin Storage panel and
+  the banner.
+- `POST /api/admin/storage` accepts `quota_bytes` (GB→bytes conversion done
+  client-side); `POST /api/admin/storage/:id` passes it through to update.
+
+**Frontend**
+- `StoragePanel`: quota progress bar + usage % per device (turns yellow at ≥90%),
+  an "Unlimited" indicator when unset, a `Quota` button to set/clear a device
+  cap (prompt in GB), and a quota (GB) field on the "Add storage device" form.
+- `AdminWorkspace`: on mount (and re-checked every 60 s) fetches
+  `/api/admin/storage`, and if the primary device is ≥90% of its quota shows a
+  yellow banner with a shortcut to the Storage tab.
 
 ## Fichiers
 | Fichier | Raison |
 |---|---|
-| src/server/routes/public-sharing.ts | Added `resolveVaultPath`; added `storage_device_id` to all share SELECTs; replaced all `path.join(options.vaultPath, ...)` blob resolutions with device-aware resolution; made background embed-cache warm-up async |
-| src/server/routes/public-folder-sharing.ts | Added `getDeviceRootMap`/`resolveVaultPathSync`; added `storage_device_id` to folder manifest/list/download SELECTs; device-aware existence checks and download path |
+| Documentation/SQL/2026-11-08-add-storage-device-quota.sql | Idempotent migration adding `quota_bytes` + guard constraint |
+| src/server/utils/storage-devices.ts | Added `quota_bytes` to types/DTO/SELECT/mapRow/create/update; quota enforcement in `selectProvisionDevice`; `quota_usage` in `toDto` |
+| src/server.ts | Accept `quota_bytes` in POST create route; added `ensureStorageDeviceQuotaColumn()` (boot-time idempotent guard) |
+| src/app/features/files/components/admin-workspace.tsx | Quota input/display/edit in StoragePanel; yellow banner in AdminWorkspace |
+| memories/session/dev-plan.md | Plan for this change |
 
 ## Contrats publics impactés
-NON (breaking). Same routes, same status codes, same response shapes. The only
-behavioral change is that blobs on any storage device now resolve to the correct
-physical path instead of the legacy root. `vaultPath` remains the safe fallback
-for legacy rows with a NULL/unknown device id.
+NON (breaking). `StorageDeviceDto` gains two new read-only fields
+(`quota_bytes`, `quota_usage`) and the admin storage create/update routes accept
+an optional `quota_bytes`; existing clients ignore unknown fields. No change to
+status codes or response shapes.
 
 ## Risques
 Perf/Sécu/Régression/Compat :
-- Perf : `resolveVaultPath` issues one extra `getStorageDevice` lookup per request
-  (a PK lookup on `storage_devices`), matching what `resolveVaultPathForRow`
-  already does across the rest of the app; folder list/count routes do a single
-  `listStorageDevices()` snapshot per request regardless of file count.
-- Sécu : no change — same share/password/secret-key guards; only the blob path is
-  now computed per-device excluding the device's SMB credentials (never returned).
-- Régression : legacy single-device deployments are unaffected (device id null →
-  legacy `vaultPath` fallback). Multi-device file share links start working again.
-- Compat : MS SQL — new `COALESCE(v.storage_device_id,f.storage_device_id)` columns
-  require only that `files`/`file_versions` carry the column (true since ADR-0001).
+- Perf : `selectProvisionDevice` now calls `getStorageDeviceUsage` per device
+  that has a quota (one small UNION query per device per upload). Acceptable for
+  typical 2–4 device pools. `toDto` already made the same call for usage.
+- Sécu : no change — quota is a soft cap on DB-tracked storage; SMB credentials
+  remain encrypted and never exposed.
+- Régression : devices with `quota_bytes = NULL` keep their exact previous
+  behaviour (unlimited, auto-balancing). The boot-time guard + idempotent SQL
+  ensure the column exists before any device is seeded/read.
+- Compat : existing devices/deployments unaffected until an admin sets a quota.
 
 ## Dette observée
-MINOR — the shared blob-resolution logic is now duplicated in three places
-(`resolveVaultPathForRow` in server.ts, `resolveVaultPath` in public-sharing.ts,
-`resolveVaultPathSync` in public-folder-sharing.ts). A future refactor could hoist
-a single `resolveBlobPathForRow(deviceId, storedPath, fallback)` into
-`utils/storage-devices.ts` and reuse it everywhere. Not blocking.
+MINOR — the quota feature uses a `window.prompt` for editing an existing
+device's quota (consistent with the existing `confirm()`-style UX on this
+panel, but not as polished as an inline form). Future work could add an inline
+edit field.
 
 ## Validation
-Build: ✅ (esbuild/vite unaffected)  Lint: ⚠ (tsc --noEmit reports only the
-pre-existing repo-wide `mssql` module-resolution errors and implicit-any errors;
-no new errors introduced by this change)  Type-check: ✅ for the edited modules
-given the environment baseline  Smoke: ⚠SKIPPED (requires live DB + running
-server across two storage devices; handed to QA).
+Build: ✅ (esbuild bundles of `storage-devices.ts` and `admin-workspace.tsx` succeed)
+Lint: ✅ (`tsc --noEmit` — no new errors; only pre-existing `mssql` module / implicit-any errors remain)
+Type-check: ✅ (same as lint)
+Smoke: ⚠️ SKIPPED (no running DB/server; SQL migration is idempotent and reviewed)
 
 ## Approbation CRITICAL
-N/A
+N/A (STANDARD change — no CRITICAL scope touched).
 
 ## Handoff TestEngineer
-Surfaces à tester :
-- With ≥2 storage devices and a file sharing row whose `files.storage_device_id`
-  points at a non-primary device: `GET /api/public/share/:token`,
-  `POST /api/public/share/:token/download`, `POST /api/public/share/:token/preview`,
-  and `GET /api/public/share/:token/embed_media` must all succeed (no 410
-  "Vault file not found.").
-- Download flow: POST download → 202 → poll status → ready → GET file serves the
-  decrypted bytes and the checksum verifies.
-- Video embed: `embed_media` and `dec_embed_media` serve byte ranges; the background
-  cache warm-up no longer aborts when the file is on a secondary device.
-- Text preview: `POST /:token/preview` returns the text for a file on a secondary
-  device.
-- Folder sharing (secondary device): `GET /:token/manifest` lists the file
-  (previously silently dropped for wrong root), `GET /:token` reports the correct
-  file_count/total_size, and `POST /:token/files/:fileId/download` succeeds.
-- Legacy regression: with only one device (or rows with NULL `storage_device_id`),
-  all of the above still work (fallback path).
-Cas limites : file pinned to an *archived version* (share_links.version_id set) on a
-secondary device; share whose device row was deleted (should fall back to
-`vaultPath`); empty folder; folder share with password/secret-key guards.
+Surfaces to test:
+1. **Quota enforcement** — set a quota on DATA-00; upload until usage meets
+   quota; verify new uploads are routed to the next enabled device, and fail
+   closed with a clear message when all quota-constrained devices are full.
+2. **Unlimited default** — devices with no quota keep receiving uploads.
+3. **Quota lifecycle** — create a device with a quota; edit it; clear it back
+   to unlimited; verify DTO reflects `quota_bytes`/`quota_usage`.
+4. **Yellow banner** — with primary DATA-00 ≥90% quota, admins see the banner
+   across all tabs, and it disappears after switching primary or freeing space.
+
+Case boundaries:
+- `quota_bytes` validation (0/negative rejected, non-numeric rejected).
+- Primary at exactly 90% vs 89.9%.
+- All devices full → upload fail-closed with a clear error.
+- Migration from a non-full device to a quota-constrained destination.
 
 ## Handoff QaEngineer
-Validation : `npm run build` passes. Report : DEV-CHANGE-REPORT.md. Trail
-approbation : feature branch `fix/sharing/multi-storage-vault-path`; commit awaits
-QA sign-off. No CRITICAL approval required.
+Resumen validation: STANDARD additive feature; lint/type-check clean (no new
+errors), esbuild bundles succeedees. Backend logic reviewed for quota
+enforcement and DTO shape. Frontend banner + StoragePanel quota UI verified by
+code review; runtime smoke on a live SQL Server + dev server remains
+outstanding. Trail approbation: not required (STANDARD).
