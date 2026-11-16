@@ -1400,12 +1400,12 @@ function StoragePanel() {
                       <td className="px-3 py-3">
                         {canMove ? (
                           <div className="flex flex-col gap-2">
-                            <div className="flex flex-wrap items-center gap-2">
+                            <div className="flex flex-nowrap items-center gap-2 whitespace-nowrap">
                               <select
                                 value={actionActive ? movingSourceId : ""}
                                 disabled={movingUserBusy && actionActive}
                                 onChange={(e) => { setMovingUserId(user.id); setMovingSourceId(e.target.value); setMovingUserPreview(null); }}
-                                className="border border-[var(--border-subtle)] bg-[var(--bg-elevated)] px-2 py-1.5 text-[var(--text-primary)]"
+                                className="w-[190px] shrink-0 border border-[var(--border-subtle)] bg-[var(--bg-elevated)] px-2 py-1.5 text-[var(--text-primary)]"
                               >
                                 <option value="">Source…</option>
                                 {user.devices.map((dev) => (
@@ -1414,12 +1414,12 @@ function StoragePanel() {
                                   </option>
                                 ))}
                               </select>
-                              <span className="text-[var(--text-muted)]">→</span>
+                              <span className="shrink-0 text-[var(--text-muted)]">→</span>
                               <select
                                 value={actionActive ? movingDestId : ""}
                                 disabled={movingUserBusy && actionActive}
                                 onChange={(e) => { setMovingUserId(user.id); setMovingDestId(e.target.value); setMovingUserPreview(null); }}
-                                className="border border-[var(--border-subtle)] bg-[var(--bg-elevated)] px-2 py-1.5 text-[var(--text-primary)]"
+                                className="w-[190px] shrink-0 border border-[var(--border-subtle)] bg-[var(--bg-elevated)] px-2 py-1.5 text-[var(--text-primary)]"
                               >
                                 <option value="">Destination…</option>
                                 {devices
