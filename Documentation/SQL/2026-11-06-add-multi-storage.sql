@@ -136,6 +136,36 @@ END
 GO
 
 -- ──────────────────────────────────────────────────────────────
+-- 5b. Composite (owner, device) indexes for per-user storage
+--     reporting (admin "Users by device" panel, move-user migration).
+--     Files group by (owner_user_id, storage_device_id); versions are
+--     scoped through files (no owner FK), so they join on file_id.
+-- ──────────────────────────────────────────────────────────────
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_files_owner_device' AND object_id=OBJECT_ID('dbo.files'))
+BEGIN
+    CREATE INDEX IX_files_owner_device ON dbo.files(owner_user_id, storage_device_id)
+        INCLUDE (size_bytes);
+    PRINT 'Created IX_files_owner_device index';
+END
+ELSE
+BEGIN
+    PRINT 'IX_files_owner_device already exists';
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_file_versions_file_device' AND object_id=OBJECT_ID('dbo.file_versions'))
+BEGIN
+    CREATE INDEX IX_file_versions_file_device ON dbo.file_versions(file_id, storage_device_id)
+        INCLUDE (size_bytes);
+    PRINT 'Created IX_file_versions_file_device index';
+END
+ELSE
+BEGIN
+    PRINT 'IX_file_versions_file_device already exists';
+END
+GO
+
+-- ──────────────────────────────────────────────────────────────
 -- Verify
 -- ──────────────────────────────────────────────────────────────
 SELECT 'storage_devices' AS tbl, COUNT(*) AS rows FROM dbo.storage_devices

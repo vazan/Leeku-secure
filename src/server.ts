@@ -6864,35 +6864,46 @@ app.get('/api/admin/storage/users', authenticateUser as express.RequestHandler, 
       file_count: number; version_count: number; bytes: number | null;
       quota_bytes: number | null;
     }>(`
+      -- Set-based aggregates (no cartesian cross join / correlated subqueries):
+      -- pre-aggregate each user's files and archived versions by device, then
+      -- combine. This stays fast even with tens of thousands of rows.
+      WITH
+      file_agg AS (
+        SELECT owner_user_id, storage_device_id,
+               COUNT(*) AS file_count, COALESCE(SUM(size_bytes), 0) AS file_bytes
+        FROM dbo.files
+        GROUP BY owner_user_id, storage_device_id
+      ),
+      version_agg AS (
+        SELECT f.owner_user_id, v.storage_device_id,
+               COUNT(*) AS version_count, COALESCE(SUM(v.size_bytes), 0) AS version_bytes
+        FROM dbo.file_versions v
+        JOIN dbo.files f ON f.id = v.file_id
+        GROUP BY f.owner_user_id, v.storage_device_id
+      ),
+      -- Distinct (user, device) pairs that actually hold blobs for this user.
+      pairs AS (
+        SELECT owner_user_id, storage_device_id FROM file_agg
+        UNION
+        SELECT owner_user_id, storage_device_id FROM version_agg
+      )
       SELECT
         u.id AS user_id,
         u.username_encrypted, u.username_iv, u.username_auth_tag,
-        d.id AS device_id, d.storage_id,
-        COUNT(DISTINCT CASE WHEN f.storage_device_id = d.id THEN f.id END) AS file_count,
-        COUNT(DISTINCT CASE WHEN v.storage_device_id = d.id THEN v.id END) AS version_count,
-        COALESCE((
-          SELECT SUM(size_bytes) FROM dbo.files
-           WHERE owner_user_id = u.id AND storage_device_id = d.id
-        ), 0) + COALESCE((
-          SELECT SUM(size_bytes) FROM dbo.file_versions
-           WHERE file_id IN (SELECT id FROM dbo.files WHERE owner_user_id = u.id)
-             AND storage_device_id = d.id
-        ), 0) AS bytes,
+        sd.id AS device_id, sd.storage_id,
+        COALESCE(fa.file_count, 0) AS file_count,
+        COALESCE(va.version_count, 0) AS version_count,
+        COALESCE(fa.file_bytes, 0) + COALESCE(va.version_bytes, 0) AS bytes,
         q.storage_limit_bytes AS quota_bytes
-      FROM dbo.users u
-      CROSS JOIN dbo.storage_devices d
+      FROM pairs p
+      JOIN dbo.users u ON u.id = p.owner_user_id
+      JOIN dbo.storage_devices sd ON sd.id = p.storage_device_id
       LEFT JOIN dbo.quotas q ON q.id = u.quota_id
-      LEFT JOIN dbo.files f
-             ON f.owner_user_id = u.id AND f.storage_device_id = d.id
-      LEFT JOIN dbo.file_versions v
-             ON v.storage_device_id = d.id
-            AND v.file_id IN (SELECT id FROM dbo.files WHERE owner_user_id = u.id)
-      WHERE
-        EXISTS (SELECT 1 FROM dbo.files            WHERE owner_user_id = u.id AND storage_device_id = d.id)
-        OR EXISTS (SELECT 1 FROM dbo.file_versions WHERE storage_device_id = d.id
-                    AND file_id IN (SELECT id FROM dbo.files WHERE owner_user_id = u.id))
-      GROUP BY u.id, u.username_encrypted, u.username_iv, u.username_auth_tag, d.id, d.storage_id, q.storage_limit_bytes
-      ORDER BY u.id ASC, d.storage_id ASC
+      LEFT JOIN file_agg fa
+             ON fa.owner_user_id = p.owner_user_id AND fa.storage_device_id = p.storage_device_id
+      LEFT JOIN version_agg va
+             ON va.owner_user_id = p.owner_user_id AND va.storage_device_id = p.storage_device_id
+      ORDER BY u.id ASC, sd.storage_id ASC
     `);
 
     const rows = result.recordset as Array<{
@@ -7584,6 +7595,28 @@ async function ensureStorageDeviceQuotaColumn(): Promise<void> {
   `);
 }
 
+// Idempotent composite (owner, device) indexes backing the admin "Users by
+// device" panel and per-user move migration. Files group by
+// (owner_user_id, storage_device_id); file_versions are scoped through files
+// (no owner FK), so they join on file_id first.
+async function ensurePerUserStorageIndexes(): Promise<void> {
+  const request = await getRequest();
+  await request.query(`
+    IF OBJECT_ID('dbo.files', 'U') IS NOT NULL
+    BEGIN
+      IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_files_owner_device' AND object_id=OBJECT_ID('dbo.files'))
+        CREATE INDEX IX_files_owner_device ON dbo.files(owner_user_id, storage_device_id)
+          INCLUDE (size_bytes);
+    END
+    IF OBJECT_ID('dbo.file_versions', 'U') IS NOT NULL
+    BEGIN
+      IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_file_versions_file_device' AND object_id=OBJECT_ID('dbo.file_versions'))
+        CREATE INDEX IX_file_versions_file_device ON dbo.file_versions(file_id, storage_device_id)
+          INCLUDE (size_bytes);
+    END
+  `);
+}
+
 async function bootstrap() {
   // 1. Validate production requirements and master encryption key
   validateProductionConfig();
@@ -7607,6 +7640,10 @@ async function bootstrap() {
 
   // 2b'. Per-device storage quota column (idempotent).
   await ensureStorageDeviceQuotaColumn();
+
+  // 2b''. Composite (owner, device) indexes for the admin "Users by device"
+  // panel + per-user move migration. Idempotent; safe to run at every boot.
+  await ensurePerUserStorageIndexes();
 
   // 2c. Multi-storage migration: seed initial device from legacy env vars and
   // backfill existing rows (ADR-0001). Idempotent.
