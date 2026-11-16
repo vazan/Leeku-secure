@@ -45,6 +45,10 @@ Sources:
 - **CORS**: Allowed origins configured with production validation
 - **Production Guardrails**: Required env vars, vault access, scanner availability checks
 - **IIS W3C Logging**: Enabled via middleware
+- **Admin-gated storage controls**: `/api/admin/storage/users` and
+  `/api/admin/storage/users/:userId/migrate` are admin-only
+  (`authenticateUser` + `verifyAdmin`); the migration supports a mutation-free
+  `dry_run` preview and writes an `Admin` audit event on real runs.
 
 ### Unverified/Outdated Elements
 - Centralized SIEM integration (not configured)

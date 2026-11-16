@@ -79,7 +79,34 @@ Then `ALTER ... SET NOT NULL` on both FKs and add the device index.
 
 ### Remove a device (read-only decommission)
 - DELETE is refused while `files`/`file_versions` reference it. An admin must
-  first migrate/archive those blobs (follow-up re-homing tool), then delete.
+  first migrate/archive those blobs — per-user re-homing tool (below) or the
+  device-level "Move files between storage devices" flow — then delete.
+
+### Per-user re-homing (move one user's data between devices)
+Used to rebalance disk usage (e.g. move a heavy user from DATA-01 → DATA-02)
+with **no impact on the user afterward** — blobs relocate wholesale and the
+user keeps full access.
+
+1. Open `/#dashboard/admin` → Storage → **Users by device**. Each row shows the
+   user, total size, storage per device, and a quota bar (used / tier quota).
+2. For the target user pick a **Source** (one of their devices) and a
+   **Destination** device, then **Preview (dry run)**.
+   - The preview is synchronous and performs **zero mutation** — it validates
+     reachability, destination free space, and per-blob existence, returning a
+     "would move / failed / skipped" summary. "Confirm & move" stays disabled
+     until a preview succeeds for that selection.
+3. **Confirm & move** starts a background job and returns a `job_id`; the UI
+   polls `GET /api/admin/storage/migrate/:jobId` for live progress.
+4. On success an audit event (`event_type = 'Admin'`, target = the moved user)
+   records who moved how many blobs between which devices.
+5. The migration is per-blob atomic (copy → FK update → source unlink); a
+   failed DB update rolls back the copy, so the source stays canonical. Failures
+   are reported per blob and retryable.
+
+> **Security:** both `GET /api/admin/storage/users` and
+> `POST /api/admin/storage/users/:userId/migrate` are **admin-only**
+> (`authenticateUser` + `verifyAdmin`) — no non-admin can list or re-home a
+> user's data. Dry-run never mutates filesystem or DB.
 
 ## 4. Start-up Validation (production)
 - `validateProductionConfig()` drops `FILE_STORAGE_UNC_PATH` and instead

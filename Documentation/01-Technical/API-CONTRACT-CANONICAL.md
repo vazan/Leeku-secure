@@ -21,7 +21,10 @@ Define a single contract baseline for API behavior to reduce integration drift a
 
 - Public endpoints: health, public sharing, login/register/verify/csrf/refresh/logout.
 - Authenticated user endpoints: files, sharing links, profile/session self-management.
-- Admin endpoints: admin user/file/log/quota operations and maintenance toggle.
+- Admin endpoints: admin user/file/log/quota operations, storage devices
+  (list/add/update/primary/delete), per-user storage re-homing
+  (`/api/admin/storage/users`, `/api/admin/storage/users/:userId/migrate`),
+  and maintenance toggle.
 
 ### Status policy (baseline)
 

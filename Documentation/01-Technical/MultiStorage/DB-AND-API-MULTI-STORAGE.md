@@ -50,6 +50,9 @@ GO
   the column is `NOT NULL` (post-backfill `ALTER`).
 - Index: `IX_files_storage_device` on `[storage_device_id]` for per-device
   inventory/cleanup queries.
+- Composite index `IX_files_owner_device` on `[owner_user_id, storage_device_id]`
+  `INCLUDE (size_bytes)` — backs the admin "Users by device" panel and per-user
+  migration (`GROUP BY owner_user_id, storage_device_id`).
 
 ## 3. `file_versions` Table Change
 
@@ -61,8 +64,14 @@ ALTER TABLE [dbo].[file_versions] WITH CHECK ADD CONSTRAINT [FK_file_versions_st
 GO
 ```
 
-Version blobs are archived under the same device as the parent row by default
-(open decision: allow re-homing on archive).
+Version blobs are archived under the same device as the parent row by default.
+Re-homing is supported at the **admin per-user migration** level: the
+`POST /api/admin/storage/users/:userId/migrate` route moves a user's current
+files + archived `file_versions` across devices simultaneously (versions are
+scoped through `files.owner_user_id`).
+- Composite index `IX_file_versions_file_device` on `[file_id, storage_device_id]`
+  `INCLUDE (size_bytes)` — scopes a user's versions through `files` for the
+  panel and migration.
 
 ## 4. Admin Storage API (new)
 
@@ -73,6 +82,14 @@ Version blobs are archived under the same device as the parent row by default
 | PATCH | `/api/admin/storage/:id` | update path / creds / provisioning_enabled |
 | PUT | `/api/admin/storage/:id/primary` | set primary (un-set others) |
 | DELETE | `/api/admin/storage/:id` | remove device (must not own files) |
+| GET | `/api/admin/storage/users` | per-user per-device storage breakdown — admin "Users by device" panel (id, username, totalBytes, quotaBytes, devices[{device_id, storage_id, files, versions, bytes}]) |
+| POST | `/api/admin/storage/users/:userId/migrate` | move one user's whole data (current files + archived versions) source→destination device; `dry_run=true` → synchronous preview (no mutation), `dry_run=false` → `{ job_id }` background run pollable via `GET /api/admin/storage/migrate/:jobId` |
+
+Both `/users` and `/users/:userId/migrate` routes are **admin-only**
+(`authenticateUser` + `verifyAdmin`) and are declared **before**
+`POST /api/admin/storage/:id` so the literal `users` segment is never captured
+by the `:id` placeholder (same ordering rule as the device-level `/migrate`
+routes).
 
 Constraints enforced server-side:
 - one primary at a time (transaction + partial unique index);
@@ -88,6 +105,8 @@ Constraints enforced server-side:
 | `src/server.ts#L570` | move `net use` into device-provisioning path; drop `STORAGE_NET_USE_*` |
 | `src/server.ts#L290` | per-device health monitor replacing global UNC monitor |
 | `src/app/features/files/components/admin-workspace.tsx` | add `"storage"` to `AdminTab` union (`#L7`) + render Storage tab |
+| `src/server/utils/storage-devices.ts` | `moveUserFiles()` (per-user re-homing, reusing shared `moveBlobToDevice()` atomic mover) + job registry |
+| `src/server.ts` | `GET /api/admin/storage/users` + `POST /api/admin/storage/users/:userId/migrate` (admin-only, dry-run preview) |
 | `scripts/cleanup-vault-orphans.ts` | derive device roots from DB, not `FILE_STORAGE_UNC_PATH` |
 
 ## 6. Encryption Contract (reuse)
@@ -98,5 +117,8 @@ Constraints enforced server-side:
 
 ## 7. Explicit Unknowns (engineer side)
 - Exact free-space watermark constant for the balancer.
-- Whether `file_versions` may re-home across devices on archive.
 - Rollback path if migration order (schema → backfill → code) is interrupted.
+
+> Resolved: whether `file_versions` may re-home across devices — **yes**, via the
+> admin per-user migration (`POST /api/admin/storage/users/:userId/migrate`),
+> which relocates current files + archived versions together.

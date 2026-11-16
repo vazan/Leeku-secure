@@ -128,6 +128,8 @@ Mounted at /api/public/share.
 | POST | /api/admin/quotas/:id/delete | Admin | Quota delete handler exists | Leeku-MSSQL/src/server.ts |
 | GET | /api/admin/maintenance/status | None | Current maintenance status | Leeku-MSSQL/src/server/routes/maintenance-mode.ts |
 | POST | /api/admin/maintenance/toggle | Admin | Toggle maintenance mode | Leeku-MSSQL/src/server/routes/maintenance-mode.ts |
+| GET | /api/admin/storage/users | Admin | Per-user per-device storage breakdown ("Users by device") | Leeku-MSSQL/src/server.ts |
+| POST | /api/admin/storage/users/:userId/migrate | Admin | Move one user's data between devices; `dry_run=true` preview, else background job (`job_id`) | Leeku-MSSQL/src/server.ts |
 
 ## 4. Explicit Unknowns
 

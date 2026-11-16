@@ -17,16 +17,20 @@ graph LR
 
     subgraph Server["Node/Express (Windows Server 2022)"]
         API["/api/admin/storage<br/>CRUD + set-primary"]
+        APIU["/api/admin/storage/users<br/>per-user breakdown + re-homing"]
         BAL["StorageBalancer<br/>select device for upload"]
         DEV["StorageDeviceService<br/>mount / health / free-space"]
         MON["PerDeviceMonitor<br/>(replaces global UNC monitor)"]
         CRYPTO["encryptColumn / decryptColumn<br/>(MASTER_KEY_BASE64)"]
     end
 
-    DB[("MSSQL<br/>storage_devices · files")]
+    DB[("MSSQL<br/>storage_devices · files · file_versions")]
 
     UI -->|"add / set primary / toggle"| API
+    UI -->|"Users by device / move"| APIU
     API --> DB
+    APIU --> DB
+    APIU --> CRYPTO
     API --> CRYPTO
     BAL -->|"provisioning_enabled=1<br/>primary first, free-space"| DEV
     DEV -->|"read/write blob"| SMB["Device pool<br/>P:\\DATA-00\\ · \\\\SRV\\DATA-00\\ ..."]
@@ -42,6 +46,7 @@ graph LR
 | `StorageDeviceService` | Mount (net use), resolve paths, free-space queries | boot-time `net use` block |
 | `PerDeviceMonitor` | Per-device reachability → route around / flag | global UNC monitor in `server.ts#L290` |
 | `Admin Storage API` | CRUD + set-primary + provisioning toggle | (new) |
+| `Per-user Storage API` | Per-user per-device breakdown + re-homing (`GET /api/admin/storage/users`, `POST /api/admin/storage/users/:userId/migrate`) | (new) |
 | Storage tab (UI) | Ops surface in `/#dashboard/admin` | (new) |
 | `Crypto` (existing) | Encrypt/decrypt SMB username & password | plaintext env creds |
 
