@@ -46,7 +46,7 @@ graph LR
 | `StorageDeviceService` | Mount (net use), resolve paths, free-space queries | boot-time `net use` block |
 | `PerDeviceMonitor` | Per-device reachability → route around / flag | global UNC monitor in `server.ts#L290` |
 | `Admin Storage API` | CRUD + set-primary + provisioning toggle | (new) |
-| `Per-user Storage API` | Per-user per-device breakdown + re-homing (`GET /api/admin/storage/users`, `POST /api/admin/storage/users/:userId/migrate`) | (new) |
+| `Per-user Storage API` | Per-user per-device breakdown + re-homing + per-user preferred default device (`GET /api/admin/storage/users`, `POST /api/admin/storage/users/:userId/migrate`, `PUT /api/admin/storage/users/:userId/device`) | (new) |
 | Storage tab (UI) | Ops surface in `/#dashboard/admin` | (new) |
 | `Crypto` (existing) | Encrypt/decrypt SMB username & password | plaintext env creds |
 
@@ -65,6 +65,30 @@ For each new upload, select a device:
 > Watermark rule (open): stop sending to a device below a configured
 > free-space watermark (e.g. < 10% free). Device stays `provisioning_enabled`
 > but is skipped until freed or marked primary-eligible.
+
+### 3a. Per-user preferred default device (provisioning override)
+
+An admin may assign a per-user **preferred default device** on `users`
+(`preferred_storage_device_id` → `storage_devices.id`, NULL by default). When
+set:
+
+- **NEW uploads** for that user provision **exclusively** to that device via
+  `selectProvisionDeviceForUser` (fail-closed — see below).
+- **Existing blobs** are **auto-migrated** to it in the background when the
+  preference is assigned (reusing `moveUserFiles` + the migration job registry).
+- Clearing the preference (set NULL) **only reverts NEW uploads** to the
+  server-wide default (`selectProvisionDevice`); it does **not** move data back.
+
+When unset (NULL), the user falls back to the global primary / auto-balancing
+provisioning exactly as before — `selectProvisionDevice` is unchanged.
+
+**Fail-closed rule:** if the user has a preference but the preferred device is
+not `provisioning_enabled`, has reached its `quota_bytes`, or is unreachable,
+the upload **fails with a clear error** — it never silently falls back to the
+global default.
+
+**Management:** admin-only (Storage tab in admin workspace). Users have no
+mutation surface; they only see (read-only) which device holds their data.
 
 ### Behavior classes
 - **All devices offline & `provisioning_enabled`** → upload fails closed
@@ -90,6 +114,10 @@ For each new upload, select a device:
 - SMB credentials are never returned plaintext by the Admin API.
 - Exactly one `is_primary` per enabled pool (new primary un-sets old).
 - `provisioning_enabled=0` devices must never receive new uploads.
+- `users.preferred_storage_device_id` is a pure preference layer **on top** of
+  the global primary model: a NULL preference preserves the exact pre-existing
+  global behavior; a set preference fails closed for that user when the
+  override device is unavailable.
 
 ## 6. Diagram Validation
 - Mermaid graph validated: ≤ 20 nodes, all edges evidence-backed
