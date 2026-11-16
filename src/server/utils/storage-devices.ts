@@ -25,8 +25,25 @@
 import fs from 'fs';
 import path from 'path';
 import { randomUUID } from 'crypto';
-import { getRequest, sql } from '../db.js';
+import { getRequest as dbGetRequest, sql } from '../db.js';
 import { encryptColumn, decryptColumn } from './encryption.js';
+
+// ──────────────────────────────────────────────────────────────
+// Test seam
+// ──────────────────────────────────────────────────────────────
+// All DB access in this module flows through a single `getRequest()` indirection
+// so tests can substitute an in-memory request (no live SQL Server). Production
+// behaviour is unchanged: the provider defaults to the real `db.getRequest`.
+let requestProvider: () => Promise<sql.Request> = dbGetRequest;
+
+/** @internal Test-only: swap the request provider (restore by passing undefined). */
+export function _setRequestProviderForTest(provider?: () => Promise<sql.Request>): void {
+  requestProvider = provider ?? dbGetRequest;
+}
+
+function getRequest(): Promise<sql.Request> {
+  return requestProvider();
+}
 
 // ──────────────────────────────────────────────────────────────
 // Types

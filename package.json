@@ -11,6 +11,8 @@
     "start": "cross-env NODE_ENV=production node dist/server.cjs",
     "clean": "rimraf dist",
     "test:desktop-updates": "tsx --test tests/desktop-updates-path.test.ts",
+    "test:storage-migration": "tsx --test tests/storage-migration.test.ts",
+    "test:all": "tsx --test tests/*.test.ts",
     "lint": "tsc --noEmit",
     "backfill:file-hashes": "tsx scripts/backfill-file-hashes.ts",
     "cleanup:vault-orphans": "tsx scripts/cleanup-vault-orphans.ts"
@@ -33,7 +35,7 @@
     "jsonwebtoken": "^9.0.3",
     "lucide-react": "^1.57.0",
     "motion": "^12.43.0",
-    "mssql": "^12.7.6",
+    "mssql": "^12.7.14",
     "multer": "^2.4.0",
     "next-themes": "^0.4.6",
     "nodemailer": "^10.1.1",
