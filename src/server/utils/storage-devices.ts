@@ -632,6 +632,116 @@ async function deviceFreeBytes(storagePath: string): Promise<number | null> {
 }
 
 /**
+ * Moves a single blob (current file or archived version) from one device to
+ * another, atomically. Shared by the device-level migration (`moveDeviceFiles`)
+ * and the per-user migration (`moveUserFiles`) so both paths use identical
+ * copy / FK-update / source-unlink semantics — no drift between the two.
+ *
+ * Guarantees:
+ *   - Source blob must exist (else counted as skipped, not failed).
+ *   - Never overwrites an existing destination path (reported as a failure).
+ *   - Dry-run: only the existence/collision checks above run; nothing is
+ *     copied, updated, or deleted.
+ *   - The physical copy is made first; only once confirmed does the DB
+ *     `storage_device_id` update run. If the DB update fails, the copy is
+ *     removed so the source stays canonical and the row never points at a
+ *     device it does not physically live on.
+ *   - After a successful copy + DB update, the source blob is removed; if
+ *     that unlink fails, the destination copy is already the canonical blob
+ *     and the leftover source becomes an orphan a vault-cleanup can reclaim.
+ */
+async function moveBlobToDevice(
+  kind: 'file' | 'version',
+  blob: { id: string; stored_path: string },
+  source: StorageDevice,
+  destination: StorageDevice,
+  result: DeviceMigrationResult,
+  options?: { dryRun?: boolean; jobId?: string },
+): Promise<void> {
+  const dryRun = !!options?.dryRun;
+  const jobId = options?.jobId;
+  const srcPath = resolveBlobPath(source, blob.stored_path);
+  const dstPath = resolveBlobPath(destination, blob.stored_path);
+
+  let srcExists = false;
+  try {
+    srcExists = !!(await fs.promises.stat(srcPath));
+  } catch {
+    srcExists = false;
+  }
+  if (!srcExists) {
+    result.skipped += 1;
+    const failure = { kind, id: blob.id, stored_path: blob.stored_path, reason: 'source blob missing on disk' };
+    result.failures.push(failure);
+    updateMigrationJobProgress(jobId, { skipped: true, failure });
+    return;
+  }
+
+  // Never clobber an existing destination blob.
+  let dstExists = false;
+  try {
+    dstExists = !!(await fs.promises.stat(dstPath));
+  } catch {
+    dstExists = false;
+  }
+  if (dstExists) {
+    result.failed += 1;
+    const failure = { kind, id: blob.id, stored_path: blob.stored_path, reason: 'destination path already exists' };
+    result.failures.push(failure);
+    updateMigrationJobProgress(jobId, { failed: true, failure });
+    return;
+  }
+
+  // Dry-run: existence + collision checks above are the only work done.
+  if (dryRun) {
+    result.moved += 1;
+    updateMigrationJobProgress(jobId, { moved: true });
+    return;
+  }
+
+  // 1) Physically copy the ciphertext blob to the destination.
+  try {
+    await fs.promises.copyFile(srcPath, dstPath);
+  } catch (err: any) {
+    result.failed += 1;
+    const failure = { kind, id: blob.id, stored_path: blob.stored_path, reason: err?.message || 'Copy failed' };
+    result.failures.push(failure);
+    updateMigrationJobProgress(jobId, { failed: true, failure });
+    return;
+  }
+
+  // 2) Move the DB reference to the destination device entity for the blob.
+  //    Only now that the physical copy is confirmed do we touch the DB row.
+  try {
+    const mreq = await getRequest();
+    mreq.input('blobId', sql.UniqueIdentifier, blob.id);
+    mreq.input('destId', sql.UniqueIdentifier, destination.id);
+    const table = kind === 'file' ? 'dbo.files' : 'dbo.file_versions';
+    await mreq.query(`UPDATE ${table} SET storage_device_id = @destId WHERE id = @blobId`);
+  } catch (err: any) {
+    // DB update failed — remove the copy so the source stays canonical and
+    // no duplicate/orphan blob is left behind.
+    try { await fs.promises.unlink(dstPath); } catch { /* best effort */ }
+    result.failed += 1;
+    const failure = { kind, id: blob.id, stored_path: blob.stored_path, reason: err?.message || 'DB update failed' };
+    result.failures.push(failure);
+    updateMigrationJobProgress(jobId, { failed: true, failure });
+    return;
+  }
+
+  // 3) Blob copy + DB update both succeeded — safe to remove the source blob.
+  //    If the source unlink fails the destination blob remains valid; the
+  //    leftover source copy is an orphan a vault-cleanup script can reclaim.
+  try {
+    await fs.promises.unlink(srcPath);
+  } catch {
+    /* best effort — destination blob is already the canonical copy */
+  }
+  result.moved += 1;
+  updateMigrationJobProgress(jobId, { moved: true });
+}
+
+/**
  * Moves every blob (current files + archived versions) that physically
  * resides on `sourceId` to `destinationId` (ADR-0001).
  *
@@ -717,97 +827,15 @@ export async function moveDeviceFiles(
   }
 
   const result: DeviceMigrationResult = { moved: 0, failed: 0, skipped: 0, failures: [] };
-
-  const migrateBlob = async (
-    kind: 'file' | 'version',
-    id: string,
-    storedPath: string,
-  ): Promise<void> => {
-    const srcPath = resolveBlobPath(source, storedPath);
-    const dstPath = resolveBlobPath(destination, storedPath);
-
-    let srcExists = false;
-    try {
-      srcExists = !!(await fs.promises.stat(srcPath));
-    } catch {
-      srcExists = false;
-    }
-    if (!srcExists) {
-      result.skipped += 1;
-      const failure = { kind, id, stored_path: storedPath, reason: 'source blob missing on disk' };
-      result.failures.push(failure);
-      updateMigrationJobProgress(jobId, { skipped: true, failure });
-      return;
-    }
-
-    // Never clobber an existing destination blob.
-    let dstExists = false;
-    try {
-      dstExists = !!(await fs.promises.stat(dstPath));
-    } catch {
-      dstExists = false;
-    }
-    if (dstExists) {
-      result.failed += 1;
-      const failure = { kind, id, stored_path: storedPath, reason: 'destination path already exists' };
-      result.failures.push(failure);
-      updateMigrationJobProgress(jobId, { failed: true, failure });
-      return;
-    }
-
-    // Dry-run: existence + collision checks above are the only work done.
-    // No data is copied, updated, or deleted.
-    if (dryRun) {
-      result.moved += 1;
-      updateMigrationJobProgress(jobId, { moved: true });
-      return;
-    }
-
-    // 1) Physically copy the ciphertext blob to the destination.
-    try {
-      await fs.promises.copyFile(srcPath, dstPath);
-    } catch (err: any) {
-      result.failed += 1;
-      const failure = { kind, id, stored_path: storedPath, reason: err?.message || 'Copy failed' };
-      result.failures.push(failure);
-      updateMigrationJobProgress(jobId, { failed: true, failure });
-      return;
-    }
-
-    // 2) Move the DB reference to the destination device entity for the blob.
-    //    Only now that the physical copy is confirmed do we touch the DB row.
-    try {
-      const mreq = await getRequest();
-      mreq.input('blobId', sql.UniqueIdentifier, id);
-      mreq.input('destId', sql.UniqueIdentifier, destinationId);
-      const table = kind === 'file' ? 'dbo.files' : 'dbo.file_versions';
-      await mreq.query(`UPDATE ${table} SET storage_device_id = @destId WHERE id = @blobId`);
-    } catch (err: any) {
-      // DB update failed — remove the copy so the source stays canonical and
-      // no duplicate/orphan blob is left behind.
-      try { await fs.promises.unlink(dstPath); } catch { /* best effort */ }
-      result.failed += 1;
-      const failure = { kind, id, stored_path: storedPath, reason: err?.message || 'DB update failed' };
-      result.failures.push(failure);
-      updateMigrationJobProgress(jobId, { failed: true, failure });
-      return;
-    }
-
-    // 3) Blob copy + DB update both succeeded — safe to remove the source blob.
-    //    If the source unlink fails the destination blob remains valid; the
-    //    leftover source copy is an orphan a vault-cleanup script can reclaim.
-    try {
-      await fs.promises.unlink(srcPath);
-    } catch {
-      /* best effort — destination blob is already the canonical copy */
-    }
-    result.moved += 1;
-    updateMigrationJobProgress(jobId, { moved: true });
-  };
+  const opts = { dryRun, jobId };
 
   try {
-    for (const blob of fileBlobs) await migrateBlob('file', blob.id, blob.stored_path);
-    for (const blob of versionBlobs) await migrateBlob('version', blob.id, blob.stored_path);
+    for (const blob of fileBlobs) {
+      await moveBlobToDevice('file', blob, source, destination, result, opts);
+    }
+    for (const blob of versionBlobs) {
+      await moveBlobToDevice('version', blob, source, destination, result, opts);
+    }
   } catch (err: any) {
     // Unexpected error that escaped the per-blob handling (e.g. DB outage
     // mid-loop). Mark the job as errored so the UI stops polling and shows
@@ -821,6 +849,119 @@ export async function moveDeviceFiles(
   // Finalize the job as done once every blob has been processed. Per-blob
   // failures/skips still produce a "done" state — the UI surfaces the
   // breakdown and can offer a retry for any failures.
+  if (jobId) {
+    finishMigrationJob(jobId, result, { status: 'done' });
+  }
+
+  return result;
+}
+
+// ──────────────────────────────────────────────────────────────
+// Per-user storage migration (move a single user's data between devices)
+// ──────────────────────────────────────────────────────────────
+
+/**
+ * Moves every blob (current files + archived versions) owned by `userId` from
+ * `sourceId` to `destinationId` (per-user re-homing).
+ *
+ * Shares the same atomic per-blob semantics as the device-level migration via
+ * `moveBlobToDevice`, and the same preflight guarantees:
+ *   - Rejects when source === destination.
+ *   - Rejects when either device is missing or unreachable.
+ *   - Rejects the user/user-owner mismatch up front (the user must exist).
+ *   - Preflights destination free space (fail closed when undeterminable or
+ *     insufficient for the total bytes being moved).
+ *   - Per-blob atomicity: copy → FK update → source unlink; a failed DB update
+ *     removes the copy so the source stays canonical.
+ *
+ * When `dryRun` is true, execution stops before any physical or DB mutation —
+ * validation and per-blob existence/collision checks run, but nothing is
+ * copied, updated, or deleted.
+ *
+ * Only blobs of the targeted user are touched — `file_versions` rows are scoped
+ * through `files.owner_user_id` so other users' versions are never re-homed.
+ */
+export async function moveUserFiles(
+  userId: string,
+  sourceId: string,
+  destinationId: string,
+  options?: { dryRun?: boolean; jobId?: string },
+): Promise<DeviceMigrationResult> {
+  const dryRun = !!options?.dryRun;
+  const jobId = options?.jobId;
+  if (!userId || !sourceId || !destinationId) throw new Error('User and source/destination device ids are required.');
+  if (sourceId === destinationId) throw new Error('Source and destination must be different devices.');
+
+  const source = await getStorageDevice(sourceId);
+  const destination = await getStorageDevice(destinationId);
+  if (!source) throw new Error('Source storage device not found.');
+  if (!destination) throw new Error('Destination storage device not found.');
+
+  if (!(await isDeviceReachable(source.storage_path)))
+    throw new Error(`Source device ${source.storage_id} is not reachable.`);
+  if (!(await isDeviceReachable(destination.storage_path)))
+    throw new Error(`Destination device ${destination.storage_id} is not reachable.`);
+
+  const req = await getRequest();
+  req.input('userId', sql.UniqueIdentifier, userId);
+  req.input('sourceId', sql.UniqueIdentifier, sourceId);
+
+  // Current-file blobs and archived-version blobs owned by this user that live
+  // on the source device. Versions are scoped through files.owner_user_id.
+  const filesRes = await req.query<{ id: string; stored_path: string; size_bytes: number }>(
+    `SELECT id, stored_path, size_bytes FROM dbo.files
+      WHERE owner_user_id = @userId AND storage_device_id = @sourceId`,
+  );
+  const versionsReq = await getRequest();
+  versionsReq.input('userId', sql.UniqueIdentifier, userId);
+  versionsReq.input('sourceId', sql.UniqueIdentifier, sourceId);
+  const versionsRes = await versionsReq.query<{ id: string; stored_path: string; size_bytes: number }>(
+    `SELECT id, stored_path, size_bytes FROM dbo.file_versions
+      WHERE storage_device_id = @sourceId
+        AND file_id IN (SELECT id FROM dbo.files WHERE owner_user_id = @userId)`,
+  );
+
+  const fileBlobs = filesRes.recordset as Array<{ id: string; stored_path: string; size_bytes: number }>;
+  const versionBlobs = versionsRes.recordset as Array<{ id: string; stored_path: string; size_bytes: number }>;
+  const totalBlobs = fileBlobs.length + versionBlobs.length;
+  const totalBytes =
+    fileBlobs.reduce((sum: number, b) => sum + Number(b.size_bytes || 0), 0) +
+    versionBlobs.reduce((sum: number, b) => sum + Number(b.size_bytes || 0), 0);
+
+  // Register/refresh the progress job (mirrors the device-level migration).
+  if (jobId) {
+    createMigrationJob(jobId, totalBlobs);
+    setMigrationJobTotal(jobId, totalBlobs);
+  }
+
+  // ---- Preflight: destination must have room for everything we will move. ---
+  const destFree = await deviceFreeBytes(destination.storage_path);
+  if (destFree === null) {
+    throw new Error(`Cannot determine free space on destination ${destination.storage_id}. Migration refused.`);
+  }
+  if (destFree < totalBytes) {
+    throw new Error(
+      `Destination ${destination.storage_id} only has ${destFree} bytes free but the migration requires ${totalBytes} bytes. Migration refused.`,
+    );
+  }
+
+  const result: DeviceMigrationResult = { moved: 0, failed: 0, skipped: 0, failures: [] };
+  const opts = { dryRun, jobId };
+
+  try {
+    for (const blob of fileBlobs) {
+      await moveBlobToDevice('file', blob, source, destination, result, opts);
+    }
+    for (const blob of versionBlobs) {
+      await moveBlobToDevice('version', blob, source, destination, result, opts);
+    }
+  } catch (err: any) {
+    if (jobId) {
+      finishMigrationJob(jobId, result, { status: 'error', error: err?.message || 'Migration failed unexpectedly.' });
+    }
+    throw err;
+  }
+
   if (jobId) {
     finishMigrationJob(jobId, result, { status: 'done' });
   }

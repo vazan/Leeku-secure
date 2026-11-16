@@ -638,9 +638,9 @@ function StatCard({ label, value, color }: { label: string; value: string; color
   return <div className={`border-2 bg-[var(--bg-panel)] p-5 shadow-[var(--admin-panel-shadow)] ${colors[color]}`}><span className="text-xs text-[var(--text-muted)]">{label}</span><strong className="mt-2 block text-2xl">{value}</strong></div>;
 }
 
-function AdminButton({ children, tone = "muted", type = "button", onClick }: { children: React.ReactNode; tone?: "muted" | "cyan" | "pink" | "green"; type?: "button" | "submit"; onClick?: () => void }) {
+function AdminButton({ children, tone = "muted", type = "button", onClick, disabled = false }: { children: React.ReactNode; tone?: "muted" | "cyan" | "pink" | "green"; type?: "button" | "submit"; onClick?: () => void; disabled?: boolean }) {
   const tones = { muted: "border-[var(--border-subtle)] text-[var(--text-muted)]", cyan: "border-[var(--admin-border-info)] text-[var(--admin-info)]", pink: "border-[var(--admin-border-critical)] text-[var(--admin-critical)]", green: "border-[var(--admin-border-success)] text-[var(--admin-success)]" };
-  return <button type={type} onClick={onClick} className={`inline-flex items-center gap-1.5 border px-3 py-2 hover:bg-[var(--bg-hover)] ${tones[tone]}`}>{children}</button>;
+  return <button type={type} onClick={onClick} disabled={disabled} className={`inline-flex items-center gap-1.5 border px-3 py-2 hover:bg-[var(--bg-hover)] disabled:cursor-not-allowed disabled:opacity-50 ${tones[tone]}`}>{children}</button>;
 }
 
 function StatusBadge({ tone, children }: { tone: "green" | "pink" | "muted"; children: React.ReactNode }) {
@@ -691,6 +691,21 @@ type StorageDeviceDto = {
   free_bytes: number | null;
 };
 
+// A user's storage footprint per device, as returned by GET /api/admin/storage/users.
+type StorageUserDto = {
+  id: string;
+  username: string;
+  totalBytes: number;
+  quotaBytes: number | null;
+  devices: Array<{
+    device_id: string;
+    storage_id: string;
+    files: number;
+    versions: number;
+    bytes: number;
+  }>;
+};
+
 function StoragePanel() {
   const [devices, setDevices] = useState<StorageDeviceDto[]>([]);
   const [loading, setLoading] = useState(true);
@@ -725,6 +740,171 @@ function StoragePanel() {
   // Holds the migration-progress poll timer so it can be cleared if the panel
   // unmounts mid-migration (avoids polling/setState after unmount).
   const migrationTimerRef = useRef<number | null>(null);
+
+  // Per-user storage (move a single user's data between devices) state.
+  const [userStorage, setUserStorage] = useState<StorageUserDto[]>([]);
+  const [usersLoading, setUsersLoading] = useState(true);
+  const [movingUserId, setMovingUserId] = useState("");
+  const [movingSourceId, setMovingSourceId] = useState("");
+  const [movingDestId, setMovingDestId] = useState("");
+  const [movingUserBusy, setMovingUserBusy] = useState(false);
+  const [movingUserPreview, setMovingUserPreview] = useState<{
+    userId: string; username: string;
+    sourceDevice: string; sourceLabel: string;
+    destLabel: string;
+    moved: number; failed: number; skipped: number;
+    failures: Array<{ kind: string; id: string; stored_path: string; reason: string }>;
+  } | null>(null);
+  const [movingUserProgress, setMovingUserProgress] = useState<{
+    processed: number; total: number; moved: number; failed: number; skipped: number;
+  } | null>(null);
+
+  const loadUsers = async () => {
+    try {
+      const response = await fetch("/api/admin/storage/users", { headers: adminHeaders() });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Failed to load user storage.");
+      setUserStorage(data.users ?? []);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Failed to load user storage.");
+    } finally {
+      setUsersLoading(false);
+    }
+  };
+
+  useEffect(() => { void loadUsers(); }, []);
+
+  // Clear per-user preview/selection once a move completes so the UI resets.
+  const resetUserMove = () => {
+    setMovingUserId("");
+    setMovingSourceId("");
+    setMovingDestId("");
+    setMovingUserPreview(null);
+    setMovingUserProgress(null);
+    setMovingUserBusy(false);
+  };
+
+  const runUserMigration = async (dryRun: boolean) => {
+    if (movingUserBusy) return; // no concurrent starts
+    const user = userStorage.find((u) => u.id === movingUserId);
+    if (!user) { toast.error("Select a user to move."); return; }
+    if (!movingSourceId) { toast.error("Select a source storage device for this user."); return; }
+    if (!movingDestId) { toast.error("Select a destination storage device."); return; }
+
+    const sourceDevice = user.devices.find((d) => d.device_id === movingSourceId);
+    if (!sourceDevice) { toast.error("The source device is not one of this user's devices."); return; }
+
+    const destDevice = devices.find((d) => d.id === movingDestId);
+    if (!destDevice) return;
+    if (sourceDevice.device_id === destDevice.id) {
+      toast.error("Source and destination must be different devices.");
+      return;
+    }
+
+    if (!dryRun && !window.confirm(
+      `Move ${user.username}'s data (${formatBytes(sourceDevice.bytes)}) from "${sourceDevice.storage_id}" to "${destDevice.storage_id}"?\n\n` +
+      `This physically copies each of the user's vault blobs and updates the database references. Run a preview first to confirm.`
+    )) return;
+
+    setMovingUserBusy(true);
+    setMovingUserPreview(null);
+    setMovingUserProgress(null);
+    try {
+      const response = await fetch(`/api/admin/storage/users/${encodeURIComponent(user.id)}/migrate`, {
+        method: "POST",
+        headers: adminHeaders(true),
+        body: JSON.stringify({
+          source_device_id: sourceDevice.device_id,
+          destination_device_id: movingDestId,
+          dry_run: dryRun,
+        }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Failed to migrate user storage.");
+
+      if (dryRun || data.dry_run) {
+        // Dry-run: the POST returns the full preview summary synchronously.
+        setMovingUserPreview({
+          userId: user.id,
+          username: user.username,
+          sourceDevice: sourceDevice.storage_id,
+          sourceLabel: sourceDevice.device_id,
+          destLabel: destDevice.storage_id,
+          moved: data.moved ?? 0,
+          failed: data.failed ?? 0,
+          skipped: data.skipped ?? 0,
+          failures: data.failures ?? [],
+        });
+        setMovingUserBusy(false);
+        toast.success(`Preview: ${data.moved} would move, ${data.failed} would fail, ${data.skipped} would skip.`);
+        return;
+      }
+
+      // Real migration: background job, poll progress until terminal.
+      const jobId = data.job_id as string;
+      if (!jobId) throw new Error("Migration job id missing from server response.");
+
+      let finished = false;
+      const applySnapshot = async (pollData: any): Promise<void> => {
+        if (pollData.status === "running") {
+          setMovingUserProgress({
+            processed: pollData.processed ?? 0,
+            total: pollData.total ?? 0,
+            moved: pollData.moved ?? 0,
+            failed: pollData.failed ?? 0,
+            skipped: pollData.skipped ?? 0,
+          });
+          return;
+        }
+        if (pollData.status === "done") {
+          finished = true;
+          setMovingUserProgress(null);
+          toast.success(`Move complete: ${pollData.moved ?? 0} moved, ${pollData.failed ?? 0} failed, ${pollData.skipped ?? 0} skipped.`);
+          await loadDevices();
+          await loadUsers();
+          resetUserMove();
+          return;
+        }
+        // status === "error"
+        finished = true;
+        setMovingUserBusy(false);
+        toast.error(pollData.error || "User migration failed.");
+      };
+
+      const pollOnce = async (): Promise<void> => {
+        try {
+          const pollRes = await fetch(`/api/admin/storage/migrate/${encodeURIComponent(jobId)}`, {
+            headers: adminHeaders(),
+          });
+          const pollData = await pollRes.json();
+          if (!pollRes.ok) {
+            finished = true;
+            setMovingUserBusy(false);
+            toast.error(pollData.error || "Failed to poll user migration progress.");
+            return;
+          }
+          await applySnapshot(pollData);
+        } catch (error) {
+          finished = true;
+          setMovingUserBusy(false);
+          toast.error(error instanceof Error ? error.message : "Failed to poll user migration progress.");
+        }
+      };
+
+      await pollOnce();
+      if (!finished) {
+        const timer = window.setInterval(async () => {
+          if (finished) { window.clearInterval(timer); migrationTimerRef.current = null; return; }
+          await pollOnce();
+          if (finished) { window.clearInterval(timer); migrationTimerRef.current = null; }
+        }, 800);
+        migrationTimerRef.current = timer;
+      }
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "User migration failed.");
+      setMovingUserBusy(false);
+    }
+  };
 
   const loadDevices = async () => {
     try {
@@ -1150,6 +1330,159 @@ function StoragePanel() {
             {migrating ? "Migrating…" : "Migrate all files"}
           </AdminButton>
         </div>
+      </AdminPanel>
+
+      <AdminPanel title="Users by device" accent="pink" meta={`${userStorage.length} user${userStorage.length === 1 ? "" : "s"}`}>
+        <p className="mb-4 text-xs text-[var(--text-muted)]">
+          Move a single user's entire data from one storage device to another (e.g. DATA-01 → DATA-02) to
+          rebalance disk usage. Preview first — the real move runs in the background and never affects the
+          user's file ids, shared links, versions, or quota.
+        </p>
+        {usersLoading ? (
+          <p className="py-8 text-center text-xs text-[var(--text-muted)]">Loading user storage…</p>
+        ) : userStorage.length === 0 ? (
+          <p className="py-8 text-center text-xs text-[var(--text-muted)]">No user storage found.</p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full border-collapse text-left text-xs">
+              <thead>
+                <tr className="bg-[var(--admin-header)] text-[var(--text-muted)]">
+                  <th className="px-3 py-2">User</th>
+                  <th className="px-3 py-2">Total size</th>
+                  <th className="px-3 py-2">Storage per device</th>
+                  <th className="px-3 py-2">Move to…</th>
+                </tr>
+              </thead>
+              <tbody>
+                {userStorage.map((user) => {
+                  const actionActive = movingUserId === user.id;
+                  const canMove = user.devices.length > 0;
+                  return (
+                    <tr key={user.id} className="border-t border-[var(--border-subtle)] align-top">
+                      <td className="px-3 py-3 font-medium text-[var(--text-primary)]">{user.username}</td>
+                      <td className="px-3 py-3 text-[var(--text-primary)]">{formatBytes(user.totalBytes)}</td>
+                      <td className="px-3 py-3">
+                        <div className="flex flex-wrap gap-2">
+                          {user.devices.map((dev) => (
+                            <span key={dev.device_id} className="inline-block rounded bg-[var(--bg-elevated)] px-2 py-1 text-[var(--text-muted)]">
+                              <strong className="text-[var(--text-primary)]">{dev.storage_id}</strong>
+                              {" · "}{formatBytes(dev.bytes)} ({dev.files} file{dev.files === 1 ? "" : "s"}, {dev.versions} version{dev.versions === 1 ? "" : "s"})
+                            </span>
+                          ))}
+                        </div>
+                        {user.quotaBytes != null && user.quotaBytes > 0 ? (
+                          (() => {
+                            const usedRatio = user.quotaBytes > 0 ? user.totalBytes / user.quotaBytes : 0;
+                            const overQuota = usedRatio >= 0.9;
+                            return (
+                              <div className="mt-2 max-w-[280px]">
+                                <div className="flex items-center justify-between text-[10px]">
+                                  <span className={overQuota ? "text-[var(--admin-warning)]" : "text-[var(--text-muted)]"}>
+                                    {formatBytes(user.totalBytes)} / {formatBytes(user.quotaBytes)}
+                                    {" "}({Math.round(usedRatio * 100)}% of quota)
+                                  </span>
+                                </div>
+                                <div className="mt-1 h-1.5 w-full max-w-[280px] overflow-hidden rounded bg-[var(--border-subtle)]">
+                                  <div
+                                    className={`h-full ${overQuota ? "bg-[var(--admin-warning)]" : "bg-[var(--admin-info)]"}`}
+                                    style={{ width: `${Math.min(100, usedRatio * 100)}%` }}
+                                  />
+                                </div>
+                              </div>
+                            );
+                          })()
+                        ) : (
+                          <p className="mt-2 text-[10px] text-[var(--text-muted)]">
+                            {formatBytes(user.totalBytes)} stored · quota not set
+                          </p>
+                        )}
+                      </td>
+                      <td className="px-3 py-3">
+                        {canMove ? (
+                          <div className="flex flex-col gap-2">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <select
+                                value={actionActive ? movingSourceId : ""}
+                                disabled={movingUserBusy && actionActive}
+                                onChange={(e) => { setMovingUserId(user.id); setMovingSourceId(e.target.value); setMovingUserPreview(null); }}
+                                className="border border-[var(--border-subtle)] bg-[var(--bg-elevated)] px-2 py-1.5 text-[var(--text-primary)]"
+                              >
+                                <option value="">Source…</option>
+                                {user.devices.map((dev) => (
+                                  <option key={dev.device_id} value={dev.device_id}>
+                                    {dev.storage_id} — {formatBytes(dev.bytes)}
+                                  </option>
+                                ))}
+                              </select>
+                              <span className="text-[var(--text-muted)]">→</span>
+                              <select
+                                value={actionActive ? movingDestId : ""}
+                                disabled={movingUserBusy && actionActive}
+                                onChange={(e) => { setMovingUserId(user.id); setMovingDestId(e.target.value); setMovingUserPreview(null); }}
+                                className="border border-[var(--border-subtle)] bg-[var(--bg-elevated)] px-2 py-1.5 text-[var(--text-primary)]"
+                              >
+                                <option value="">Destination…</option>
+                                {devices
+                                  .filter((d) => d.id !== (actionActive ? movingSourceId : ""))
+                                  .map((d) => (
+                                    <option key={d.id} value={d.id}>
+                                      {d.storage_id} — {formatBytes(d.bytes_used)}
+                                    </option>
+                                  ))}
+                              </select>
+                            </div>
+                            {actionActive && (
+                              <>
+                                {movingUserProgress && (
+                                  <p className="text-xs text-[var(--text-muted)]">
+                                    Moving… {movingUserProgress.processed} / {movingUserProgress.total} blob(s)
+                                    {" · "}<strong className="text-[var(--admin-success)]">{movingUserProgress.moved} moved</strong>
+                                    {" · "}<strong className="text-[var(--admin-critical)]">{movingUserProgress.failed} failed</strong>
+                                    {" · "}{movingUserProgress.skipped} skipped
+                                  </p>
+                                )}
+                                {movingUserPreview && movingUserPreview.userId === user.id && (
+                                  <div className="border border-[var(--border-subtle)] bg-[var(--admin-surface)] p-2 text-[var(--text-muted)]">
+                                    <p>
+                                      Preview: <strong className="text-[var(--admin-success)]">{movingUserPreview.moved} would move</strong>
+                                      {" · "}<strong className="text-[var(--admin-critical)]">{movingUserPreview.failed} would fail</strong>
+                                      {" · "}{movingUserPreview.skipped} would skip
+                                    </p>
+                                    {movingUserPreview.failures.length > 0 && (
+                                      <ul className="mt-1 max-h-20 list-disc space-y-0.5 overflow-y-auto pl-4">
+                                        {movingUserPreview.failures.map((f, index) => (
+                                          <li key={index}>[{f.kind}] {f.stored_path} — {f.reason}</li>
+                                        ))}
+                                      </ul>
+                                    )}
+                                  </div>
+                                )}
+                                <div className="flex gap-2">
+                                  <AdminButton tone="muted" onClick={() => void runUserMigration(true)}>
+                                    {movingUserBusy ? "Previewing…" : "Preview (dry run)"}
+                                  </AdminButton>
+                                  <AdminButton
+                                    tone="pink"
+                                    onClick={() => void runUserMigration(false)}
+                                    disabled={!movingUserPreview || movingUserPreview.userId !== user.id}
+                                  >
+                                    {movingUserBusy ? "Moving…" : "Confirm & move"}
+                                  </AdminButton>
+                                </div>
+                              </>
+                            )}
+                          </div>
+                        ) : (
+                          <span className="text-[var(--text-muted)]">No data to move</span>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
       </AdminPanel>
 
       <AdminPanel title="Add storage device" accent="purple">

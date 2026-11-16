@@ -79,6 +79,7 @@ import {
   migrateLegacyStorage,
   toDto,
   moveDeviceFiles,
+  moveUserFiles,
   getMigrationProgress,
   createMigrationJob,
   finishMigrationJob,
@@ -6837,6 +6838,169 @@ function stopMigrationJobSweep(): void {
     migrationJobSweepTimer = null;
   }
 }
+
+// ──────────────────────────────────────────────────────────────
+// Admin: per-user storage migration
+// Lists each user's storage per device and moves one user's entire
+// data from one device to another (per-user re-homing, ADR-0001).
+//
+// IMPORTANT: both routes below MUST be registered before `POST
+// /api/admin/storage/:id`, otherwise Express would match the literal
+// "users" segment to the `:id` placeholder (same ordering rule as the
+// device-level /storage/migrate routes).
+// ──────────────────────────────────────────────────────────────
+
+// GET /api/admin/storage/users
+// Admin-only: returns every user with a non-zero blob presence, along with a
+// per-device breakdown (device id, logical storage_id, file/version counts and
+// bytes) so the admin can rebalance disk usage by moving one user's data.
+app.get('/api/admin/storage/users', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, async (_req: AuthenticatedRequest, res) => {
+  try {
+    const req = await getRequest();
+    const result = await req.query<{
+      user_id: string;
+      username_encrypted: Buffer; username_iv: Buffer; username_auth_tag: Buffer;
+      device_id: string; storage_id: string;
+      file_count: number; version_count: number; bytes: number | null;
+      quota_bytes: number | null;
+    }>(`
+      SELECT
+        u.id AS user_id,
+        u.username_encrypted, u.username_iv, u.username_auth_tag,
+        d.id AS device_id, d.storage_id,
+        COUNT(DISTINCT CASE WHEN f.storage_device_id = d.id THEN f.id END) AS file_count,
+        COUNT(DISTINCT CASE WHEN v.storage_device_id = d.id THEN v.id END) AS version_count,
+        COALESCE((
+          SELECT SUM(size_bytes) FROM dbo.files
+           WHERE owner_user_id = u.id AND storage_device_id = d.id
+        ), 0) + COALESCE((
+          SELECT SUM(size_bytes) FROM dbo.file_versions
+           WHERE file_id IN (SELECT id FROM dbo.files WHERE owner_user_id = u.id)
+             AND storage_device_id = d.id
+        ), 0) AS bytes,
+        q.storage_limit_bytes AS quota_bytes
+      FROM dbo.users u
+      CROSS JOIN dbo.storage_devices d
+      LEFT JOIN dbo.quotas q ON q.id = u.quota_id
+      LEFT JOIN dbo.files f
+             ON f.owner_user_id = u.id AND f.storage_device_id = d.id
+      LEFT JOIN dbo.file_versions v
+             ON v.storage_device_id = d.id
+            AND v.file_id IN (SELECT id FROM dbo.files WHERE owner_user_id = u.id)
+      WHERE
+        EXISTS (SELECT 1 FROM dbo.files            WHERE owner_user_id = u.id AND storage_device_id = d.id)
+        OR EXISTS (SELECT 1 FROM dbo.file_versions WHERE storage_device_id = d.id
+                    AND file_id IN (SELECT id FROM dbo.files WHERE owner_user_id = u.id))
+      GROUP BY u.id, u.username_encrypted, u.username_iv, u.username_auth_tag, d.id, d.storage_id, q.storage_limit_bytes
+      ORDER BY u.id ASC, d.storage_id ASC
+    `);
+
+    const rows = result.recordset as Array<{
+      user_id: string; username_encrypted: Buffer; username_iv: Buffer; username_auth_tag: Buffer;
+      device_id: string; storage_id: string; file_count: number; version_count: number; bytes: number | null;
+      quota_bytes: number | null;
+    }>;
+
+    // Group per-user rows into { id, username, totalBytes, quotaBytes, devices[] }.
+    const byUser = new Map<string, {
+      id: string; username: string; totalBytes: number; quotaBytes: number | null;
+      devices: Array<{ device_id: string; storage_id: string; files: number; versions: number; bytes: number }>;
+    }>();
+    for (const row of rows) {
+      const username = decryptColumn(row.username_encrypted, row.username_iv, row.username_auth_tag);
+      let entry = byUser.get(row.user_id);
+      if (!entry) {
+        entry = {
+          id: row.user_id,
+          username,
+          totalBytes: 0,
+          quotaBytes: row.quota_bytes != null ? Number(row.quota_bytes) : null,
+          devices: [],
+        };
+        byUser.set(row.user_id, entry);
+      }
+      const bytes = Number(row.bytes ?? 0);
+      entry.devices.push({
+        device_id: row.device_id,
+        storage_id: row.storage_id,
+        files: Number(row.file_count ?? 0),
+        versions: Number(row.version_count ?? 0),
+        bytes,
+      });
+      entry.totalBytes += bytes;
+    }
+    res.json({ success: true, users: Array.from(byUser.values()) });
+  } catch (err) {
+    console.error('[GET /api/admin/storage/users]', err);
+    res.status(500).json({ error: 'Failed to list user storage.' });
+  }
+});
+
+// POST /api/admin/storage/users/:userId/migrate
+// Admin-only: moves the targeted user's entire data (current files + archived
+// versions) from one storage device to another.
+//   - dry_run=true  -> synchronous preview summary (nothing is changed).
+//   - dry_run=false -> background run; returns { job_id } for live progress
+//     polling via GET /api/admin/storage/migrate/:jobId.
+app.post('/api/admin/storage/users/:userId/migrate', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = getSingleParam(req.params.userId);
+    if (!userId) return res.status(400).json({ error: 'userId is required.' });
+    const body = req.body ?? {};
+    const sourceId = String(body.source_device_id ?? '').trim();
+    const destinationId = String(body.destination_device_id ?? '').trim();
+    const dryRun = body.dry_run === true;
+    if (!sourceId || !destinationId) {
+      return res.status(400).json({ error: 'source_device_id and destination_device_id are required.' });
+    }
+
+    // Resolve the target user's username for the audit trail.
+    const userReq = await getRequest();
+    userReq.input('userId', sql.UniqueIdentifier, userId);
+    const userRes = await userReq.query<{ username_encrypted: Buffer; username_iv: Buffer; username_auth_tag: Buffer }>(
+      `SELECT username_encrypted, username_iv, username_auth_tag FROM dbo.users WHERE id = @userId`
+    );
+    if (userRes.recordset.length === 0) {
+      return res.status(404).json({ error: 'User not found.' });
+    }
+    const targetUserRow = userRes.recordset[0];
+    const targetUsername = decryptColumn(targetUserRow.username_encrypted, targetUserRow.username_iv, targetUserRow.username_auth_tag);
+
+    if (dryRun) {
+      // Fast preview: validation + stat checks only, nothing is changed.
+      const summary = await moveUserFiles(userId, sourceId, destinationId, { dryRun });
+      return res.json({ success: true, dry_run: true, ...summary });
+    }
+
+    // Real migration: background with a pollable job id (same as device-level).
+    const jobId = crypto.randomUUID();
+    createMigrationJob(jobId, 0);
+    void moveUserFiles(userId, sourceId, destinationId, { dryRun: false, jobId })
+      .then(async (summary) => {
+        // Audit trail: who moved which user's data between which devices.
+        const sourceDev = await getStorageDevice(sourceId);
+        const destDev = await getStorageDevice(destinationId);
+        const srcLabel = sourceDev?.storage_id ?? sourceId;
+        const dstLabel = destDev?.storage_id ?? destinationId;
+        await logSystemEvent(
+          req.userId!, req.user!.username, 'Admin', 'User', userId, req,
+          `Moved ${summary.moved} blob(s) (${summary.failed} failed, ${summary.skipped} skipped) for user "${targetUsername}" from ${srcLabel} to ${dstLabel}.`,
+        );
+      })
+      .catch((err: any) => {
+        finishMigrationJob(jobId, { moved: 0, failed: 0, skipped: 0, failures: [] }, {
+          status: 'error',
+          error: err?.message || 'Migration failed unexpectedly.',
+        });
+        console.error('[POST /api/admin/storage/users/:userId/migrate] background run failed:', err);
+      });
+
+    res.json({ success: true, dry_run: false, job_id: jobId, status: 'running' });
+  } catch (err: any) {
+    console.error('[POST /api/admin/storage/users/:userId/migrate]', err);
+    res.status(400).json({ error: err?.message || 'Failed to migrate user storage.' });
+  }
+});
 
 app.post('/api/admin/storage/:id', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
   try {
