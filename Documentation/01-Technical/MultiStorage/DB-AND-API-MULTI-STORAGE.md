@@ -73,6 +73,28 @@ scoped through `files.owner_user_id`).
   `INCLUDE (size_bytes)` — scopes a user's versions through `files` for the
   panel and migration.
 
+## 3b. `users` Table Change (per-user preferred default device)
+
+```sql
+ALTER TABLE [dbo].[users] ADD [preferred_storage_device_id] [uniqueidentifier] NULL
+GO
+ALTER TABLE [dbo].[users] WITH CHECK ADD CONSTRAINT [FK_users_preferred_storage]
+    FOREIGN KEY ([preferred_storage_device_id]) REFERENCES [dbo].[storage_devices]([id])
+    ON DELETE SET NULL
+GO
+CREATE INDEX [IX_users_preferred_storage] ON [dbo].[users]([preferred_storage_device_id])
+GO
+```
+
+- `NULL` (the default) means the user falls back to the server-wide default
+  provisioning (`selectProvisionDevice`) — the pre-existing global primary /
+  auto-balancing behavior is fully preserved.
+- When set, the user's **new uploads** provision exclusively to that device
+  (fail-closed via `selectProvisionDeviceForUser`), and on assignment the
+  user's existing blobs **auto-migrate** to it in the background.
+- `ON DELETE SET NULL`: deleting a device clears the preference instead of
+  failing the delete.
+
 ## 4. Admin Storage API (new)
 
 | Method | Endpoint | Handler duty |
@@ -82,8 +104,9 @@ scoped through `files.owner_user_id`).
 | PATCH | `/api/admin/storage/:id` | update path / creds / provisioning_enabled |
 | PUT | `/api/admin/storage/:id/primary` | set primary (un-set others) |
 | DELETE | `/api/admin/storage/:id` | remove device (must not own files) |
-| GET | `/api/admin/storage/users` | per-user per-device storage breakdown — admin "Users by device" panel (id, username, totalBytes, quotaBytes, devices[{device_id, storage_id, files, versions, bytes}]) |
+| GET | `/api/admin/storage/users` | per-user per-device storage breakdown — admin "Users by device" panel (id, username, totalBytes, quotaBytes, preferredDeviceId, devices[{device_id, storage_id, files, versions, bytes}]) |
 | POST | `/api/admin/storage/users/:userId/migrate` | move one user's whole data (current files + archived versions) source→destination device; `dry_run=true` → synchronous preview (no mutation), `dry_run=false` → `{ job_id }` background run pollable via `GET /api/admin/storage/migrate/:jobId` |
+| PUT | `/api/admin/storage/users/:userId/device` | set/clear a user's **preferred default device** for new-upload provisioning. Body `{ device_id }` (a storage device id) or `{ device_id: null }` to clear. On SET: updates `users.preferred_storage_device_id`, auto-migrates the user's existing blobs to it in the background (`{ job_id }`), fail-closed on the preference. On CLEAR: column set NULL, no data movement. |
 
 Both `/users` and `/users/:userId/migrate` routes are **admin-only**
 (`authenticateUser` + `verifyAdmin`) and are declared **before**

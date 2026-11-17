@@ -74,6 +74,8 @@ import {
   updateStorageDevice,
   deleteStorageDevice,
   selectProvisionDevice,
+  getUserPreferredStorageDevice,
+  selectProvisionDeviceForUser,
   resolveBlobPath,
   isDeviceReachable,
   migrateLegacyStorage,
@@ -87,6 +89,7 @@ import {
   decryptedUsername,
   decryptedPassword,
   type StorageDevice,
+  type DeviceMigrationResult,
 } from './server/utils/storage-devices.js';
 import { getTextPreviewKind, TEXT_PREVIEW_MAX_BYTES } from './server/utils/text-preview.js';
 import type { AdminFileFolder, Quota, User, FileMetadata, FileFolder, FolderShareLink, ShareLink, SystemLog, SystemStats } from './app/shared/types/index.js';
@@ -3458,10 +3461,19 @@ app.post(
       currentStage = 'encrypt_file';
       const vaultFileName = generateSecureToken(16) + '.vault';
 
-      // Select the target device for this upload (auto-balancing, ADR-0001).
-      // Fail closed if no provisionable + reachable device exists.
+      // Select the target device for this upload.
+      // A per-user preferred default device overrides the server-wide
+      // auto-balancing default for this user's NEW uploads (fail-closed — it
+      // must be provisionable/reachable/within-quota). Falls back to the global
+      // `selectProvisionDevice` only when the user has no preference set.
       const devicePool = await listStorageDevices();
-      const target = await selectProvisionDevice(devicePool);
+      const preferredDevice = await getUserPreferredStorageDevice(req.userId!);
+      let target: StorageDevice | null;
+      if (preferredDevice) {
+        target = await selectProvisionDeviceForUser(devicePool, req.userId!);
+      } else {
+        target = await selectProvisionDevice(devicePool);
+      }
       if (!target) {
         throw new Error('No storage device available for provisioning. Add an enabled device in the admin panel or verify device reachability.');
       }
@@ -6863,6 +6875,7 @@ app.get('/api/admin/storage/users', authenticateUser as express.RequestHandler, 
       device_id: string; storage_id: string;
       file_count: number; version_count: number; bytes: number | null;
       quota_bytes: number | null;
+      preferred_storage_device_id: string | null;
     }>(`
       -- Set-based aggregates (no cartesian cross join / correlated subqueries):
       -- pre-aggregate each user's files and archived versions by device, then
@@ -6890,6 +6903,7 @@ app.get('/api/admin/storage/users', authenticateUser as express.RequestHandler, 
       SELECT
         u.id AS user_id,
         u.username_encrypted, u.username_iv, u.username_auth_tag,
+        u.preferred_storage_device_id,
         sd.id AS device_id, sd.storage_id,
         COALESCE(fa.file_count, 0) AS file_count,
         COALESCE(va.version_count, 0) AS version_count,
@@ -6910,11 +6924,13 @@ app.get('/api/admin/storage/users', authenticateUser as express.RequestHandler, 
       user_id: string; username_encrypted: Buffer; username_iv: Buffer; username_auth_tag: Buffer;
       device_id: string; storage_id: string; file_count: number; version_count: number; bytes: number | null;
       quota_bytes: number | null;
+      preferred_storage_device_id: string | null;
     }>;
 
     // Group per-user rows into { id, username, totalBytes, quotaBytes, devices[] }.
     const byUser = new Map<string, {
       id: string; username: string; totalBytes: number; quotaBytes: number | null;
+      preferredDeviceId: string | null;
       devices: Array<{ device_id: string; storage_id: string; files: number; versions: number; bytes: number }>;
     }>();
     for (const row of rows) {
@@ -6926,6 +6942,7 @@ app.get('/api/admin/storage/users', authenticateUser as express.RequestHandler, 
           username,
           totalBytes: 0,
           quotaBytes: row.quota_bytes != null ? Number(row.quota_bytes) : null,
+          preferredDeviceId: row.preferred_storage_device_id ?? null,
           devices: [],
         };
         byUser.set(row.user_id, entry);
@@ -7010,6 +7027,146 @@ app.post('/api/admin/storage/users/:userId/migrate', authenticateUser as express
   } catch (err: any) {
     console.error('[POST /api/admin/storage/users/:userId/migrate]', err);
     res.status(400).json({ error: err?.message || 'Failed to migrate user storage.' });
+  }
+});
+
+// PUT /api/admin/storage/users/:userId/device
+// Admin-only: set (body { device_id }) or clear (body { device_id: null }) a
+// user's preferred default storage device. When SET, the user's NEW uploads
+// provision exclusively to that device (fail-closed), and the user's EXISTING
+// blobs are AUTO-MIGRATED to it in the background (reusing moveUserFiles +
+// createMigrationJob). When CLEAR (null), the column is set NULL and the user
+// reverts to server-wide default provisioning — no data movement back.
+// Returns { job_id } only when a background auto-migration was kicked off.
+app.put('/api/admin/storage/users/:userId/device', authenticateUser as express.RequestHandler, verifyAdmin as express.RequestHandler, async (req: AuthenticatedRequest, res) => {
+  try {
+    const userId = getSingleParam(req.params.userId);
+    if (!userId) return res.status(400).json({ error: 'userId is required.' });
+    const body = req.body ?? {};
+    const rawDeviceId = body.device_id == null ? null : String(body.device_id).trim();
+    const deviceId = rawDeviceId === '' ? null : rawDeviceId;
+
+    // Resolve the target user for the audit trail + existence check.
+    const userReq = await getRequest();
+    userReq.input('userId', sql.UniqueIdentifier, userId);
+    const userRes = await userReq.query<{
+      username_encrypted: Buffer; username_iv: Buffer; username_auth_tag: Buffer;
+      preferred_storage_device_id: string | null;
+    }>(
+      `SELECT username_encrypted, username_iv, username_auth_tag, preferred_storage_device_id
+         FROM dbo.users WHERE id = @userId`
+    );
+    if (userRes.recordset.length === 0) {
+      return res.status(404).json({ error: 'User not found.' });
+    }
+    const targetUserRow = userRes.recordset[0];
+    const targetUsername = decryptColumn(targetUserRow.username_encrypted, targetUserRow.username_iv, targetUserRow.username_auth_tag);
+
+    // Validate the target device exists when setting (device_id non-null).
+    let targetDev: StorageDevice | null = null;
+    if (deviceId) {
+      targetDev = await getStorageDevice(deviceId);
+      if (!targetDev) {
+        return res.status(400).json({ error: 'Storage device not found.' });
+      }
+    }
+
+    // Persist the preference (parameterized; FK-safe via update).
+    const updateReq = await getRequest();
+    updateReq.input('userId', sql.UniqueIdentifier, userId);
+    updateReq.input('deviceId', sql.UniqueIdentifier, deviceId);
+    await updateReq.query(
+      `UPDATE dbo.users SET preferred_storage_device_id = @deviceId WHERE id = @userId`
+    );
+
+    // Audit trail: who set/cleared which device for which user.
+    if (deviceId) {
+      await logSystemEvent(
+        req.userId!, req.user!.username, 'Admin', 'User', userId, req,
+        `Set preferred storage device for user "${targetUsername}" to ${targetDev!.storage_id}.`,
+      );
+    } else {
+      await logSystemEvent(
+        req.userId!, req.user!.username, 'Admin', 'User', userId, req,
+        `Cleared preferred storage device for user "${targetUsername}" (reverted to server default provisioning).`,
+      );
+    }
+
+    // On CLEAR (null) there is no data movement — done.
+    if (!deviceId) {
+      return res.json({ success: true, preferred_storage_device_id: null, migrated: false });
+    }
+
+    // Auto-migrate the user's EXISTING blobs to the new preferred device.
+    // The user's data may currently live on one or several devices; move from
+    // each non-target device via the shared atomic per-blob mover. If the data
+    // is already all on the target, nothing needs moving.
+    const sourceReq = await getRequest();
+    sourceReq.input('userId', sql.UniqueIdentifier, userId);
+    const sourceRes = await sourceReq.query<{ device_id: string }>(
+      `SELECT DISTINCT storage_device_id AS device_id FROM dbo.files WHERE owner_user_id = @userId AND storage_device_id IS NOT NULL
+       UNION
+       SELECT DISTINCT v.storage_device_id AS device_id FROM dbo.file_versions v
+         WHERE v.storage_device_id IS NOT NULL
+           AND v.file_id IN (SELECT id FROM dbo.files WHERE owner_user_id = @userId)`
+    );
+    const sourceDeviceIds = sourceRes.recordset
+      .map((r) => r.device_id)
+      .filter((id) => id !== deviceId) as string[];
+
+    if (sourceDeviceIds.length === 0) {
+      return res.json({
+        success: true,
+        preferred_storage_device_id: deviceId,
+        migrated: true,
+        status: 'done',
+        moved: 0, failed: 0, skipped: 0,
+      });
+    }
+
+    // Background job with live progress polling (same pattern as the manual
+    // migrate endpoint). A single job aggregates the moves across all source
+    // devices; each per-device run reuses the same jobId for progress deltas.
+    const jobId = crypto.randomUUID();
+    createMigrationJob(jobId, 0);
+    void (async () => {
+      let moved = 0, failed = 0, skipped = 0;
+      const failures: DeviceMigrationResult['failures'] = [];
+      try {
+        // POURQUOI : total is computed lazily because each moveUserFiles run
+        // returns its own counts; setMigrationJobTotal is called per run so the
+        // UI's progress bar converges on the true blob count.
+        for (const srcId of sourceDeviceIds) {
+          const summary = await moveUserFiles(userId, srcId, deviceId, { dryRun: false, jobId });
+          moved += summary.moved;
+          failed += summary.failed;
+          skipped += summary.skipped;
+          failures.push(...summary.failures);
+        }
+        finishMigrationJob(jobId, { moved, failed, skipped, failures }, { status: 'done' });
+        await logSystemEvent(
+          req.userId!, req.user!.username, 'Admin', 'User', userId, req,
+          `Auto-migrated ${moved} blob(s) (${failed} failed, ${skipped} skipped) for user "${targetUsername}" to preferred device ${targetDev!.storage_id}.`,
+        );
+      } catch (err: any) {
+        finishMigrationJob(jobId, { moved, failed, skipped, failures }, {
+          status: 'error',
+          error: err?.message || 'Auto-migration to preferred device failed unexpectedly.',
+        });
+        console.error('[PUT /api/admin/storage/users/:userId/device] background auto-migration failed:', err);
+      }
+    })();
+
+    return res.json({
+      success: true,
+      preferred_storage_device_id: deviceId,
+      migrated: true,
+      job_id: jobId,
+      status: 'running',
+    });
+  } catch (err: any) {
+    console.error('[PUT /api/admin/storage/users/:userId/device]', err);
+    res.status(400).json({ error: err?.message || 'Failed to set preferred storage device.' });
   }
 });
 
@@ -7617,6 +7774,36 @@ async function ensurePerUserStorageIndexes(): Promise<void> {
   `);
 }
 
+// Idempotent per-user preferred-storage-device column + FK + index. Mirrors
+// ensureStorageDeviceQuotaColumn: an admin may assign a preferred device per
+// user (feat/storage/per-user-default-device). Adding the column at boot keeps
+// a fresh checkout / existing DB forward-compatible with the migration file
+// (Documentation/SQL/2026-11-16-add-user-preferred-storage-device.sql).
+async function ensureUserPreferredStorageColumn(): Promise<void> {
+  const request = await getRequest();
+  await request.query(`
+    IF OBJECT_ID('dbo.users', 'U') IS NOT NULL
+    BEGIN
+      IF COL_LENGTH('dbo.users', 'preferred_storage_device_id') IS NULL
+        ALTER TABLE dbo.users ADD preferred_storage_device_id UNIQUEIDENTIFIER NULL;
+    END
+    IF OBJECT_ID('dbo.storage_devices', 'U') IS NOT NULL
+    AND OBJECT_ID('dbo.users', 'U') IS NOT NULL
+    AND NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = 'FK_users_preferred_storage')
+    BEGIN
+      ALTER TABLE dbo.users WITH CHECK ADD CONSTRAINT [FK_users_preferred_storage]
+        FOREIGN KEY ([preferred_storage_device_id])
+        REFERENCES dbo.storage_devices([id])
+        ON DELETE SET NULL;
+    END
+    IF OBJECT_ID('dbo.users', 'U') IS NOT NULL
+    AND NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_users_preferred_storage' AND object_id=OBJECT_ID('dbo.users'))
+    BEGIN
+      CREATE INDEX IX_users_preferred_storage ON dbo.users(preferred_storage_device_id);
+    END
+  `);
+}
+
 async function bootstrap() {
   // 1. Validate production requirements and master encryption key
   validateProductionConfig();
@@ -7644,6 +7831,9 @@ async function bootstrap() {
   // 2b''. Composite (owner, device) indexes for the admin "Users by device"
   // panel + per-user move migration. Idempotent; safe to run at every boot.
   await ensurePerUserStorageIndexes();
+
+  // 2b'''. Per-user preferred storage device column + FK + index (idempotent).
+  await ensureUserPreferredStorageColumn();
 
   // 2c. Multi-storage migration: seed initial device from legacy env vars and
   // backfill existing rows (ADR-0001). Idempotent.

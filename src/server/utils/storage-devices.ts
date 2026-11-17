@@ -359,6 +359,74 @@ export async function selectProvisionDevice(devices: StorageDevice[]): Promise<S
 }
 
 // ──────────────────────────────────────────────────────────────
+// Per-user preferred default device (provisioning override)
+// ──────────────────────────────────────────────────────────────
+
+/**
+ * Resolves the user's preferred default storage device, or null when unset.
+ *
+ * A per-user preference overrides the server-wide default provisioning for NEW
+ * uploads only. Returns null when the column is NULL (falls back to the global
+ * `selectProvisionDevice`) or when the referenced device no longer exists
+ * (e.g. deleted — ON DELETE SET NULL keeps this from surfacing normally).
+ */
+export async function getUserPreferredStorageDevice(userId: string): Promise<StorageDevice | null> {
+  const req = await getRequest();
+  req.input('userId', sql.UniqueIdentifier, userId);
+  const result = await req.query<{ device_id: string | null }>(
+    `SELECT TOP 1 preferred_storage_device_id AS device_id
+       FROM dbo.users WHERE id = @userId`
+  );
+  const deviceId = result.recordset.length ? result.recordset[0]!.device_id : null;
+  if (!deviceId) return null;
+  return getStorageDevice(deviceId);
+}
+
+/**
+ * Selects the provisioning target for a user who has a preferred default
+ * device set. Fail-closed: the preferred device MUST be provisioning-enabled
+ * AND within its per-device quota AND reachable — otherwise this THROWS so the
+ * upload fails clearly instead of silently falling back to the global default.
+ *
+ * Mirrors the checks in `selectProvisionDevice` (quota usage, reachability) but
+ * only ever evaluates the single preferred device — there is no auto-balancing
+ * fallback within this function.
+ */
+export async function selectProvisionDeviceForUser(
+  devices: StorageDevice[],
+  userId: string,
+): Promise<StorageDevice> {
+  const preferred = await getUserPreferredStorageDevice(userId);
+  if (!preferred) {
+    throw new Error('No preferred storage device is set for this user — fall back to server default provisioning.');
+  }
+
+  const enabled = devices.find((d) => d.id === preferred.id);
+  if (!enabled || !enabled.provisioning_enabled) {
+    throw new Error(
+      `Preferred storage device is not provisioning-enabled for this user's uploads. ` +
+      `Enable provisioning for the device or clear the user's preferred device in the admin panel.`,
+    );
+  }
+  if (enabled.quota_bytes != null && enabled.quota_bytes > 0) {
+    const usage = await getStorageDeviceUsage(enabled.id);
+    if (usage.totalBytes >= enabled.quota_bytes) {
+      throw new Error(
+        `Preferred storage device has reached its storage quota for this user's uploads. ` +
+        `Raise the device quota or clear the user's preferred device in the admin panel.`,
+      );
+    }
+  }
+  if (!(await isDeviceReachable(enabled.storage_path))) {
+    throw new Error(
+      `Preferred storage device is not reachable for this user's uploads. ` +
+      `Restore the device or clear the user's preferred device in the admin panel.`,
+    );
+  }
+  return enabled;
+}
+
+// ──────────────────────────────────────────────────────────────
 // CRUD: update / delete
 // ──────────────────────────────────────────────────────────────
 

@@ -130,6 +130,7 @@ Mounted at /api/public/share.
 | POST | /api/admin/maintenance/toggle | Admin | Toggle maintenance mode | Leeku-MSSQL/src/server/routes/maintenance-mode.ts |
 | GET | /api/admin/storage/users | Admin | Per-user per-device storage breakdown ("Users by device") | Leeku-MSSQL/src/server.ts |
 | POST | /api/admin/storage/users/:userId/migrate | Admin | Move one user's data between devices; `dry_run=true` preview, else background job (`job_id`) | Leeku-MSSQL/src/server.ts |
+| PUT | /api/admin/storage/users/:userId/device | Admin | Set/clear a user's preferred default device for new-upload provisioning; body `{ device_id }` or `{ device_id: null }` to clear. On SET, existing blobs auto-migrate in background (`job_id`) | Leeku-MSSQL/src/server.ts |
 
 ## 4. Explicit Unknowns
 

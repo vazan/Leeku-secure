@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test, { before, after, beforeEach } from 'node:test';
+import type { StorageDevice } from '../src/server/utils/storage-devices.js';
 
 /**
  * Regression suite for the admin per-user storage migration
@@ -47,7 +48,10 @@ const DST = '22222222-2222-2222-2222-222222222222';
 const USER_A = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
 const USER_B = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb';
 
-function deviceRow(id: string, storageId: string, storagePath: string) {
+function deviceRow(id: string, storageId: string, storagePath: string, overrides: {
+  provisioning_enabled?: boolean;
+  quota_bytes?: number | null;
+} = {}) {
   return {
     id,
     storage_id: storageId,
@@ -58,9 +62,9 @@ function deviceRow(id: string, storageId: string, storagePath: string) {
     smb_password_encrypted: null,
     smb_password_iv: null,
     smb_password_auth_tag: null,
-    provisioning_enabled: 1,
+    provisioning_enabled: overrides.provisioning_enabled !== undefined ? (overrides.provisioning_enabled ? 1 : 0) : 1,
     is_primary: 0,
-    quota_bytes: null,
+    quota_bytes: overrides.quota_bytes !== undefined ? overrides.quota_bytes : null,
     created_at: new Date(),
   };
 }
@@ -75,12 +79,30 @@ function makeFakeRequest(setup: {
   versions: Array<{ id: string; stored_path: string; size_bytes: number }>;
   deviceIds: string[];
   failUpdateBlobIds?: string[];
+  /**
+   * Per-device-provisioning flags for the preference tests (defaults: enabled,
+   * unlimited quota). Keys are device ids.
+   */
+  deviceFlags?: Record<string, { provisioning_enabled?: boolean; quota_bytes?: number | null }>;
+  /**
+   * Maps a userId to its preferred default device id (or null/absent = unset).
+   * Served from the `users` table lookup in getUserPreferredStorageDevice.
+   */
+  preferredDeviceByUser?: Record<string, string | null>;
+  /**
+   * Per-device usage totals (bytes) served by getStorageDeviceUsage, for the
+   * quota-exceeded fail-closed test. Defaults to 0.
+   */
+  deviceUsageBytes?: Record<string, number>;
 }) {
   const queries: string[] = [];
   const updates: Array<{ blobId: string; destId: string; table: string }> = [];
   const inputBindings: Array<{ name: string; value: unknown }> = [];
   const inputs = new Map<string, unknown>();
   const failUpdateBlobIds = new Set(setup.failUpdateBlobIds ?? []);
+  const deviceFlags = setup.deviceFlags ?? {};
+  const preferredDeviceByUser = setup.preferredDeviceByUser ?? {};
+  const deviceUsageBytes = setup.deviceUsageBytes ?? {};
 
   const request = {
     queries,
@@ -109,11 +131,25 @@ function makeFakeRequest(setup: {
         return { recordset: [], rowsAffected: [1] };
       }
 
+      // storage usage aggregate (getStorageDeviceUsage)
+      if (/COALESCE\(SUM\(size_bytes\)/i.test(text)) {
+        const id = String(inputs.get('id') ?? '');
+        const usageBytes = deviceUsageBytes[id] ?? 0;
+        return { recordset: [{ files: usageBytes > 0 ? 1 : 0, versions: 0, bytes: usageBytes }] };
+      }
+
+      // users.preferred_storage_device_id lookup (getUserPreferredStorageDevice)
+      if (/FROM\s+dbo\.users/i.test(text)) {
+        const userId = String(inputs.get('userId') ?? '');
+        const prefId = preferredDeviceByUser[userId] ?? null;
+        return { recordset: [{ device_id: prefId }] };
+      }
+
       // storage device lookup
       if (/FROM\s+dbo\.storage_devices/i.test(text)) {
         const id = String(inputs.get('id') ?? '');
         const row = setup.deviceIds.includes(id)
-          ? deviceRow(id, id === SRC ? 'DATA-01' : 'DATA-02', id === SRC ? srcDir : dstDir)
+          ? deviceRow(id, id === SRC ? 'DATA-01' : 'DATA-02', id === SRC ? srcDir : dstDir, deviceFlags[id])
           : null;
         return { recordset: row ? [row] : [] };
       }
@@ -424,4 +460,152 @@ test('malicious user input is parameterized — never concatenated into SQL', as
   for (const q of fake.queries) {
     assert.equal(q.includes(evil), false, 'SQL must not interpolate user payload');
   }
+});
+
+// ---------------------------------------------------------------------------
+// Per-user preferred default device (feat/storage/per-user-default-device)
+// ---------------------------------------------------------------------------
+// Covers `getUserPreferredStorageDevice` + `selectProvisionDeviceForUser`:
+//   - preferred device set → the user's NEW uploads provision to it
+//   - preferred device unset (NULL) → null, falls back to selectProvisionDevice
+//   - fail-closed: preferred device unreachable / quota-exceeded /
+//     not provisioning_enabled → THROWS with a clear error (no fallback)
+//   - auto-migrate on set uses moveUserFiles (FK updates target the new device)
+
+// Builds the device pool passed to selectProvisionDeviceForUser / selectProvisionDevice
+// the same way the upload route does. The credential/encrypted fields are null in
+// tests (not exercised by the provisioning selection logic).
+function poolDevice(p: {
+  id: string; storage_id: string; storage_path: string;
+  provisioning_enabled?: boolean; is_primary?: boolean; quota_bytes?: number | null;
+}): StorageDevice {
+  return {
+    id: p.id,
+    storage_id: p.storage_id,
+    storage_path: p.storage_path,
+    smb_username_encrypted: null,
+    smb_username_iv: null,
+    smb_username_auth_tag: null,
+    smb_password_encrypted: null,
+    smb_password_iv: null,
+    smb_password_auth_tag: null,
+    provisioning_enabled: p.provisioning_enabled ?? true,
+    is_primary: p.is_primary ?? false,
+    quota_bytes: p.quota_bytes ?? null,
+    created_at: new Date(),
+  };
+}
+
+test('preferred device set → selectProvisionDeviceForUser returns it', async () => {
+  // SRC points at srcDir (exists), provisioning enabled, unlimited quota.
+  const fake = installProvider({
+    files: [],
+    versions: [],
+    deviceIds: [SRC],
+    preferredDeviceByUser: { [USER_A]: SRC },
+  });
+
+  const pool = [poolDevice({ id: SRC, storage_id: 'DATA-01', storage_path: srcDir })];
+  const target = await storage.selectProvisionDeviceForUser(pool, USER_A);
+  assert.equal(target.id, SRC);
+});
+
+test('preferred device unset (NULL) → getUserPreferredStorageDevice returns null (falls back to default)', async () => {
+  const fake = installProvider({
+    files: [],
+    versions: [],
+    deviceIds: [SRC],
+    preferredDeviceByUser: { [USER_A]: null },
+  });
+
+  const preferred = await storage.getUserPreferredStorageDevice(USER_A);
+  assert.equal(preferred, null);
+
+  // NULL preference must NOT break the global default path (no regression).
+  const pool = [
+    poolDevice({ id: SRC, storage_id: 'DATA-01', storage_path: srcDir, provisioning_enabled: true, is_primary: true }),
+  ];
+  const defaultTarget = await storage.selectProvisionDevice(pool);
+  assert.equal(defaultTarget!.id, SRC);
+});
+
+test('preferred device not provisioning_enabled → upload fails closed', async () => {
+  const fake = installProvider({
+    files: [],
+    versions: [],
+    deviceIds: [SRC],
+    deviceFlags: { [SRC]: { provisioning_enabled: false } },
+    preferredDeviceByUser: { [USER_A]: SRC },
+  });
+
+  const pool = [poolDevice({ id: SRC, storage_id: 'DATA-01', storage_path: srcDir, provisioning_enabled: false })];
+  await assert.rejects(
+    () => storage.selectProvisionDeviceForUser(pool, USER_A),
+    /not provisioning-enabled/,
+  );
+});
+
+test('preferred device quota-exceeded → upload fails closed', async () => {
+  // quota_bytes = 5, and the device already holds usage_bytes > quota → the
+  // preferred device must fail closed (the new upload may not provision).
+  const fake = installProvider({
+    files: [],
+    versions: [],
+    deviceIds: [SRC],
+    deviceFlags: { [SRC]: { quota_bytes: 5 } },
+    deviceUsageBytes: { [SRC]: 100 },
+    preferredDeviceByUser: { [USER_A]: SRC },
+  });
+
+  const pool = [poolDevice({ id: SRC, storage_id: 'DATA-01', storage_path: srcDir, quota_bytes: 5 })];
+  await assert.rejects(
+    () => storage.selectProvisionDeviceForUser(pool, USER_A),
+    /reached its storage quota/,
+  );
+});
+
+test('preferred device unreachable → upload fails closed', async () => {
+  const fake = installProvider({
+    files: [],
+    versions: [],
+    deviceIds: [SRC],
+    preferredDeviceByUser: { [USER_A]: SRC },
+  });
+
+  // Point the preferred device at a non-existent path (unreachable).
+  const pool = [poolDevice({ id: SRC, storage_id: 'DATA-01', storage_path: '/nonexistent-device-root-xyz' })];
+  await assert.rejects(
+    () => storage.selectProvisionDeviceForUser(pool, USER_A),
+    /not reachable/,
+  );
+});
+
+test('auto-migrate on set routes the user\'s blobs to the preferred device (FK updates target it)', async () => {
+  // "Auto-migrate on set" reuses moveUserFiles. Assigning a preferred device
+  // kicks off a background job moving the user's existing blobs TO it. Here we
+  // prove the per-blob FK UPDATE targets the newly preferred device (DST) and
+  // that the atomic copy/FK/unlink ran end-to-end.
+  const uaFile = 'uA/f.bin';
+  const uaVer = 'uA/v.bin';
+  writeBlob(srcDir, uaFile, 'A-file');
+  writeBlob(srcDir, uaVer, 'A-ver');
+  ensureParent(dstDir, uaFile);
+  ensureParent(dstDir, uaVer);
+
+  const fake = installProvider({
+    files: [{ id: 'fA', stored_path: uaFile, size_bytes: 7 }],
+    versions: [{ id: 'vA', stored_path: uaVer, size_bytes: 5 }],
+    deviceIds: [SRC, DST],
+    preferredDeviceByUser: { [USER_A]: DST },
+  });
+
+  const jobId = 'job-pref-auto';
+  const result = await storage.moveUserFiles(USER_A, SRC, DST, { jobId });
+
+  assert.equal(result.moved, 2);
+  assert.deepEqual(fake.updates.map((u) => u.destId), [DST, DST], 'both FK updates target the preferred device');
+  assert.equal(blobExists(dstDir, uaFile), true, 'file copied to preferred device');
+  assert.equal(blobExists(dstDir, uaVer), true, 'version copied to preferred device');
+  assert.equal(blobExists(srcDir, uaFile), false, 'source file unlinked');
+  assert.equal(blobExists(srcDir, uaVer), false, 'source version unlinked');
 });

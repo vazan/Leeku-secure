@@ -697,6 +697,8 @@ type StorageUserDto = {
   username: string;
   totalBytes: number;
   quotaBytes: number | null;
+  /** Preferred per-user default device id, or null → server-default provisioning. */
+  preferredDeviceId?: string | null;
   devices: Array<{
     device_id: string;
     storage_id: string;
@@ -758,6 +760,45 @@ function StoragePanel() {
   const [movingUserProgress, setMovingUserProgress] = useState<{
     processed: number; total: number; moved: number; failed: number; skipped: number;
   } | null>(null);
+
+  // Per-user preferred default device state (set/clear control).
+  // Holds a draft device selection per user id so multiple rows can be edited
+  // independently without resetting the others.
+  const [preferredDeviceId, setPreferredDeviceId] = useState<Record<string, string>>({});
+  const [preferredBusy, setPreferredBusy] = useState(false);
+
+  // Applies an admin-set preferred device (or clears it) for a user via the
+  // PUT /api/admin/storage/users/:userId/device endpoint.
+  const applyPreferredDevice = async (user: StorageUserDto, nextDeviceId: string | null) => {
+    if (preferredBusy) return;
+    const confirmText = nextDeviceId
+      ? `Assign "${user.username}" a preferred storage device?\n\n` +
+        `New uploads will provision exclusively to that device (fail-closed if it is full/unreachable/disabled), and their existing data will auto-migrate to it in the background.`
+      : `Clear "${user.username}"'s preferred storage device?\n\n` +
+        `New uploads revert to the server-wide default provisioning. Existing data is NOT moved back.`;
+    if (!window.confirm(confirmText)) return;
+
+    setPreferredBusy(true);
+    try {
+      const response = await fetch(`/api/admin/storage/users/${encodeURIComponent(user.id)}/device`, {
+        method: "PUT",
+        headers: adminHeaders(true),
+        body: JSON.stringify({ device_id: nextDeviceId }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Failed to set preferred storage device.");
+      toast.success(nextDeviceId
+        ? `Preferred device set for ${user.username}. ${data.migrated ? "Existing data is migrating in the background." : ""}`
+        : `Preferred device cleared for ${user.username}.`);
+      setPreferredDeviceId((prev) => ({ ...prev, [user.id]: "" }));
+      await loadDevices();
+      await loadUsers();
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Failed to set preferred storage device.");
+    } finally {
+      setPreferredBusy(false);
+    }
+  };
 
   const loadUsers = async () => {
     try {
@@ -1336,7 +1377,10 @@ function StoragePanel() {
         <p className="mb-4 text-xs text-[var(--text-muted)]">
           Move a single user's entire data from one storage device to another (e.g. DATA-01 → DATA-02) to
           rebalance disk usage. Preview first — the real move runs in the background and never affects the
-          user's file ids, shared links, versions, or quota.
+          user's file ids, shared links, versions, or quota. You can also assign a
+          per-user <strong>preferred device</strong>: new uploads provision exclusively to it
+          (fail-closed if full/unreachable/disabled) and existing data auto-migrates in the
+          background.
         </p>
         {usersLoading ? (
           <p className="py-8 text-center text-xs text-[var(--text-muted)]">Loading user storage…</p>
@@ -1350,6 +1394,7 @@ function StoragePanel() {
                   <th className="px-3 py-2">User</th>
                   <th className="px-3 py-2">Total size</th>
                   <th className="px-3 py-2">Storage per device</th>
+                  <th className="px-3 py-2">Preferred device</th>
                   <th className="px-3 py-2">Move to…</th>
                 </tr>
               </thead>
@@ -1396,6 +1441,57 @@ function StoragePanel() {
                             {formatBytes(user.totalBytes)} stored · quota not set
                           </p>
                         )}
+                      </td>
+                      <td className="px-3 py-3">
+                        {(() => {
+                          const prefId = user.preferredDeviceId ?? null;
+                          // The preferred device's label, when it is one of the
+                          // device pool entries the panel knows about.
+                          const prefLabel = prefId
+                            ? devices.find((d) => d.id === prefId)?.storage_id ?? prefId
+                            : null;
+                          const draftId = preferredDeviceId[user.id] ?? "";
+                          return (
+                            <div className="flex flex-col gap-1.5">
+                              <span className="inline-block rounded bg-[var(--bg-elevated)] px-2 py-1 text-[var(--text-muted)]">
+                                {prefLabel
+                                  ? <><strong className="text-[var(--text-primary)]">{prefLabel}</strong> <span className="ml-1">(preferred)</span></>
+                                  : <span className="text-[var(--text-muted)]">Default (server-wide)</span>}
+                              </span>
+                              <div className="flex flex-wrap items-center gap-1.5">
+                                <select
+                                  value={draftId}
+                                  disabled={preferredBusy}
+                                  onChange={(e) => setPreferredDeviceId((prev) => ({ ...prev, [user.id]: e.target.value }))}
+                                  className="w-[150px] shrink-0 border border-[var(--border-subtle)] bg-[var(--bg-elevated)] px-2 py-1.5 text-[var(--text-primary)]"
+                                >
+                                  <option value="">Set…</option>
+                                  {devices.map((d) => (
+                                    <option key={d.id} value={d.id}>
+                                      {d.storage_id}
+                                    </option>
+                                  ))}
+                                </select>
+                                <AdminButton
+                                  tone="green"
+                                  disabled={preferredBusy || !draftId}
+                                  onClick={() => void applyPreferredDevice(user, draftId || null)}
+                                >
+                                  Set
+                                </AdminButton>
+                                {prefLabel && (
+                                  <AdminButton
+                                    tone="muted"
+                                    disabled={preferredBusy}
+                                    onClick={() => void applyPreferredDevice(user, null)}
+                                  >
+                                    Clear
+                                  </AdminButton>
+                                )}
+                              </div>
+                            </div>
+                          );
+                        })()}
                       </td>
                       <td className="px-3 py-3">
                         {canMove ? (

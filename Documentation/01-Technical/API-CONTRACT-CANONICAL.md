@@ -24,6 +24,8 @@ Define a single contract baseline for API behavior to reduce integration drift a
 - Admin endpoints: admin user/file/log/quota operations, storage devices
   (list/add/update/primary/delete), per-user storage re-homing
   (`/api/admin/storage/users`, `/api/admin/storage/users/:userId/migrate`),
+  per-user preferred default device set/clear
+  (`PUT /api/admin/storage/users/:userId/device`),
   and maintenance toggle.
 
 ### Status policy (baseline)
