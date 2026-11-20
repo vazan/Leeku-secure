@@ -241,14 +241,44 @@ export function decryptedPassword(device: StorageDevice): string | null {
 // ──────────────────────────────────────────────────────────────
 
 /** Checks a device root is readable (used by per-device health monitor + admin). */
-export async function isDeviceReachable(storagePath: string): Promise<boolean> {
+// POURQUOI : the old probe called readdir() on the device root. Vault blobs
+// live flat in that root, so every probe enumerated the whole vault (~8 s for
+// ~20k files over SMB) and it ran for EVERY upload. Each probe pinned one of
+// libuv's 4 threadpool threads, starving all other fs I/O (static files, chunk
+// writes, temp files) and making the site crawl after large backups.
+// A stat()+access() on the root proves the share is mounted and readable in
+// constant time; results are cached briefly so bursts of uploads share one probe.
+const REACHABILITY_CACHE_TTL_MS = 30_000;
+const reachabilityCache = new Map<string, { ok: boolean; checkedAt: number }>();
+const reachabilityInflight = new Map<string, Promise<boolean>>();
+
+async function probeDeviceRoot(storagePath: string): Promise<boolean> {
   try {
+    const stat = await fs.promises.stat(storagePath);
+    if (!stat.isDirectory()) return false;
     await fs.promises.access(storagePath, fs.constants.R_OK);
-    await fs.promises.readdir(storagePath);
     return true;
   } catch {
     return false;
   }
+}
+
+export async function isDeviceReachable(storagePath: string, options: { fresh?: boolean } = {}): Promise<boolean> {
+  const cached = reachabilityCache.get(storagePath);
+  if (!options.fresh && cached && Date.now() - cached.checkedAt < REACHABILITY_CACHE_TTL_MS) {
+    return cached.ok;
+  }
+  const inflight = reachabilityInflight.get(storagePath);
+  if (inflight) return inflight;
+
+  const probe = probeDeviceRoot(storagePath)
+    .then((ok) => {
+      reachabilityCache.set(storagePath, { ok, checkedAt: Date.now() });
+      return ok;
+    })
+    .finally(() => reachabilityInflight.delete(storagePath));
+  reachabilityInflight.set(storagePath, probe);
+  return probe;
 }
 
 /** Builds a safe admin DTO (no encrypted blobs, no plaintext credentials). */
@@ -866,9 +896,9 @@ export async function moveDeviceFiles(
   if (!source) throw new Error('Source storage device not found.');
   if (!destination) throw new Error('Destination storage device not found.');
 
-  if (!(await isDeviceReachable(source.storage_path)))
+  if (!(await isDeviceReachable(source.storage_path, { fresh: true })))
     throw new Error(`Source device ${source.storage_id} is not reachable.`);
-  if (!(await isDeviceReachable(destination.storage_path)))
+  if (!(await isDeviceReachable(destination.storage_path, { fresh: true })))
     throw new Error(`Destination device ${destination.storage_id} is not reachable.`);
 
   const req = await getRequest();
@@ -982,9 +1012,9 @@ export async function moveUserFiles(
   if (!source) throw new Error('Source storage device not found.');
   if (!destination) throw new Error('Destination storage device not found.');
 
-  if (!(await isDeviceReachable(source.storage_path)))
+  if (!(await isDeviceReachable(source.storage_path, { fresh: true })))
     throw new Error(`Source device ${source.storage_id} is not reachable.`);
-  if (!(await isDeviceReachable(destination.storage_path)))
+  if (!(await isDeviceReachable(destination.storage_path, { fresh: true })))
     throw new Error(`Destination device ${destination.storage_id} is not reachable.`);
 
   const req = await getRequest();

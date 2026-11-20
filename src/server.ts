@@ -394,13 +394,10 @@ let uncShareMonitorTimer: ReturnType<typeof setInterval> | null = null;
 let uncShareMonitorRunning = false;
 
 async function isUncShareAvailable(sharePath: string): Promise<boolean> {
-  try {
-    await fs.promises.access(sharePath, fs.constants.R_OK);
-    await fs.promises.readdir(sharePath);
-    return true;
-  } catch {
-    return false;
-  }
+  // Constant-time probe (no readdir of the flat vault root) — see
+  // isDeviceReachable in storage-devices.ts for why. fresh=true so the
+  // health monitor always reflects the current state and refreshes the cache.
+  return isDeviceReachable(sharePath, { fresh: true });
 }
 
 /**
