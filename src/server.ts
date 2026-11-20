@@ -65,7 +65,8 @@ import { cleanupPublicShareDecryptedPreviewFiles, createPublicSharingRouter } fr
 import { createPublicFolderSharingRouter } from './server/routes/public-folder-sharing.js';
 import { createMaintenanceModeRouter } from './server/routes/maintenance-mode.js';
 import { createDesktopUpdatesRouter, SYSTEM_UPDATE_FOLDER_NAME } from './server/routes/desktop-updates.js';
-import { mergeChunks, isSafeResumableIdentifier } from './server/merge-chunks.js';
+import { mergeChunks, isSafeResumableIdentifier, tryAcquireMergeLock } from './server/merge-chunks.js';
+import { SharedSessionStore, isClusterMode } from './server/utils/shared-session-store.js';
 import { validateProductionConfig } from './server/utils/production.js';
 import {
   listStorageDevices,
@@ -123,6 +124,8 @@ const APP_URL            = process.env.APP_URL || `http://localhost:${PORT}`;
 const NODE_ENV           = process.env.NODE_ENV || 'development';
 const FILE_VAULT         = process.env.FILE_STORAGE_UNC_PATH || path.join(process.cwd(), 'vault');
 const UPLOAD_TEMP        = process.env.UPLOAD_TEMP_PATH || path.join(os.tmpdir(), 'leeku-uploads');
+// Opt-in only (CLUSTER_ENABLED=true). See shared-session-store.ts for why.
+const CLUSTER_ENABLED    = isClusterMode();
 const PUBLIC_SHARE_DECRYPTED_PREVIEW_PATH = String(process.env.PUBLIC_SHARE_DECRYPTED_PREVIEW_PATH || '').trim() || null;
 const PROFILE_PICTURE_PATH = process.env.PROFILE_PICTURE_PATH || path.join(FILE_VAULT, 'users');
 const MAX_LOG_ENTRIES    = parseInt(process.env.MAX_LOG_ENTRIES || '500', 10);
@@ -199,12 +202,16 @@ interface PrivateDownloadSession {
   loaded: number;
   total: number;
   expiresAt: number;
-  claimed: boolean;
   error?: string;
 }
 
 const PRIVATE_DOWNLOAD_SESSION_TTL_MS = 10 * 60_000;
-const privateDownloadSessions = new Map<string, PrivateDownloadSession>();
+// Shared across cluster workers (JSON files under UPLOAD_TEMP/sessions) when
+// CLUSTER_ENABLED=true; a plain in-process Map otherwise.
+const privateDownloadSessions = new SharedSessionStore<PrivateDownloadSession>({
+  shared: () => CLUSTER_ENABLED,
+  dir: () => path.join(UPLOAD_TEMP, 'sessions', 'download'),
+});
 
 // Track temp files from the direct download path so the sweep can clean them up
 const orphanedTempFiles = new Set<string>();
@@ -217,25 +224,31 @@ function unregisterTempFile(tempPath: string): void {
   orphanedTempFiles.delete(tempPath);
 }
 
-function removePrivateDownloadSession(downloadId: string): void {
-  const session = privateDownloadSessions.get(downloadId);
-  if (!session) return;
-  privateDownloadSessions.delete(downloadId);
-  unregisterTempFile(session.tempFile);
+function releaseSessionTempFile(tempFile: string): void {
+  unregisterTempFile(tempFile);
   try {
-    if (fs.existsSync(session.tempFile)) fs.unlinkSync(session.tempFile);
+    if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile);
   } catch {
     // best-effort cleanup only
   }
 }
 
+function removePrivateDownloadSession(downloadId: string): void {
+  const session = privateDownloadSessions.delete(downloadId);
+  if (!session) return;
+  releaseSessionTempFile(session.tempFile);
+}
+
+// Sweeps are triggered from request handlers too; in cluster mode each sweep
+// lists the shared session directory, so cap how often one process does it.
+const SESSION_SWEEP_MIN_INTERVAL_MS = 2_000;
+let lastPrivateDownloadSweepAt = 0;
+
 function sweepPrivateDownloadSessions(): void {
   const now = Date.now();
-  for (const [id, session] of privateDownloadSessions.entries()) {
-    if (now > session.expiresAt) {
-      removePrivateDownloadSession(id);
-    }
-  }
+  if (now - lastPrivateDownloadSweepAt < SESSION_SWEEP_MIN_INTERVAL_MS) return;
+  lastPrivateDownloadSweepAt = now;
+  privateDownloadSessions.sweep((session) => releaseSessionTempFile(session.tempFile), now);
 
   // Also scan the temp directory for any leeku-dl-*.tmp files older than 30 min
   if (fs.existsSync(UPLOAD_TEMP)) {
@@ -278,27 +291,24 @@ interface MediaPreviewSession {
 }
 
 const MEDIA_PREVIEW_SESSION_TTL_MS = 10 * 60_000;
-const mediaPreviewSessions = new Map<string, MediaPreviewSession>();
+const mediaPreviewSessions = new SharedSessionStore<MediaPreviewSession>({
+  shared: () => CLUSTER_ENABLED,
+  dir: () => path.join(UPLOAD_TEMP, 'sessions', 'preview'),
+});
 
 function removeMediaPreviewSession(previewId: string): void {
-  const session = mediaPreviewSessions.get(previewId);
+  const session = mediaPreviewSessions.delete(previewId);
   if (!session) return;
-  mediaPreviewSessions.delete(previewId);
-  unregisterTempFile(session.tempFile);
-  try {
-    if (fs.existsSync(session.tempFile)) fs.unlinkSync(session.tempFile);
-  } catch {
-    // best-effort cleanup only
-  }
+  releaseSessionTempFile(session.tempFile);
 }
+
+let lastMediaPreviewSweepAt = 0;
 
 function sweepMediaPreviewSessions(): void {
   const now = Date.now();
-  for (const [id, session] of mediaPreviewSessions.entries()) {
-    if (now > session.expiresAt) {
-      removeMediaPreviewSession(id);
-    }
-  }
+  if (now - lastMediaPreviewSweepAt < SESSION_SWEEP_MIN_INTERVAL_MS) return;
+  lastMediaPreviewSweepAt = now;
+  mediaPreviewSessions.sweep((session) => releaseSessionTempFile(session.tempFile), now);
 }
 
 // ── Video faststart normalization ──────────────────────────────────────
@@ -799,29 +809,6 @@ async function generateLeekuVibe(filename: string, clean: boolean): Promise<stri
 // ──────────────────────────────────────────────────────────────
 
 const app = express();
-
-// ── Worker-affinity cookie for prepared-download stickiness ──
-const CLUSTER_ENABLED = process.env.CLUSTER_ENABLED !== 'false';
-if (CLUSTER_ENABLED && cluster.isWorker) {
-  app.use((req, res, next) => {
-    // Set a cookie on /prepare responses so the next /status and /file calls
-    // hint the load balancer. With cluster round-robin, this is best-effort.
-    // For production, pair with a reverse proxy that supports sticky sessions.
-    const originalJson = res.json.bind(res);
-    res.json = function (body: any) {
-      if (req.path.includes('/download/prepare') && res.statusCode === 202) {
-        res.cookie('worker_id', String(cluster.worker!.id), {
-          httpOnly: true,
-          sameSite: 'strict',
-          path: '/api/files',
-          maxAge: 15 * 60 * 1000, // 15 minutes
-        });
-      }
-      return originalJson(body);
-    } as typeof res.json;
-    next();
-  });
-}
 
 if (PROXY_TRUST_HOPS > 0) app.set('trust proxy', PROXY_TRUST_HOPS);
 
@@ -3172,6 +3159,23 @@ app.post(
         totalSize,
       });
 
+      // Only one request (across all workers) may merge this upload.
+      const releaseMergeLock = tryAcquireMergeLock(identifier);
+      // Re-count under the lock: a concurrent request may have just merged
+      // (and deleted) the chunks before we got here.
+      if (!releaseMergeLock || countReceivedChunks(identifier) < totalChunks) {
+        releaseMergeLock?.();
+        console.info('[upload] Final chunk arrived while this upload is already being finalized — not merging twice.', {
+          userId: req.user!.id,
+          identifier,
+          chunkNumber,
+        });
+        return res.status(409).json({
+          error: 'This upload is already being finalized. Refresh in a moment to see the file.',
+          finalizing: true,
+        });
+      }
+
       let mergedPath: string;
       try {
         mergedPath = await mergeChunks(identifier, totalChunks);
@@ -3182,6 +3186,8 @@ app.post(
           error: mergeErr instanceof Error ? mergeErr.message : String(mergeErr),
         });
         return res.status(500).json({ error: 'Failed to assemble file chunks. Please try again.' });
+      } finally {
+        releaseMergeLock();
       }
 
       // ── Synthesise a multer-compatible file object ─────────
@@ -5159,9 +5165,8 @@ app.post('/api/files/:id/download/prepare', authenticateUser as express.RequestH
       loaded: 0,
       total: encryptedSize,
       expiresAt: Date.now() + PRIVATE_DOWNLOAD_SESSION_TTL_MS,
-      claimed: false,
     };
-    privateDownloadSessions.set(sessionId, session);
+    privateDownloadSessions.create(session);
     let clientDisconnected = false;
     req.on('close', () => {
       clientDisconnected = true;
@@ -5172,8 +5177,6 @@ app.post('/api/files/:id/download/prepare', authenticateUser as express.RequestH
       return;
     }
 
-    const current = privateDownloadSessions.get(sessionId);
-
     const keyRow = keyRes.recordset[0];
     const fileKey = unwrapKey(keyRow.encrypted_key, keyRow.key_iv, keyRow.key_auth_tag);
 
@@ -5182,19 +5185,21 @@ app.post('/api/files/:id/download/prepare', authenticateUser as express.RequestH
         const hash = crypto.createHash('sha256');
 
         await decryptFileStream(vaultPath, tempFile, fileKey, keyRow.file_iv, keyRow.file_auth_tag, ({ processedBytes, totalBytes }) => {
-          const current = privateDownloadSessions.get(sessionId);
+          const current = privateDownloadSessions.getOwned(sessionId);
           if (!current) return;
           current.phase = 'decrypting';
           current.loaded = processedBytes;
           current.total = totalBytes;
           current.expiresAt = Date.now() + PRIVATE_DOWNLOAD_SESSION_TTL_MS;
+          privateDownloadSessions.save(current, { progress: true });
         }, hash);   // ← pass hash into decryptFileStream
 
-        const current = privateDownloadSessions.get(sessionId);
+        const current = privateDownloadSessions.getOwned(sessionId);
         if (!current) return;
         current.phase = 'verifying';
         current.loaded = 0;
         current.total = current.sizeBytes || 1;
+        privateDownloadSessions.save(current);
 
         // ── Checksum already computed during decryption — just compare ──
         const checksum = hash.digest('hex');
@@ -5205,17 +5210,19 @@ app.post('/api/files/:id/download/prepare', authenticateUser as express.RequestH
 
         current.loaded = current.sizeBytes;
         current.total = current.sizeBytes;
+        privateDownloadSessions.save(current);
 
         if (file.client_secret_hash) {
           if (!file.client_crypto_salt || !file.client_crypto_iv || !file.client_crypto_iterations) {
             throw new Error('Secret-key metadata is missing for this file.');
           }
 
-          const active = privateDownloadSessions.get(sessionId);
+          const active = privateDownloadSessions.getOwned(sessionId);
           if (!active) return;
           active.phase = 'finalizing';
           active.loaded = 0;
           active.total = 1;
+          privateDownloadSessions.save(active);
 
           await decryptClientProtectedFileInPlace(
             tempFile,
@@ -5226,22 +5233,28 @@ app.post('/api/files/:id/download/prepare', authenticateUser as express.RequestH
           );
           active.loaded = 1;
           active.total = 1;
+          privateDownloadSessions.save(active);
         }
 
-        const ready = privateDownloadSessions.get(sessionId);
+        const ready = privateDownloadSessions.getOwned(sessionId);
         if (!ready) return;
         ready.status = 'ready';
         ready.phase = 'ready';
         ready.loaded = ready.sizeBytes;
         ready.total = ready.sizeBytes;
         ready.expiresAt = Date.now() + PRIVATE_DOWNLOAD_SESSION_TTL_MS;
+        if (!privateDownloadSessions.save(ready)) {
+          // Cancelled/removed by another worker while we were decrypting.
+          releaseSessionTempFile(tempFile);
+        }
       } catch (error) {
-        const failed = privateDownloadSessions.get(sessionId);
+        const failed = privateDownloadSessions.getOwned(sessionId);
         if (failed) {
           failed.status = 'error';
           failed.phase = 'error';
           failed.error = error instanceof Error ? error.message : 'Download failed.';
           failed.expiresAt = Date.now() + 30_000;
+          privateDownloadSessions.save(failed);
         }
         try { if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile); } catch {}
       }
@@ -5296,11 +5309,10 @@ app.get('/api/files/:id/download/:downloadId/file', authenticateUser as express.
   if (session.status !== 'ready') {
     return res.status(409).json({ error: 'Download is still being prepared.' });
   }
-  if (session.claimed) {
+  // Claim-once across all workers (exclusive file create in cluster mode).
+  if (!privateDownloadSessions.claim(downloadId)) {
     return res.status(409).json({ error: 'This download session has already been used.' });
   }
-
-  session.claimed = true;
 
   // Listen for early client disconnect before the stream is set up
   let streamPiped = false;
@@ -5325,7 +5337,7 @@ app.get('/api/files/:id/download/:downloadId/file', authenticateUser as express.
     res.on('finish', () => removePrivateDownloadSession(downloadId));
     res.on('close', () => removePrivateDownloadSession(downloadId));
   } catch (err) {
-    session.claimed = false;
+    privateDownloadSessions.releaseClaim(downloadId);
     console.error('[GET /api/files/:id/download/:downloadId/file]', err);
     if (!res.headersSent) res.status(500).json({ error: 'Download failed.' });
   }
@@ -5396,25 +5408,27 @@ app.post('/api/files/:id/preview/prepare', authenticateUser as express.RequestHa
       total: encryptedSize,
       expiresAt: Date.now() + MEDIA_PREVIEW_SESSION_TTL_MS,
     };
-    mediaPreviewSessions.set(previewId, session);
+    mediaPreviewSessions.create(session);
 
     void (async () => {
       try {
         const hash = crypto.createHash('sha256');
         await decryptFileStream(vaultPath, tempFile, fileKey, keyRow.file_iv, keyRow.file_auth_tag, ({ processedBytes, totalBytes }) => {
-          const current = mediaPreviewSessions.get(previewId);
+          const current = mediaPreviewSessions.getOwned(previewId);
           if (!current) return;
           current.phase = 'decrypting';
           current.loaded = processedBytes;
           current.total = totalBytes;
           current.expiresAt = Date.now() + MEDIA_PREVIEW_SESSION_TTL_MS;
+          mediaPreviewSessions.save(current, { progress: true });
         }, hash);
 
-        const current = mediaPreviewSessions.get(previewId);
+        const current = mediaPreviewSessions.getOwned(previewId);
         if (!current) return;
         current.phase = 'verifying';
         current.loaded = 0;
         current.total = current.sizeBytes || 1;
+        mediaPreviewSessions.save(current);
 
         const checksum = hash.digest('hex');
         if (checksum !== file.checksum_sha256) {
@@ -5429,12 +5443,13 @@ app.post('/api/files/:id/preview/prepare', authenticateUser as express.RequestHa
         // decrypted file rather than breaking preview entirely.
         let servedFile = tempFile;
         if (isFaststartCandidate(file.mime_type)) {
-          const optimizing = mediaPreviewSessions.get(previewId);
+          const optimizing = mediaPreviewSessions.getOwned(previewId);
           if (optimizing) {
             optimizing.phase = 'optimizing';
             optimizing.loaded = 0;
             optimizing.total = fs.statSync(tempFile).size || 1;
             optimizing.expiresAt = Date.now() + MEDIA_PREVIEW_SESSION_TTL_MS;
+            mediaPreviewSessions.save(optimizing);
           }
 
           const faststartFile = buildUniqueTempFilePath(UPLOAD_TEMP, 'leeku-dl', fileId);
@@ -5459,7 +5474,7 @@ app.post('/api/files/:id/preview/prepare', authenticateUser as express.RequestHa
           }
         }
 
-        const ready = mediaPreviewSessions.get(previewId);
+        const ready = mediaPreviewSessions.getOwned(previewId);
         if (!ready) return;
         const servedSize = fs.existsSync(servedFile) ? fs.statSync(servedFile).size : ready.sizeBytes;
         ready.tempFile = servedFile;
@@ -5469,13 +5484,18 @@ app.post('/api/files/:id/preview/prepare', authenticateUser as express.RequestHa
         ready.loaded = servedSize;
         ready.total = servedSize;
         ready.expiresAt = Date.now() + MEDIA_PREVIEW_SESSION_TTL_MS;
+        if (!mediaPreviewSessions.save(ready)) {
+          // Removed by another worker while we were preparing it.
+          releaseSessionTempFile(servedFile);
+        }
       } catch (error) {
-        const failed = mediaPreviewSessions.get(previewId);
+        const failed = mediaPreviewSessions.getOwned(previewId);
         if (failed) {
           failed.status = 'error';
           failed.phase = 'error';
           failed.error = error instanceof Error ? error.message : 'Preview failed.';
           failed.expiresAt = Date.now() + 30_000;
+          mediaPreviewSessions.save(failed);
         }
         try { if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile); } catch {}
       }
@@ -7801,21 +7821,12 @@ async function ensureUserPreferredStorageColumn(): Promise<void> {
   `);
 }
 
-async function bootstrap() {
-  // 1. Validate production requirements and master encryption key
-  validateProductionConfig();
-  validateEncryptionConfig();
-
-  // 1b. Load (and cache) RS256 signing/verification keys now so a missing or
-  // unreadable key file surfaces at boot — never at login time. Consent to
-  // RS256 implies the key files are required in every environment.
-  getJwtSigningKey();
-  getJwtVerifyKey();
-
-  // 2. Connect SQL Server
-  await getPool();
-  console.log('[server] SQL Server connection pool ready.');
-
+/**
+ * One-time startup work that must NOT run concurrently: idempotent schema
+ * migrations, legacy-storage seeding and UNC provisioning. Runs in the single
+ * process, or once in the cluster primary before any worker is forked.
+ */
+async function runStartupMigrations(): Promise<void> {
   // 2b. Lightweight schema migration for optional user-provided file secrets.
   await ensureOptionalFileSecretColumns();
   await ensureOptionalShareLinkColumns();
@@ -7858,6 +7869,36 @@ async function bootstrap() {
   } catch (e: any) {
     console.error('[storage] Boot-time device presence check failed:', e?.message ?? e);
   }
+}
+
+/**
+ * Whether this process owns the singleton background jobs (expiry cleanup,
+ * trash purge, storage health monitor, migration-job sweep, thumbnail scan).
+ * In cluster mode exactly one worker is forked with LEEKU_BACKGROUND_JOBS=1;
+ * otherwise each job ran N times in parallel — N× probes of the UNC share,
+ * N workers flipping maintenance mode, N trash purges racing on the same rows.
+ */
+const RUNS_BACKGROUND_JOBS = !CLUSTER_ENABLED || process.env.LEEKU_BACKGROUND_JOBS === '1';
+
+async function bootstrap() {
+  // 1. Validate production requirements and master encryption key
+  validateProductionConfig();
+  validateEncryptionConfig();
+
+  // 1b. Load (and cache) RS256 signing/verification keys now so a missing or
+  // unreadable key file surfaces at boot — never at login time. Consent to
+  // RS256 implies the key files are required in every environment.
+  getJwtSigningKey();
+  getJwtVerifyKey();
+
+  // 2. Connect SQL Server
+  await getPool();
+  console.log('[server] SQL Server connection pool ready.');
+
+  // 2b–2e. Schema migrations + storage provisioning. In cluster mode the
+  // primary already ran these once before forking (see the fork block below);
+  // running them in N workers at once raced DDL and `net use` against itself.
+  if (!CLUSTER_ENABLED) await runStartupMigrations();
 
   app.use('/api/health', createHealthRouter(FILE_VAULT, NODE_ENV === 'production'));
 
@@ -7882,26 +7923,35 @@ async function bootstrap() {
     console.log('[server] SMTP not configured — email verification disabled.');
   }
 
-  // 6. Start expiry cleanup
-  startExpiryCleanup(getExpiredFiles, markFilesExpired, logExpiredFile);
+  // 6. Clean up stale download temp files from previous crashes. Deletes every
+  // leeku-dl-*.tmp, so it only runs when no sibling can be using one: here in
+  // single-process mode, or in the cluster primary before forking. (It used to
+  // run in every worker, so each auto-restarted worker wiped the in-flight
+  // downloads/previews of all the others.)
+  if (!CLUSTER_ENABLED) cleanupStaleTempFiles(UPLOAD_TEMP);
 
-  // 6a. Start trash purge (permanently deletes files past retention in trash)
-  startTrashPurge();
-
-  // 6b. Clean up stale download temp files from previous crashes
-  cleanupStaleTempFiles(UPLOAD_TEMP);
-
-  // 6c. Start periodic sweep of expired download sessions
+  // 6a. Periodic sweep of expired download/preview sessions (every worker;
+  // idempotent against the shared session directory).
   startPrivateDownloadSweep();
 
-  // 6d. Start UNC share health monitor (auto-maintenance toggle)
-  startUncShareMonitor();
+  if (RUNS_BACKGROUND_JOBS) {
+    // 6b. Expiry cleanup
+    startExpiryCleanup(getExpiredFiles, markFilesExpired, logExpiredFile);
 
-  // 6e. Start migration job registry sweep (stale migration progress cleanup)
-  startMigrationJobSweep();
+    // 6c. Trash purge (permanently deletes files past retention in trash)
+    startTrashPurge();
 
-  // 6f. Start thumbnail background scan job
-  startThumbnailScan(60); // Run every 60 minutes
+    // 6d. UNC share health monitor (auto-maintenance toggle)
+    startUncShareMonitor();
+
+    // 6e. Migration job registry sweep (stale migration progress cleanup)
+    startMigrationJobSweep();
+
+    // 6f. Thumbnail background scan job
+    startThumbnailScan(60); // Run every 60 minutes
+
+    if (CLUSTER_ENABLED) console.log(`[server] Worker ${process.pid} owns background jobs.`);
+  }
 
   // 7. Share link vanity path (Discord embeds) & SPA fallback
   const distPath = path.join(process.cwd(), 'dist');
@@ -8011,18 +8061,45 @@ async function bootstrap() {
 // ── Primary / Worker fork ───────────────────────────────
 
 if (CLUSTER_ENABLED && cluster.isPrimary) {
-  const numCPUs = os.cpus().length;
+  const numCPUs = Math.max(1, parseInt(process.env.CLUSTER_WORKERS || '', 10) || os.cpus().length);
   console.log(`[server] Primary ${process.pid} is running`);
-  console.log(`[server] Forking ${numCPUs} workers...`);
 
-  for (let i = 0; i < numCPUs; i++) {
-    cluster.fork();
-  }
+  // Exactly one worker carries LEEKU_BACKGROUND_JOBS=1; if it dies, its
+  // replacement inherits the role so the jobs never stop or double up.
+  let backgroundWorkerId: number | null = null;
+  const forkWorker = (withBackgroundJobs: boolean) => {
+    const worker = cluster.fork(withBackgroundJobs ? { LEEKU_BACKGROUND_JOBS: '1' } : {});
+    if (withBackgroundJobs) backgroundWorkerId = worker.id;
+  };
 
   cluster.on('exit', (worker, code, signal) => {
     console.log(`[server] Worker ${worker.process.pid} died (code=${code}, signal=${signal}). Restarting...`);
-    cluster.fork();
+    forkWorker(worker.id === backgroundWorkerId);
   });
+
+  void (async () => {
+    try {
+      validateProductionConfig();
+      validateEncryptionConfig();
+      await getPool();
+      await runStartupMigrations();
+      // Nothing is running yet, so anything left in temp is from a previous run.
+      cleanupStaleTempFiles(UPLOAD_TEMP);
+      try {
+        fs.rmSync(path.join(UPLOAD_TEMP, 'sessions'), { recursive: true, force: true });
+      } catch (err) {
+        console.warn('[server] Could not clear stale session state:', err);
+      }
+    } catch (err) {
+      console.error('[server] Fatal startup error (primary):', err);
+      process.exit(1);
+    }
+    // Workers open their own pools; the primary serves no requests.
+    try { await closePool(); } catch { /* best effort */ }
+
+    console.log(`[server] Forking ${numCPUs} workers...`);
+    for (let i = 0; i < numCPUs; i++) forkWorker(i === 0);
+  })();
 
   // Graceful shutdown of all workers on SIGTERM/SIGINT
   const shutdownCluster = (sig: string) => {

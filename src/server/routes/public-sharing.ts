@@ -1,4 +1,5 @@
 import express from 'express';
+import { SharedSessionStore, isClusterMode } from '../utils/shared-session-store.js';
 import rateLimit from 'express-rate-limit';
 import crypto from 'crypto';
 import fs from 'fs';
@@ -60,7 +61,6 @@ interface PublicDownloadSession {
   loaded: number;
   total: number;
   expiresAt: number;
-  claimed: boolean;
   error?: string;
 }
 
@@ -233,7 +233,14 @@ export function createPublicSharingRouter(options: {
   const EMBED_CACHE_SWEEP_INTERVAL_MS = 60_000;
   const DOWNLOAD_SESSION_TTL_MS = 10 * 60_000;
   const embedCacheInflight = new Map<string, Promise<string>>();
-  const downloadSessions = new Map<string, PublicDownloadSession>();
+  // Shared across cluster workers when CLUSTER_ENABLED=true: the prepare,
+  // status and file requests of one download can each land on a different
+  // worker. Plain in-process Map otherwise.
+  const downloadSessions = new SharedSessionStore<PublicDownloadSession>({
+    shared: isClusterMode,
+    dir: () => path.join(options.tempPath, 'sessions', 'public-share'),
+  });
+  let lastDownloadSessionSweep = 0;
   let lastEmbedCacheSweep = 0;
   const decryptedPreviewPath = options.decryptedPreviewPath ? path.resolve(options.decryptedPreviewPath) : null;
 
@@ -304,9 +311,8 @@ export function createPublicSharingRouter(options: {
   };
 
   const removeDownloadSession = (downloadId: string) => {
-    const session = downloadSessions.get(downloadId);
+    const session = downloadSessions.delete(downloadId);
     if (!session) return;
-    downloadSessions.delete(downloadId);
     try {
       if (fs.existsSync(session.tempFile)) fs.unlinkSync(session.tempFile);
     } catch {
@@ -316,11 +322,11 @@ export function createPublicSharingRouter(options: {
 
   const sweepDownloadSessions = () => {
     const now = Date.now();
-    for (const [downloadId, session] of downloadSessions.entries()) {
-      if (session.expiresAt <= now) {
-        removeDownloadSession(downloadId);
-      }
-    }
+    if (now - lastDownloadSessionSweep < 2_000) return;
+    lastDownloadSessionSweep = now;
+    downloadSessions.sweep((session) => {
+      try { if (fs.existsSync(session.tempFile)) fs.unlinkSync(session.tempFile); } catch { /* best effort */ }
+    }, now + 1); // `<= now` semantics of the old loop
   };
 
   const ensureEmbedCacheFile = async (
@@ -858,28 +864,29 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
         loaded: 0,
         total: encryptedSize,
         expiresAt: Date.now() + DOWNLOAD_SESSION_TTL_MS,
-        claimed: false,
       };
-      downloadSessions.set(sessionId, session);
+      downloadSessions.create(session);
 
       void (async () => {
         try {
             const hash = crypto.createHash('sha256');
 
             await decryptFileStream(vaultFile, tempFile, fileKey, row.file_iv, row.file_auth_tag, ({ processedBytes, totalBytes }) => {
-                const current = downloadSessions.get(sessionId);
+                const current = downloadSessions.getOwned(sessionId);
                 if (!current) return;
                 current.phase = 'decrypting';
                 current.loaded = processedBytes;
                 current.total = totalBytes;
                 current.expiresAt = Date.now() + DOWNLOAD_SESSION_TTL_MS;
+                downloadSessions.save(current, { progress: true });
             }, hash);   // ← pass hash into decryptFileStream
 
-            const current = downloadSessions.get(sessionId);
+            const current = downloadSessions.getOwned(sessionId);
             if (!current) return;
             current.phase = 'verifying';
             current.loaded = 0;
             current.total = current.sizeBytes || 1;
+            downloadSessions.save(current);
 
             // ── Checksum already computed during decryption — just compare ──
             const checksum = hash.digest('hex');
@@ -889,6 +896,7 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
 
             current.loaded = current.sizeBytes;
             current.total = current.sizeBytes;
+            downloadSessions.save(current);
 
 
           if (row.client_secret_hash) {
@@ -896,11 +904,12 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
                 throw new Error('Secret-key metadata is missing for this file.');
             }
 
-            const active = downloadSessions.get(sessionId);
+            const active = downloadSessions.getOwned(sessionId);
             if (!active) return;
             active.phase = 'finalizing';
             active.loaded = 0;
             active.total = 1;
+            downloadSessions.save(active);
             const providedSecret = typeof secret_key === 'string' ? secret_key.trim() : '';
             await decryptClientProtectedFileInPlace(
               tempFile,
@@ -912,22 +921,28 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
 
             active.loaded = 1;
             active.total = 1;
+            downloadSessions.save(active);
         }
 
-          const ready = downloadSessions.get(sessionId);
+          const ready = downloadSessions.getOwned(sessionId);
           if (!ready) return;
           ready.status = 'ready';
           ready.phase = 'ready';
           ready.loaded = ready.sizeBytes;
           ready.total = ready.sizeBytes;
           ready.expiresAt = Date.now() + DOWNLOAD_SESSION_TTL_MS;
+          if (!downloadSessions.save(ready)) {
+            // Removed by another worker while we were decrypting.
+            try { if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile); } catch {}
+          }
         } catch (error) {
-          const failed = downloadSessions.get(sessionId);
+          const failed = downloadSessions.getOwned(sessionId);
           if (failed) {
             failed.status = 'error';
             failed.phase = 'error';
             failed.error = error instanceof Error ? error.message : 'Download failed.';
             failed.expiresAt = Date.now() + 30_000;
+            downloadSessions.save(failed);
           }
           try { if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile); } catch {}
         }
@@ -980,11 +995,11 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
     if (session.status !== 'ready') {
       return res.status(409).json({ error: 'Download is still being prepared.' });
     }
-    if (session.claimed) {
+    // Claim-once across all workers, so one prepared download can't be
+    // streamed (and counted against max_downloads) twice.
+    if (!downloadSessions.claim(downloadId)) {
       return res.status(409).json({ error: 'This download session has already been used.' });
     }
-
-    session.claimed = true;
 
     try {
       const reserve = await getRequest(); reserve.input('id', sql.UniqueIdentifier, session.shareId);
@@ -1028,7 +1043,7 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
       res.on('finish', () => removeDownloadSession(downloadId));
       res.on('close', () => removeDownloadSession(downloadId));
     } catch (error) {
-      session.claimed = false;
+      downloadSessions.releaseClaim(downloadId);
       console.error('[GET /api/public/share/:token/download/:downloadId/file]', error);
       return res.status(500).json({ error: 'Download failed.' });
     }
