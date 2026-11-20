@@ -31,6 +31,49 @@ export function isSafeResumableIdentifier(identifier: string): boolean {
     && /^[A-Za-z0-9_-]{1,128}$/.test(identifier);
 }
 
+// A merge lock older than this belongs to a worker that died mid-merge.
+const STALE_MERGE_LOCK_MS = 60 * 60_000;
+
+function mergeLockPath(identifier: string): string {
+  return path.join(resumableChunkDir(identifier), '.merging');
+}
+
+/**
+ * Claim the right to merge a resumable upload. Returns a release function, or
+ * null when another request (in this or another cluster worker) already holds it.
+ *
+ * POURQUOI : the "all chunks present?" check counts files on disk. Two requests
+ * finishing at the same time (parallel workers, or a retried final chunk while
+ * the first merge is still streaming) both saw N of N and both ran mergeChunks
+ * into the same merged_<id> file, deleting chunks out from under each other
+ * ("Missing chunk X of N", corrupt output, or a duplicated file row). An
+ * exclusive create ('wx') is atomic on every platform and filesystem we use,
+ * so exactly one caller wins.
+ */
+export function tryAcquireMergeLock(identifier: string): (() => void) | null {
+  if (!isSafeResumableIdentifier(identifier)) return null;
+  const lock = mergeLockPath(identifier);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      fs.closeSync(fs.openSync(lock, 'wx'));
+      return () => {
+        try { fs.unlinkSync(lock); } catch { /* best effort */ }
+        // mergeChunks could not remove the directory while the lock was in it.
+        try { fs.rmdirSync(resumableChunkDir(identifier)); } catch { /* not empty / gone */ }
+      };
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+      try {
+        if (Date.now() - fs.statSync(lock).mtimeMs <= STALE_MERGE_LOCK_MS) return null;
+        fs.unlinkSync(lock); // stale: previous holder crashed — take over
+      } catch {
+        // lock vanished between open and stat — retry the create
+      }
+    }
+  }
+  return null;
+}
+
 // Bounded block size (1 MiB) used to stream each chunk file into the merge. A
 // single block is in flight at a time thanks to Readable.from's backpressure,
 // so memory stays flat regardless of chunk/account size. Fresh buffers per read

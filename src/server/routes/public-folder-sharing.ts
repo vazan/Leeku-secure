@@ -1,4 +1,5 @@
 import crypto from 'crypto';
+import { SharedSessionStore, isClusterMode } from '../utils/shared-session-store.js';
 import express from 'express';
 import rateLimit from 'express-rate-limit';
 import fs from 'fs';
@@ -45,7 +46,6 @@ interface FolderDownloadSession {
   loaded: number;
   total: number;
   expiresAt: number;
-  claimed: boolean;
   error?: string;
 }
 
@@ -80,7 +80,12 @@ export function createPublicFolderSharingRouter(options: {
 }): express.Router {
   const router = express.Router();
   const FACEBOOK_APP_ID = String(process.env.FACEBOOK_APP_ID || process.env.FB_APP_ID || '').trim();
-  const downloadSessions = new Map<string, FolderDownloadSession>();
+  // Shared across cluster workers when CLUSTER_ENABLED=true (see public-sharing.ts).
+  const downloadSessions = new SharedSessionStore<FolderDownloadSession>({
+    shared: isClusterMode,
+    dir: () => path.join(options.tempPath, 'sessions', 'public-folder'),
+  });
+  let lastSessionSweep = 0;
 
   if (!fs.existsSync(options.tempPath)) fs.mkdirSync(options.tempPath, { recursive: true });
 
@@ -103,17 +108,18 @@ export function createPublicFolderSharingRouter(options: {
   };
 
   const removeSession = (downloadId: string) => {
-    const session = downloadSessions.get(downloadId);
+    const session = downloadSessions.delete(downloadId);
     if (!session) return;
-    downloadSessions.delete(downloadId);
     try { if (fs.existsSync(session.tempFile)) fs.unlinkSync(session.tempFile); } catch {}
   };
 
   const sweepSessions = () => {
     const now = Date.now();
-    for (const [downloadId, session] of downloadSessions) {
-      if (session.expiresAt <= now) removeSession(downloadId);
-    }
+    if (now - lastSessionSweep < 2_000) return;
+    lastSessionSweep = now;
+    downloadSessions.sweep((session) => {
+      try { if (fs.existsSync(session.tempFile)) fs.unlinkSync(session.tempFile); } catch {}
+    }, now + 1);
   };
 
   const loadShare = async (token: string): Promise<FolderShareRow | null> => {
@@ -461,32 +467,35 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
         id: sessionId, accessToken, token: getSingleParam(req.params.token), shareId: row.id, fileId: file.id, originalName,
         mimeType: file.mime_type || 'application/octet-stream', tempFile, sizeBytes: Number(file.size_bytes || 0),
         status: 'preparing', phase: 'decrypting', loaded: 0, total: encryptedSize,
-        expiresAt: Date.now() + DOWNLOAD_SESSION_TTL_MS, claimed: false,
+        expiresAt: Date.now() + DOWNLOAD_SESSION_TTL_MS,
       };
-      downloadSessions.set(sessionId, session);
+      downloadSessions.create(session);
 
       void (async () => {
         try {
           const hash = crypto.createHash('sha256');
           const fileKey = unwrapKey(file.encrypted_key, file.key_iv, file.key_auth_tag);
           await decryptFileStream(vaultFile, tempFile, fileKey, file.file_iv, file.file_auth_tag, ({ processedBytes, totalBytes }) => {
-            const current = downloadSessions.get(sessionId);
+            const current = downloadSessions.getOwned(sessionId);
             if (!current) return;
             current.loaded = processedBytes;
             current.total = totalBytes;
             current.expiresAt = Date.now() + DOWNLOAD_SESSION_TTL_MS;
+            downloadSessions.save(current, { progress: true });
           }, hash);
-          const current = downloadSessions.get(sessionId);
+          const current = downloadSessions.getOwned(sessionId);
           if (!current) return;
           current.phase = 'verifying';
           current.loaded = 0;
           current.total = current.sizeBytes || 1;
+          downloadSessions.save(current);
           if (hash.digest('hex') !== file.checksum_sha256) throw new Error('File integrity check failed.');
           if (file.client_secret_hash) {
             if (!file.client_crypto_salt || !file.client_crypto_iv || !file.client_crypto_iterations) {
               throw new Error('Secret-key metadata is missing for this file.');
             }
             current.phase = 'finalizing';
+            downloadSessions.save(current);
             await decryptClientProtectedFileInPlace(tempFile, secretKey, file.client_crypto_salt, file.client_crypto_iv, file.client_crypto_iterations);
           }
           current.status = 'ready';
@@ -494,13 +503,17 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
           current.loaded = current.sizeBytes;
           current.total = current.sizeBytes;
           current.expiresAt = Date.now() + DOWNLOAD_SESSION_TTL_MS;
+          if (!downloadSessions.save(current)) {
+            try { if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile); } catch {}
+          }
         } catch (error) {
-          const current = downloadSessions.get(sessionId);
+          const current = downloadSessions.getOwned(sessionId);
           if (current) {
             current.status = 'error';
             current.phase = 'error';
             current.error = error instanceof Error ? error.message : 'Download failed.';
             current.expiresAt = Date.now() + 30_000;
+            downloadSessions.save(current);
           }
           try { if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile); } catch {}
         }
@@ -544,8 +557,7 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
       return res.status(500).json({ error: message });
     }
     if (session.status !== 'ready') return res.status(409).json({ error: 'Download is still being prepared.' });
-    if (session.claimed) return res.status(409).json({ error: 'This download session has already been used.' });
-    session.claimed = true;
+    if (!downloadSessions.claim(session.id)) return res.status(409).json({ error: 'This download session has already been used.' });
     try {
       const request = await getRequest();
       request.input('id', sql.UniqueIdentifier, session.shareId);
@@ -568,7 +580,7 @@ ${isCrawlerUa ? '' : `<script>window.location.replace(${JSON.stringify(appUrl)})
       res.on('finish', () => removeSession(session.id));
       res.on('close', () => removeSession(session.id));
     } catch (error) {
-      session.claimed = false;
+      downloadSessions.releaseClaim(session.id);
       console.error('[GET /api/public/folder/:token/download/:downloadId/file]', error);
       if (!res.headersSent) res.status(500).json({ error: 'Download failed.' });
     }

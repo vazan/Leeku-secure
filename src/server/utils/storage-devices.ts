@@ -25,6 +25,8 @@
 import fs from 'fs';
 import path from 'path';
 import { randomUUID } from 'crypto';
+import os from 'os';
+import { SharedSessionStore, isClusterMode } from './shared-session-store.js';
 import { getRequest as dbGetRequest, sql } from '../db.js';
 import { encryptColumn, decryptColumn } from './encryption.js';
 
@@ -241,14 +243,44 @@ export function decryptedPassword(device: StorageDevice): string | null {
 // ──────────────────────────────────────────────────────────────
 
 /** Checks a device root is readable (used by per-device health monitor + admin). */
-export async function isDeviceReachable(storagePath: string): Promise<boolean> {
+// POURQUOI : the old probe called readdir() on the device root. Vault blobs
+// live flat in that root, so every probe enumerated the whole vault (~8 s for
+// ~20k files over SMB) and it ran for EVERY upload. Each probe pinned one of
+// libuv's 4 threadpool threads, starving all other fs I/O (static files, chunk
+// writes, temp files) and making the site crawl after large backups.
+// A stat()+access() on the root proves the share is mounted and readable in
+// constant time; results are cached briefly so bursts of uploads share one probe.
+const REACHABILITY_CACHE_TTL_MS = 30_000;
+const reachabilityCache = new Map<string, { ok: boolean; checkedAt: number }>();
+const reachabilityInflight = new Map<string, Promise<boolean>>();
+
+async function probeDeviceRoot(storagePath: string): Promise<boolean> {
   try {
+    const stat = await fs.promises.stat(storagePath);
+    if (!stat.isDirectory()) return false;
     await fs.promises.access(storagePath, fs.constants.R_OK);
-    await fs.promises.readdir(storagePath);
     return true;
   } catch {
     return false;
   }
+}
+
+export async function isDeviceReachable(storagePath: string, options: { fresh?: boolean } = {}): Promise<boolean> {
+  const cached = reachabilityCache.get(storagePath);
+  if (!options.fresh && cached && Date.now() - cached.checkedAt < REACHABILITY_CACHE_TTL_MS) {
+    return cached.ok;
+  }
+  const inflight = reachabilityInflight.get(storagePath);
+  if (inflight) return inflight;
+
+  const probe = probeDeviceRoot(storagePath)
+    .then((ok) => {
+      reachabilityCache.set(storagePath, { ok, checkedAt: Date.now() });
+      return ok;
+    })
+    .finally(() => reachabilityInflight.delete(storagePath));
+  reachabilityInflight.set(storagePath, probe);
+  return probe;
 }
 
 /** Builds a safe admin DTO (no encrypted blobs, no plaintext credentials). */
@@ -607,23 +639,46 @@ export interface MigrationProgress {
 }
 
 /**
- * In-process registry of active/recent device-migration jobs, keyed by an
- * opaque job id handed back to the admin UI so it can poll progress.
- * In-memory (not persisted): a job that outlives a process restart simply
- * loses its progress reporting, but the migration itself is per-file atomic
- * and resumable via a fresh run.
+ * Registry of active/recent device-migration jobs, keyed by an opaque job id
+ * handed back to the admin UI so it can poll progress. With CLUSTER_ENABLED=true
+ * the registry is mirrored to UPLOAD_TEMP/sessions/migration so a poll that lands
+ * on a different worker than the one running the job still finds it. It is not
+ * durable across a full restart: the migration itself is per-file atomic and
+ * resumable via a fresh run.
  */
-const migrationJobs = new Map<string, MigrationProgress>();
+type MigrationJobRecord = MigrationProgress & { id: string; expiresAt: number };
+
+const migrationJobs = new SharedSessionStore<MigrationJobRecord>({
+  shared: isClusterMode,
+  dir: () => path.join(
+    process.env.UPLOAD_TEMP_PATH || path.join(os.tmpdir(), 'leeku-uploads'),
+    'sessions',
+    'migration',
+  ),
+  progressWriteIntervalMs: 1_000,
+});
+
+/** A running job with no progress for this long lost its worker (crash/restart). */
+const ORPHANED_RUNNING_JOB_MS = 24 * 60 * 60_000;
+
+function toProgress(record: MigrationJobRecord): MigrationProgress {
+  const { id: _id, expiresAt: _expiresAt, ...progress } = record;
+  return progress;
+}
 
 /** Snapshot of a migration job's progress, or null when unknown/expired. */
 export function getMigrationProgress(jobId: string): MigrationProgress | null {
-  return migrationJobs.get(jobId) ?? null;
+  const record = migrationJobs.get(jobId);
+  return record ? toProgress(record) : null;
 }
 
 /** Creates a new running job entry. Returns false if one already exists. */
 export function createMigrationJob(jobId: string, total: number): boolean {
-  if (migrationJobs.has(jobId)) return false;
-  migrationJobs.set(jobId, {
+  if (migrationJobs.get(jobId)) return false;
+  migrationJobs.create({
+    id: jobId,
+    // Expiry is handled by sweepStaleMigrationJobs (status-aware), not the store.
+    expiresAt: Number.MAX_SAFE_INTEGER,
     status: 'running',
     total,
     processed: 0,
@@ -642,8 +697,11 @@ export function createMigrationJob(jobId: string, total: number): boolean {
  * job is absent or no longer running.
  */
 export function setMigrationJobTotal(jobId: string, total: number): void {
-  const job = migrationJobs.get(jobId);
-  if (job && job.status === 'running') job.total = total;
+  const job = migrationJobs.getOwned(jobId);
+  if (job && job.status === 'running') {
+    job.total = total;
+    migrationJobs.save(job);
+  }
 }
 
 /** Marks a migration job as finished with a summary. */
@@ -652,7 +710,7 @@ export function finishMigrationJob(
   result: DeviceMigrationResult,
   options?: { status?: MigrationStatus; error?: string },
 ): void {
-  const job = migrationJobs.get(jobId);
+  const job = migrationJobs.getOwned(jobId);
   if (!job) return;
   job.status = options?.status ?? 'done';
   job.error = options?.error;
@@ -662,6 +720,7 @@ export function finishMigrationJob(
   job.skipped = result.skipped;
   job.failures = result.failures;
   job.updatedAt = Date.now();
+  migrationJobs.save(job);
 }
 
 /** Applies a per-blob result delta to a live job (no-op when job is absent). */
@@ -670,7 +729,7 @@ function updateMigrationJobProgress(
   outcome: { moved?: boolean; failed?: boolean; skipped?: boolean; failure?: DeviceMigrationResult['failures'][number] },
 ): void {
   if (!jobId) return;
-  const job = migrationJobs.get(jobId);
+  const job = migrationJobs.getOwned(jobId);
   if (!job || job.status !== 'running') return;
   if (outcome.moved) job.moved += 1;
   else if (outcome.failed) job.failed += 1;
@@ -678,6 +737,7 @@ function updateMigrationJobProgress(
   if (outcome.failure) job.failures.push(outcome.failure);
   job.processed += 1;
   job.updatedAt = Date.now();
+  migrationJobs.save(job, { progress: true });
 }
 
 /** Removes a finished/errored migration job, freeing memory. */
@@ -687,15 +747,18 @@ export function clearMigrationJob(jobId: string): void {
 
 /**
  * Removes all migration jobs that have been terminal (done/error) for longer
- * than `ttlMs`. Used by a periodic sweep so the in-memory registry does not
- * grow unbounded across many migrations. Returns the number removed.
+ * than `ttlMs`, plus running jobs whose worker evidently died. Used by a
+ * periodic sweep so the registry does not grow unbounded. Returns the number removed.
  */
 export function sweepStaleMigrationJobs(ttlMs: number): number {
-  const cutoff = Date.now() - ttlMs;
+  const now = Date.now();
   let removed = 0;
-  for (const [jobId, job] of migrationJobs) {
-    if (job.status !== 'running' && job.updatedAt < cutoff) {
-      migrationJobs.delete(jobId);
+  for (const job of migrationJobs.values()) {
+    const stale = job.status === 'running'
+      ? now - job.updatedAt > ORPHANED_RUNNING_JOB_MS
+      : now - job.updatedAt > ttlMs;
+    if (stale) {
+      migrationJobs.delete(job.id);
       removed += 1;
     }
   }
@@ -866,9 +929,9 @@ export async function moveDeviceFiles(
   if (!source) throw new Error('Source storage device not found.');
   if (!destination) throw new Error('Destination storage device not found.');
 
-  if (!(await isDeviceReachable(source.storage_path)))
+  if (!(await isDeviceReachable(source.storage_path, { fresh: true })))
     throw new Error(`Source device ${source.storage_id} is not reachable.`);
-  if (!(await isDeviceReachable(destination.storage_path)))
+  if (!(await isDeviceReachable(destination.storage_path, { fresh: true })))
     throw new Error(`Destination device ${destination.storage_id} is not reachable.`);
 
   const req = await getRequest();
@@ -982,9 +1045,9 @@ export async function moveUserFiles(
   if (!source) throw new Error('Source storage device not found.');
   if (!destination) throw new Error('Destination storage device not found.');
 
-  if (!(await isDeviceReachable(source.storage_path)))
+  if (!(await isDeviceReachable(source.storage_path, { fresh: true })))
     throw new Error(`Source device ${source.storage_id} is not reachable.`);
-  if (!(await isDeviceReachable(destination.storage_path)))
+  if (!(await isDeviceReachable(destination.storage_path, { fresh: true })))
     throw new Error(`Destination device ${destination.storage_id} is not reachable.`);
 
   const req = await getRequest();
